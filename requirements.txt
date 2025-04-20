@@ -1,0 +1,58 @@
+# Core dependencies
+streamlit
+langchain
+langchain-community
+langchain-openai
+langchain-experimental
+langchain-core
+openai
+
+# Document processing
+chromadb
+faiss-cpu
+unstructured
+pypdf
+pydantic
+pdf2image
+pypandoc
+python-docx
+sentence-transformers
+pymupdf4llm
+
+# Web tools and research
+wikipedia
+duckduckgo-search
+beautifulsoup4
+requests
+
+# Markdown and text processing
+markdown
+markdownify
+
+# Utility
+tqdm
+uuid
+aiohttp
+asyncio
+numpy
+pandas
+nest_asyncio
+pymupdf
+ffmpeg-python==0.2.0
+ffprobe==0.5
+pydub==0.25.1
+
+
+# Web page processing tools
+bs4
+lxml
+
+# Database support
+sqlite3-api
+
+# Visual elements 
+matplotlib
+plotly
+
+# Optional: for improved performance
+llama-cpp-python
