@@ -6,10 +6,10 @@ langchain-community
 langchain-openai
 langchain-experimental
 langchain-core
+langgraph-supervisor
 openai
 
 # Document processing
-chromadb
 faiss-cpu
 unstructured
 pypdf
