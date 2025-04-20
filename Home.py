@@ -259,7 +259,8 @@ workflow.add_edge("generate", END)
 st.set_page_config(
     page_title="Anya",
     layout="wide",
-    page_icon="🥜"
+    page_icon="🥜",
+    initial_sidebar_state="expanded"
 )
 
 # Initialize session state for the model if it doesn't exist
