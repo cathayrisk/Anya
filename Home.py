@@ -11,6 +11,8 @@ import re
 import sys
 import io
 
+st.sidebar.success("Select a demo above.")
+
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
