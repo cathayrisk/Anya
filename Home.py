@@ -3,7 +3,7 @@ import streamlit as st
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from langchain_community.tools import DuckDuckGoSearchResults
+from duckduckgo_search import DDGS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
@@ -72,20 +72,17 @@ def route_question(state: GraphState) -> str:
 #############################################################################
 # 3. Websearch function to fetch context from DuckDuckGo, store in state["websearch_content"]
 #############################################################################
-def websearch(state: GraphState) -> GraphState:
-    """
-    Uses DuckDuckGo to search the web for the question, then appends results into `websearch_content`.
-    """
+from duckduckgo_search import DDGS
+
+def websearch(state):
     question = state["question"]
     try:
         print("Performing DuckDuckGo web search...")
-        DDG_web_tool = DuckDuckGoSearchResults()
-        DDG_news_tool = DuckDuckGoSearchResults(backend="news")
-
+        ddgs = DDGS()
         # 搜尋網頁
-        web_results = DDG_web_tool.run(question)
+        web_results = ddgs.text(question, region="wt-wt", safesearch="moderate", max_results=10)
         # 搜尋新聞
-        news_results = DDG_news_tool.run(question)
+        news_results = ddgs.news(question, region="wt-wt", safesearch="moderate", max_results=10)
 
         # 合併結果
         all_results = []
@@ -99,7 +96,7 @@ def websearch(state: GraphState) -> GraphState:
         for item in all_results:
             snippet = item.get("body", "") or item.get("snippet", "")
             title = item.get("title", "")
-            link = item.get("href", "") or item.get("link", "")
+            link = item.get("href", "") or item.get("link", "") or item.get("url", "")
             docs.append(f"{title}\n{snippet}\n{link}")
 
         state["websearch_content"] = "\n\n".join(docs)
