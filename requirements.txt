@@ -1,5 +1,6 @@
 # Core dependencies
 streamlit
+langgraph
 langchain
 langchain-community
 langchain-openai
