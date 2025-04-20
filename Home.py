@@ -1,373 +1,370 @@
-import streamlit as st
 import os
-from CommonUtils.rag_utils import SOURCE_PATH, DB_PATH, get_client
+import streamlit as st
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from tavily import TavilyClient
+from langchain_community.tools import DuckDuckGoSearchResults
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+import re
+import sys
+import io
 
-def initApp():
-    # Create the directories if they do not exist    
-    os.makedirs(SOURCE_PATH, exist_ok=True)
-    os.makedirs(DB_PATH, exist_ok=True)
+#############################################################################
+# 1. Define the GraphState (minimal fields: question, generation, websearch_content)
+#############################################################################
+class GraphState(TypedDict):
+    question: str
+    generation: str
+    websearch_content: str  # we store Tavily search results here, if any
+    web_flag: str #To know whether a websearch was used to answer the question
 
-    # Clean up source documents directory
-    for file in os.listdir(SOURCE_PATH):
-        file_path = os.path.join(SOURCE_PATH, file)
-        if os.path.isfile(file_path):
-            os.remove(file_path)
+#############################################################################
+# 2. Router function to decide whether to use web search or directly generate
+#############################################################################
+def route_question(state: GraphState) -> str:
+    question = state["question"]
+    web_flag = state.get("web_flag", "False")
+    tool_selection = {
+    "websearch": (
+        "Questions requiring recent statistics, real-time information, recent news, or current updates. "
+    ),
+    "generate": (
+        "Questions that require access to a large language model's general knowledge, but not requiring recent statistics, real-time information, recent news, or current updates."
+    )
+    }
 
-    # Initialize session state variables
-    if 'ollama_model' not in st.session_state:
-        st.session_state.ollama_model = None
-    if 'chatReady' not in st.session_state:
-        st.session_state.chatReady = False
-    if 'dropDown_model_list' not in st.session_state:
-        st.session_state.dropDown_model_list = []
-    if 'dropDown_embeddingModel_list' not in st.session_state:
-        st.session_state.dropDown_embeddingModel_list = []
-    if 'loaded_model_list' not in st.session_state:
-        st.session_state.loaded_model_list = []
-    if 'llm' not in st.session_state:
-        st.session_state.llm = None
-    if 'embedding' not in st.session_state:
-        st.session_state.embedding = None
-    if 'context_model' not in st.session_state:
-        st.session_state.context_model = ""
-    if 'embeddingModel' not in st.session_state:
-        st.session_state.embeddingModel = ""
-    if 'ollama_embedding_model' not in st.session_state:
-        st.session_state.ollama_embedding_model = None
-    if 'collection' not in st.session_state:
-        st.session_state.collection = None
-    if 'chroma_client' not in st.session_state:
-        st.session_state.chroma_client = get_client()
-    if 'docs' not in st.session_state:
-        st.session_state.docs = []
-    if 'newMaxTokens' not in st.session_state:
-        st.session_state.newMaxTokens = 1024
-    if 'CRAG_iterations' not in st.session_state:
-        st.session_state.CRAG_iterations = 5
-    if 'overlap' not in st.session_state:
-        st.session_state.overlap = 200
-    if 'chunk_size' not in st.session_state:
-        st.session_state.chunk_size = 1000
-    if 'database_ready' not in st.session_state:
-        st.session_state.database_ready = False
-    if 'contextWindow' not in st.session_state:
-        st.session_state.contextWindow = 2048
-    if 'db_ready' not in st.session_state:
-        st.session_state.db_ready = False
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": "How may I assist you today?"}]
-    if "ContextualRAG" not in st.session_state:
-        st.session_state.ContextualRAG = False
-    if "ContextualBM25RAG" not in st.session_state:
-        st.session_state.ContextualBM25RAG = False
-    if "BM25retriver" not in st.session_state:
-        st.session_state.BM25retriver = None
-    if "dbRetrievalAmount" not in st.session_state:
-        st.session_state.dbRetrievalAmount = 3
-    if "temperature" not in st.session_state:
-        st.session_state.temperature = 1.0
-    if "system_prompt" not in st.session_state:
-        st.session_state.system_prompt = "You are a helpful assistant."
+    SYS_PROMPT = """Act as a router to select specific tools or functions based on user's question, using the following rules:
+                    - Analyze the given question and use the given tool selection dictionary to output the name of the relevant tool based on its description and relevancy with the question. 
+                    - The dictionary has tool names as keys and their descriptions as values. 
+                    - Output only and only tool name, i.e., the exact key and nothing else with no explanations at all. 
+                    - Present the text in its Traditional Chinese.
+                """
 
-# Set page config
+    # Define the ChatPromptTemplate
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", SYS_PROMPT),
+            ("human", """Here is the question:
+                        {question}
+                        Here is the tool selection dictionary:
+                        {tool_selection}
+                        Output the required tool.
+                    """),
+        ]
+    )
+
+    # Pass the inputs to the prompt
+    inputs = {
+        "question": question,
+        "tool_selection": tool_selection
+    }
+
+    # Invoke the chain
+    tool = (prompt | st.session_state.llm | StrOutputParser()).invoke(inputs)
+    tool = re.sub(r"[\\'\"`]", "", tool.strip()) # Remove any backslashes and extra spaces
+    if tool == "websearch":
+        state["web_flag"] = "True"
+    print(f"Invoking {tool} tool through {st.session_state.llm.model_name}")
+    return tool
+
+#############################################################################
+# 3. Websearch function to fetch context from DuckDuckGo, store in state["websearch_content"]
+#############################################################################
+def websearch(state: GraphState) -> GraphState:
+    """
+    Uses DuckDuckGo to search the web for the question, then appends results into `websearch_content`.
+    """
+    question = state["question"]
+    try:
+        print("Performing DuckDuckGo web search...")
+        DDG_web_tool = DuckDuckGoSearchResults()
+        DDG_news_tool = DuckDuckGoSearchResults(backend="news")
+
+        # 搜尋網頁
+        web_results = DDG_web_tool.run(question)
+        # 搜尋新聞
+        news_results = DDG_news_tool.run(question)
+
+        # 合併結果
+        all_results = []
+        if isinstance(web_results, list):
+            all_results.extend(web_results)
+        if isinstance(news_results, list):
+            all_results.extend(news_results)
+
+        # 整理內容
+        docs = []
+        for item in all_results:
+            snippet = item.get("body", "") or item.get("snippet", "")
+            title = item.get("title", "")
+            link = item.get("href", "") or item.get("link", "")
+            docs.append(f"{title}\n{snippet}\n{link}")
+
+        state["websearch_content"] = "\n\n".join(docs)
+        state["web_flag"] = "True"
+    except Exception as e:
+        print(f"Error during DuckDuckGo web search: {e}")
+        state["websearch_content"] = f"Error from DuckDuckGo: {e}"
+
+    return state
+
+#############################################################################
+# 4. Generation function that calls Groq LLM, optionally includes websearch content
+#############################################################################
+def generate(state: GraphState) -> GraphState:
+    question = state["question"]
+    context = state.get("websearch_content", "")
+    web_flag = state.get("web_flag", "False")
+    if "llm" not in st.session_state:
+        raise RuntimeError("LLM not initialized. Please call initialize_app first.")
+
+prompt = f"""
+# 角色與目標
+你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
+
+# 指令
+- 回答時務必使用正體中文，並遵循台灣用語。
+- 以安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
+- 適時加入可愛的emoji（如🥜、😆、🤩、✨等）。
+- 若有數學公式，請用雙重美元符號`$$`包圍Latex表達式。
+- 若web_flag為'True'，請在答案最後以「## 來源」Markdown標題列出所有參考網址，每行一個。
+- 若收到一篇文章或長內容，請用條列式、簡單可愛的方式摘要重點，並自動分段加上小標題。
+- 多層次資訊請用巢狀清單。
+- 步驟請用有序清單，重點用粗體，摘要用引用，表格用於比較。
+- 請確保Markdown語法正確，方便直接渲染。
+- 若無法根據context回答，請用引用格式並說「安妮亞不知道這個答案～」。
+- 請勿捏造資訊，僅根據提供的context與自身常識回答。
+- 每一題都要根據內容靈活選擇並組合上述格式，不可只用單一格式。
+
+# 格式化規則
+- 根據內容選擇最合適的 Markdown 元素：
+    - 摘要用引用（`>`）
+    - 步驟用有序清單（`1. 2. 3.`）
+    - 比較用表格（`| 標題 | ... |`）
+    - 重點用粗體（`**重點**`）
+    - 多層次資訊用巢狀清單（`-`、`  -`）
+    - 內容較長時自動分段並加上小標題（`## 小標題`）
+    - 數學公式用`$$`包圍LaTeX
+    - 來源用`## 來源`標題加清單
+- 請靈活組合上述格式，確保資訊分層清楚、易於閱讀。
+
+# 回答步驟
+1. 先用安妮亞的語氣簡單回應或打招呼。
+2. 條列式摘要或回答重點，語氣可愛、簡單明瞭。
+3. 根據內容自動選擇最合適的Markdown格式，並靈活組合。
+4. 若有數學公式，正確使用$$Latex$$格式。
+5. 若web_flag為'True'，在答案最後用`## 來源`列出所有參考網址。
+6. 適時穿插emoji。
+7. 結尾可用「安妮亞回答完畢！」、「還有什麼想問安妮亞嗎？」等可愛語句。
+8. 請先思考再作答，確保每一題都用最合適的格式呈現。
+
+# 範例
+## 範例1：摘要與巢狀清單
+哇～這是關於花生的文章耶！🥜
+
+> **花生重點摘要：**
+> - **蛋白質豐富**：花生有很多蛋白質，可以讓人變強壯💪
+> - **健康脂肪**：裡面有健康的脂肪，對身體很好
+>   - 有助於心臟健康
+>   - 可以當作能量來源
+> - **受歡迎的零食**：很多人都喜歡吃花生，因為又香又好吃😋
+
+安妮亞也超喜歡花生的！✨
+
+## 範例2：數學公式與小標題
+安妮亞來幫你整理數學重點囉！🧮
+
+## 畢氏定理
+1. **公式**：$$c^2 = a^2 + b^2$$
+2. 只要知道兩邊長，就可以算出斜邊長度
+3. 這個公式超級實用，安妮亞覺得很厲害！🤩
+
+## 範例3：比較表格
+安妮亞幫你整理A和B的比較表：
+
+| 項目   | A     | B     |
+|--------|-------|-------|
+| 速度   | 快    | 慢    |
+| 價格   | 便宜  | 貴    |
+| 功能   | 多    | 少    |
+
+## 小結
+- **A比較適合需要速度和多功能的人**
+- **B適合預算較高、需求單純的人**
+
+## 範例4：來源與長內容分段
+安妮亞找到這些重點：
+
+## 第一部分
+> - 這是第一個重點
+> - 這是第二個重點
+
+## 第二部分
+> - 這是第三個重點
+> - 這是第四個重點
+
+## 來源
+https://example.com/1  
+https://example.com/2  
+
+安妮亞回答完畢！還有什麼想問安妮亞嗎？🥜
+
+## 範例5：無法回答
+> 安妮亞不知道這個答案～（抱歉啦！😅）
+
+---
+
+# Context
+問題：{question}
+
+文章內容：{context}
+
+web_flag: {web_flag}
+
+---
+
+請依照上述規則與範例，思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
+"""
+    try:
+        response = st.session_state.llm.invoke(prompt)
+        state["generation"] = response
+    except Exception as e:
+        state["generation"] = f"Error generating answer: {str(e)}"
+
+    return state
+
+#############################################################################
+# 5. Build the LangGraph pipeline
+#############################################################################
+workflow = StateGraph(GraphState)
+# Add nodes
+workflow.add_node("websearch", websearch)
+workflow.add_node("generate", generate)
+# We'll route from "route_question" to either "websearch" or "generate"
+# Then from "websearch" -> "generate" -> END
+# From "generate" -> END directly if no search is needed.
+workflow.set_conditional_entry_point(
+    route_question,  # The router function
+    {
+        "websearch": "websearch",
+        "generate": "generate"
+    }
+)
+workflow.add_edge("websearch", "generate")
+workflow.add_edge("generate", END)
+
+# Configure the Streamlit page layout
 st.set_page_config(
-    page_title="OllamaRAG",
-    page_icon="🦙",
-    layout="wide"
+    page_title="LangGraph Chatbot",
+    layout="wide",
+    page_icon="🤖"
 )
 
-# Custom CSS styling
-st.markdown("""
-<style>
-    /* Main background and text colors */
-    .stApp {
-        color: #1a2234;
-    }
-    
-    /* Headers */
-    h1 {
-        color: #0D47A1 !important;
-        margin-bottom: 1rem !important;
-        font-size: 2.2em !important;
-        font-weight: 800 !important;
-    }
-    
-    h2 {
-        color: #1E88E5 !important;
-        margin-bottom: 0.8rem !important;
-        font-size: 1.8em !important;
-        font-weight: 700 !important;
-    }
-    
-    h3 {
-        color: #1976D2 !important;
-        margin-bottom: 0.6rem !important;
-        font-size: 1.4em !important;
-        font-weight: 600 !important;
-    }
-    
-    /* Card styling */
-    [data-testid="stExpander"] {
-        border: none !important;
-        box-shadow: none !important;
-    }
-    
-    /* Buttons */
-    .stButton button {
-        border-radius: 4px;
-    }
-    
-    /* Container borders */
-    [data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"] > div[style*="flex-direction: column"] > div[data-testid="stVerticalBlock"] {
-        border-radius: 10px;
-        padding: 1rem;
-    }
-    
-    /* Success and warning messages */
-    .stSuccess, .stWarning, .stError, .stInfo {
-        border-radius: 4px;
-    }
-    
-    /* Input fields */
-    .stTextInput input, .stNumberInput input, .stTextArea textarea, .stSelectbox select {
-        border-radius: 4px;
-    }
-    
-    /* Feature card styling */
-    .feature-card {
-        background-color: #f8f9fa;
-        border-radius: 8px;
-        border-left: 4px solid #1E88E5;
-        padding: 15px;
-        margin-bottom: 15px;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-    }
-    
-    /* Status indicators */
-    .status-card {
-        padding: 15px;
-        border-radius: 8px;
-        margin-bottom: 15px;
-        background-color: #f8f9fa;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-    }
-</style>
-""", unsafe_allow_html=True)
+# Initialize session state for the model if it doesn't exist
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "GPT-4.1"
+        
+options=["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
+model_name = st.pills("Choose a model:", options)
 
-# Initialize app
-initApp()
+# Map model names to OpenAI model IDs
+if model_name == "GPT-4.1-mini":
+    st.session_state.selected_model = "gpt-4.1-mini"
+elif model_name == "GPT-4 Omni":
+    st.session_state.selected_model = "gpt-4.1"
+else:
+    st.session_state.selected_model = "gpt-4.1-nano"
+#############################################################################
+# 6. The initialize_app function
+#############################################################################
+def initialize_app(model_name: str):
+    """
+    Initialize the app with the given model name, avoiding redundant initialization.
+    """
+    # Check if the LLM is already initialized
+    if "current_model" in st.session_state and st.session_state.current_model == model_name:
+        return workflow.compile()  # Return the compiled workflow directly
 
-# Main page content
-st.markdown("""
-<h1 style="text-align: center; color: #0D47A1; margin-bottom: 20px;">
-    🦙 OllamaRAG - Local LLM Assistant
-</h1>
-""", unsafe_allow_html=True)
+    # Initialize the LLM for the first time or switch models
+    st.session_state.llm = ChatOpenAI(model=model_name, openai_api_key=st.secrets["OPENAI_KEY"], temperature=0.0, streaming=True)
+    st.session_state.current_model = model_name
+    print(f"Using model: {model_name}")
+    return workflow.compile()
 
-# Introduction section with blue card styling
-st.markdown("""
-<div style="background-color: #f0f7ff; padding: 20px; border-radius: 10px; margin-bottom: 30px; border-left: 5px solid #1E88E5;">
-<h2 style="color: #1E88E5; margin-top: 0;">Welcome to OllamaRAG</h2>
+# Initialize session state for messages
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-A powerful platform that combines Ollama's local LLMs with advanced Retrieval-Augmented Generation (RAG), 
-deep research capabilities, and debate tools - all running locally on your machine.
+# Display conversation history
+for message in st.session_state.messages:
+    if message["role"] == "user":
+        with st.chat_message("user"):
+            st.markdown(message['content'])
+    elif message["role"] == "assistant":
+        with st.chat_message("assistant"):
+            st.markdown(message['content'])
+            
 
-- 🔒 **Privacy-focused**: All processing happens on your device
-- 🚀 **No API costs**: Use your own local models without subscription fees
-- 🔍 **Enhanced context**: RAG technology for more accurate responses
-- 📚 **Document intelligence**: Process your documents for better answers
-- 🔎 **Research capabilities**: Automated deep research across multiple sources
-- 🗣️ **Debate simulation**: Generate balanced perspectives on any topic
-</div>
-""", unsafe_allow_html=True)
+# Initialize the LangGraph application with the selected model
+app = initialize_app(model_name=st.session_state.selected_model)
 
-# Quick Start Guide
-st.markdown('<h2 style="color: #1E88E5;">Getting Started</h2>', unsafe_allow_html=True)
+# Input box for new messages
+# Input box for new messages
+if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
-st.markdown("""
-<div style="background-color: #f0f7ff; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-<h3 style="color: #1E88E5; margin-top: 0;">📚 Quick Start Guide</h3>
+    # Capture print statements from agentic_rag.py
+    output_buffer = io.StringIO()
+    sys.stdout = output_buffer  # Redirect stdout to the buffer
 
-<ol>
-    <li><strong>Set up a model</strong> - First, visit the Model Settings page to select and configure your Ollama model</li>
-    <li><strong>Configure RAG</strong> - Upload documents and set up your embedding model in the RAG Configuration page</li>
-    <li><strong>Start chatting</strong> - Use the Chat interface to interact with your model with document context</li>
-    <li><strong>Try advanced features</strong> - Explore Deep Research or Debate simulation capabilities</li>
-</ol>
+    try:
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            debug_placeholder = st.empty()
+            streamed_response = ""
 
-<p><strong>Need Help?</strong> Each page includes detailed instructions and tooltips to guide you through the process.</p>
-</div>
-""", unsafe_allow_html=True)
+            # Show spinner while streaming the response
+            with st.spinner("Thinking...", show_time=True):
+                inputs = {"question": user_input}
+                for i, output in enumerate(app.stream(inputs)):
+                    # Capture intermediate print messages
+                    debug_logs = output_buffer.getvalue()
+                    debug_placeholder.text_area(
+                        "Debug Logs",
+                        debug_logs,
+                        height=100,
+                        key=f"debug_logs_{i}"
+                    )
 
-# Features section in a grid layout
-st.markdown('<h2 style="color: #1E88E5;">Main Features</h2>', unsafe_allow_html=True)
+                    if "generate" in output and "generation" in output["generate"]:
+                        chunk = output["generate"]["generation"]
 
-col1, col2 = st.columns(2)
+                        # Safely extract the text content
+                        if hasattr(chunk, "content"):  # If chunk is an AIMessage
+                            chunk_text = chunk.content
+                        else:  # Otherwise, convert to string
+                            chunk_text = str(chunk)
 
-with col1:
-    st.markdown("""
-    <div class="feature-card">
-        <h3 style="color: #1E88E5; margin-top: 0;">🦙 Model Settings</h3>
-        <p>Configure and manage your Ollama models:</p>
-        <ul>
-            <li>Select from locally installed models</li>
-            <li>Configure temperature and token settings</li>
-            <li>Customize context window size</li>
-            <li>Define system prompts for specialized assistants</li>
-        </ul>
-        <a href="./🦙_Model_Settings">Configure your models →</a>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="feature-card">
-        <h3 style="color: #1E88E5; margin-top: 0;">💬 Chat Interface</h3>
-        <p>Interact with your models in a modern chat interface:</p>
-        <ul>
-            <li>Chat with context from your documents</li>
-            <li>Access specific databases using <code>@database_name</code> mentions</li>
-            <li>Save and load conversations</li>
-            <li>Clear conversation history when needed</li>
-        </ul>
-        <a href="./💬_Chat">Start chatting →</a>
-    </div>
-    """, unsafe_allow_html=True)
+                        # Append the text to the streamed response
+                        streamed_response += chunk_text
 
-with col2:
-    st.markdown("""
-    <div class="feature-card">
-        <h3 style="color: #1E88E5; margin-top: 0;">🔗 RAG Configuration</h3>
-        <p>Set up your Retrieval-Augmented Generation system:</p>
-        <ul>
-            <li>Upload and process documents (PDF, DOCX, TXT)</li>
-            <li>Configure embedding models for semantic search</li>
-            <li>Customize document chunking parameters</li>
-            <li>Enable contextual processing for better retrieval</li>
-        </ul>
-        <a href="./🔗_RAG_Config">Configure RAG →</a>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("""
-    <div class="feature-card">
-        <h3 style="color: #1E88E5; margin-top: 0;">🔍 Deep Research</h3>
-        <p>Perform comprehensive research on any topic:</p>
-        <ul>
-            <li>Break down topics into logical subtopics</li>
-            <li>Search across multiple sources (Web, News, Wikipedia)</li>
-            <li>Generate well-structured research reports</li>
-            <li>Track research progress and sources</li>
-        </ul>
-        <a href="./🔍_DeepResearch">Start researching →</a>
-    </div>
-    """, unsafe_allow_html=True)
+                        # Update the placeholder with the streamed response so far
+                        response_placeholder.markdown(streamed_response)
 
-# Advanced Features Section
-st.markdown('<h2 style="color: #1E88E5; margin-top: 30px;">Advanced Capabilities</h2>', unsafe_allow_html=True)
+            # Store the final response in session state
+            st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
 
-col1, col2 = st.columns(2)
+    except Exception as e:
+        # Handle errors and display in the conversation history
+        error_message = f"An error occurred: {e}"
+        st.session_state.messages.append({"role": "assistant", "content": error_message})
+        # 直接使用 st.error 而不是嵌套在 st.chat_message 內
+        st.error(error_message)
 
-with col1:
-    st.markdown("""
-    <div class="feature-card">
-        <h3 style="color: #1E88E5; margin-top: 0;">🗣️ Debate Simulation</h3>
-        <p>Generate balanced perspectives on any topic:</p>
-        <ul>
-            <li>Configure two AI debaters with different viewpoints</li>
-            <li>Set a neutral AI judge to evaluate arguments</li>
-            <li>Customize debate parameters and depth</li>
-            <li>Explore complex topics from multiple angles</li>
-        </ul>
-        <a href="./🗣️_Debate">Start a debate →</a>
-    </div>
-    """, unsafe_allow_html=True)
-
-with col2:
-    st.markdown("""
-    <div class="feature-card">
-        <h3 style="color: #1E88E5; margin-top: 0;">⚙️ RAG Technology</h3>
-        <p>Advanced Retrieval-Augmented Generation features:</p>
-        <ul>
-            <li>Context-aware document retrieval</li>
-            <li>BM25 + semantic hybrid search options</li>
-            <li>Custom chunking strategies for different document types</li>
-            <li>Iterative context generation for complex queries</li>
-        </ul>
-    </div>
-    """, unsafe_allow_html=True)
-
-# System Status
-st.markdown('<h2 style="color: #1E88E5; margin-top: 30px;">System Status</h2>', unsafe_allow_html=True)
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    if st.session_state.chatReady and st.session_state.ollama_model:
-        st.markdown("""
-        <div class="status-card" style="border-left: 4px solid #4CAF50;">
-            <h3 style="color: #4CAF50; margin-top: 0; font-size: 1.2em;">✅ Model Connected</h3>
-            <p><strong>Active Model:</strong> {}</p>
-            <p><strong>Temperature:</strong> {}</p>
-            <p><strong>Max Tokens:</strong> {}</p>
-        </div>
-        """.format(
-            st.session_state.ollama_model,
-            st.session_state.temperature,
-            st.session_state.newMaxTokens
-        ), unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="status-card" style="border-left: 4px solid #F44336;">
-            <h3 style="color: #F44336; margin-top: 0; font-size: 1.2em;">❌ No Model Connected</h3>
-            <p>Please visit the Model Settings page to select and configure an Ollama model.</p>
-            <a href="./🦙_Model_Settings">Configure model →</a>
-        </div>
-        """, unsafe_allow_html=True)
-
-with col2:
-    if st.session_state.db_ready:
-        st.markdown("""
-        <div class="status-card" style="border-left: 4px solid #4CAF50;">
-            <h3 style="color: #4CAF50; margin-top: 0; font-size: 1.2em;">✅ RAG System Ready</h3>
-            <p><strong>Embedding Model:</strong> {}</p>
-            <p><strong>Chunk Size:</strong> {}</p>
-            <p><strong>Retrieved Docs:</strong> {}</p>
-        </div>
-        """.format(
-            st.session_state.embeddingModel,
-            st.session_state.chunk_size,
-            st.session_state.dbRetrievalAmount
-        ), unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="status-card" style="border-left: 4px solid #FF9800;">
-            <h3 style="color: #FF9800; margin-top: 0; font-size: 1.2em;">⚠️ RAG Not Configured</h3>
-            <p>Visit the RAG Configuration page to set up your document database.</p>
-            <a href="./🔗_RAG_Config">Configure RAG →</a>
-        </div>
-        """, unsafe_allow_html=True)
-
-with col3:
-    if len(st.session_state.docs) > 0:
-        st.markdown("""
-        <div class="status-card" style="border-left: 4px solid #2196F3;">
-            <h3 style="color: #2196F3; margin-top: 0; font-size: 1.2em;">ℹ️ Documents Loaded</h3>
-            <p><strong>Document Count:</strong> {}</p>
-            <p>Your documents have been processed and are ready for use with RAG.</p>
-        </div>
-        """.format(len(st.session_state.docs)), unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="status-card" style="border-left: 4px solid #9E9E9E;">
-            <h3 style="color: #9E9E9E; margin-top: 0; font-size: 1.2em;">📄 No Documents</h3>
-            <p>Upload documents in the RAG Configuration page to enable document-based context.</p>
-            <a href="./🔗_RAG_Config">Upload documents →</a>
-        </div>
-        """, unsafe_allow_html=True)
-# Footer
-st.markdown("""
-<div style="margin-top: 50px; text-align: center; color: #666; font-size: 0.9em;">
-<p>OllamaRAG runs entirely on your local machine. No data is sent to external servers.</p>
-<p>For more information, visit the <a href="https://github.com/ollama/ollama" target="_blank">Ollama GitHub page</a>.</p>
-</div>
-""", unsafe_allow_html=True) 
+    finally:
+        # Restore stdout to its original state
+        sys.stdout = sys.__stdout__
