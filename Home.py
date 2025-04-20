@@ -121,7 +121,7 @@ def generate(state: GraphState) -> GraphState:
     if "llm" not in st.session_state:
         raise RuntimeError("LLM not initialized. Please call initialize_app first.")
 
-prompt = f"""
+prompt = (f"""
 # 角色與目標
 你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 
@@ -227,7 +227,7 @@ web_flag: {web_flag}
 ---
 
 請依照上述規則與範例，思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
-"""
+""")
     try:
         response = st.session_state.llm.invoke(prompt)
         state["generation"] = response
