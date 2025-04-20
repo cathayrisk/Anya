@@ -11,10 +11,6 @@ import re
 import sys
 import io
 
-doc_comparison = st.Page("pages/1_Document_Comparison.py", title="Document Comparison", icon=":material_compare:")
-pg = st.navigation([doc_comparison])
-pg.run()
-
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
