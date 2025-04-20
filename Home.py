@@ -274,7 +274,7 @@ st.set_page_config(
     page_title="Anya",
     layout="wide",
     page_icon="🥜",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"
 )
 
 # Initialize session state for the model if it doesn't exist
