@@ -7,6 +7,7 @@ from tavily import TavilyClient
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import AIMessage, HumanMessage
 import re
 import sys
 import io
@@ -299,12 +300,25 @@ if "messages" not in st.session_state:
 
 # Display conversation history
 for message in st.session_state.messages:
-    if message["role"] == "user":
+    if isinstance(message, dict):
+        role = message.get("role")
+        content = message.get("content", "")
+    elif isinstance(message, AIMessage):
+        role = "assistant"
+        content = message.content
+    elif isinstance(message, HumanMessage):
+        role = "user"
+        content = message.content
+    else:
+        role = "assistant"
+        content = str(message)
+
+    if role == "user":
         with st.chat_message("user"):
-            st.markdown(message['content'])
-    elif message["role"] == "assistant":
+            st.markdown(content)
+    elif role == "assistant":
         with st.chat_message("assistant"):
-            st.markdown(message['content'])
+            st.markdown(content)
             
 
 # Initialize the LangGraph application with the selected model
