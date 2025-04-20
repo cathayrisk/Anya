@@ -2,7 +2,7 @@
 base = "light"
 primaryColor = "#AD4746"
 backgroundColor = "#FFDFE0"
-secondaryBackgroundColor = "#E6E6FA"
+secondaryBackgroundColor = "#FFE8E9"
 textColor = "#4B3832"
 linkColor = "#1E90FF"
 codeBackgroundColor = "#FFF2CC"
