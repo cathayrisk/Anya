@@ -276,7 +276,7 @@ st.set_page_config(
     page_icon="🥜",
     initial_sidebar_state="auto"
 )
-st.sidebar.success("👋")
+
 # Initialize session state for the model if it doesn't exist
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
