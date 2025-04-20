@@ -3,7 +3,6 @@ import streamlit as st
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from tavily import TavilyClient
 from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
