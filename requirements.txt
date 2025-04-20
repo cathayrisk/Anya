@@ -47,13 +47,3 @@ pydub==0.25.1
 # Web page processing tools
 bs4
 lxml
-
-# Database support
-sqlite3-api
-
-# Visual elements 
-matplotlib
-plotly
-
-# Optional: for improved performance
-llama-cpp-python
