@@ -17,7 +17,7 @@ import io
 class GraphState(TypedDict):
     question: str
     generation: str
-    websearch_content: str  # we store Tavily search results here, if any
+    websearch_content: str  # we store search results here, if any
     web_flag: str #To know whether a websearch was used to answer the question
 
 #############################################################################
@@ -89,7 +89,7 @@ def route_question(state: GraphState) -> str:
 #############################################################################
 # 3. Websearch function to fetch context from DuckDuckGo, store in state["websearch_content"]
 #############################################################################
-from duckduckgo_search import DDGS
+
 
 def websearch(state):
     question = state["question"]
