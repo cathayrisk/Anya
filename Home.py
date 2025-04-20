@@ -35,11 +35,28 @@ def route_question(state: GraphState) -> str:
     )
     }
 
-    SYS_PROMPT = """Act as a router to select specific tools or functions based on user's question, using the following rules:
-                    - Analyze the given question and use the given tool selection dictionary to output the name of the relevant tool based on its description and relevancy with the question. 
-                    - The dictionary has tool names as keys and their descriptions as values. 
-                    - Output only and only tool name, i.e., the exact key and nothing else with no explanations at all. 
-                    - Present the text in its Traditional Chinese.
+    SYS_PROMPT = """
+    # Role and Objective
+    You are a tool selection router. Based on the user's question, select the most appropriate tool.
+
+    # Tool Selection Rules
+    - Analyze the user's question and, according to the descriptions in the tool dictionary below, select the most relevant tool name.
+    - The tool dictionary's key is the tool name, and the value is its description.
+    - Strictly output only the tool name (i.e., the key). Do NOT provide any explanations, punctuation, spaces, or extra content.
+    - If the user's question is a long passage (for example, more than three sentences, over 200 characters, or clearly a pasted news article, paper, or lengthy description), directly select the "generate" tool. Do NOT select "websearch" in this case.
+    - Please present your output in Traditional Chinese.
+
+    # Examples
+    ## Example 1
+    User question: "請問2024年台灣總統大選的最新民調？"
+    → Output: websearch
+
+    ## Example 2
+    User question: "以下是我寫的文章，請幫我潤稿：……（一大段）"
+    → Output: generate
+
+    # Important Reminder
+    Output only the tool name (key). Absolutely no extra content.
                 """
 
     # Define the ChatPromptTemplate
