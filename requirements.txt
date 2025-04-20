@@ -18,6 +18,7 @@ pypandoc
 python-docx
 sentence-transformers
 pymupdf4llm
+pymupdf
 
 # Web tools and research
 wikipedia
