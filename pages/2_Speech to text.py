@@ -753,7 +753,7 @@ if f is not None:
                     for item in other_stuff:
                         st.markdown(f"- **內容**: {item['content']}")
 
-                    st.text(arguments_data)
+                    #st.text(arguments_data)
 
                     # 提取特定內容
                     title = arguments_data['metadata']['title']
