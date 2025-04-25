@@ -174,7 +174,11 @@ prompt_template = PromptTemplate(
         "主持人：感謝大家的參與，會議到此結束。\n"
         "\n"
         "# Final Instructions\n"
-        "Think step by step. Carefully follow all formatting and output rules. Do not skip any content. Output only the formatted text in markdown, no extra explanation.\n\n"
+        "Think step by step. Carefully follow all formatting and output rules. Do not skip any content. Output only the formatted text in markdown, no extra explanation.\n"
+        "- **Do not skip, summarize, or omit any part of the input. Output the entire content in full, even if it is very long.**\n"
+        "- **Do not use phrases like '以下省略', '內容過長', '請分段查閱', or any similar wording.**\n"
+        "- **If the output exceeds the length limit, continue outputting in multiple parts until the entire content is presented.**\n"
+        "- Output only the formatted text in markdown, no extra explanation.\n"
         "## Input Text\n"
         "{text}\n"
     )
