@@ -51,7 +51,21 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ValidationNode
 from pydantic import BaseModel, Field, field_validator
 import json
+from langchain_core.callbacks.base import BaseCallbackHandler
+from streamlit.delta_generator import DeltaGenerator
 
+class StreamHandler(BaseCallbackHandler):
+    def __init__(self, message_container: DeltaGenerator):
+        self.text = ""
+        self.message_container = message_container
+        self.cursor_visible = True
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        self.text += token
+        self.cursor_visible = not self.cursor_visible
+        cursor = "▌" if self.cursor_visible else " "
+        self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
+        time.sleep(0.01)
 
 # 配置 pydub 使用 FFmpeg
 AudioSegment.converter = which("ffmpeg")
@@ -63,6 +77,36 @@ client = OpenAI()
 
 # 初始化 LangChain 的 ChatOpenAI 模型
 llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, streaming=True)
+
+judge_llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.0)
+
+def llm_is_truncated(last_line: str, judge_llm) -> bool:
+    prompt = f"""
+你是一個判斷助手。請判斷下面這一行是否是在請求用戶續接內容、或是省略提示（例如：內容過長、僅展示部分內容、請繼續、continue、remaining content 等），而不是一般內容。
+如果是，請回答「是」；如果不是，請回答「否」。
+內容：
+{last_line}
+"""
+    response = judge_llm.invoke(prompt)
+    answer = response.strip()
+    return answer.startswith("是")
+
+def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
+    user_input = {"text": transcription}
+    all_text = ""
+    for idx in range(max_rounds):
+        message_container = st.container()
+        handler = StreamHandler(message_container)
+        # 流式輸出
+        result = chain.invoke(user_input, config={"callbacks": [handler]})
+        message_container.markdown(handler.text)
+        all_text += handler.text + "\n"
+        # 判斷最後一行是否為省略提示
+        last_line = handler.text.strip().split('\n')[-1]
+        if not llm_is_truncated(last_line, judge_llm):
+            break
+        user_input = {"text": "請繼續輸出剩餘內容。"}
+    return all_text
 
 # 設置網頁標題和圖標
 st.set_page_config(page_title="Speech to Text Transcription", layout="wide", page_icon="👄")
@@ -675,7 +719,7 @@ if f is not None:
 
             # 使用 LangChain 改善文本格式
             status.update(label="Formatting transcription...")
-            formatted_transcription = formatting_chain.invoke({"text": full_transcription})
+            formatted_transcription = stream_full_formatted_transcription(formatting_chain, full_transcription, judge_llm)
 
             status.update(label="Transcription complete!", state="complete", expanded=False)
         except Exception as e:
