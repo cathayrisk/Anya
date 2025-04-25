@@ -62,10 +62,15 @@ class StreamHandler(BaseCallbackHandler):
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         self.text += token
+        # 游標閃爍
         self.cursor_visible = not self.cursor_visible
-        cursor = "▌" if self.cursor_visible else " "
+        cursor = '<span style="color:#2ecc71;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
-        time.sleep(0.01)
+        time.sleep(0.04)  # 控制打字速度
+
+    def on_llm_end(self, *args, **kwargs):
+        # 輸出結束時移除游標
+        self.message_container.markdown(self.text, unsafe_allow_html=True)
 
 # 配置 pydub 使用 FFmpeg
 AudioSegment.converter = which("ffmpeg")
