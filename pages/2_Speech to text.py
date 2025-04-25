@@ -62,14 +62,13 @@ class StreamHandler(BaseCallbackHandler):
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         self.text += token
-        # 游標閃爍
         self.cursor_visible = not self.cursor_visible
         cursor = '<span style="color:#2ecc71;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
+        # 這裡每次都覆蓋同一個區塊
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
-        time.sleep(0.04)  # 控制打字速度
+        time.sleep(0.04)
 
     def on_llm_end(self, *args, **kwargs):
-        # 輸出結束時移除游標
         self.message_container.markdown(self.text, unsafe_allow_html=True)
 
 # 配置 pydub 使用 FFmpeg
@@ -100,13 +99,11 @@ def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rou
     user_input = {"text": transcription}
     all_text = ""
     for idx in range(max_rounds):
-        message_container = st.container()
+        message_container = st.empty()  # 用 st.empty() 取代 st.container()
         handler = StreamHandler(message_container)
-        # 流式輸出
         result = chain.invoke(user_input, config={"callbacks": [handler]})
-        message_container.markdown(handler.text)
+        message_container.markdown(handler.text, unsafe_allow_html=True)
         all_text += handler.text + "\n"
-        # 判斷最後一行是否為省略提示
         last_line = handler.text.strip().split('\n')[-1]
         if not llm_is_truncated(last_line, judge_llm):
             break
