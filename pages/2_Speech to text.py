@@ -184,9 +184,9 @@ prompt_template = PromptTemplate(
 formatting_chain = prompt_template | llm | StrOutputParser()
 
 # 分割文件
-text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=1000, chunk_overlap=0)
+text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=1500, chunk_overlap=0)
 
-token_max = 100000
+token_max = 200000
 
 # 定義狀態類型
 class SummaryState(TypedDict):
@@ -818,13 +818,13 @@ if f is not None:
                     overall_summary = arguments_data['overall_summary']
                     next_steps = arguments_data['next_steps']
 
-                    st.text(f"標題: {title}")
-                    st.text(f"地點: {location}")
-                    st.text(f"持續時間: {duration}")
-                    st.text(f"關鍵時刻: {key_moments}")
-                    st.text(f"深刻引用: {insightful_quotes}")
-                    st.text(f"整體摘要: {overall_summary}")
-                    st.text(f"下一步: {next_steps}")
+                    #st.text(f"標題: {title}")
+                    #st.text(f"地點: {location}")
+                    #st.text(f"持續時間: {duration}")
+                    #st.text(f"關鍵時刻: {key_moments}")
+                    #st.text(f"深刻引用: {insightful_quotes}")
+                    #st.text(f"整體摘要: {overall_summary}")
+                    #st.text(f"下一步: {next_steps}")
             
             except Exception as e:
                 st.markdown(f"發生錯誤: {repr(e)}")
