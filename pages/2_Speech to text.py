@@ -675,6 +675,8 @@ class TranscriptSummary(BaseModel):
         ..., description="Additional relevant information."
     )
 
+formatted_transcription = ""  # 先初始化
+
 # 處理上傳的文件
 if f is not None:
     st.audio(f)
@@ -726,6 +728,7 @@ if f is not None:
             status.update(label="Transcription complete!", state="complete", expanded=False)
         except Exception as e:
             st.error(f"Error processing audio file: {e}")
+            formatted_transcription = "⚠️ 轉錄或格式化時發生錯誤。"
 
     # 顯示 formatted_transcription
     tab1, tab2, tab3, tab4 = st.tabs(["轉錄結果", "重點摘要", "內容解析", "原始內容"])
@@ -872,11 +875,6 @@ if f is not None:
     with tab4:
         with st.container():
             st.markdown(full_transcription)
-            #st.download_button(
-            #    label="Download Raw Transcription",
-            #    data=st.session_state['full_transcription'],
-            #    file_name="raw_transcription.txt",
-            #    mime="text/plain"
-            #)
+
 else:
     st.stop()
