@@ -87,11 +87,18 @@ class StreamHandler(BaseCallbackHandler):
         # 顯示內容+游標
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
 
-        # 模擬人類打字：隨機延遲 0.03~0.12 秒
+        # 模擬人類打字：隨機延遲
         time.sleep(random.uniform(0.02, 0.1))
         
     def on_llm_end(self, *args, **kwargs):
-        self.message_container.markdown(self.text, unsafe_allow_html=True)
+        # 用正則移除所有高亮 <span ...>...</span>
+        clean_text = re.sub(
+            r'<span style="background: #ffe066; color: #222; border-radius:3px; padding:1px 2px;">(.*?)</span>',
+            r'\1',
+            self.text
+        )
+        self.message_container.markdown(clean_text, unsafe_allow_html=True)
+        #self.message_container.markdown(self.text, unsafe_allow_html=True)
 
 # 配置 pydub 使用 FFmpeg
 AudioSegment.converter = which("ffmpeg")
