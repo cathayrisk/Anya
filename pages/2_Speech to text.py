@@ -92,7 +92,7 @@ def llm_is_truncated(last_line: str, judge_llm) -> bool:
 {last_line}
 """
     response = judge_llm.invoke(prompt)
-    answer = response.strip()
+    answer = response.content.strip()
     return answer.startswith("是")
 
 def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
