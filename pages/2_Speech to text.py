@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import re
 import time
+import random
 import tempfile
 from openai import OpenAI
 from pydub import AudioSegment
