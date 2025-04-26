@@ -63,43 +63,29 @@ class StreamHandler(BaseCallbackHandler):
         self.cursor_visible = True
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-   #     self.text += token
-   #     self.cursor_visible = not self.cursor_visible
-   #     cursor = '<span style="color:#2ecc71;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
-        # 這裡每次都覆蓋同一個區塊
-   #     self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
-   #     time.sleep(0.04)
-        # 新 token 高亮
-        highlight = f'<span style="background: #ffe066; color: #222; border-radius:3px; padding:1px 2px;">{token}</span>'
-        self.text += highlight
-
-        # 閃爍游標
+        self.text += token
+        self.cursor_visible = not self.cursor_visible
+        #cursor = '<span style="color:#2ecc71;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
         cursor = '''
-        <span style="color:#e74c3c;font-weight:bold;animation: blink 1s steps(1) infinite;">▌</span>
+        <span style="
+            color:#2ecc71;
+            font-weight:bold;
+            position:relative;
+            animation: jump 0.5s infinite alternate;
+            ">▌</span>
         <style>
-        @keyframes blink {
-          0% { opacity: 1; }
-          50% { opacity: 0; }
-          100% { opacity: 1; }
+        @keyframes jump {
+          0% { top: 0px; }
+          100% { top: -5px; }
         }
         </style>
         '''
-
-        # 顯示內容+游標
+        # 這裡每次都覆蓋同一個區塊
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
-
-        # 模擬人類打字：隨機延遲
-        time.sleep(random.uniform(0.02, 0.1))
+        time.sleep(0.04)
         
     def on_llm_end(self, *args, **kwargs):
-        # 用正則移除所有高亮 <span ...>...</span>
-        clean_text = re.sub(
-            r'<span style="background: #ffe066; color: #222; border-radius:3px; padding:1px 2px;">(.*?)</span>',
-            r'\1',
-            self.text
-        )
-        self.message_container.markdown(clean_text, unsafe_allow_html=True)
-        #self.message_container.markdown(self.text, unsafe_allow_html=True)
+        self.message_container.markdown(self.text, unsafe_allow_html=True)
 
 # 配置 pydub 使用 FFmpeg
 AudioSegment.converter = which("ffmpeg")
