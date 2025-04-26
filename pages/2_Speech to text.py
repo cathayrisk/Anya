@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import re
 import time
 import tempfile
 from openai import OpenAI
@@ -122,6 +123,30 @@ def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rou
         message_container.markdown(handler.text, unsafe_allow_html=True)
         all_text += handler.text + "\n"
     return all_text
+
+def beautify_transcript(text):
+    # 1. 主題加粗
+    text = re.sub(r'^(主題：.*)$', r'**\1**', text, flags=re.MULTILINE)
+    # 2. 主題後加空行（如果沒有的話）
+    text = re.sub(r'(\*\*主題：.*?\*\*)(\n)(?!\n)', r'\1\n\n', text)
+    # 3. 段落間加空行（兩行以上不重複）
+    text = re.sub(r'([^\n])\n([^\n])', r'\1\n\n\2', text)
+    # 4. 關鍵詞高亮（可自行擴充）
+    keywords = [
+        'non-bank f.i.', 'msr', 'ltv', 'NPL', 'FTP', 'SPA', 'ICR', 'LTC', 'provision',
+        'syndication', 'refinance', 'credit', '投資等級', '信評', '平等', '預放比', '集中度'
+    ]
+    for kw in keywords:
+        # 避免重複加粗
+        text = re.sub(rf'(?<!\*)({re.escape(kw)})(?!\*)', r'**\1**', text)
+    # 5. 【疑似錯誤】標紅
+    text = re.sub(r'【疑似錯誤】', r'<span style="color:red">【疑似錯誤】</span>', text)
+    # 6. 移除多餘空行（最多兩行）
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # 7. 去除開頭多餘空行
+    text = text.lstrip('\n')
+    return text
+
 
 # 設置網頁標題和圖標
 st.set_page_config(page_title="Speech to Text Transcription", layout="wide", page_icon="👄")
@@ -747,7 +772,7 @@ if f is not None:
     tab1, tab2, tab3, tab4 = st.tabs(["轉錄結果", "重點摘要", "內容解析", "原始內容"])
     with tab1:
         with st.container():
-            st.markdown(formatted_transcription)
+            st.markdown(beautify_transcript(formatted_transcription), unsafe_allow_html=True)
             st.balloons()
 
     # 異步計算 summarize_transcription 並在 Tab2 中顯示 spinner
