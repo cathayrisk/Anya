@@ -132,13 +132,13 @@ def beautify_transcript(text):
     # 3. 段落間加空行（兩行以上不重複）
     text = re.sub(r'([^\n])\n([^\n])', r'\1\n\n\2', text)
     # 4. 關鍵詞高亮（可自行擴充）
-    keywords = [
-        'non-bank f.i.', 'msr', 'ltv', 'NPL', 'FTP', 'SPA', 'ICR', 'LTC', 'provision',
-        'syndication', 'refinance', 'credit', '投資等級', '信評', '平等', '預放比', '集中度'
-    ]
-    for kw in keywords:
+    #keywords = [
+    #    'non-bank f.i.', 'msr', 'ltv', 'NPL', 'FTP', 'SPA', 'ICR', 'LTC', 'provision',
+    #    'syndication', 'refinance', 'credit', '投資等級', '信評', '平等', '預放比', '集中度'
+    #]
+    #for kw in keywords:
         # 避免重複加粗
-        text = re.sub(rf'(?<!\*)({re.escape(kw)})(?!\*)', r'**\1**', text)
+    #    text = re.sub(rf'(?<!\*)({re.escape(kw)})(?!\*)', r'**\1**', text)
     # 5. 【疑似錯誤】標紅
     text = re.sub(r'【疑似錯誤】', r'<span style="color:red">【疑似錯誤】</span>', text)
     # 6. 移除多餘空行（最多兩行）
@@ -262,7 +262,7 @@ prompt_template = PromptTemplate(
 formatting_chain = prompt_template | llm | StrOutputParser()
 
 # 分割文件
-text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=1500, chunk_overlap=0)
+text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=1500, chunk_overlap=100)
 
 token_max = 200000
 
