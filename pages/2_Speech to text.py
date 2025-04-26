@@ -62,13 +62,34 @@ class StreamHandler(BaseCallbackHandler):
         self.cursor_visible = True
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        self.text += token
-        self.cursor_visible = not self.cursor_visible
-        cursor = '<span style="color:#2ecc71;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
+   #     self.text += token
+   #     self.cursor_visible = not self.cursor_visible
+   #     cursor = '<span style="color:#2ecc71;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
         # 這裡每次都覆蓋同一個區塊
-        self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
-        time.sleep(0.04)
+   #     self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
+   #     time.sleep(0.04)
+        # 新 token 高亮
+        highlight = f'<span style="background: #ffe066; color: #222; border-radius:3px; padding:1px 2px;">{token}</span>'
+        self.text += highlight
 
+        # 閃爍游標
+        cursor = '''
+        <span style="color:#e74c3c;font-weight:bold;animation: blink 1s steps(1) infinite;">▌</span>
+        <style>
+        @keyframes blink {
+          0% { opacity: 1; }
+          50% { opacity: 0; }
+          100% { opacity: 1; }
+        }
+        </style>
+        '''
+
+        # 顯示內容+游標
+        self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
+
+        # 模擬人類打字：隨機延遲 0.03~0.12 秒
+        time.sleep(random.uniform(0.02, 0.1))
+        
     def on_llm_end(self, *args, **kwargs):
         self.message_container.markdown(self.text, unsafe_allow_html=True)
 
@@ -95,21 +116,6 @@ def llm_is_truncated(last_line: str, judge_llm) -> bool:
     response = judge_llm.invoke(prompt)
     answer = response.content.strip()
     return answer.startswith("是")
-
-#def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
-#    user_input = {"text": transcription}
-#    all_text = ""
-#    for idx in range(max_rounds):
-#        message_container = st.empty()  # 用 st.empty() 取代 st.container()
-#        handler = StreamHandler(message_container)
-#        result = chain.invoke(user_input, config={"callbacks": [handler]})
-#        message_container.markdown(handler.text, unsafe_allow_html=True)
-#        all_text += handler.text + "\n"
-#        last_line = handler.text.strip().split('\n')[-1]
-#        if not llm_is_truncated(last_line, judge_llm):
-#            break
-#        user_input = {"text": "請繼續輸出剩餘內容。"}
-#    return all_text
 
 def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
     # 用 CharacterTextSplitter 分段
