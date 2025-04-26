@@ -95,19 +95,32 @@ def llm_is_truncated(last_line: str, judge_llm) -> bool:
     answer = response.content.strip()
     return answer.startswith("是")
 
+#def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
+#    user_input = {"text": transcription}
+#    all_text = ""
+#    for idx in range(max_rounds):
+#        message_container = st.empty()  # 用 st.empty() 取代 st.container()
+#        handler = StreamHandler(message_container)
+#        result = chain.invoke(user_input, config={"callbacks": [handler]})
+#        message_container.markdown(handler.text, unsafe_allow_html=True)
+#        all_text += handler.text + "\n"
+#        last_line = handler.text.strip().split('\n')[-1]
+#        if not llm_is_truncated(last_line, judge_llm):
+#            break
+#        user_input = {"text": "請繼續輸出剩餘內容。"}
+#    return all_text
+
 def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
-    user_input = {"text": transcription}
+    # 用 CharacterTextSplitter 分段
+    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
+    chunks = text_splitter.split_text(transcription)
     all_text = ""
-    for idx in range(max_rounds):
-        message_container = st.empty()  # 用 st.empty() 取代 st.container()
+    for idx, chunk in enumerate(chunks):
+        message_container = st.empty()
         handler = StreamHandler(message_container)
-        result = chain.invoke(user_input, config={"callbacks": [handler]})
+        result = chain.invoke({"text": chunk}, config={"callbacks": [handler]})
         message_container.markdown(handler.text, unsafe_allow_html=True)
         all_text += handler.text + "\n"
-        last_line = handler.text.strip().split('\n')[-1]
-        if not llm_is_truncated(last_line, judge_llm):
-            break
-        user_input = {"text": "請繼續輸出剩餘內容。"}
     return all_text
 
 # 設置網頁標題和圖標
