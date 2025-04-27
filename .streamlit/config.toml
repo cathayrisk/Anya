@@ -1,8 +1,10 @@
 [theme]
 base = "light"
 primaryColor = "#AD4746"
-backgroundColor = "#FFDFE0"
-secondaryBackgroundColor = "#FFE8E9"
+#backgroundColor = "#FFDFE0"
+backgroundColor = "#FFF6F7"
+#secondaryBackgroundColor = "#FFE8E9"
+secondaryBackgroundColor = "#FFDFE0"
 textColor = "#4B3832"
 linkColor = "#1E90FF"
 codeBackgroundColor = "#FFF2CC"
