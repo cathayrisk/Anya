@@ -250,7 +250,7 @@ formatting_chain = prompt_template | llm | StrOutputParser()
 # 分割文件
 text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=1500, chunk_overlap=100)
 
-token_max = 200000
+token_max = 250000
 
 # 定義狀態類型
 class SummaryState(TypedDict):
@@ -319,26 +319,101 @@ app = graph.compile()
 
 # 定義提示模板
 map_template = """
-Please read the following transcribed content from a recording and identify the main themes and key insights. Focus on extracting the core information and specific details from the recording.
-- Use bullet points to list key insights and specific details for each theme.
-- Include specific data, examples, and references to support each theme, ensuring a rich level of detail.
-- Explain the cause-and-effect relationships for each key point, highlighting how different factors interact.
-- Pay attention to the tone and style to ensure consistency with the conversational nature of the recording.
-- Identify and highlight any important action items or decisions, and explain the rationale behind them.
-- Summarize the key points that the speaker most wants to convey.
-If the source is in Chinese, please respond in Traditional Chinese, not Simplified Chinese.
-Content: {context}
+# 角色與目標
+你是一位專業逐字稿分析師，請閱讀下方逐字稿分段內容，篩選出所有真正重要的主題與重點，並針對每個重點進行詳細說明。**僅根據本段內容，不可補充外部知識或推測未明說的內容。**
+
+# 指令
+- 只根據本段內容，嚴禁補充外部知識或推論。
+- 篩選出所有明確且重要的主題與子主題。
+- 每個主題下，條列真正重要的重點，並針對每個重點進行詳細說明（說明內容需根據本段內容，包含背景、原因、影響、細節等）。
+- 若本段內容有明確的決策、行動項目、因果關係，也請詳細說明。
+- 若發現本段重點可能與其他段落有關聯或尚未完整，請明確標註「此重點可能需與其他段落合併補全」。
+- 使用清楚的分層條列格式：
+    - 主題用「【主題】」
+    - 子主題用「【子主題】」
+    - 重點用「-」
+    - 每個重點下方用縮排方式詳細說明（可多行）。
+    - 重要詞彙用全形括號（如【重點】）
+- 回答請使用繁體中文。
+
+# 推理步驟
+1. 完整閱讀本段內容。
+2. 篩選出所有真正重要的主題與子主題。
+3. 條列每個主題下的重要重點，並針對每個重點進行詳細說明（說明內容需根據本段內容）。
+4. 若有明確決策、行動項目、因果關係，也請詳細說明。
+5. 若發現重點可能與其他段落有關聯或尚未完整，請明確標註。
+6. 不可補充外部知識或推論。
+
+# 輸出格式
+- 依主題分段，主題用「【主題】」，子主題用「【子主題】」，重點用「-」條列，重點下方用縮排詳細說明。
+- 若有跨段重點，請於重點說明後加註「（此重點可能需與其他段落合併補全）」。
+
+# 範例
+【主題】市場策略
+- 【重點觀察】：本次會議強調市場多元化策略。
+    多位與會者認為現有市場已趨於飽和，因此提出應積極開發新興市場，以分散風險並尋求成長動能。
+- 【數據支持】：2024年預計成長20%。
+    財務部門報告指出，若能順利推動多元化策略，2024年營收有望成長20%。
+- 【決策】：將優先投入新興市場。
+    經過討論後，決議將資源優先配置於新興市場，並成立專案小組負責執行。
+
+【主題】產品開發
+- 【測試進度】：目前產品測試進度落後。
+    研發部門回報，因人力資源不足及部分技術瓶頸，導致產品測試進度較原計畫延遲兩週。（此重點可能需與其他段落合併補全）
+
+# 逐字稿分段內容
+{context}
+
+# 最終指令
+請務必只根據本段內容篩選並詳細說明每個重點，不要補充外部知識或推測未明說的內容。如有跨段重點，請明確標註。
 """
 
 reduce_template = """
-The following are summaries of key themes extracted from the recording:
+# 角色與目標
+你是一位資深逐字稿分析師，請將下方多個分段主題摘要進行合併、去重、補全與分層整理，並針對每個主題與重點進行詳細說明。**僅根據主題摘要內容，不可補充外部知識或推測未明說的內容。**
+
+# 指令
+- 只根據下方主題摘要內容，嚴禁補充外部知識或推論。
+- 將相關主題歸納為大類，並於每個大類下條列所有重要重點，針對每個重點進行詳細說明（說明內容需根據摘要內容）。
+- 合併主題時，僅在摘要內容明確顯示關聯時才合併，並補全跨段重點，使其內容完整。
+- 對所有重點進行去重、補全、分層，並檢查是否有遺漏主題或重點。
+- 若有明確決策、行動項目、因果關係，也請詳細說明。
+- 使用清楚的分層條列格式：
+    - 主題用「【主題】」
+    - 子主題用「【子主題】」
+    - 重點用「-」
+    - 每個重點下方用縮排方式詳細說明（可多行）。
+- 回答請使用繁體中文。
+
+# 推理步驟
+1. 閱讀所有主題摘要。
+2. 歸納、合併相關主題（僅限明確關聯），並補全跨段重點。
+3. 條列每個大類下的重要重點，並針對每個重點進行詳細說明（說明內容需根據摘要內容）。
+4. 對所有重點進行去重、補全、分層，並檢查是否有遺漏主題或重點。
+5. 若有明確決策、行動項目、因果關係，也請詳細說明。
+6. 不可補充外部知識或推論。
+
+# 輸出格式
+- 依大類分段，主題用「【主題】」，子主題用「【子主題】」，重點用「-」條列，重點下方用縮排詳細說明。
+
+# 範例
+【主題】市場策略
+- 【重點觀察】：強調市場多元化。
+    會議中多位主管認為現有市場成長有限，需積極開發新興市場以分散風險。
+- 【決策】：優先投入新興市場。
+    決議將資源優先配置於新興市場，並成立專案小組負責執行。
+
+【主題】產品開發
+- 【測試進度】：產品測試進度落後。
+    研發部門回報因人力不足及技術瓶頸，導致測試延遲兩週。此重點已整合所有相關段落資訊。
+- 【行動項目】：加派人力支援測試。
+    會議決議由其他部門調派人力支援，確保產品如期上市。
+
+# 主題摘要內容
 {docs}
-Please consolidate these into broader categories, focusing on grouping related themes under major categories. For each major category, provide a detailed summary using bullet points to highlight key insights, specific details, and explain the cause-and-effect relationships.
-- Ensure all important details and examples are included to support each category's summary, enhancing the richness of the content.
-- Maintain consistency in tone and style, reflecting the conversational nature of the recording.
-- Ensure identification and emphasis on any important action items or decisions, and provide explanations for these recommendations.
-- Summarize the key points that the speaker most wants to convey, without assuming additional strategic implications unless explicitly mentioned.
-If the source is in Chinese, please respond in Traditional Chinese, not Simplified Chinese.
+
+# 最終指令
+請務必只根據主題摘要內容歸納、去重、補全並詳細說明每個重點，不要補充外部知識或推測未明說的內容。特別注意跨段重點的整合與補全。
 """
 
 map_prompt = ChatPromptTemplate([("human", map_template)])
