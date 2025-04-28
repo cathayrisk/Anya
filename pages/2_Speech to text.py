@@ -139,10 +139,11 @@ st.set_page_config(page_title="Speech to Text Transcription", layout="wide", pag
 st.title("Speech to text transcription")
 
 # 創建一個表單來上傳文件
-with st.form(key="my_form"):
-    f = st.file_uploader("Upload your audio file", type=["wav", "mp3", "mp4", "mpeg", "mpga", "m4a", "webm"])
-    st.info("👆 上傳一個音效文件（支援 .wav, .mp3, .mp4, .mpeg, .mpga, .m4a, .wav, .webm）。")
-    submit_button = st.form_submit_button(label="Transcribe")
+with st.expander("Upload your PDF files", expanded=True):
+    with st.form(key="my_form"):
+        f = st.file_uploader("Upload your audio file", type=["wav", "mp3", "mp4", "mpeg", "mpga", "m4a", "webm"])
+        st.info("👆 上傳一個音效文件（支援 .wav, .mp3, .mp4, .mpeg, .mpga, .m4a, .wav, .webm）。")
+        submit_button = st.form_submit_button(label="Transcribe")
 
 # 定義生成器函數來逐步產生轉錄文本
 def stream_transcription(transcription_text):
@@ -163,7 +164,7 @@ def transcribe_chunk(chunk, index):
                 model="gpt-4o-transcribe",
                 file=audio_file,
                 response_format="text",
-                prompt="This audio contains a discussion or presentation. If the speech is in Chinese, please transcribe the content into Traditional Chinese characters. The audio may cover various topics such as updates, feedback, or informative lectures."
+                prompt="This audio contains a discussion or presentation. Always preserve the original language of each sentence. If a sentence is in English, output it in English; if in Chinese, output it in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate or alter the language. The audio may cover various topics such as updates, feedback, or informative lectures."
             )
         os.remove(temp_mp3_file.name)
     return transcription.lower()
