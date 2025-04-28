@@ -135,11 +135,11 @@ def beautify_transcript(text):
 
 
 # 設置網頁標題和圖標
-st.set_page_config(page_title="Speech to Text Transcription", layout="wide", page_icon="👄")
+st.set_page_config(page_title="#Speech to Text Transcription", layout="wide", page_icon="👄")
 #st.title("Speech to text transcription")
 
 # 創建一個表單來上傳文件
-with st.expander("Speech to text transcription👄", expanded=True):
+with st.expander("Speech to text transcription", expanded=True, icon="👄"):
     with st.form(key="my_form"):
         f = st.file_uploader("Upload your audio file", type=["wav", "mp3", "mp4", "mpeg", "mpga", "m4a", "webm"])
         st.info("👆 上傳一個音效文件（支援 .wav, .mp3, .mp4, .mpeg, .mpga, .m4a, .wav, .webm）。")
