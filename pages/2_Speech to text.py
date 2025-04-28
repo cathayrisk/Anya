@@ -313,6 +313,20 @@ def llm_is_truncated(last_line: str, judge_llm=None) -> bool:
 #                break
 #    return all_text
 
+def split_sentences(text):
+    """
+    將中文文本依據句號、問號、驚嘆號、分號、換行等標點斷句。
+    """
+    # 以標點符號或換行為斷句依據
+    sentences = re.split(r'([。！？；\n])', text)
+    result = []
+    for i in range(0, len(sentences)-1, 2):
+        result.append(sentences[i] + sentences[i+1])
+    if len(sentences) % 2 != 0:
+        result.append(sentences[-1])
+    # 去除空白
+    return [s.strip() for s in result if s.strip()]
+
 def get_unprocessed_sentences(original_sentences, formatted_sentences):
     # 用 difflib 判斷哪些原始句子還沒出現在格式化內容
     unprocessed = []
