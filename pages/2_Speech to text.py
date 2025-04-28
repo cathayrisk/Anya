@@ -55,6 +55,8 @@ from pydantic import BaseModel, Field, field_validator
 import json
 from langchain_core.callbacks.base import BaseCallbackHandler
 from streamlit.delta_generator import DeltaGenerator
+import difflib
+
 
 class StreamHandler(BaseCallbackHandler):
     def __init__(self, message_container: DeltaGenerator):
@@ -277,38 +279,82 @@ def llm_is_truncated(last_line: str, judge_llm=None) -> bool:
 #                break
 #    return all_text
 
-def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
-    """
-    將逐字稿分段格式化，遇到省略自動續接，直到內容完整或達到 max_rounds。
-    """
-    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
+#def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
+#    """
+#    將逐字稿分段格式化，遇到省略自動續接，直到內容完整或達到 max_rounds。
+#    """
+#    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
+#    chunks = text_splitter.split_text(transcription)
+#    all_text = ""
+#    for idx, chunk in enumerate(chunks):
+#        message_container = st.empty()
+#        handler = StreamHandler(message_container)
+#        current_prompt = {"text": chunk}
+#        round_count = 0
+#        while True:
+#            handler.text = ""  # 每輪都重設
+#            result = chain.invoke(current_prompt, config={"callbacks": [handler]})
+#            message_container.markdown(handler.text, unsafe_allow_html=True)
+#            lines = handler.text.splitlines()
+#            if round_count == 0:
+#                all_text += handler.text + "\n"
+#            else:
+                # 只加新續接的內容（去掉重複的第一行）
+#                if len(lines) > 1:
+#                    all_text += "\n".join(lines[1:]) + "\n"
+#            last_line = lines[-1] if lines else ""
+#            if not llm_is_truncated(last_line, judge_llm):
+#                break
+#            current_prompt = {"text": "請繼續"}
+#            round_count += 1
+#            if round_count >= max_rounds:
+                # 可選：log警告
+#                print(f"Warning: chunk {idx} reached max_rounds({max_rounds}) for continuation.")
+#                break
+#    return all_text
+
+def get_unprocessed_sentences(original_sentences, formatted_sentences):
+    # 用 difflib 判斷哪些原始句子還沒出現在格式化內容
+    unprocessed = []
+    formatted_text = ''.join(formatted_sentences)
+    for sent in original_sentences:
+        # 用 in 或相似度判斷
+        if sent not in formatted_text:
+            # 也可用 difflib.SequenceMatcher(None, sent, formatted_text).ratio() < 0.7
+            unprocessed.append(sent)
+    return unprocessed
+
+def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=15):
+    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=2000, chunk_overlap=0)
     chunks = text_splitter.split_text(transcription)
     all_text = ""
     for idx, chunk in enumerate(chunks):
         message_container = st.empty()
         handler = StreamHandler(message_container)
-        current_prompt = {"text": chunk}
+        remaining_text = chunk
         round_count = 0
-        while True:
-            handler.text = ""  # 每輪都重設
-            result = chain.invoke(current_prompt, config={"callbacks": [handler]})
+        while remaining_text and round_count < max_rounds:
+            handler.text = ""
+            result = chain.invoke({"text": remaining_text}, config={"callbacks": [handler]})
             message_container.markdown(handler.text, unsafe_allow_html=True)
-            lines = handler.text.splitlines()
-            if round_count == 0:
-                all_text += handler.text + "\n"
+            # 分句
+            original_sentences = split_sentences(remaining_text)
+            formatted_sentences = split_sentences(handler.text)
+            # 比對
+            unprocessed = get_unprocessed_sentences(original_sentences, formatted_sentences)
+            # 判斷是否被截斷
+            last_line = handler.text.strip().split('\n')[-1]
+            if llm_is_truncated(last_line, judge_llm) or unprocessed:
+                # 只送還沒處理的句子
+                remaining_text = ''.join(unprocessed)
+                round_count += 1
             else:
-                # 只加新續接的內容（去掉重複的第一行）
-                if len(lines) > 1:
-                    all_text += "\n".join(lines[1:]) + "\n"
-            last_line = lines[-1] if lines else ""
-            if not llm_is_truncated(last_line, judge_llm):
+                all_text += handler.text + "\n"
                 break
-            current_prompt = {"text": "請繼續"}
-            round_count += 1
-            if round_count >= max_rounds:
-                # 可選：log警告
-                print(f"Warning: chunk {idx} reached max_rounds({max_rounds}) for continuation.")
-                break
+        if round_count >= max_rounds:
+            print(f"Warning: chunk {idx} reached max_rounds({max_rounds}) for continuation.")
+    # 移除所有「請繼續」等字眼
+    all_text = re.sub(r"(請繼續|內容過長|見下則繼續)", "", all_text, flags=re.I)
     return all_text
 
 def beautify_transcript(text):
