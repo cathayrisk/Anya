@@ -65,7 +65,7 @@ class StreamHandler(BaseCallbackHandler):
     def on_llm_new_token(self, token: str, **kwargs) -> None:
         self.text += token
         self.cursor_visible = not self.cursor_visible
-        cursor = '<span style="color:#2ecc71;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
+        cursor = '<span style="color:#4B3832;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
         # 這裡每次都覆蓋同一個區塊
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
         time.sleep(0.04)
