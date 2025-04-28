@@ -86,29 +86,58 @@ llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, streaming=True)
 
 judge_llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.0)
 
-def llm_is_truncated(last_line: str, judge_llm) -> bool:
-    prompt = f"""
-你是一個判斷助手。請判斷下面這一行是否是在請求用戶續接內容、或是省略提示（例如：內容過長、僅展示部分內容、請繼續、continue、remaining content 等），而不是一般內容。
-如果是，請回答「是」；如果不是，請回答「否」。
-內容：
-{last_line}
-"""
-    response = judge_llm.invoke(prompt)
-    answer = response.content.strip()
-    return answer.startswith("是")
+def get_full_llm_output(prompt, llm, judge_llm, continue_prompt="請繼續"):
+    all_content = ""
+    current_prompt = prompt
+    while True:
+        response = llm.invoke(current_prompt)
+        content = response.content.strip()
+        all_content += content + "\n"
+        # 取最後一行
+        last_line = content.splitlines()[-1] if content.splitlines() else ""
+        # 判斷是否被截斷
+        if not llm_is_truncated(last_line, judge_llm):
+            break
+        # 若被截斷，則用續接提示
+        current_prompt = continue_prompt
+    return all_content
+
+#def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
+    # 用 CharacterTextSplitter 分段
+#    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
+#    chunks = text_splitter.split_text(transcription)
+#    all_text = ""
+#    for idx, chunk in enumerate(chunks):
+#        message_container = st.empty()
+#        handler = StreamHandler(message_container)
+#        result = chain.invoke({"text": chunk}, config={"callbacks": [handler]})
+#        message_container.markdown(handler.text, unsafe_allow_html=True)
+#        all_text += handler.text + "\n"
+#    return all_text
 
 def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
-    # 用 CharacterTextSplitter 分段
     text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
     chunks = text_splitter.split_text(transcription)
     all_text = ""
     for idx, chunk in enumerate(chunks):
         message_container = st.empty()
         handler = StreamHandler(message_container)
-        result = chain.invoke({"text": chunk}, config={"callbacks": [handler]})
-        message_container.markdown(handler.text, unsafe_allow_html=True)
-        all_text += handler.text + "\n"
+        current_prompt = {"text": chunk}
+        round_count = 0
+        while True:
+            result = chain.invoke(current_prompt, config={"callbacks": [handler]})
+            message_container.markdown(handler.text, unsafe_allow_html=True)
+            all_text += handler.text + "\n"
+            last_line = handler.text.splitlines()[-1] if handler.text.splitlines() else ""
+            if not llm_is_truncated(last_line, judge_llm):
+                break
+            # 若被截斷，則用續接提示
+            current_prompt = {"text": "請繼續"}
+            round_count += 1
+            if round_count >= max_rounds:
+                break
     return all_text
+    
 
 def beautify_transcript(text):
     # 1. 主題加粗
