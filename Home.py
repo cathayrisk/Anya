@@ -288,10 +288,10 @@ model_name = st.pills("Choose a model:", options)
 # Map model names to OpenAI model IDs
 if model_name == "GPT-4.1-mini":
     st.session_state.selected_model = "gpt-4.1-mini"
-elif model_name == "GPT-4.1":
-    st.session_state.selected_model = "gpt-4.1"
-else:
+elif model_name == "GPT-4.1-nano":
     st.session_state.selected_model = "gpt-4.1-nano"
+else:
+    st.session_state.selected_model = "gpt-4.1"
 #############################################################################
 # 6. The initialize_app function
 #############################################################################
@@ -340,7 +340,6 @@ for message in st.session_state.messages:
 app = initialize_app(model_name=st.session_state.selected_model)
 
 # Input box for new messages
-# Input box for new messages
 if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
@@ -365,7 +364,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
                     debug_placeholder.text_area(
                         "Debug Logs",
                         debug_logs,
-                        height=100,
+                        height=80,
                         key=f"debug_logs_{i}"
                     )
 
