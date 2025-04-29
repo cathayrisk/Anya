@@ -60,21 +60,60 @@ import difflib
 
 class StreamHandler(BaseCallbackHandler):
     def __init__(self, message_container: DeltaGenerator):
-        self.text = ""
+        self.tokens = []
         self.message_container = message_container
         self.cursor_visible = True
 
+    @property
+    def text(self):
+        return ''.join(self.tokens)
+
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        self.text += token
+        self.tokens.append(token)
         self.cursor_visible = not self.cursor_visible
         cursor = '<span style="color:#4B3832;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
-        # 這裡每次都覆蓋同一個區塊
-        self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
-        time.sleep(0.04)
-        
-    def on_llm_end(self, *args, **kwargs):
-        self.message_container.markdown(self.text, unsafe_allow_html=True)
 
+        pulse_grow_in_style = """
+        <style>
+        @keyframes pulseGrowInA8 {
+          0% {
+            opacity: 0;
+            transform: scale(0.1);
+          }
+          40% {
+            opacity: 1;
+            transform: scale(1.4);
+          }
+          60% {
+            transform: scale(0.8);
+          }
+          80% {
+            transform: scale(1.15);
+          }
+          100% {
+            opacity: 1;
+            transform: scale(1);
+          }
+        }
+        .pulse-grow-ina8 {
+          animation: pulseGrowInA8 1.2s cubic-bezier(.68,-0.55,.27,1.55);
+          display: inline-block;
+        }
+        </style>
+        """
+
+        safe_text = ''.join(self.tokens[:-1])
+        pulse_grow_token = f'<span class="pulse-grow-ina8">{self.tokens[-1]}</span>'
+
+        self.message_container.markdown(
+            pulse_grow_in_style + safe_text + pulse_grow_token + cursor,
+            unsafe_allow_html=True
+        )
+        time.sleep(0.05)
+
+    def on_llm_end(self, *args, **kwargs):
+        self.message_container.markdown(''.join(self.tokens), unsafe_allow_html=True)
+        
 # 配置 pydub 使用 FFmpeg
 AudioSegment.converter = which("ffmpeg")
 AudioSegment.ffprobe = which("ffprobe")
