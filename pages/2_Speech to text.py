@@ -84,234 +84,9 @@ os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 client = OpenAI()
 
 # 初始化 LangChain 的 ChatOpenAI 模型
-llm = ChatOpenAI(model="gpt-4.1", temperature=0.0, streaming=True)
+llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.0, streaming=True)
 
-judge_llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.0)
-
-def llm_is_truncated(last_line: str, judge_llm=None) -> bool:
-    """
-    判斷最後一行是否為 LLM 輸出省略提示。
-    先用正則判斷常見語句，不確定時才丟給 judge_llm。
-    """
-    if not last_line:
-        return False
-
-    # 常見省略語（可持續擴充）
-    omit_patterns = [
-        r"內容過長",
-        r"請見(下則|續篇|下篇|下段|下文)",
-        r"請繼續",
-        r"continue",
-        r"remaining content",
-        r"only partial content",
-        r"僅展示部分內容",
-        r"下文請見",
-        r"to be continued",
-        r"see next part",
-        r"see continuation",
-        r"see next",
-        r"（續）",
-        r"…$",
-        r"\.\.\.$",
-        r"未完待續",
-        r"下篇繼續",
-        r"下段繼續",
-        r"see next section",
-        r"see next chapter",
-        r"see next page",
-        r"see next message",
-        r"see next reply",
-        r"see next response",
-        r"see next output",
-        r"see next transcript",
-        r"see next conversation",
-        r"see next dialogue",
-        r"see next dialog",
-        r"see next turn",
-        r"see next utterance",
-        r"see next statement",
-        r"see next sentence",
-        r"see next paragraph",
-        r"see next line",
-        r"see next text",
-        r"see next content",
-        r"see next part",
-        r"see next portion",
-        r"see next segment",
-        r"see next fragment",
-        r"see next excerpt",
-        r"see next snippet",
-        r"see next chunk",
-        r"see next batch",
-        r"see next block",
-        r"see next section",
-        r"see next division",
-        r"see next subdivision",
-        r"see next subdivision",
-        r"see next subpart",
-        r"see next subsegment",
-        r"see next subchunk",
-        r"see next subbatch",
-        r"see next subblock",
-        r"see next subsection",
-        r"see next subchapter",
-        r"see next subpage",
-        r"see next submessage",
-        r"see next subreply",
-        r"see next subresponse",
-        r"see next suboutput",
-        r"see next subtranscript",
-        r"see next subconversation",
-        r"see next subdialogue",
-        r"see next subdialog",
-        r"see next subturn",
-        r"see next subutterance",
-        r"see next substatement",
-        r"see next subsentence",
-        r"see next subparagraph",
-        r"see next subline",
-        r"see next subtext",
-        r"see next subcontent",
-        r"see next subpart",
-        r"see next subportion",
-        r"see next subsegment",
-        r"see next subfragment",
-        r"see next subexcerpt",
-        r"see next subsnippet",
-        r"see next subchunk",
-        r"see next subbatch",
-        r"see next subblock",
-        r"see next subsubsection",
-        r"see next subsubchapter",
-        r"see next subsubpage",
-        r"see next subsubmessage",
-        r"see next subsubreply",
-        r"see next subsubresponse",
-        r"see next subsuboutput",
-        r"see next subsubtranscript",
-        r"see next subsubconversation",
-        r"see next subsubdialogue",
-        r"see next subsubdialog",
-        r"see next subsubturn",
-        r"see next subsubutterance",
-        r"see next subsubstatement",
-        r"see next subsubsentence",
-        r"see next subsubparagraph",
-        r"see next subsubline",
-        r"see next subsubtext",
-        r"see next subsubcontent",
-        r"see next subsubpart",
-        r"see next subsubportion",
-        r"see next subsubsegment",
-        r"see next subsubfragment",
-        r"see next subsubexcerpt",
-        r"see next subsubsnippet",
-        r"see next subsubchunk",
-        r"see next subsubbatch",
-        r"see next subsubblock",
-    ]
-    for pat in omit_patterns:
-        if re.search(pat, last_line, re.IGNORECASE):
-            return True
-
-    # 若還是不確定，再丟給 judge_llm
-    if judge_llm:
-        prompt = f"""
-你是一個判斷助手。請判斷下面這一行是否是在請求用戶續接內容、或是省略提示（例如：內容過長、僅展示部分內容、請繼續、continue、remaining content 等），而不是一般內容。
-如果是，請回答「是」；如果不是，請回答「否」。
-內容：
-{last_line}
-"""
-        response = judge_llm.invoke(prompt)
-        answer = response.content.strip()
-        return answer.startswith("是")
-    return False
-
-#def get_full_llm_output(prompt, llm, judge_llm, continue_prompt="請繼續"):
-#    all_content = ""
-#    current_prompt = prompt
-#    while True:
-#        response = llm.invoke(current_prompt)
-#        content = response.content.strip()
-#        all_content += content + "\n"
-        # 取最後一行
-#        last_line = content.splitlines()[-1] if content.splitlines() else ""
-        # 判斷是否被截斷
-#        if not llm_is_truncated(last_line, judge_llm):
-#            break
-        # 若被截斷，則用續接提示
-#        current_prompt = continue_prompt
-#    return all_content
-
-#def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
-    # 用 CharacterTextSplitter 分段
-#    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
-#    chunks = text_splitter.split_text(transcription)
-#    all_text = ""
-#    for idx, chunk in enumerate(chunks):
-#        message_container = st.empty()
-#        handler = StreamHandler(message_container)
-#        result = chain.invoke({"text": chunk}, config={"callbacks": [handler]})
-#        message_container.markdown(handler.text, unsafe_allow_html=True)
-#        all_text += handler.text + "\n"
-#    return all_text
-
-#def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
-#    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
-#    chunks = text_splitter.split_text(transcription)
-#    all_text = ""
-#    for idx, chunk in enumerate(chunks):
-#        message_container = st.empty()
-#        handler = StreamHandler(message_container)
-#        current_prompt = {"text": chunk}
-#        round_count = 0
-#        while True:
-#            result = chain.invoke(current_prompt, config={"callbacks": [handler]})
-#            message_container.markdown(handler.text, unsafe_allow_html=True)
-#            all_text += handler.text + "\n"
-#            last_line = handler.text.splitlines()[-1] if handler.text.splitlines() else ""
-#            if not llm_is_truncated(last_line, judge_llm):
-#                break
-            # 若被截斷，則用續接提示
-#            current_prompt = {"text": "請繼續"}
-#            round_count += 1
-#            if round_count >= max_rounds:
-#                break
-#    return all_text
-
-#def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=10):
-#    """
-#    將逐字稿分段格式化，遇到省略自動續接，直到內容完整或達到 max_rounds。
-#    """
-#    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=3000, chunk_overlap=0)
-#    chunks = text_splitter.split_text(transcription)
-#    all_text = ""
-#    for idx, chunk in enumerate(chunks):
-#        message_container = st.empty()
-#        handler = StreamHandler(message_container)
-#        current_prompt = {"text": chunk}
-#        round_count = 0
-#        while True:
-#            handler.text = ""  # 每輪都重設
-#            result = chain.invoke(current_prompt, config={"callbacks": [handler]})
-#            message_container.markdown(handler.text, unsafe_allow_html=True)
-#            lines = handler.text.splitlines()
-#            if round_count == 0:
-#                all_text += handler.text + "\n"
-#            else:
-                # 只加新續接的內容（去掉重複的第一行）
-#                if len(lines) > 1:
-#                    all_text += "\n".join(lines[1:]) + "\n"
-#            last_line = lines[-1] if lines else ""
-#            if not llm_is_truncated(last_line, judge_llm):
-#                break
-#            current_prompt = {"text": "請繼續"}
-#            round_count += 1
-#            if round_count >= max_rounds:
-                # 可選：log警告
-#                print(f"Warning: chunk {idx} reached max_rounds({max_rounds}) for continuation.")
-#                break
-#    return all_text
+judge_llm = ChatOpenAI(model="gpt-4.1", temperature=0.0)
 
 def split_sentences(text):
     """
@@ -327,49 +102,29 @@ def split_sentences(text):
     # 去除空白
     return [s.strip() for s in result if s.strip()]
 
-def get_unprocessed_sentences(original_sentences, formatted_sentences):
-    # 用 difflib 判斷哪些原始句子還沒出現在格式化內容
+def get_unprocessed_sentences(original_sentences, formatted_sentences, threshold=0.7):
     unprocessed = []
-    formatted_text = ''.join(formatted_sentences)
     for sent in original_sentences:
-        # 用 in 或相似度判斷
-        if sent not in formatted_text:
-            # 也可用 difflib.SequenceMatcher(None, sent, formatted_text).ratio() < 0.7
+        found = False
+        for fsent in formatted_sentences:
+            if difflib.SequenceMatcher(None, sent, fsent).ratio() > threshold:
+                found = True
+                break
+        if not found:
             unprocessed.append(sent)
     return unprocessed
 
-def stream_full_formatted_transcription(chain, transcription, judge_llm, max_rounds=15):
-    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=2000, chunk_overlap=0)
-    chunks = text_splitter.split_text(transcription)
-    all_text = ""
-    for idx, chunk in enumerate(chunks):
+def format_transcript_by_chunks(full_transcription, chain, chunk_size=2000, chunk_overlap=0):
+    splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunks = splitter.split_text(full_transcription)
+    formatted_chunks = []
+    for i, chunk in enumerate(chunks):
         message_container = st.empty()
         handler = StreamHandler(message_container)
-        remaining_text = chunk
-        round_count = 0
-        while remaining_text and round_count < max_rounds:
-            handler.text = ""
-            result = chain.invoke({"text": remaining_text}, config={"callbacks": [handler]})
-            message_container.markdown(handler.text, unsafe_allow_html=True)
-            # 分句
-            original_sentences = split_sentences(remaining_text)
-            formatted_sentences = split_sentences(handler.text)
-            # 比對
-            unprocessed = get_unprocessed_sentences(original_sentences, formatted_sentences)
-            # 判斷是否被截斷
-            last_line = handler.text.strip().split('\n')[-1]
-            if llm_is_truncated(last_line, judge_llm) or unprocessed:
-                # 只送還沒處理的句子
-                remaining_text = ''.join(unprocessed)
-                round_count += 1
-            else:
-                all_text += handler.text + "\n"
-                break
-        if round_count >= max_rounds:
-            print(f"Warning: chunk {idx} reached max_rounds({max_rounds}) for continuation.")
-    # 移除所有「請繼續」等字眼
-    all_text = re.sub(r"(請繼續|內容過長|見下則繼續)", "", all_text, flags=re.I)
-    return all_text
+        formatted = chain.invoke({"text": chunk}, config={"callbacks": [handler]})
+        # 取出 handler.text（streaming 過程中已經顯示，這裡只是收集結果）
+        formatted_chunks.append(handler.text)
+    return "\n".join(formatted_chunks)
 
 def beautify_transcript(text):
     # 1. 主題加粗
@@ -378,14 +133,6 @@ def beautify_transcript(text):
     text = re.sub(r'(\*\*主題：.*?\*\*)(\n)(?!\n)', r'\1\n\n', text)
     # 3. 段落間加空行（兩行以上不重複）
     text = re.sub(r'([^\n])\n([^\n])', r'\1\n\n\2', text)
-    # 4. 關鍵詞高亮（可自行擴充）
-    #keywords = [
-    #    'non-bank f.i.', 'msr', 'ltv', 'NPL', 'FTP', 'SPA', 'ICR', 'LTC', 'provision',
-    #    'syndication', 'refinance', 'credit', '投資等級', '信評', '平等', '預放比', '集中度'
-    #]
-    #for kw in keywords:
-        # 避免重複加粗
-    #    text = re.sub(rf'(?<!\*)({re.escape(kw)})(?!\*)', r'**\1**', text)
     # 5. 【疑似錯誤】標紅
     text = re.sub(r'【疑似錯誤】', r'<span style="color:red">【疑似錯誤】</span>', text)
     # 6. 移除多餘空行（最多兩行）
@@ -421,7 +168,6 @@ def transcribe_chunk(chunk, index):
         chunk.export(temp_mp3_file.name, format="mp3")
         with open(temp_mp3_file.name, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                #model="whisper-1",
                 model="gpt-4o-transcribe",
                 file=audio_file,
                 response_format="text",
@@ -1155,7 +901,8 @@ if f is not None:
 
             # 使用 LangChain 改善文本格式
             status.update(label="Formatting transcription...")
-            formatted_transcription = stream_full_formatted_transcription(formatting_chain, full_transcription, judge_llm)
+            #formatted_transcription = stream_full_formatted_transcription(formatting_chain, full_transcription, judge_llm)
+            final_transcript = format_transcript_by_chunks(full_transcription, formatting_chain)
 
             status.update(label="Transcription complete!", state="complete", expanded=False)
         except Exception as e:
@@ -1166,7 +913,7 @@ if f is not None:
     tab1, tab2, tab3, tab4 = st.tabs(["轉錄結果", "重點摘要", "內容解析", "原始內容"])
     with tab1:
         with st.container():
-            st.markdown(beautify_transcript(formatted_transcription), unsafe_allow_html=True)
+            st.markdown(beautify_transcript(final_transcript), unsafe_allow_html=True)
             st.balloons()
 
     # 異步計算 summarize_transcription 並在 Tab2 中顯示 spinner
@@ -1292,14 +1039,6 @@ if f is not None:
                     insightful_quotes = arguments_data['insightful_quotes']
                     overall_summary = arguments_data['overall_summary']
                     next_steps = arguments_data['next_steps']
-
-                    #st.text(f"標題: {title}")
-                    #st.text(f"地點: {location}")
-                    #st.text(f"持續時間: {duration}")
-                    #st.text(f"關鍵時刻: {key_moments}")
-                    #st.text(f"深刻引用: {insightful_quotes}")
-                    #st.text(f"整體摘要: {overall_summary}")
-                    #st.text(f"下一步: {next_steps}")
             
             except Exception as e:
                 st.markdown(f"發生錯誤: {repr(e)}")
