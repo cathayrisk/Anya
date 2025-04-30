@@ -5,7 +5,7 @@ import difflib
 import pandas as pd
 import html
 
-st.set_page_config(page_title="文件差異比對", layout="wide")
+st.set_page_config(page_title="安妮亞來找碴", layout="wide")
 st.title("文件差異比對工具（高亮、上下文、分頁）")
 
 def extract_pdf_text(uploaded_file):
