@@ -122,8 +122,8 @@ def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text
 # 5. AI摘要（LangChain）
 def ai_summarize_diff(df):
     prompt = (
-        "請根據下列差異表格，總結兩份文件的主要不同點，"
-        "用條列式中文簡明說明，重點放在內容意義的變化：\n"
+        "請根據下列差異表格，直接條列出每一筆文字內容的差異（例如：第X行：A→B、刪除、或新增），"
+        "不用解釋意義，也不用總結，只要明確列出差異內容即可：\n"
         + df.to_string(index=False)
     )
     llm = ChatOpenAI(
@@ -174,17 +174,19 @@ if file1 and file2:
                 if len(df) == 0:
                     st.info("兩份文件沒有明顯差異。")
                 else:
+                    st.text("文件差異")
                     st.dataframe(df, hide_index=True)
                     download_report(df)
 
             with tab2:
                 st.markdown("#### AI自動摘要（LangChain）")
-                with st.spinner("AI 正在摘要..."):
-                    try:
-                        ai_summary = ai_summarize_diff(df)
-                        st.success(ai_summary)
-                    except Exception as e:
-                        st.error(f"AI 摘要失敗：{e}")
+                if st.button("啟動AI比對"):
+                    with st.spinner("AI 正在摘要..."):
+                        try:
+                            ai_summary = ai_summarize_diff(df)
+                            st.success(ai_summary)
+                        except Exception as e:
+                            st.error(f"AI 摘要失敗：{e}")
 
 else:
     st.info("請分別上傳文件1與文件2")
