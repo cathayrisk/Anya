@@ -387,13 +387,13 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
             debug_placeholder = st.empty()
             handler = StreamHandler(message_container, debug_placeholder, output_buffer)
 
-        with st.spinner("Thinking...", show_time=True):
-            inputs = {"question": user_input}
-            app.invoke(inputs, config={"callbacks": [handler]})
+            with st.spinner("Thinking...", show_time=True):
+                inputs = {"question": user_input}
+                app.invoke(inputs, config={"callbacks": [handler]})
 
-            # 移除游標，顯示最終內容
-            message_container.markdown(handler.text, unsafe_allow_html=True)
-            st.session_state.messages.append({"role": "assistant", "content": handler.text})
+                # 移除游標，顯示最終內容
+                message_container.markdown(handler.text, unsafe_allow_html=True)
+                st.session_state.messages.append({"role": "assistant", "content": handler.text})
 
     except Exception as e:
         error_message = f"An error occurred: {e}"
