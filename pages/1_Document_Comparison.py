@@ -3,7 +3,6 @@ import tempfile
 import fitz  # pymupdf
 import difflib
 import pandas as pd
-import math
 import io
 
 st.set_page_config(page_title="🔍安妮亞來找碴🔎", layout="wide")
@@ -57,28 +56,18 @@ def extract_diff_dataframe_v2(text1, text2):
         # 'equal' 不顯示
     return pd.DataFrame(diff_rows)
 
-# 3. 分頁顯示
-def show_paginated_table(df, page_size=20):
-    total = len(df)
-    if total == 0:
-        st.info("兩份文件沒有明顯差異。")
-        return
-    total_pages = math.ceil(total / page_size)
-    page = st.number_input("頁碼", min_value=1, max_value=total_pages, value=1, step=1)
-    start = (page - 1) * page_size
-    end = start + page_size
-    st.dataframe(df.iloc[start:end], hide_index=True)
-    st.write(f"第 {page} / {total_pages} 頁，共 {total} 筆")
-
-# 4. 下載報告
+# 3. 下載報告（只保留 Excel）
 def download_report(df):
-    csv = df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("下載 CSV 報告", csv, file_name="diff_report.csv", mime="text/csv")
     excel_buffer = io.BytesIO()
     df.to_excel(excel_buffer, index=False)
-    st.download_button("下載 Excel 報告", excel_buffer.getvalue(), file_name="diff_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "下載 Excel 報告",
+        excel_buffer.getvalue(),
+        file_name="diff_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-# 5. UI
+# 4. UI
 with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expanded=True):
     col1, col2 = st.columns(2)
     with col1:
@@ -103,8 +92,10 @@ if file1 and file2:
             df = df[~((df['文件1內容'] == "") & (df['文件2內容'] == ""))]
             df = df.reset_index(drop=True)
             st.write(f"本次比對共發現 {len(df)} 處差異。")
-            show_paginated_table(df, page_size=20)
-            if len(df) > 0:
+            if len(df) == 0:
+                st.info("兩份文件沒有明顯差異。")
+            else:
+                st.dataframe(df, hide_index=True)
                 download_report(df)
 else:
     st.info("請分別上傳文件1與文件2")
