@@ -191,13 +191,12 @@ if file1 and file2:
 
             with tab2:
                 st.markdown("#### AI自動摘要")
-                if st.button("啟動AI比對"):
-                    with st.spinner("AI 正在摘要..."):
-                        try:
-                            ai_summary = ai_summarize_diff(df)
-                            st.success(ai_summary)
-                        except Exception as e:
-                            st.error(f"AI 摘要失敗：{e}")
+                with st.spinner("AI 正在摘要..."):
+                    try:
+                        ai_summary = ai_summarize_diff(df)
+                        st.success(ai_summary)
+                    except Exception as e:
+                        st.error(f"AI 摘要失敗：{e}")
 
 else:
     st.info("請分別上傳文件1與文件2")
