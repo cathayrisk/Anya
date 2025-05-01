@@ -5,6 +5,7 @@ from docx import Document  # pip install python-docx
 import difflib
 import pandas as pd
 import io
+import html
 
 # ========== 1. 文字抽取 ==========
 @st.cache_data(show_spinner="正在抽取 PDF 文字...")
@@ -106,22 +107,39 @@ def get_diff_brief(old, new):
             diff.append(f"新增「{new[b0:b1]}」")
     return "；".join(diff) if diff else "細微變動"
 
-def generate_diff_summary_brief_with_lineno_and_context(df):
+def generate_diff_summary_brief_with_lineno_and_context(df, context_len=10):
     summary = []
     for idx, row in df.iterrows():
         l1 = row['基準文件內容'].strip()
         l2 = row['比較文件內容'].strip()
         line_no = row['行號1'] if row['行號1'] else row['行號2']
-        context = l1 if l1 else l2
         prefix = f"第{line_no}行：" if line_no else ""
         if row['差異類型'] == "修改":
-            diff_brief = get_diff_brief(l1, l2)
-            summary.append(f"{prefix}「{context}」{diff_brief}")
+            # 找出第一個差異區段
+            seqm = difflib.SequenceMatcher(None, l1, l2)
+            for opcode, a0, a1, b0, b1 in seqm.get_opcodes():
+                if opcode in ('replace', 'delete', 'insert'):
+                    # 取前後 context_len 字
+                    start1 = max(0, a0 - context_len)
+                    end1 = min(len(l1), a1 + context_len)
+                    start2 = max(0, b0 - context_len)
+                    end2 = min(len(l2), b1 + context_len)
+                    l1_snip = l1[start1:end1]
+                    l2_snip = l2[start2:end2]
+                    l1_hl, l2_hl = highlight_diff(l1_snip, l2_snip)
+                    summary.append(
+                        f"{prefix}<br>原文：{l1_hl}<br>新文：{l2_hl}"
+                    )
+                    break
         elif row['差異類型'] == "新增":
-            summary.append(f"{prefix}新增內容：「{context}」")
+            snippet = l2[:20] + ("..." if len(l2) > 20 else "")
+            _, l2_hl = highlight_diff("", snippet)
+            summary.append(f"{prefix}新增內容：{l2_hl}")
         elif row['差異類型'] == "刪除":
-            summary.append(f"{prefix}刪除內容：「{context}」")
-    return "<br>".join(summary)
+            snippet = l1[:20] + ("..." if len(l1) > 20 else "")
+            l1_hl, _ = highlight_diff(snippet, "")
+            summary.append(f"{prefix}刪除內容：{l1_hl}")
+    return "<br><br>".join(summary)
 
 # ========== 4. 下載報告 ==========
 def download_report(df):
@@ -145,6 +163,24 @@ def highlight_diffs_in_text(text, diff_lines, color="#fff2ac"):
             highlighted.append(line)
     return "<br>".join(highlighted)
 
+def highlight_diff(a, b):
+    """回傳 a, b 兩字串，將差異部分用黃色高亮（HTML span）"""
+    seqm = difflib.SequenceMatcher(None, a, b)
+    a_out, b_out = "", ""
+    for opcode, a0, a1, b0, b1 in seqm.get_opcodes():
+        a_part = html.escape(a[a0:a1])
+        b_part = html.escape(b[b0:b1])
+        if opcode == "equal":
+            a_out += a_part
+            b_out += b_part
+        elif opcode == "replace":
+            a_out += f"<span style='background-color:#FFFF00'>{a_part}</span>"
+            b_out += f"<span style='background-color:#FFFF00'>{b_part}</span>"
+        elif opcode == "delete":
+            a_out += f"<span style='background-color:#FFB6B6'>{a_part}</span>"
+        elif opcode == "insert":
+            b_out += f"<span style='background-color:#B6FFB6'>{b_part}</span>"
+    return a_out, b_out
 # ========== 6. UI ==========
 st.set_page_config(page_title="🔍文件差異比對工具", layout="wide")
 st.title("文件差異比對工具")
