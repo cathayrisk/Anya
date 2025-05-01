@@ -6,15 +6,7 @@ import pandas as pd
 import io
 import re
 
-# AI摘要用
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import HumanMessage
-
-st.set_page_config(page_title="🔍安妮亞來找碴🔎", layout="wide")
-st.title("文件差異比對工具")
-
-# 1. 快取 PDF 文字抽取
+# ========== 1. PDF 文字抽取 ==========
 @st.cache_data(show_spinner="正在抽取 PDF 文字...")
 def extract_pdf_text(pdf_bytes):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf_file:
@@ -28,10 +20,10 @@ def extract_pdf_text(pdf_bytes):
     doc.close()
     return doc_text
 
-# 2. 比對邏輯
+# ========== 2. 差異比對 ==========
 def extract_diff_dataframe_v2(text1, text2):
-    lines1 = text1.splitlines()
-    lines2 = text2.splitlines()
+    lines1 = [line for line in text1.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
+    lines2 = [line for line in text2.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
     sm = difflib.SequenceMatcher(None, lines1, lines2)
     diff_rows = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -41,40 +33,34 @@ def extract_diff_dataframe_v2(text1, text2):
                 l1 = lines1[i1 + k] if i1 + k < i2 else ""
                 l2 = lines2[j1 + k] if j1 + k < j2 else ""
                 diff_rows.append({
+                    "行號1": i1 + k + 1 if i1 + k < i2 else "",
+                    "行號2": j1 + k + 1 if j1 + k < j2 else "",
                     "差異類型": "修改",
-                    "文件1內容": l1,
-                    "文件2內容": l2
+                    "基準文件內容": l1,
+                    "比較文件內容": l2
                 })
         elif tag == 'delete':
-            for l1 in lines1[i1:i2]:
+            for k, l1 in enumerate(lines1[i1:i2]):
                 diff_rows.append({
+                    "行號1": i1 + k + 1,
+                    "行號2": "",
                     "差異類型": "刪除",
-                    "文件1內容": l1,
-                    "文件2內容": ""
+                    "基準文件內容": l1,
+                    "比較文件內容": ""
                 })
         elif tag == 'insert':
-            for l2 in lines2[j1:j2]:
+            for k, l2 in enumerate(lines2[j1:j2]):
                 diff_rows.append({
+                    "行號1": "",
+                    "行號2": j1 + k + 1,
                     "差異類型": "新增",
-                    "文件1內容": "",
-                    "文件2內容": l2
+                    "基準文件內容": "",
+                    "比較文件內容": l2
                 })
-        # 'equal' 不顯示
     return pd.DataFrame(diff_rows)
 
-# 3. 下載報告（只保留 Excel）
-def download_report(df):
-    excel_buffer = io.BytesIO()
-    df.to_excel(excel_buffer, index=False)
-    st.download_button(
-        "下載 Excel 報告",
-        excel_buffer.getvalue(),
-        file_name="diff_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
+# ========== 3. 人工規則摘要 ==========
 def get_diff_brief(old, new):
-    # 只顯示不同的部分
     seqm = difflib.SequenceMatcher(None, old, new)
     diff = []
     for opcode, a0, a1, b0, b1 in seqm.get_opcodes():
@@ -86,33 +72,14 @@ def get_diff_brief(old, new):
             diff.append(f"新增「{new[b0:b1]}」")
     return "；".join(diff) if diff else "細微變動"
 
-def get_content_lines(doc_text):
-    # 過濾掉分頁標記行
-    return [line for line in doc_text.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
-
-def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text):
-    lines1 = doc1_text.splitlines()
-    lines2 = doc2_text.splitlines()
+def generate_diff_summary_brief_with_lineno_and_context(df):
     summary = []
     for idx, row in df.iterrows():
-        l1 = row['文件1內容']
-        l2 = row['文件2內容']
-        line_no = -1
-        context = ""
-        if row['差異類型'] in ["修改", "刪除"]:
-            try:
-                line_no = lines1.index(l1) + 1
-                context = l1.strip()
-            except ValueError:
-                pass
-        elif row['差異類型'] == "新增":
-            try:
-                line_no = lines2.index(l2) + 1
-                context = l2.strip()
-            except ValueError:
-                pass
-
-        prefix = f"第{line_no}行：" if line_no > 0 else ""
+        l1 = row['基準文件內容'].strip()
+        l2 = row['比較文件內容'].strip()
+        line_no = row['行號1'] if row['行號1'] else row['行號2']
+        context = l1 if l1 else l2
+        prefix = f"第{line_no}行：" if line_no else ""
         if row['差異類型'] == "修改":
             diff_brief = get_diff_brief(l1, l2)
             summary.append(f"{prefix}「{context}」{diff_brief}")
@@ -120,26 +87,35 @@ def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text
             summary.append(f"{prefix}新增內容：「{context}」")
         elif row['差異類型'] == "刪除":
             summary.append(f"{prefix}刪除內容：「{context}」")
-    # 用 <br> 強制換行
     return "<br>".join(summary)
 
-# 5. AI摘要（LangChain）
-def ai_summarize_diff(df):
-    prompt = (
-        "請根據下列差異表格，直接條列出每一筆文字內容的差異（例如：第X行：A→B、刪除、或新增），"
-        "不用解釋意義，也不用總結，只要明確列出差異內容即可：\n"
-        + df.to_string(index=False)
+# ========== 4. 下載報告 ==========
+def download_report(df):
+    excel_buffer = io.BytesIO()
+    df.to_excel(excel_buffer, index=False)
+    st.download_button(
+        "下載 Excel 報告",
+        excel_buffer.getvalue(),
+        file_name="diff_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-    llm = ChatOpenAI(
-        model="gpt-4.1-mini",
-        openai_api_key=st.secrets["OPENAI_KEY"],
-        temperature=0.0
-    )
-    messages = [HumanMessage(content=prompt)]
-    response = llm(messages)
-    return response.content
 
-# 6. UI
+# ========== 5. 原文高亮 ==========
+def highlight_diffs_in_text(text, diff_lines, color="#fff2ac"):
+    # diff_lines: set of line numbers (1-based)
+    lines = [line for line in text.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
+    highlighted = []
+    for idx, line in enumerate(lines, 1):
+        if idx in diff_lines:
+            highlighted.append(f"<span style='background-color:{color}'>{line}</span>")
+        else:
+            highlighted.append(line)
+    return "<br>".join(highlighted)
+
+# ========== 6. UI ==========
+st.set_page_config(page_title="🔍文件差異比對工具", layout="wide")
+st.title("文件差異比對工具")
+
 with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expanded=True):
     col1, col2 = st.columns(2)
     with col1:
@@ -153,43 +129,49 @@ with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expand
             st.success(f"已上傳：{file2.name}")
             st.session_state['file2_bytes'] = file2.getvalue()
 
-if file1 and file2:
-    st.markdown("---")
-    st.subheader("比對差異分析")
-    with st.spinner("正在抽取 PDF 文字..."):
-        doc1_text = extract_pdf_text(file1.getvalue())
-        doc2_text = extract_pdf_text(file2.getvalue())
+if st.session_state.get('file1_bytes') and st.session_state.get('file2_bytes'):
+    doc1_text = extract_pdf_text(st.session_state['file1_bytes'])
+    doc2_text = extract_pdf_text(st.session_state['file2_bytes'])
 
     if st.button("開始比對並顯示所有差異"):
         with st.spinner("正在比對..."):
             df = extract_diff_dataframe_v2(doc1_text, doc2_text)
-            df = df[~((df['文件1內容'] == "") & (df['文件2內容'] == ""))]
             df = df.reset_index(drop=True)
-            st.session_state['diff_df'] = df  # 存進 session_state
+            st.session_state['diff_df'] = df
             st.session_state['doc1_text'] = doc1_text
             st.session_state['doc2_text'] = doc2_text
             st.session_state['has_compared'] = True
-            st.write(f"本次比對共發現 {len(df)} 處差異。")
 
-        if st.session_state.get('has_compared', False):
-            df = st.session_state['diff_df']
-            doc1_text = st.session_state['doc1_text']
-            doc2_text = st.session_state['doc2_text']
+if st.session_state.get('has_compared', False):
+    df = st.session_state['diff_df']
+    doc1_text = st.session_state['doc1_text']
+    doc2_text = st.session_state['doc2_text']
 
+    # ========== 頁面上方：AI/人工摘要 ==========
+    st.subheader("🔎 差異摘要")
+    summary = generate_diff_summary_brief_with_lineno_and_context(df)
+    st.markdown(summary, unsafe_allow_html=True)
 
-            st.markdown("#### 人工規則摘要")
-            summary = generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text)
-            if summary:
-                st.markdown(summary, unsafe_allow_html=True)
-            else:
-                st.info("無明顯差異可摘要。")
-                    
-            if len(df) == 0:
-                st.info("兩份文件沒有明顯差異。")
-            else:
-                st.text("文件差異")
-                st.dataframe(df, hide_index=True)
-                download_report(df)
+    # ========== 中間：差異表格 ==========
+    st.subheader("📋 差異明細表格")
+    search = st.text_input("搜尋差異內容（可輸入關鍵字）")
+    filter_type = st.selectbox("篩選差異類型", ["全部", "修改", "新增", "刪除"])
+    df_show = df.copy()
+    if search:
+        df_show = df_show[df_show.apply(lambda row: search in row['基準文件內容'] or search in row['比較文件內容'], axis=1)]
+    if filter_type != "全部":
+        df_show = df_show[df_show['差異類型'] == filter_type]
+    st.dataframe(df_show, hide_index=True)
+    download_report(df_show)
 
+    # ========== 下方：原文高亮 ==========
+    st.subheader("📝 原文高亮顯示")
+    tab_a, tab_b = st.tabs(["基準文件", "比較文件"])
+    diff_lines1 = set(df['行號1'].dropna().astype(int))
+    diff_lines2 = set(df['行號2'].dropna().astype(int))
+    with tab_a:
+        st.markdown(highlight_diffs_in_text(doc1_text, diff_lines1, color="#ffcccc"), unsafe_allow_html=True)
+    with tab_b:
+        st.markdown(highlight_diffs_in_text(doc2_text, diff_lines2, color="#ccffcc"), unsafe_allow_html=True)
 else:
-    st.info("請分別上傳文件1與文件2")
+    st.info("請先上傳文件並執行比對")
