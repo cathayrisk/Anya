@@ -93,12 +93,11 @@ def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text
     for idx, row in df.iterrows():
         l1 = row['文件1內容']
         l2 = row['文件2內容']
-        # 預設行號為 -1
         line_no = -1
         context = ""
         if row['差異類型'] in ["修改", "刪除"]:
             try:
-                line_no = lines1.index(l1) + 1  # 行號從1開始
+                line_no = lines1.index(l1) + 1
                 context = l1.strip()
             except ValueError:
                 pass
@@ -117,7 +116,8 @@ def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text
             summary.append(f"{prefix}新增內容：「{context}」")
         elif row['差異類型'] == "刪除":
             summary.append(f"{prefix}刪除內容：「{context}」")
-    return "\n".join(summary)
+    # 用 <br> 強制換行
+    return "<br>".join(summary)
 
 # 5. AI摘要（LangChain）
 def ai_summarize_diff(df):
@@ -167,7 +167,7 @@ if file1 and file2:
                 st.markdown("#### 人工規則摘要")
                 summary = generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text)
                 if summary:
-                    st.info(summary)
+                    st.markdown(summary, unsafe_allow_html=True)
                 else:
                     st.info("無明顯差異可摘要。")
                     
