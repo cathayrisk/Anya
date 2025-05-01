@@ -27,7 +27,11 @@ class StreamHandler(BaseCallbackHandler):
             return
         self.text += token
         self.cursor_visible = not self.cursor_visible
-        cursor = "▌" if self.cursor_visible else " "
+        if self.text:
+            cursor = "▌" if self.cursor_visible else " "
+            self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
+        else:
+            self.message_container.markdown("", unsafe_allow_html=True)
         # 只用 message_container，不要用 st.chat_message
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
         # 更新 debug log
