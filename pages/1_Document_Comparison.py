@@ -86,25 +86,29 @@ def get_diff_brief(old, new):
             diff.append(f"新增「{new[b0:b1]}」")
     return "；".join(diff) if diff else "細微變動"
 
+def get_content_lines(doc_text):
+    # 過濾掉分頁標記行
+    return [line for line in doc_text.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
+
 def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text):
-    lines1 = doc1_text.splitlines()
-    lines2 = doc2_text.splitlines()
+    lines1 = get_content_lines(doc1_text)
+    lines2 = get_content_lines(doc2_text)
     summary = []
     for idx, row in df.iterrows():
-        l1 = row['文件1內容']
-        l2 = row['文件2內容']
+        l1 = row['文件1內容'].strip()
+        l2 = row['文件2內容'].strip()
         line_no = -1
         context = ""
         if row['差異類型'] in ["修改", "刪除"]:
             try:
                 line_no = lines1.index(l1) + 1
-                context = l1.strip()
+                context = l1
             except ValueError:
                 pass
         elif row['差異類型'] == "新增":
             try:
                 line_no = lines2.index(l2) + 1
-                context = l2.strip()
+                context = l2
             except ValueError:
                 pass
 
@@ -116,7 +120,6 @@ def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text
             summary.append(f"{prefix}新增內容：「{context}」")
         elif row['差異類型'] == "刪除":
             summary.append(f"{prefix}刪除內容：「{context}」")
-    # 用 <br> 強制換行
     return "<br>".join(summary)
 
 # 5. AI摘要（LangChain）
@@ -171,32 +174,21 @@ if file1 and file2:
             df = st.session_state['diff_df']
             doc1_text = st.session_state['doc1_text']
             doc2_text = st.session_state['doc2_text']
-            
-            tab1, tab2 = st.tabs(["比對差異表格", "自動摘要（AI/人工）"])
 
-            with tab1:
-                st.markdown("#### 人工規則摘要")
-                summary = generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text)
-                if summary:
-                    st.markdown(summary, unsafe_allow_html=True)
-                else:
-                    st.info("無明顯差異可摘要。")
+
+            st.markdown("#### 人工規則摘要")
+            summary = generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text)
+            if summary:
+                st.markdown(summary, unsafe_allow_html=True)
+            else:
+                st.info("無明顯差異可摘要。")
                     
-                if len(df) == 0:
-                    st.info("兩份文件沒有明顯差異。")
-                else:
-                    st.text("文件差異")
-                    st.dataframe(df, hide_index=True)
-                    download_report(df)
-
-            with tab2:
-                st.markdown("#### AI自動摘要")
-                with st.spinner("AI 正在摘要..."):
-                    try:
-                        ai_summary = ai_summarize_diff(df)
-                        st.success(ai_summary)
-                    except Exception as e:
-                        st.error(f"AI 摘要失敗：{e}")
+            if len(df) == 0:
+                st.info("兩份文件沒有明顯差異。")
+            else:
+                st.text("文件差異")
+                st.dataframe(df, hide_index=True)
+                download_report(df)
 
 else:
     st.info("請分別上傳文件1與文件2")
