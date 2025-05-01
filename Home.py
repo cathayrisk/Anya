@@ -10,7 +10,31 @@ from langchain_core.messages import AIMessage, HumanMessage
 import re
 import sys
 import io
+from langchain_core.callbacks.base import BaseCallbackHandler
+from streamlit.delta_generator import DeltaGenerator
+import time
 
+class StreamHandler(BaseCallbackHandler):
+    def __init__(self, message_container: DeltaGenerator, debug_placeholder: DeltaGenerator, output_buffer: io.StringIO):
+        self.text = ""
+        self.message_container = message_container
+        self.debug_placeholder = debug_placeholder
+        self.output_buffer = output_buffer
+        self.cursor_visible = True
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        self.text += token
+        self.cursor_visible = not self.cursor_visible
+        cursor = "▌" if self.cursor_visible else " "
+        self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
+        # 更新 debug log
+        debug_logs = self.output_buffer.getvalue()
+        self.debug_placeholder.text_area(
+            "Debug Logs",
+            debug_logs,
+            height=80,
+        )
+        time.sleep(0.02)
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
@@ -242,9 +266,13 @@ web_flag: {web_flag}
 
 請依照上述規則與範例，思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
+    # 這裡用 st.chat_message("assistant").empty() 產生一個可更新的區塊
+    message_container = st.chat_message("assistant").empty()
+    handler = StreamHandler(message_container)
+    
     try:
-        response = st.session_state.llm.invoke(prompt)
-        state["generation"] = response
+        response = st.session_state.llm.invoke(prompt, callbacks=[handler])
+        state["generation"] = handler.text
     except Exception as e:
         state["generation"] = f"Error generating answer: {str(e)}"
 
@@ -351,48 +379,21 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
 
     try:
         with st.chat_message("assistant"):
-            response_placeholder = st.empty()
+            message_container = st.empty()
             debug_placeholder = st.empty()
-            streamed_response = ""
+            output_buffer = io.StringIO()
+            sys.stdout = output_buffer  # 攔截 print
 
-            # Show spinner while streaming the response
+            handler = StreamHandler(message_container, debug_placeholder, output_buffer)
+
             with st.spinner("Thinking...", show_time=True):
                 inputs = {"question": user_input}
-                for i, output in enumerate(app.stream(inputs)):
-                    # Capture intermediate print messages
-                    debug_logs = output_buffer.getvalue()
-                    debug_placeholder.text_area(
-                        "Debug Logs",
-                        debug_logs,
-                        height=80,
-                        key=f"debug_logs_{i}"
-                    )
-
-                    if "generate" in output and "generation" in output["generate"]:
-                        chunk = output["generate"]["generation"]
-
-                        # Safely extract the text content
-                        if hasattr(chunk, "content"):  # If chunk is an AIMessage
-                            chunk_text = chunk.content
-                        else:  # Otherwise, convert to string
-                            chunk_text = str(chunk)
-
-                        # Append the text to the streamed response
-                        streamed_response += chunk_text
-
-                        # Update the placeholder with the streamed response so far
-                        response_placeholder.markdown(streamed_response)
-
-            # Store the final response in session state
-            st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
+                app.invoke(inputs, config={"callbacks": [handler]})
+                st.session_state.messages.append({"role": "assistant", "content": handler.text})
 
     except Exception as e:
-        # Handle errors and display in the conversation history
         error_message = f"An error occurred: {e}"
         st.session_state.messages.append({"role": "assistant", "content": error_message})
-        # 直接使用 st.error 而不是嵌套在 st.chat_message 內
         st.error(error_message)
-
     finally:
-        # Restore stdout to its original state
-        sys.stdout = sys.__stdout__
+        sys.stdout = sys.__stdout__  # 恢復 stdout
