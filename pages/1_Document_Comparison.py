@@ -164,14 +164,21 @@ with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expand
             st.session_state['file2_bytes'] = file2.getvalue()
             st.session_state['file2_name'] = file2.name
 
+class FakeUpload:
+    def __init__(self, name, value):
+        self.name = name
+        self._value = value
+    def getvalue(self):
+        return self._value
+
 if st.session_state.get('file1_bytes') and st.session_state.get('file2_bytes'):
     try:
         with st.spinner("正在抽取文件文字..."):
             doc1_text = get_text_from_file(
-                type("FakeUpload", (), {"name": st.session_state['file1_name'], "getvalue": lambda: st.session_state['file1_bytes']})()
+                FakeUpload(st.session_state['file1_name'], st.session_state['file1_bytes'])
             )
             doc2_text = get_text_from_file(
-                type("FakeUpload", (), {"name": st.session_state['file2_name'], "getvalue": lambda: st.session_state['file2_bytes']})()
+                FakeUpload(st.session_state['file2_name'], st.session_state['file2_bytes'])
             )
     except Exception as e:
         st.error(f"檔案解析失敗：{e}")
