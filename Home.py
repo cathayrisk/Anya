@@ -18,8 +18,8 @@ class StreamHandler(BaseCallbackHandler):
     def __init__(self, message_container, debug_placeholder, output_buffer):
         self.text = ""
         self.message_container = message_container
-        self.debug_placeholder = debug_placeholder
-        self.output_buffer = output_buffer
+        #self.debug_placeholder = debug_placeholder
+        #self.output_buffer = output_buffer
         self.cursor_visible = True
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
@@ -29,14 +29,14 @@ class StreamHandler(BaseCallbackHandler):
         # 只用 message_container，不要用 st.chat_message
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
         # 更新 debug log
-        debug_logs = self.output_buffer.getvalue()
-        self.debug_placeholder.text_area(
-            "Debug Logs",
-            debug_logs,
-            height=80,
-            key="debug_logs"  # 加一個固定 key
-        )
-        time.sleep(0.02)  # 可選
+        #debug_logs = self.output_buffer.getvalue()
+        #self.debug_placeholder.text_area(
+        #    "Debug Logs",
+        #    debug_logs,
+        #    height=80,
+        #    key="debug_logs"  # 加一個固定 key
+        #)
+        time.sleep(0.03)  # 可選
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
