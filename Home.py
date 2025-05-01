@@ -172,7 +172,7 @@ def generate(state: GraphState) -> GraphState:
 
 # 指令
 - 回答時務必使用正體中文，並遵循台灣用語。
-- 若是在討論法律、醫療、財經、學術等重要嚴肅主題，或是使用者要求要認真、正式或者是嚴肅回答的內容，請使用正式的語氣。
+- 若是在討論法律、醫療、財經、學術等重要嚴肅主題以及在要求翻譯與討論文章的時候，或是使用者要求要認真、正式或者是嚴肅回答的內容，請使用正式的語氣。
 - 以安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
 - 適時加入可愛的emoji（如🥜、😆、🤩、✨等）。
 - 若有數學公式，請用雙重美元符號`$$`包圍Latex表達式。
@@ -378,7 +378,6 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 只在這裡產生 output_buffer、message_container、debug_placeholder
     output_buffer = io.StringIO()
     sys.stdout = output_buffer  # Redirect stdout to the buffer
 
@@ -388,13 +387,52 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
             debug_placeholder = st.empty()
             handler = StreamHandler(message_container, debug_placeholder, output_buffer)
 
-            with st.spinner("Thinking...", show_time=True):
-                inputs = {"question": user_input}
-                # 這裡直接用 app.invoke，handler 會自動流式顯示
-                app.invoke(inputs, config={"callbacks": [handler]})
-                # 移除游標，顯示最終內容
-                message_container.markdown(handler.text, unsafe_allow_html=True)
-                st.session_state.messages.append({"role": "assistant", "content": handler.text})
+            # 顯示自訂 loading 動畫
+            loading_placeholder = st.empty()
+            show_anya_loading = lambda: loading_placeholder.markdown("""
+            <div id="anya-loader" style="display: flex; align-items: center; margin-bottom: 1em;">
+                <div class="anya-peanut"></div>
+                <span style="margin-left: 12px; font-size: 1.2em;">安妮亞正在努力思考中... wakuwaku 等一下下喔！🥜✨</span>
+            </div>
+            <style>
+            .anya-peanut {
+              width: 32px;
+              height: 32px;
+              border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+              background: #f5d07b;
+              position: relative;
+              animation: anya-spin 1s linear infinite;
+              box-shadow: 0 0 0 4px #f5d07b44;
+            }
+            .anya-peanut:before, .anya-peanut:after {
+              content: '';
+              position: absolute;
+              background: #e0a800;
+              border-radius: 50%;
+            }
+            .anya-peanut:before {
+              width: 8px; height: 8px; left: 6px; top: 8px;
+            }
+            .anya-peanut:after {
+              width: 6px; height: 6px; right: 6px; bottom: 8px;
+            }
+            @keyframes anya-spin {
+              0% { transform: rotate(0deg);}
+              100% { transform: rotate(360deg);}
+            }
+            </style>
+            """, unsafe_allow_html=True)
+            show_anya_loading()
+
+            inputs = {"question": user_input}
+            app.invoke(inputs, config={"callbacks": [handler]})
+
+            # 移除 loading 動畫
+            loading_placeholder.empty()
+
+            # 移除游標，顯示最終內容
+            message_container.markdown(handler.text, unsafe_allow_html=True)
+            st.session_state.messages.append({"role": "assistant", "content": handler.text})
 
     except Exception as e:
         error_message = f"An error occurred: {e}"
