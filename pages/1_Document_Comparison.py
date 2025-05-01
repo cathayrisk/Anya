@@ -91,24 +91,24 @@ def get_content_lines(doc_text):
     return [line for line in doc_text.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
 
 def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text):
-    lines1 = get_content_lines(doc1_text)
-    lines2 = get_content_lines(doc2_text)
+    lines1 = doc1_text.splitlines()
+    lines2 = doc2_text.splitlines()
     summary = []
     for idx, row in df.iterrows():
-        l1 = row['文件1內容'].strip()
-        l2 = row['文件2內容'].strip()
+        l1 = row['文件1內容']
+        l2 = row['文件2內容']
         line_no = -1
         context = ""
         if row['差異類型'] in ["修改", "刪除"]:
             try:
                 line_no = lines1.index(l1) + 1
-                context = l1
+                context = l1.strip()
             except ValueError:
                 pass
         elif row['差異類型'] == "新增":
             try:
                 line_no = lines2.index(l2) + 1
-                context = l2
+                context = l2.strip()
             except ValueError:
                 pass
 
@@ -120,6 +120,7 @@ def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text
             summary.append(f"{prefix}新增內容：「{context}」")
         elif row['差異類型'] == "刪除":
             summary.append(f"{prefix}刪除內容：「{context}」")
+    # 用 <br> 強制換行
     return "<br>".join(summary)
 
 # 5. AI摘要（LangChain）
