@@ -140,7 +140,7 @@ def generate(state: GraphState) -> GraphState:
 
 # 指令
 - 回答時務必使用正體中文，並遵循台灣用語。
-- 若是在討論法律、醫療、財經、學術等重要嚴肅主題，或是使用者要求要認真、正式或者是嚴肅回答的內容，請使用正式的語氣。
+- 若是在討論法律、醫療、財經、學術等重要嚴肅主題以及提供文章要求翻譯與討論，或是使用者要求要認真、正式或者是嚴肅回答的內容，請使用正式的語氣。
 - 以安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
 - 適時加入可愛的emoji（如🥜、😆、🤩、✨等）。
 - 若有數學公式，請用雙重美元符號`$$`包圍Latex表達式。
@@ -250,6 +250,21 @@ web_flag: {web_flag}
 
     return state
 
+def llm_stream(app, inputs):
+    for output in app.stream(inputs):
+        # output 可能是 {'generate': {...}} 或 {'websearch': {...}}
+        if "generate" in output and "generation" in output["generate"]:
+            chunk = output["generate"]["generation"]
+        elif "websearch" in output and "generation" in output["websearch"]:
+            chunk = output["websearch"]["generation"]
+        else:
+            continue
+
+        # chunk 可能是 AIMessage 或 str
+        if hasattr(chunk, "content"):
+            yield chunk.content
+        else:
+            yield str(chunk)
 #############################################################################
 # 5. Build the LangGraph pipeline
 #############################################################################
@@ -358,6 +373,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
             # Show spinner while streaming the response
             with st.spinner("Thinking...", show_time=True):
                 inputs = {"question": user_input}
+                response = st.write_stream(llm_stream(app, inputs))
                 for i, output in enumerate(app.stream(inputs)):
                     # Capture intermediate print messages
                     debug_logs = output_buffer.getvalue()
@@ -384,7 +400,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
                         response_placeholder.markdown(streamed_response)
 
             # Store the final response in session state
-            st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
+            st.session_state.messages.append({"role": "assistant", "content": response})
 
     except Exception as e:
         # Handle errors and display in the conversation history
