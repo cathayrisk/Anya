@@ -1,12 +1,12 @@
 import streamlit as st
 import tempfile
-import fitz  # pymupdf
+import fitz  # pip install pymupdf
+from docx import Document  # pip install python-docx
 import difflib
 import pandas as pd
 import io
-import re
 
-# ========== 1. PDF 文字抽取 ==========
+# ========== 1. 文字抽取 ==========
 @st.cache_data(show_spinner="正在抽取 PDF 文字...")
 def extract_pdf_text(pdf_bytes):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf_file:
@@ -20,13 +20,45 @@ def extract_pdf_text(pdf_bytes):
     doc.close()
     return doc_text
 
-# ========== 2. 差異比對 ==========
-def extract_diff_dataframe_v2(text1, text2):
-    lines1 = [line for line in text1.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
-    lines2 = [line for line in text2.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
+@st.cache_data(show_spinner="正在抽取 DOCX 文字...")
+def extract_docx_text(docx_bytes):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as temp_docx_file:
+        temp_docx_file.write(docx_bytes)
+        temp_docx_path = temp_docx_file.name
+    doc = Document(temp_docx_path)
+    doc_text = ""
+    for para in doc.paragraphs:
+        doc_text += para.text + "\n"
+    return doc_text
+
+@st.cache_data(show_spinner="正在抽取 TXT/MD 文字...")
+def extract_txt_md_text(file_bytes):
+    try:
+        return file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return file_bytes.decode("big5", errors="ignore")
+
+def get_text_from_file(uploaded_file):
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        return extract_pdf_text(uploaded_file.getvalue())
+    elif name.endswith(".docx"):
+        return extract_docx_text(uploaded_file.getvalue())
+    elif name.endswith(".txt") or name.endswith(".md"):
+        return extract_txt_md_text(uploaded_file.getvalue())
+    else:
+        raise ValueError("不支援的檔案格式")
+
+# ========== 2. 差異比對（含進度條） ==========
+def extract_diff_dataframe_with_progress(text1, text2):
+    lines1 = [line for line in text1.splitlines() if line.strip()]
+    lines2 = [line for line in text2.splitlines() if line.strip()]
     sm = difflib.SequenceMatcher(None, lines1, lines2)
     diff_rows = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    opcodes = sm.get_opcodes()
+    progress_bar = st.progress(0, text="比對進度")
+    total = len(opcodes)
+    for idx, (tag, i1, i2, j1, j2) in enumerate(opcodes):
         if tag == 'replace':
             maxlen = max(i2 - i1, j2 - j1)
             for k in range(maxlen):
@@ -57,6 +89,8 @@ def extract_diff_dataframe_v2(text1, text2):
                     "基準文件內容": "",
                     "比較文件內容": l2
                 })
+        progress_bar.progress((idx + 1) / total, text=f"比對進度：{idx+1}/{total}")
+    progress_bar.empty()
     return pd.DataFrame(diff_rows)
 
 # ========== 3. 人工規則摘要 ==========
@@ -102,8 +136,7 @@ def download_report(df):
 
 # ========== 5. 原文高亮 ==========
 def highlight_diffs_in_text(text, diff_lines, color="#fff2ac"):
-    # diff_lines: set of line numbers (1-based)
-    lines = [line for line in text.splitlines() if not line.strip().startswith('--- Page') and line.strip() != '']
+    lines = [line for line in text.splitlines() if line.strip()]
     highlighted = []
     for idx, line in enumerate(lines, 1):
         if idx in diff_lines:
@@ -119,35 +152,50 @@ st.title("文件差異比對工具")
 with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expanded=True):
     col1, col2 = st.columns(2)
     with col1:
-        file1 = st.file_uploader("請上傳文件1（基準檔）", type=["pdf"], key="file1")
+        file1 = st.file_uploader("請上傳文件1（基準檔）", type=["pdf", "docx", "txt", "md"], key="file1")
         if file1:
             st.success(f"已上傳：{file1.name}")
             st.session_state['file1_bytes'] = file1.getvalue()
+            st.session_state['file1_name'] = file1.name
     with col2:
-        file2 = st.file_uploader("請上傳文件2（比較檔）", type=["pdf"], key="file2")
+        file2 = st.file_uploader("請上傳文件2（比較檔）", type=["pdf", "docx", "txt", "md"], key="file2")
         if file2:
             st.success(f"已上傳：{file2.name}")
             st.session_state['file2_bytes'] = file2.getvalue()
+            st.session_state['file2_name'] = file2.name
 
 if st.session_state.get('file1_bytes') and st.session_state.get('file2_bytes'):
-    doc1_text = extract_pdf_text(st.session_state['file1_bytes'])
-    doc2_text = extract_pdf_text(st.session_state['file2_bytes'])
+    try:
+        with st.spinner("正在抽取文件文字..."):
+            doc1_text = get_text_from_file(
+                type("FakeUpload", (), {"name": st.session_state['file1_name'], "getvalue": lambda: st.session_state['file1_bytes']})()
+            )
+            doc2_text = get_text_from_file(
+                type("FakeUpload", (), {"name": st.session_state['file2_name'], "getvalue": lambda: st.session_state['file2_bytes']})()
+            )
+    except Exception as e:
+        st.error(f"檔案解析失敗：{e}")
+        st.stop()
 
     if st.button("開始比對並顯示所有差異"):
         with st.spinner("正在比對..."):
-            df = extract_diff_dataframe_v2(doc1_text, doc2_text)
-            df = df.reset_index(drop=True)
-            st.session_state['diff_df'] = df
-            st.session_state['doc1_text'] = doc1_text
-            st.session_state['doc2_text'] = doc2_text
-            st.session_state['has_compared'] = True
+            try:
+                df = extract_diff_dataframe_with_progress(doc1_text, doc2_text)
+                df = df.reset_index(drop=True)
+                st.session_state['diff_df'] = df
+                st.session_state['doc1_text'] = doc1_text
+                st.session_state['doc2_text'] = doc2_text
+                st.session_state['has_compared'] = True
+            except Exception as e:
+                st.error(f"比對過程發生錯誤：{e}")
+                st.stop()
 
 if st.session_state.get('has_compared', False):
     df = st.session_state['diff_df']
     doc1_text = st.session_state['doc1_text']
     doc2_text = st.session_state['doc2_text']
 
-    # ========== 頁面上方：AI/人工摘要 ==========
+    # ========== 頁面上方：人工摘要 ==========
     st.subheader("🔎 差異摘要")
     summary = generate_diff_summary_brief_with_lineno_and_context(df)
     st.markdown(summary, unsafe_allow_html=True)
@@ -167,6 +215,7 @@ if st.session_state.get('has_compared', False):
     # ========== 下方：原文高亮 ==========
     st.subheader("📝 原文高亮顯示")
     tab_a, tab_b = st.tabs(["基準文件", "比較文件"])
+    import pandas as pd
     diff_lines1 = set(pd.to_numeric(df['行號1'], errors='coerce').dropna().astype(int))
     diff_lines2 = set(pd.to_numeric(df['行號2'], errors='coerce').dropna().astype(int))
     with tab_a:
