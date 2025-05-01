@@ -159,8 +159,17 @@ if file1 and file2:
             df = extract_diff_dataframe_v2(doc1_text, doc2_text)
             df = df[~((df['文件1內容'] == "") & (df['文件2內容'] == ""))]
             df = df.reset_index(drop=True)
+            st.session_state['diff_df'] = df  # 存進 session_state
+            st.session_state['doc1_text'] = doc1_text
+            st.session_state['doc2_text'] = doc2_text
+            st.session_state['has_compared'] = True
             st.write(f"本次比對共發現 {len(df)} 處差異。")
 
+        if st.session_state.get('has_compared', False):
+            df = st.session_state['diff_df']
+            doc1_text = st.session_state['doc1_text']
+            doc2_text = st.session_state['doc2_text']
+            
             tab1, tab2 = st.tabs(["比對差異表格", "自動摘要（AI/人工）"])
 
             with tab1:
@@ -179,13 +188,14 @@ if file1 and file2:
                     download_report(df)
 
             with tab2:
-                st.markdown("#### AI自動摘要（LangChain）")
-                with st.spinner("AI 正在摘要..."):
-                    try:
-                        ai_summary = ai_summarize_diff(df)
-                        st.success(ai_summary)
-                    except Exception as e:
-                        st.error(f"AI 摘要失敗：{e}")
+                st.markdown("#### AI自動摘要")
+                if st.button("啟動AI比對"):
+                    with st.spinner("AI 正在摘要..."):
+                        try:
+                            ai_summary = ai_summarize_diff(df)
+                            st.success(ai_summary)
+                        except Exception as e:
+                            st.error(f"AI 摘要失敗：{e}")
 
 else:
     st.info("請分別上傳文件1與文件2")
