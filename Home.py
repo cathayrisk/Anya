@@ -388,6 +388,8 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
                 inputs = {"question": user_input}
                 # 這裡直接用 app.invoke，handler 會自動流式顯示
                 app.invoke(inputs, config={"callbacks": [handler]})
+                # 移除游標，顯示最終內容
+                message_container.markdown(handler.text, unsafe_allow_html=True)
                 st.session_state.messages.append({"role": "assistant", "content": handler.text})
 
     except Exception as e:
