@@ -10,28 +10,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 import re
 import sys
 import io
-from langchain_core.callbacks.base import BaseCallbackHandler
-from streamlit.delta_generator import DeltaGenerator
-import time
+from datetime import datetime
 
-def get_streamlit_cb(container: DeltaGenerator) -> BaseCallbackHandler:
-    class StreamHandler(BaseCallbackHandler):
-        def __init__(self, container: DeltaGenerator):
-            self.container = container
-            self.token_placeholder = self.container.empty()
-            self.text = ""
-            self.started = False  # 用來跳過 workflow key
-
-        def on_llm_new_token(self, token: str, **kwargs) -> None:
-            # 跳過 workflow key
-            if not self.started:
-                if isinstance(token, str) and token.strip() in ["websearch", "generate"]:
-                    return
-                self.started = True
-            self.text += token
-            self.token_placeholder.markdown(self.text, unsafe_allow_html=True)
-            time.sleep(0.01)  # 模擬打字速度
-    return StreamHandler(container)
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
@@ -159,9 +139,12 @@ def generate(state: GraphState) -> GraphState:
 # 角色與目標
 你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 
+#今天的日期
+Today is {datetime.now().strftime("%Y-%m-%d")}
+
 # 指令
 - 回答時務必使用正體中文，並遵循台灣用語。
-- 若是在討論法律、醫療、財經、學術等重要嚴肅主題以及提供文件要求翻譯與討論，或是使用者要求要認真、正式或者是嚴肅回答的內容，請使用正式的語氣。
+- 若是在討論法律、醫療、財經、學術等重要嚴肅主題，或是使用者要求要認真、正式或者是嚴肅回答的內容，請使用正式的語氣。
 - 以安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
 - 適時加入可愛的emoji（如🥜、😆、🤩、✨等）。
 - 若有數學公式，請用雙重美元符號`$$`包圍Latex表達式。
@@ -265,12 +248,10 @@ web_flag: {web_flag}
 """
     try:
         response = st.session_state.llm.invoke(prompt)
-        if hasattr(response, "content"):
-            state["generation"] = response.content
-        else:
-            state["generation"] = str(response)
+        state["generation"] = response
     except Exception as e:
         state["generation"] = f"Error generating answer: {str(e)}"
+
     return state
 
 #############################################################################
@@ -368,6 +349,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     with st.chat_message("user"):
         st.markdown(user_input)
 
+    # Capture print statements from agentic_rag.py
     output_buffer = io.StringIO()
     sys.stdout = output_buffer  # Redirect stdout to the buffer
 
@@ -375,20 +357,46 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             debug_placeholder = st.empty()
-            handler = get_streamlit_cb(response_placeholder)
+            streamed_response = ""
 
+            # Show spinner while streaming the response
             with st.spinner("Thinking...", show_time=True):
                 inputs = {"question": user_input}
-                # 這裡直接用 app.invoke，handler 會自動流式顯示
-                app.invoke(inputs, config={"callbacks": [handler]})
+                for i, output in enumerate(app.stream(inputs)):
+                    # Capture intermediate print messages
+                    debug_logs = output_buffer.getvalue()
+                    debug_placeholder.text_area(
+                        "Debug Logs",
+                        debug_logs,
+                        height=50,
+                        key=f"debug_logs_{i}"
+                    )
 
-                # 最後再顯示一次完整內容（移除游標等）
-                response_placeholder.markdown(handler.text, unsafe_allow_html=True)
-                st.session_state.messages.append({"role": "assistant", "content": handler.text})
+                    if "generate" in output and "generation" in output["generate"]:
+                        chunk = output["generate"]["generation"]
+
+                        # Safely extract the text content
+                        if hasattr(chunk, "content"):  # If chunk is an AIMessage
+                            chunk_text = chunk.content
+                        else:  # Otherwise, convert to string
+                            chunk_text = str(chunk)
+
+                        # Append the text to the streamed response
+                        streamed_response += chunk_text
+
+                        # Update the placeholder with the streamed response so far
+                        response_placeholder.markdown(streamed_response)
+
+            # Store the final response in session state
+            st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
 
     except Exception as e:
+        # Handle errors and display in the conversation history
         error_message = f"An error occurred: {e}"
         st.session_state.messages.append({"role": "assistant", "content": error_message})
+        # 直接使用 st.error 而不是嵌套在 st.chat_message 內
         st.error(error_message)
+
     finally:
+        # Restore stdout to its original state
         sys.stdout = sys.__stdout__
