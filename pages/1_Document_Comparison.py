@@ -182,8 +182,7 @@ def highlight_diff(a, b):
             b_out += f"<span style='background-color:#B6FFB6'>{b_part}</span>"
     return a_out, b_out
 # ========== 6. UI ==========
-st.set_page_config(page_title="🔍文件差異比對工具", layout="wide")
-st.title("文件差異比對工具")
+st.set_page_config(page_title="🔍安妮亞來找碴", layout="wide")
 
 with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expanded=True):
     col1, col2 = st.columns(2)
