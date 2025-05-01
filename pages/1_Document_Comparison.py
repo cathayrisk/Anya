@@ -4,6 +4,12 @@ import fitz  # pymupdf
 import difflib
 import pandas as pd
 import io
+import re
+
+# AI摘要用
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema import HumanMessage
 
 st.set_page_config(page_title="🔍安妮亞來找碴🔎", layout="wide")
 st.title("文件差異比對工具")
@@ -67,7 +73,51 @@ def download_report(df):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# 4. UI
+# 4. 人工規則摘要
+def find_section(line, doc_text):
+    # 根據你的文件格式，找出該行屬於哪個主題
+    # 這裡假設主題格式為 •【主題】
+    sections = re.findall(r"•\s*【(.+?)】", doc_text)
+    for section in sections:
+        if section in line:
+            return section
+    # 若找不到，回傳空字串
+    return ""
+
+def generate_diff_summary(df, doc1_text, doc2_text):
+    summary = []
+    for idx, row in df.iterrows():
+        # 嘗試找出主題
+        section = find_section(row['文件1內容'], doc1_text) or find_section(row['文件2內容'], doc2_text)
+        if not section:
+            section = "未知主題"
+        # 產生摘要句
+        if row['差異類型'] == "修改":
+            summary.append(f"在「{section}」部分，內容由「{row['文件1內容']}」修改為「{row['文件2內容']}」。")
+        elif row['差異類型'] == "新增":
+            summary.append(f"在「{section}」部分，新增內容：「{row['文件2內容']}」。")
+        elif row['差異類型'] == "刪除":
+            summary.append(f"在「{section}」部分，刪除內容：「{row['文件1內容']}」。")
+    return "\n".join(summary)
+
+# 5. AI摘要（LangChain）
+def ai_summarize_diff(df):
+    prompt = (
+        "請根據下列差異表格，總結兩份文件的主要不同點，"
+        "用條列式中文簡明說明，重點放在內容意義的變化：\n"
+        + df.to_string(index=False)
+    )
+    llm = ChatOpenAI(
+        model="gpt-4-1106-preview",
+        openai_api_key=st.secrets["OPENAI_KEY"],
+        temperature=0.0,
+        streaming=False
+    )
+    messages = [HumanMessage(content=prompt)]
+    response = llm(messages)
+    return response.content
+
+# 6. UI
 with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expanded=True):
     col1, col2 = st.columns(2)
     with col1:
@@ -81,7 +131,7 @@ with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expand
 
 if file1 and file2:
     st.markdown("---")
-    st.subheader("比對差異表格")
+    st.subheader("比對差異分析")
     with st.spinner("正在抽取 PDF 文字..."):
         doc1_text = extract_pdf_text(file1.getvalue())
         doc2_text = extract_pdf_text(file2.getvalue())
@@ -92,10 +142,31 @@ if file1 and file2:
             df = df[~((df['文件1內容'] == "") & (df['文件2內容'] == ""))]
             df = df.reset_index(drop=True)
             st.write(f"本次比對共發現 {len(df)} 處差異。")
-            if len(df) == 0:
-                st.info("兩份文件沒有明顯差異。")
-            else:
-                st.dataframe(df, hide_index=True)
-                download_report(df)
+
+            tab1, tab2 = st.tabs(["比對差異表格", "自動摘要（AI/人工）"])
+
+            with tab1:
+                if len(df) == 0:
+                    st.info("兩份文件沒有明顯差異。")
+                else:
+                    st.dataframe(df, hide_index=True)
+                    download_report(df)
+
+            with tab2:
+                st.markdown("#### 人工規則摘要")
+                summary = generate_diff_summary(df, doc1_text, doc2_text)
+                if summary:
+                    st.info(summary)
+                else:
+                    st.info("無明顯差異可摘要。")
+
+                st.markdown("#### AI自動摘要（LangChain）")
+                with st.spinner("AI 正在摘要..."):
+                    try:
+                        ai_summary = ai_summarize_diff(df, openai_api_key)
+                        st.success(ai_summary)
+                    except Exception as e:
+                        st.error(f"AI 摘要失敗：{e}")
+
 else:
     st.info("請分別上傳文件1與文件2")
