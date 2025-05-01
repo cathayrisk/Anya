@@ -164,7 +164,7 @@ def highlight_diffs_in_text(text, diff_lines, color="#fff2ac"):
     return "<br>".join(highlighted)
 
 def highlight_diff(a, b):
-    """回傳 a, b 兩字串，將差異部分用黃色高亮（HTML span）"""
+    """回傳 a, b 兩字串，將差異部分用黃色顯示（HTML span）"""
     seqm = difflib.SequenceMatcher(None, a, b)
     a_out, b_out = "", ""
     for opcode, a0, a1, b0, b1 in seqm.get_opcodes():
@@ -263,8 +263,8 @@ if st.session_state.get('has_compared', False):
     st.dataframe(df_show, hide_index=True)
     download_report(df_show)
 
-    # ========== 下方：原文高亮 ==========
-    st.subheader("📝 原文高亮顯示")
+    # ========== 下方：原文內容 ==========
+    st.subheader("📝 原文變動顯示")
     tab_a, tab_b = st.tabs(["基準文件", "比較文件"])
     import pandas as pd
     diff_lines1 = set(pd.to_numeric(df['行號1'], errors='coerce').dropna().astype(int))
