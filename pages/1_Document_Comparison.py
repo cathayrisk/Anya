@@ -162,7 +162,7 @@ if file1 and file2:
                 st.markdown("#### AI自動摘要（LangChain）")
                 with st.spinner("AI 正在摘要..."):
                     try:
-                        ai_summary = ai_summarize_diff(df, openai_api_key)
+                        ai_summary = ai_summarize_diff(df)
                         st.success(ai_summary)
                     except Exception as e:
                         st.error(f"AI 摘要失敗：{e}")
