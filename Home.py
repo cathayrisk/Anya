@@ -387,48 +387,9 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
             debug_placeholder = st.empty()
             handler = StreamHandler(message_container, debug_placeholder, output_buffer)
 
-            # 顯示自訂 loading 動畫
-            loading_placeholder = st.empty()
-            show_anya_loading = lambda: loading_placeholder.markdown("""
-            <div id="anya-loader" style="display: flex; align-items: center; margin-bottom: 1em;">
-                <div class="anya-peanut"></div>
-                <span style="margin-left: 10px; font-size: 1em;">安妮亞正在努力思考中... wakuwaku 等一下下喔！🥜✨</span>
-            </div>
-            <style>
-            .anya-peanut {
-              width: 22px;
-              height: 22px;
-              border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
-              background: #f5d07b;
-              position: relative;
-              animation: anya-spin 1s linear infinite;
-              box-shadow: 0 0 0 4px #f5d07b44;
-            }
-            .anya-peanut:before, .anya-peanut:after {
-              content: '';
-              position: absolute;
-              background: #e0a800;
-              border-radius: 50%;
-            }
-            .anya-peanut:before {
-              width: 8px; height: 8px; left: 6px; top: 8px;
-            }
-            .anya-peanut:after {
-              width: 6px; height: 6px; right: 6px; bottom: 8px;
-            }
-            @keyframes anya-spin {
-              0% { transform: rotate(0deg);}
-              100% { transform: rotate(360deg);}
-            }
-            </style>
-            """, unsafe_allow_html=True)
-            show_anya_loading()
-
+        with st.spinner("Thinking...", show_time=True):
             inputs = {"question": user_input}
             app.invoke(inputs, config={"callbacks": [handler]})
-
-            # 移除 loading 動畫
-            loading_placeholder.empty()
 
             # 移除游標，顯示最終內容
             message_container.markdown(handler.text, unsafe_allow_html=True)
