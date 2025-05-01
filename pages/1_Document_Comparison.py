@@ -86,18 +86,37 @@ def get_diff_brief(old, new):
             diff.append(f"新增「{new[b0:b1]}」")
     return "；".join(diff) if diff else "細微變動"
 
-def generate_diff_summary_brief(df):
+def generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text):
+    lines1 = doc1_text.splitlines()
+    lines2 = doc2_text.splitlines()
     summary = []
     for idx, row in df.iterrows():
         l1 = row['文件1內容']
         l2 = row['文件2內容']
+        # 預設行號為 -1
+        line_no = -1
+        context = ""
+        if row['差異類型'] in ["修改", "刪除"]:
+            try:
+                line_no = lines1.index(l1) + 1  # 行號從1開始
+                context = l1.strip()
+            except ValueError:
+                pass
+        elif row['差異類型'] == "新增":
+            try:
+                line_no = lines2.index(l2) + 1
+                context = l2.strip()
+            except ValueError:
+                pass
+
+        prefix = f"第{line_no}行：" if line_no > 0 else ""
         if row['差異類型'] == "修改":
             diff_brief = get_diff_brief(l1, l2)
-            summary.append(diff_brief)
+            summary.append(f"{prefix}「{context}」{diff_brief}")
         elif row['差異類型'] == "新增":
-            summary.append(f"新增內容：「{l2.strip()}」")
+            summary.append(f"{prefix}新增內容：「{context}」")
         elif row['差異類型'] == "刪除":
-            summary.append(f"刪除內容：「{l1.strip()}」")
+            summary.append(f"{prefix}刪除內容：「{context}」")
     return "\n".join(summary)
 
 # 5. AI摘要（LangChain）
@@ -146,7 +165,7 @@ if file1 and file2:
 
             with tab1:
                 st.markdown("#### 人工規則摘要")
-                summary = generate_diff_summary_brief(df)
+                summary = generate_diff_summary_brief_with_lineno_and_context(df, doc1_text, doc2_text)
                 if summary:
                     st.info(summary)
                 else:
