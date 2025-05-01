@@ -368,7 +368,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
                     debug_placeholder.text_area(
                         "Debug Logs",
                         debug_logs,
-                        height=50,
+                        height=68,
                         key=f"debug_logs_{i}"
                     )
 
