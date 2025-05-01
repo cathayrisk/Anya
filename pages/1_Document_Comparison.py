@@ -108,10 +108,9 @@ def ai_summarize_diff(df):
         + df.to_string(index=False)
     )
     llm = ChatOpenAI(
-        model="gpt-4-1106-preview",
+        model="gpt-4.1-mini",
         openai_api_key=st.secrets["OPENAI_KEY"],
-        temperature=0.0,
-        streaming=False
+        temperature=0.0
     )
     messages = [HumanMessage(content=prompt)]
     response = llm(messages)
