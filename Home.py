@@ -18,41 +18,33 @@ class StreamHandler(BaseCallbackHandler):
     def __init__(self, message_container, debug_placeholder=None, output_buffer=None):
         self.text = ""
         self.message_container = message_container
-        #self.debug_placeholder = debug_placeholder
-        #self.output_buffer = output_buffer
         self.cursor_visible = True
-        self.started = False  # 新增：是否已經開始顯示 LLM 回答
+        self.started = False
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
+        # Debug: print token type and value
         print(f"token type: {type(token)}, token: {token}")
-        # 若 token 是 dict，取 value
+        # 如果 token 是 dict，取 value
         if isinstance(token, dict):
             token = list(token.values())[0]
-        # 若 token 是 AIMessage，取 content
+        # 如果 token 是 AIMessage，取 content
         if hasattr(token, "content"):
             token = token.content
         # 跳過 workflow key
-        if token.strip() in ["websearch", "generate"]:
-            return
-        # 顯示 LLM 回答內容
+        if not self.started:
+            if isinstance(token, str) and token.strip() in ["websearch", "generate"]:
+                return
+            else:
+                self.started = True
         self.text += token
         self.cursor_visible = not self.cursor_visible
         if self.text:
             cursor = "▌" if self.cursor_visible else " "
             self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
         else:
+            # 只顯示空字串，不要加 cursor
             self.message_container.markdown("", unsafe_allow_html=True)
-        # 只用 message_container，不要用 st.chat_message
-        self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
-        # 更新 debug log
-        #debug_logs = self.output_buffer.getvalue()
-        #self.debug_placeholder.text_area(
-        #    "Debug Logs",
-        #    debug_logs,
-        #    height=80,
-        #    key="debug_logs"  # 加一個固定 key
-        #)
-        time.sleep(0.03)  # 可選
+        time.sleep(0.03)
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
