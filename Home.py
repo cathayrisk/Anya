@@ -244,10 +244,12 @@ web_flag: {web_flag}
 """
     try:
         response = st.session_state.llm.invoke(prompt)
-        state["generation"] = response
+        if hasattr(response, "content"):
+            state["generation"] = response.content
+        else:
+            state["generation"] = str(response)
     except Exception as e:
         state["generation"] = f"Error generating answer: {str(e)}"
-
     return state
 
 def llm_stream(app, inputs):
