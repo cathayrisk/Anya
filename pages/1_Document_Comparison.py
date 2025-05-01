@@ -142,10 +142,12 @@ with st.expander("上傳文件1（基準檔）與文件2（比較檔）", expand
         file1 = st.file_uploader("請上傳文件1（基準檔）", type=["pdf"], key="file1")
         if file1:
             st.success(f"已上傳：{file1.name}")
+            st.session_state['file1_bytes'] = file1.getvalue()
     with col2:
         file2 = st.file_uploader("請上傳文件2（比較檔）", type=["pdf"], key="file2")
         if file2:
             st.success(f"已上傳：{file2.name}")
+            st.session_state['file2_bytes'] = file2.getvalue()
 
 if file1 and file2:
     st.markdown("---")
