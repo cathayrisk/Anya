@@ -15,16 +15,18 @@ from streamlit.delta_generator import DeltaGenerator
 import time
 
 class StreamHandler(BaseCallbackHandler):
-    def __init__(self, message_container, debug_placeholder, output_buffer):
+    def __init__(self, message_container, debug_placeholder=None, output_buffer=None):
         self.text = ""
         self.message_container = message_container
         #self.debug_placeholder = debug_placeholder
         #self.output_buffer = output_buffer
         self.cursor_visible = True
+        self.started = False  # 新增：是否已經開始顯示 LLM 回答
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        if token.strip() in ["websearch", "generate"]:
+        if not self.started and token.strip() in ["websearch", "generate"]:
             return
+        self.started = True  # 只要不是 workflow key，之後都顯示
         self.text += token
         self.cursor_visible = not self.cursor_visible
         if self.text:
