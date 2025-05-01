@@ -12,6 +12,7 @@ import sys
 import io
 from langchain_core.callbacks.base import BaseCallbackHandler
 from streamlit.delta_generator import DeltaGenerator
+import time
 
 def get_streamlit_cb(container: DeltaGenerator) -> BaseCallbackHandler:
     class StreamHandler(BaseCallbackHandler):
@@ -378,18 +379,12 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
 
             with st.spinner("Thinking...", show_time=True):
                 inputs = {"question": user_input}
-                # 用 stream_mode="messages" streaming LLM token
-                for stream_mode, data in app.stream(inputs, stream_mode="messages"):
-                    if stream_mode == "messages":
-                        chunk = data[0]  # AIMessageChunk
-                        if hasattr(chunk, "content"):
-                            handler.on_llm_new_token(chunk.content)
-                        else:
-                            handler.on_llm_new_token(str(chunk))
+                # 這裡直接用 app.invoke，handler 會自動流式顯示
+                app.invoke(inputs, config={"callbacks": [handler]})
 
-            # 最後再顯示一次完整內容（移除游標等）
-            response_placeholder.markdown(handler.text, unsafe_allow_html=True)
-            st.session_state.messages.append({"role": "assistant", "content": handler.text})
+                # 最後再顯示一次完整內容（移除游標等）
+                response_placeholder.markdown(handler.text, unsafe_allow_html=True)
+                st.session_state.messages.append({"role": "assistant", "content": handler.text})
 
     except Exception as e:
         error_message = f"An error occurred: {e}"
