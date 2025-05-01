@@ -240,7 +240,7 @@ if st.session_state.get('has_compared', False):
 
     # ========== 頁面上方：人工摘要 ==========
     st.subheader("🔎 差異摘要")
-    with st.container():
+    with st.expander("差異顏色說明", expanded=True):
         st.markdown("""
         **差異顏色說明：**
         
