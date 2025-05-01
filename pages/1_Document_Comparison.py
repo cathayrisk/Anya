@@ -145,6 +145,13 @@ if file1 and file2:
             tab1, tab2 = st.tabs(["比對差異表格", "自動摘要（AI/人工）"])
 
             with tab1:
+                st.markdown("#### 人工規則摘要")
+                summary = generate_diff_summary_brief(df)
+                if summary:
+                    st.info(summary)
+                else:
+                    st.info("無明顯差異可摘要。")
+                    
                 if len(df) == 0:
                     st.info("兩份文件沒有明顯差異。")
                 else:
@@ -152,13 +159,6 @@ if file1 and file2:
                     download_report(df)
 
             with tab2:
-                st.markdown("#### 人工規則摘要")
-                summary = generate_diff_summary(df, doc1_text, doc2_text)
-                if summary:
-                    st.info(summary)
-                else:
-                    st.info("無明顯差異可摘要。")
-
                 st.markdown("#### AI自動摘要（LangChain）")
                 with st.spinner("AI 正在摘要..."):
                     try:
