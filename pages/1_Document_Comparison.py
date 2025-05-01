@@ -247,8 +247,8 @@ if st.session_state.get('has_compared', False):
         <span style="background-color:#FFFF00">黃色</span>：修改  
         <span style="background-color:#FFB6B6">紅色</span>：刪除  
         <span style="background-color:#B6FFB6">綠色</span>：新增
-        st.markdown("---")  # 水平線
         """, unsafe_allow_html=True)
+    st.markdown("---")  # 水平線
     summary = generate_diff_summary_brief_with_lineno_and_context(df)
     st.markdown(summary, unsafe_allow_html=True)
 
