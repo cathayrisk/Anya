@@ -167,8 +167,8 @@ if st.session_state.get('has_compared', False):
     # ========== 下方：原文高亮 ==========
     st.subheader("📝 原文高亮顯示")
     tab_a, tab_b = st.tabs(["基準文件", "比較文件"])
-    diff_lines1 = set(df['行號1'].dropna().astype(int))
-    diff_lines2 = set(df['行號2'].dropna().astype(int))
+    diff_lines1 = set(pd.to_numeric(df['行號1'], errors='coerce').dropna().astype(int))
+    diff_lines2 = set(pd.to_numeric(df['行號2'], errors='coerce').dropna().astype(int))
     with tab_a:
         st.markdown(highlight_diffs_in_text(doc1_text, diff_lines1, color="#ffcccc"), unsafe_allow_html=True)
     with tab_b:
