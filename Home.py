@@ -15,7 +15,7 @@ from streamlit.delta_generator import DeltaGenerator
 import time
 
 class StreamHandler(BaseCallbackHandler):
-    def __init__(self, message_container: DeltaGenerator, debug_placeholder: DeltaGenerator, output_buffer: io.StringIO):
+    def __init__(self, message_container, debug_placeholder, output_buffer):
         self.text = ""
         self.message_container = message_container
         self.debug_placeholder = debug_placeholder
@@ -26,6 +26,7 @@ class StreamHandler(BaseCallbackHandler):
         self.text += token
         self.cursor_visible = not self.cursor_visible
         cursor = "▌" if self.cursor_visible else " "
+        # 只用 message_container，不要用 st.chat_message
         self.message_container.markdown(self.text + cursor, unsafe_allow_html=True)
         # 更新 debug log
         debug_logs = self.output_buffer.getvalue()
@@ -33,8 +34,9 @@ class StreamHandler(BaseCallbackHandler):
             "Debug Logs",
             debug_logs,
             height=80,
+            key="debug_logs"  # 加一個固定 key
         )
-        time.sleep(0.02)
+        time.sleep(0.02)  # 可選
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
