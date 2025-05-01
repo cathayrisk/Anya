@@ -24,11 +24,16 @@ class StreamHandler(BaseCallbackHandler):
         self.started = False  # 新增：是否已經開始顯示 LLM 回答
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        if not self.started:
-            if token.strip() in ["websearch", "generate"]:
-                return
-            else:
-                self.started = True  # 只要遇到第一個非 workflow key token，之後都顯示
+        # 若 token 是 dict，取 value
+        if isinstance(token, dict):
+            token = list(token.values())[0]
+        # 若 token 是 AIMessage，取 content
+        if hasattr(token, "content"):
+            token = token.content
+        # 跳過 workflow key
+        if token.strip() in ["websearch", "generate"]:
+            return
+        # 顯示 LLM 回答內容
         self.text += token
         self.cursor_visible = not self.cursor_visible
         if self.text:
