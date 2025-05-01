@@ -73,31 +73,31 @@ def download_report(df):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# 4. 人工規則摘要
-def find_section(line, doc_text):
-    # 根據你的文件格式，找出該行屬於哪個主題
-    # 這裡假設主題格式為 •【主題】
-    sections = re.findall(r"•\s*【(.+?)】", doc_text)
-    for section in sections:
-        if section in line:
-            return section
-    # 若找不到，回傳空字串
-    return ""
+def get_diff_brief(old, new):
+    # 只顯示不同的部分
+    seqm = difflib.SequenceMatcher(None, old, new)
+    diff = []
+    for opcode, a0, a1, b0, b1 in seqm.get_opcodes():
+        if opcode == 'replace':
+            diff.append(f"「{old[a0:a1]}」→「{new[b0:b1]}」")
+        elif opcode == 'delete':
+            diff.append(f"刪除「{old[a0:a1]}」")
+        elif opcode == 'insert':
+            diff.append(f"新增「{new[b0:b1]}」")
+    return "；".join(diff) if diff else "細微變動"
 
-def generate_diff_summary(df, doc1_text, doc2_text):
+def generate_diff_summary_brief(df):
     summary = []
     for idx, row in df.iterrows():
-        # 嘗試找出主題
-        section = find_section(row['文件1內容'], doc1_text) or find_section(row['文件2內容'], doc2_text)
-        if not section:
-            section = "未知主題"
-        # 產生摘要句
+        l1 = row['文件1內容']
+        l2 = row['文件2內容']
         if row['差異類型'] == "修改":
-            summary.append(f"在「{section}」部分，內容由「{row['文件1內容']}」修改為「{row['文件2內容']}」。")
+            diff_brief = get_diff_brief(l1, l2)
+            summary.append(diff_brief)
         elif row['差異類型'] == "新增":
-            summary.append(f"在「{section}」部分，新增內容：「{row['文件2內容']}」。")
+            summary.append(f"新增內容：「{l2.strip()}」")
         elif row['差異類型'] == "刪除":
-            summary.append(f"在「{section}」部分，刪除內容：「{row['文件1內容']}」。")
+            summary.append(f"刪除內容：「{l1.strip()}」")
     return "\n".join(summary)
 
 # 5. AI摘要（LangChain）
