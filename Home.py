@@ -30,7 +30,7 @@ def get_streamlit_cb(container: DeltaGenerator) -> BaseCallbackHandler:
                 self.started = True
             self.text += token
             self.token_placeholder.markdown(self.text, unsafe_allow_html=True)
-            time.sleep(0.02)  # 模擬打字速度
+            time.sleep(0.01)  # 模擬打字速度
     return StreamHandler(container)
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
