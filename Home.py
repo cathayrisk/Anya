@@ -392,12 +392,12 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
             show_anya_loading = lambda: loading_placeholder.markdown("""
             <div id="anya-loader" style="display: flex; align-items: center; margin-bottom: 1em;">
                 <div class="anya-peanut"></div>
-                <span style="margin-left: 12px; font-size: 1.2em;">安妮亞正在努力思考中... wakuwaku 等一下下喔！🥜✨</span>
+                <span style="margin-left: 10px; font-size: 1em;">安妮亞正在努力思考中... wakuwaku 等一下下喔！🥜✨</span>
             </div>
             <style>
             .anya-peanut {
-              width: 32px;
-              height: 32px;
+              width: 22px;
+              height: 22px;
               border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
               background: #f5d07b;
               position: relative;
