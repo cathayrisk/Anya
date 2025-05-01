@@ -240,6 +240,13 @@ if st.session_state.get('has_compared', False):
 
     # ========== 頁面上方：人工摘要 ==========
     st.subheader("🔎 差異摘要")
+    st.markdown("""
+    **差異顏色說明：**
+
+    <span style="background-color:#FFFF00">黃色</span>：修改  
+    <span style="background-color:#FFB6B6">紅色</span>：刪除  
+    <span style="background-color:#B6FFB6">綠色</span>：新增  
+    """, unsafe_allow_html=True)
     summary = generate_diff_summary_brief_with_lineno_and_context(df)
     st.markdown(summary, unsafe_allow_html=True)
 
