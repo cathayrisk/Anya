@@ -24,9 +24,11 @@ class StreamHandler(BaseCallbackHandler):
         self.started = False  # 新增：是否已經開始顯示 LLM 回答
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        if not self.started and token.strip() in ["websearch", "generate"]:
-            return
-        self.started = True  # 只要不是 workflow key，之後都顯示
+        if not self.started:
+            if token.strip() in ["websearch", "generate"]:
+                return
+            else:
+                self.started = True  # 只要遇到第一個非 workflow key token，之後都顯示
         self.text += token
         self.cursor_visible = not self.cursor_visible
         if self.text:
