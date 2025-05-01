@@ -24,6 +24,7 @@ class StreamHandler(BaseCallbackHandler):
         self.started = False  # 新增：是否已經開始顯示 LLM 回答
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
+        print(f"token type: {type(token)}, token: {token}")
         # 若 token 是 dict，取 value
         if isinstance(token, dict):
             token = list(token.values())[0]
