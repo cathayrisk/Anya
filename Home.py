@@ -23,6 +23,8 @@ class StreamHandler(BaseCallbackHandler):
         self.cursor_visible = True
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
+        if token.strip() in ["websearch", "generate"]:
+            return
         self.text += token
         self.cursor_visible = not self.cursor_visible
         cursor = "▌" if self.cursor_visible else " "
