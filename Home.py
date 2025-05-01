@@ -268,13 +268,10 @@ web_flag: {web_flag}
 
 請依照上述規則與範例，思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
-    # 這裡用 st.chat_message("assistant").empty() 產生一個可更新的區塊
-    message_container = st.chat_message("assistant").empty()
-    handler = StreamHandler(message_container)
     
     try:
-        response = st.session_state.llm.invoke(prompt, callbacks=[handler])
-        state["generation"] = handler.text
+        response = st.session_state.llm.invoke(prompt)
+        state["generation"] = response
     except Exception as e:
         state["generation"] = f"Error generating answer: {str(e)}"
 
@@ -375,7 +372,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Capture print statements from agentic_rag.py
+    # 只在這裡產生 output_buffer、message_container、debug_placeholder
     output_buffer = io.StringIO()
     sys.stdout = output_buffer  # Redirect stdout to the buffer
 
@@ -383,13 +380,11 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
         with st.chat_message("assistant"):
             message_container = st.empty()
             debug_placeholder = st.empty()
-            output_buffer = io.StringIO()
-            sys.stdout = output_buffer  # 攔截 print
-
             handler = StreamHandler(message_container, debug_placeholder, output_buffer)
 
             with st.spinner("Thinking...", show_time=True):
                 inputs = {"question": user_input}
+                # 這裡直接用 app.invoke，handler 會自動流式顯示
                 app.invoke(inputs, config={"callbacks": [handler]})
                 st.session_state.messages.append({"role": "assistant", "content": handler.text})
 
