@@ -114,7 +114,7 @@ def deep_thought_tool(content: str) -> str:
     安妮亞仔細思考深入分析。
     """
     try:
-        return analyze_deeply(content).strip() + + "\n\n---\n\n"
+        return analyze_deeply(content).strip() + "\n\n---\n\n"
     except Exception as e:
         return f"deep_thought_tool error: {e}"
 
