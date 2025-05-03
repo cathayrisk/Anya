@@ -184,13 +184,7 @@ builder.add_edge("store_memory", "call_model")
 graph = builder.compile()
 
 # --- 11. Streamlit UI ---
-# Configure the Streamlit page layout
-st.set_page_config(
-    page_title="Anya",
-    layout="wide",
-    page_icon="🥜",
-    initial_sidebar_state="collapsed"
-)
+
 
 with st.expander("🧠 記憶內容 (Memory)", expanded=False):
     if st.session_state.memories:
