@@ -105,7 +105,6 @@ def analyze_deeply(input_question: str) -> str:
     prompt = prompt_template.format(input_question=input_question)
     result = llmo1.invoke(prompt)
     # 包裝成 content 屬性
-    result = llmo1.invoke(prompt)
     return str(result)
 
 @tool
