@@ -407,7 +407,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
         for _ in app.stream(
             {"question": user_input},
             config={"callbacks": {"generate": [st_callback]}}
-        )
+        ):
             pass
         # 取得最終答案
         final_answer = st_callback.text
