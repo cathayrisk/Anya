@@ -12,7 +12,17 @@ import sys
 import io
 from datetime import datetime
 import time
+from langchain_core.callbacks.base import BaseCallbackHandler
 
+class StreamlitLLMCallbackHandler(BaseCallbackHandler):
+    def __init__(self, response_placeholder):
+        self.response_placeholder = response_placeholder
+        self.text = ""
+
+    def on_llm_new_token(self, token, **kwargs):
+        self.text += token
+        self.response_placeholder.markdown(self.text)
+        
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
@@ -129,7 +139,7 @@ def websearch(state):
 #############################################################################
 # 4. Generation function that streams LLM tokens using writer (for LangGraph custom streaming)
 #############################################################################
-def generate(state: GraphState, config=None, writer=None):
+def generate(state: GraphState) -> GraphState:
     question = state["question"]
     context = state.get("websearch_content", "")
     web_flag = state.get("web_flag", "False")
@@ -260,18 +270,8 @@ web_flag: {web_flag}
 
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
-    # 這裡用 streaming
-    response = ""
-    for chunk in st.session_state.llm.stream(prompt):
-        if hasattr(chunk, "content"):
-            token = chunk.content
-        else:
-            token = str(chunk)
-        response += token
-        # streaming to UI via writer
-        if writer is not None:
-            metadata = {**(config["metadata"] if config and "metadata" in config else {}), "langgraph_node": "generate"}
-            writer(({"content": token}, metadata))
+    # 這裡不用 streaming，直接同步呼叫
+    response = st.session_state.llm.invoke(prompt)
     state["generation"] = response
     return state
 
@@ -357,25 +357,19 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             debug_placeholder = st.empty()
-            streamed_response = ""
 
             with st.spinner("Thinking...", show_time=True):
-                inputs = {"question": user_input}
-                # streaming generate node tokens via custom mode
-                for msg, metadata in app.stream(inputs, stream_mode="custom"):
-                    debug_logs = output_buffer.getvalue()
-                    debug_placeholder.text_area(
-                        "Debug Logs",
-                        debug_logs,
-                        height=68,
-                        key=f"debug_logs_{id(msg)}"
-                    )
-                    if metadata.get("langgraph_node") == "generate" and msg.get("content"):
-                        streamed_response += msg["content"]
-                        response_placeholder.markdown(streamed_response)
-                        time.sleep(0.1)  # 可選，讓 UI 更順暢
+                st_callback = StreamlitLLMCallbackHandler(response_placeholder)
+                response = app.invoke(
+                    {"question": user_input},
+                    config={"callbacks": [st_callback]}
+                )
+                if isinstance(response, dict) and "generation" in response:
+                    final_answer = response["generation"]
+                else:
+                    final_answer = str(response)
 
-            st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
+            st.session_state.messages.append({"role": "assistant", "content": final_answer or "No response generated."})
 
     except Exception as e:
         error_message = f"An error occurred: {e}"
