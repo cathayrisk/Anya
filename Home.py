@@ -1,18 +1,13 @@
 import os
 import streamlit as st
-from typing_extensions import TypedDict, Annotated
-from dataclasses import dataclass, field, fields
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import AIMessage, HumanMessage, AnyMessage
-from langchain_core.tools import tool
-from langchain_core.runnables import RunnableConfig
-from langchain_core.callbacks.base import BaseCallbackHandler
-from langgraph.graph import StateGraph, END, add_messages
 from datetime import datetime
-import re
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langgraph.graph import MessagesState, StateGraph, START
+from langgraph.prebuilt import tools_condition, ToolNode
 import inspect
-from typing import Callable, TypeVar, Any, Dict
-import asyncio
+from typing import Callable, TypeVar
 
 st.set_page_config(
     page_title="Anya",
@@ -81,12 +76,7 @@ def upsert_memory(content: str, context: str = "") -> str:
     st.session_state.memories.append(mem)
     return f"記憶已儲存：{content}"
 
-# --- 6. State 定義 ---
-@dataclass(kw_only=True)
-class State:
-    messages: Annotated[list[AnyMessage], add_messages]
-
-# --- 7. Configuration 定義 ---
+# --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 **若用戶要求翻譯，請暫時不用安妮亞的語氣，直接正式逐句翻譯。**
 
@@ -191,23 +181,7 @@ https://example.com/2
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
 
-@dataclass(kw_only=True)
-class Configuration:
-    user_id: str = "default"
-    model: str = field(default="gpt-4.1")
-    system_prompt: str = ANYA_SYSTEM_PROMPT
-
-    @classmethod
-    def from_runnable_config(cls, config=None):
-        configurable = config.get("configurable", {}) if config else {}
-        values = {
-            f.name: os.environ.get(f.name.upper(), configurable.get(f.name))
-            for f in fields(cls)
-            if f.init
-        }
-        return cls(**{k: v for k, v in values.items() if v})
-
-# --- 8. Streaming Callback Handler ---
+# --- 7. Streaming Callback Handler ---
 def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
     from langchain_core.callbacks.base import BaseCallbackHandler
     class StreamHandler(BaseCallbackHandler):
@@ -235,10 +209,12 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
             setattr(st_cb, method_name, add_streamlit_context(method_func))
     return st_cb
 
-# --- 9. Graph node functions ---
-async def call_model(state: State, config: RunnableConfig) -> dict:
-    ensure_llm()
-    configurable = Configuration.from_runnable_config(config)
+# --- 8. LangGraph Agent 架構 ---
+tools = [ddgs_search, upsert_memory]
+llm = st.session_state.llm.bind_tools(tools)
+
+# System message
+def get_sys_msg():
     # 將記憶加到 system prompt
     memories = st.session_state.memories[-10:]  # 只取最近10條
     if memories:
@@ -248,47 +224,24 @@ async def call_model(state: State, config: RunnableConfig) -> dict:
         mem_block = f"\n\nUser memories:\n{mem_str}\n"
     else:
         mem_block = ""
-    sys = configurable.system_prompt + mem_block + f"\nSystem Time: {datetime.now().isoformat()}"
-    llm = st.session_state.llm.bind_tools([ddgs_search, upsert_memory])
-    msg = await llm.ainvoke(
-        [{"role": "system", "content": sys}, *state.messages],
-        {"configurable": {"model": configurable.model}}
-    )
-    return {"messages": [msg]}
+    return SystemMessage(content=ANYA_SYSTEM_PROMPT + mem_block + f"\nSystem Time: {datetime.now().isoformat()}")
 
-async def store_memory(state: State, config: RunnableConfig):
-    last_msg = state.messages[-1]
-    tool_calls = getattr(last_msg, "tool_calls", [])
-    results = []
-    for tc in tool_calls:
-        if tc["name"] == "upsert_memory":
-            args = tc.get("args", {})
-            result = upsert_memory(**args)
-            results.append({
-                "role": "tool",
-                "content": result,
-                "tool_call_id": tc["id"],
-            })
-    await asyncio.sleep(0.01)
-    # 正確：累加 messages
-    return {"messages": state.messages + results}
+# Assistant node
+def assistant(state: MessagesState):
+    sys_msg = get_sys_msg()
+    return {"messages": [llm.invoke([sys_msg] + state["messages"])]}
 
-def route_message(state: State):
-    msg = state.messages[-1]
-    if getattr(msg, "tool_calls", None):
-        return "store_memory"
-    return END
-
-# --- 10. Build LangGraph ---
-builder = StateGraph(State, config_schema=Configuration)
-builder.add_node(call_model)
-builder.add_edge("__start__", "call_model")
-builder.add_node(store_memory)
-builder.add_conditional_edges("call_model", route_message, ["store_memory", END])
-builder.add_edge("store_memory", "call_model")
+# --- 9. Build LangGraph ---
+builder = StateGraph(MessagesState)
+builder.add_node("assistant", assistant)
+builder.add_node("tools", ToolNode(tools))
+builder.add_edge(START, "assistant")
+builder.add_conditional_edges("assistant", tools_condition)
+builder.add_edge("tools", "assistant")
 graph = builder.compile()
 
-# --- 11. Streaming async function ---
+# --- 10. Streaming async function ---
+import asyncio
 async def run_graph_stream(graph, messages, st_callback):
     response = None
     async for chunk in graph.astream(
@@ -298,7 +251,7 @@ async def run_graph_stream(graph, messages, st_callback):
         response = chunk
     return response
 
-# --- 12. Streamlit UI ---
+# --- 11. Streamlit UI ---
 
 with st.expander("🧠 記憶內容 (Memory)", expanded=False):
     if st.session_state.memories:
@@ -308,10 +261,10 @@ with st.expander("🧠 記憶內容 (Memory)", expanded=False):
         st.info("目前沒有記憶。")
 
 for message in st.session_state.messages:
-    if isinstance(message, AIMessage):
-        st.chat_message("assistant").write(message.content)
-    elif isinstance(message, HumanMessage):
-        st.chat_message("user").write(message.content)
+    if hasattr(message, "role") and message.role == "assistant":
+        st.chat_message("assistant").write(getattr(message, "content", ""))
+    elif hasattr(message, "role") and message.role == "user":
+        st.chat_message("user").write(getattr(message, "content", ""))
 
 if prompt := st.chat_input("Say something..."):
     st.session_state.messages.append(HumanMessage(content=prompt))
@@ -324,7 +277,11 @@ if prompt := st.chat_input("Say something..."):
         )
         # 取得最終答案
         if isinstance(response, dict) and "messages" in response and response["messages"]:
-            final_answer = response["messages"][-1].content
+            # 只 append assistant/human/tool message，不要覆蓋
+            st.session_state.messages = response["messages"]
+            # 顯示最後一個 assistant 回覆
+            final_answer = [m for m in response["messages"] if getattr(m, "role", None) == "assistant"]
+            if final_answer:
+                st.write(final_answer[-1].content)
         else:
-            final_answer = "No response generated."
-        st.session_state.messages.append(AIMessage(content=final_answer))
+            st.write("No response generated.")
