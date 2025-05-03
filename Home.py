@@ -39,8 +39,6 @@ def route_question(state: GraphState) -> str:
     SYS_PROMPT = """
     # Role and Objective
     You are a tool selection router. Based on the user's question, select the most appropriate tool.
-    # Date information
-    Today is {datetime.now().strftime("%Y-%m-%d")}
 
     # Tool Selection Rules
     - Analyze the user's question and, according to the descriptions in the tool dictionary below, select the most relevant tool name.
@@ -144,9 +142,6 @@ def generate(state: GraphState) -> GraphState:
 # 角色與目標
 你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 **若用戶要求翻譯，請暫時不用安妮亞的語氣，直接正式逐句翻譯。**
-
-#今天的日期
-Today is {datetime.now().strftime("%Y-%m-%d")}
 
 # 指令
 - 回答時務必使用正體中文，並遵循台灣用語。
