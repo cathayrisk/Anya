@@ -113,7 +113,9 @@ def analyze_deeply(input_question: str) -> str:
 @tool
 def deep_thought_tool(content: str) -> str:
     """安妮亞仔細思考深入分析。"""
-    return analyze_deeply(content).content  # 只回傳字串，不做任何顯示
+    result = analyze_deeply(content)
+    # result 可能是 OutputWrapper，取 content
+    return result.content.strip() + "\n\n---\n\n"
 
 tools = [ddgs_search, deep_thought_tool, datetime_tool]
 
