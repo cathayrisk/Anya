@@ -373,7 +373,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
                     if metadata.get("langgraph_node") == "generate" and msg.get("content"):
                         streamed_response += msg["content"]
                         response_placeholder.markdown(streamed_response)
-                        # time.sleep(0.01)  # 可選，讓 UI 更順暢
+                        time.sleep(0.1)  # 可選，讓 UI 更順暢
 
             st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
 
