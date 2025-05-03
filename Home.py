@@ -257,14 +257,12 @@ async def call_model(state: State, config: RunnableConfig) -> dict:
     return {"messages": [msg]}
 
 async def store_memory(state: State, config: RunnableConfig):
-    # 處理 LLM tool call upsert_memory
     last_msg = state.messages[-1]
     tool_calls = getattr(last_msg, "tool_calls", [])
     results = []
     for tc in tool_calls:
         if tc["name"] == "upsert_memory":
             args = tc.get("args", {})
-            # 直接呼叫 upsert_memory tool
             result = upsert_memory(**args)
             results.append({
                 "role": "tool",
@@ -272,7 +270,8 @@ async def store_memory(state: State, config: RunnableConfig):
                 "tool_call_id": tc["id"],
             })
     await asyncio.sleep(0.01)
-    return {"messages": results}
+    # 正確：累加 messages
+    return {"messages": state.messages + results}
 
 def route_message(state: State):
     msg = state.messages[-1]
