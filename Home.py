@@ -42,7 +42,7 @@ def route_question(state: GraphState) -> str:
     # Role and Objective
     You are a tool selection router. Based on the user's question, select the most appropriate tool.
     # Date information
-    Today is {datetime.now().strftime("%Y-%m-%d")}
+    #Today is {datetime.now().strftime("%Y-%m-%d")}
 
     # Tool Selection Rules
     - Analyze the user's question and, according to the descriptions in the tool dictionary below, select the most relevant tool name.
@@ -143,7 +143,7 @@ def generate(state: GraphState) -> GraphState:
 **若用戶要求翻譯，請暫時不用安妮亞的語氣，直接正式逐句翻譯。**
 
 #今天的日期
-Today is {datetime.now().strftime("%Y-%m-%d")}
+#Today is {datetime.now().strftime("%Y-%m-%d")}
 
 # 回答語言與風格
 - 請務必以正體中文回應，並遵循台灣用語習慣。
