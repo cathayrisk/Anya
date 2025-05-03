@@ -366,6 +366,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
                     if metadata.get("langgraph_node") == "generate" and msg.content:
                         streamed_response += msg.content
                         response_placeholder.markdown(streamed_response)
+                        time.sleep(0.1)  # 這一行很重要，讓 Streamlit 有機會刷新
 
             st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
 
