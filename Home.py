@@ -263,6 +263,13 @@ workflow.set_conditional_entry_point(
 workflow.add_edge("websearch", "generate")
 workflow.add_edge("generate", END)
 
+st.set_page_config(
+    page_title="Anya",
+    layout="wide",
+    page_icon="🥜",
+    initial_sidebar_state="collapsed"
+)
+
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
 
@@ -275,13 +282,6 @@ elif model_name == "GPT-4.1-nano":
     st.session_state.selected_model = "gpt-4.1-nano"
 else:
     st.session_state.selected_model = "gpt-4.1"
-
-st.set_page_config(
-    page_title="Anya",
-    layout="wide",
-    page_icon="🥜",
-    initial_sidebar_state="collapsed"
-)
 
 def initialize_app(model_name: str):
     if "llm" not in st.session_state or st.session_state.current_model != model_name:
