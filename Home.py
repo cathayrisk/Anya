@@ -102,7 +102,7 @@ class Configuration:
 
 # --- 8. Streaming Callback Handler ---
 def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
-    class StreamHandler:
+    class StreamHandler(BaseCallbackHandler): 
         def __init__(self, container: st.delta_generator.DeltaGenerator, initial_text: str = ""):
             self.container = container
             self.token_placeholder = self.container.empty()
@@ -111,6 +111,7 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.text += token
             self.token_placeholder.markdown(self.text)
+            time.sleep(0.03)  # 模擬打字速度
 
     fn_return_type = TypeVar('fn_return_type')
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
