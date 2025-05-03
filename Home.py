@@ -10,6 +10,7 @@ import inspect
 from typing import Callable, TypeVar
 import asyncio
 import time
+from langchain_core.tools import tool
 
 st.set_page_config(
     page_title="Anya",
@@ -47,16 +48,37 @@ ensure_llm()
 # --- 3. 工具定義 ---
 @tool
 def ddgs_search(query: str) -> str:
-    """DuckDuckGo 搜尋。"""
-    from duckduckgo_search import DDGS
-    ddgs = DDGS()
-    results = ddgs.text(query, region="wt-wt", safesearch="moderate", max_results=5)
-    if not results:
-        return "No results found."
-    return "\n\n".join(
-        f"{r['title']}\n{r.get('body', r.get('snippet', ''))}\n{r['href']}"
-        for r in results
-    )
+    """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳更豐富的內容）。"""
+    try:
+        from duckduckgo_search import DDGS
+        ddgs = DDGS()
+        # 搜尋網頁
+        web_results = ddgs.text(query, region="wt-wt", safesearch="moderate", max_results=10)
+        # 搜尋新聞
+        news_results = ddgs.news(query, region="wt-wt", safesearch="moderate", max_results=10)
+
+        # 合併結果
+        all_results = []
+        if isinstance(web_results, list):
+            all_results.extend(web_results)
+        if isinstance(news_results, list):
+            all_results.extend(news_results)
+
+        # 整理內容
+        docs = []
+        for item in all_results:
+            snippet = item.get("body", "") or item.get("snippet", "")
+            title = item.get("title", "")
+            link = item.get("href", "") or item.get("link", "") or item.get("url", "")
+            docs.append(f"{title}\n{snippet}\n{link}")
+
+        if not docs:
+            return "No results found."
+
+        return "\n\n".join(docs)
+    except Exception as e:
+        print(f"Error during DuckDuckGo web search: {e}")
+        return f"Error from DuckDuckGo: {e}"
 
 @tool
 def upsert_memory(content: str, context: str = "") -> str:
