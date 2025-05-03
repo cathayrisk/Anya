@@ -320,3 +320,4 @@ if user_input:
         response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
         ai_msg = response["messages"][-1]
         st.session_state.messages.append(ai_msg)
+        status.update(label="安妮亞回答完畢！🎉", state="complete")
