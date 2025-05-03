@@ -11,6 +11,7 @@ import re
 import sys
 import io
 from datetime import datetime
+import time
 
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
@@ -126,9 +127,9 @@ def websearch(state):
     return state
 
 #############################################################################
-# 4. Generation function that calls Groq LLM, optionally includes websearch content
+# 4. Generation function that streams LLM tokens using writer (for LangGraph custom streaming)
 #############################################################################
-def generate(state: GraphState) -> GraphState:
+def generate(state: GraphState, config=None, writer=None):
     question = state["question"]
     context = state.get("websearch_content", "")
     web_flag = state.get("web_flag", "False")
@@ -263,9 +264,14 @@ web_flag: {web_flag}
     response = ""
     for chunk in st.session_state.llm.stream(prompt):
         if hasattr(chunk, "content"):
-            response += chunk.content
+            token = chunk.content
         else:
-            response += str(chunk)
+            token = str(chunk)
+        response += token
+        # streaming to UI via writer
+        if writer is not None:
+            metadata = {**(config["metadata"] if config and "metadata" in config else {}), "langgraph_node": "generate"}
+            writer(({"content": token}, metadata))
     state["generation"] = response
     return state
 
@@ -355,8 +361,8 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
 
             with st.spinner("Thinking...", show_time=True):
                 inputs = {"question": user_input}
-                # 只 streaming generate node 的 token
-                for msg, metadata in app.stream(inputs, stream_mode="messages"):
+                # streaming generate node tokens via custom mode
+                for msg, metadata in app.stream(inputs, stream_mode="custom"):
                     debug_logs = output_buffer.getvalue()
                     debug_placeholder.text_area(
                         "Debug Logs",
@@ -364,11 +370,10 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
                         height=68,
                         key=f"debug_logs_{id(msg)}"
                     )
-                    # 只顯示 generate node 的 token
-                    if metadata.get("langgraph_node") == "generate" and msg.content:
-                        streamed_response += msg.content
+                    if metadata.get("langgraph_node") == "generate" and msg.get("content"):
+                        streamed_response += msg["content"]
                         response_placeholder.markdown(streamed_response)
-                        time.sleep(0.1)  # 這一行很重要，讓 Streamlit 有機會刷新
+                        # time.sleep(0.01)  # 可選，讓 UI 更順暢
 
             st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
 
