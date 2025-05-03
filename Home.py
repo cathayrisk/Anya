@@ -406,7 +406,7 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
         st_callback = get_streamlit_cb(st.container())
         response = app.invoke(
             {"question": user_input},
-            config={"callbacks": [st_callback]}
+            config={"callbacks": {"generate": [st_callback]}}
         )
         if isinstance(response, dict) and "generation" in response:
             final_answer = response["generation"]
