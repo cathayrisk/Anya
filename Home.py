@@ -74,6 +74,7 @@ def upsert_memory(content: str, context: str = "") -> dict:
         "content": content,
         "context": context,
         "time": datetime.now().isoformat()
+    }
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
