@@ -23,9 +23,11 @@ if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
 if "current_model" not in st.session_state:
     st.session_state.current_model = None
+if "llm" not in st.session_state:
+    st.session_state.llm = None
 
 def ensure_llm():
-    if "llm" not in st.session_state or st.session_state.current_model != st.session_state.selected_model:
+    if st.session_state.llm is None or st.session_state.current_model != st.session_state.selected_model:
         st.session_state.llm = ChatOpenAI(
             model=st.session_state.selected_model,
             openai_api_key=st.secrets["OPENAI_KEY"],
