@@ -10,18 +10,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 import re
 from datetime import datetime
 
-def initialize_app(model_name: str):
-    if "llm" not in st.session_state or st.session_state.current_model != model_name:
-        st.session_state.llm = ChatOpenAI(
-            model=model_name,
-            openai_api_key=st.secrets["OPENAI_KEY"],
-            temperature=0.0,
-            streaming=True
-        )
-        st.session_state.current_model = model_name
-        print(f"Using model: {model_name}")
-    return workflow.compile()
-
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
 
@@ -297,6 +285,17 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+def initialize_app(model_name: str):
+    if "llm" not in st.session_state or st.session_state.current_model != model_name:
+        st.session_state.llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=st.secrets["OPENAI_KEY"],
+            temperature=0.0,
+            streaming=True
+        )
+        st.session_state.current_model = model_name
+        print(f"Using model: {model_name}")
+    return workflow.compile()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
