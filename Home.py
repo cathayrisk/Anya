@@ -10,21 +10,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 import re
 from datetime import datetime
 
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = "GPT-4.1"
-
-options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
-model_name = st.pills("Choose a model:", options)
-
-if model_name == "GPT-4.1-mini":
-    st.session_state.selected_model = "gpt-4.1-mini"
-elif model_name == "GPT-4.1-nano":
-    st.session_state.selected_model = "gpt-4.1-nano"
-else:
-    st.session_state.selected_model = "gpt-4.1"
-
-app = initialize_app(model_name=st.session_state.selected_model)
-
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
@@ -278,6 +263,19 @@ workflow.set_conditional_entry_point(
 workflow.add_edge("websearch", "generate")
 workflow.add_edge("generate", END)
 
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "GPT-4.1"
+
+options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
+model_name = st.pills("Choose a model:", options)
+
+if model_name == "GPT-4.1-mini":
+    st.session_state.selected_model = "gpt-4.1-mini"
+elif model_name == "GPT-4.1-nano":
+    st.session_state.selected_model = "gpt-4.1-nano"
+else:
+    st.session_state.selected_model = "gpt-4.1"
+
 st.set_page_config(
     page_title="Anya",
     layout="wide",
@@ -296,6 +294,8 @@ def initialize_app(model_name: str):
         st.session_state.current_model = model_name
         print(f"Using model: {model_name}")
     return workflow.compile()
+
+app = initialize_app(model_name=st.session_state.selected_model)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
