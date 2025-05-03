@@ -8,6 +8,7 @@ from langgraph.graph import MessagesState, StateGraph, START
 from langgraph.prebuilt import tools_condition, ToolNode
 import inspect
 from typing import Callable, TypeVar
+import asyncio
 
 st.set_page_config(
     page_title="Anya",
@@ -229,7 +230,9 @@ def get_sys_msg():
 # Assistant node
 def assistant(state: MessagesState):
     sys_msg = get_sys_msg()
-    return {"messages": [llm.invoke([sys_msg] + state["messages"])]}
+    ai_msg = llm.invoke([sys_msg] + state["messages"])
+    # 關鍵：append 新 assistant message 到歷史
+    return {"messages": state["messages"] + [ai_msg]}
 
 # --- 9. Build LangGraph ---
 builder = StateGraph(MessagesState)
@@ -241,7 +244,6 @@ builder.add_edge("tools", "assistant")
 graph = builder.compile()
 
 # --- 10. Streaming async function ---
-import asyncio
 async def run_graph_stream(graph, messages, st_callback):
     response = None
     async for chunk in graph.astream(
@@ -260,11 +262,14 @@ with st.expander("🧠 記憶內容 (Memory)", expanded=False):
     else:
         st.info("目前沒有記憶。")
 
+# 顯示所有歷史訊息
 for message in st.session_state.messages:
     if hasattr(message, "role") and message.role == "assistant":
         st.chat_message("assistant").write(getattr(message, "content", ""))
     elif hasattr(message, "role") and message.role == "user":
         st.chat_message("user").write(getattr(message, "content", ""))
+    elif hasattr(message, "role") and message.role == "tool":
+        st.chat_message("assistant").write(f"【工具回應】{getattr(message, 'content', '')}")
 
 if prompt := st.chat_input("Say something..."):
     st.session_state.messages.append(HumanMessage(content=prompt))
@@ -275,9 +280,8 @@ if prompt := st.chat_input("Say something..."):
         response = asyncio.run(
             run_graph_stream(graph, st.session_state.messages, st_callback)
         )
-        # 取得最終答案
         if isinstance(response, dict) and "messages" in response and response["messages"]:
-            # 只 append assistant/human/tool message，不要覆蓋
+            # 保留完整歷史
             st.session_state.messages = response["messages"]
             # 顯示最後一個 assistant 回覆
             final_answer = [m for m in response["messages"] if getattr(m, "role", None) == "assistant"]
