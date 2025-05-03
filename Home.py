@@ -105,17 +105,15 @@ def analyze_deeply(input_question: str) -> str:
     prompt = prompt_template.format(input_question=input_question)
     result = llmo1.invoke(prompt)
     # 包裝成 content 屬性
-    class OutputWrapper:
-        def __init__(self, content):
-            self.content = content
-    return OutputWrapper(result)
+    result = llmo1.invoke(prompt)
+    return str(result)
 
 @tool
 def deep_thought_tool(content: str) -> str:
-    """安妮亞仔細思考深入分析。"""
-    result = analyze_deeply(content)
-    # result 可能是 OutputWrapper，取 content
-    return result.content.strip() + "\n\n---\n\n"
+    try:
+        return analyze_deeply(content).strip() + "\n\n"
+    except Exception as e:
+        return f"deep_thought_tool error: {e}"
 
 tools = [ddgs_search, deep_thought_tool, datetime_tool]
 
