@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.callbacks.base import BaseCallbackHandler
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 import re
 from datetime import datetime
 import inspect
@@ -356,7 +357,7 @@ app = initialize_app(model_name=st.session_state.selected_model)
 #############################################################################
 # 6. Streamlit Callback Handler for LLM token streaming and tool calling
 #############################################################################
-def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
+def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator) -> BaseCallbackHandler:
     class StreamHandler(BaseCallbackHandler):
         def __init__(self, container: st.delta_generator.DeltaGenerator, initial_text: str = ""):
             self.container = container
@@ -386,8 +387,8 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
                 self.tool_output_placeholder.code(output.content)
 
     fn_return_type = TypeVar('fn_return_type')
+    ctx = get_script_run_ctx()  # 只取一次 context
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
-        ctx = st.runtime.scriptrunner.get_script_run_ctx()
         def wrapper(*args, **kwargs) -> fn_return_type:
             add_script_run_ctx(ctx=ctx)
             return fn(*args, **kwargs)
@@ -398,7 +399,6 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
         if method_name.startswith('on_'):
             setattr(st_cb, method_name, add_streamlit_context(method_func))
     return st_cb
-
 #############################################################################
 # 7. Main chat input and streaming logic
 #############################################################################
