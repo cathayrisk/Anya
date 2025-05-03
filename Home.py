@@ -188,7 +188,7 @@ https://example.com/2
 class Configuration:
     user_id: str = "default"
     model: str = field(default="gpt-4.1")
-    system_prompt: str = str = ANYA_SYSTEM_PROMPT
+    system_prompt: str = ANYA_SYSTEM_PROMPT
 
     @classmethod
     def from_runnable_config(cls, config=None):
@@ -293,7 +293,12 @@ async def run_graph_stream(graph, messages, st_callback):
     return response
 
 # --- 12. Streamlit UI ---
-st.title("DDGS Agent Demo (with Streaming & Memory)")
+st.set_page_config(
+    page_title="Anya",
+    layout="wide",
+    page_icon="🥜",
+    initial_sidebar_state="collapsed"
+)
 
 with st.expander("🧠 記憶內容 (Memory)", expanded=False):
     if st.session_state.memories:
