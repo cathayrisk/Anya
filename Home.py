@@ -22,7 +22,7 @@ class GraphState(TypedDict):
 def ensure_llm():
     if "llm" not in st.session_state or st.session_state.current_model != st.session_state.selected_model:
         st.session_state.llm = ChatOpenAI(
-            model=st.session_state.selected_model,
+            model="gpt-4.1",
             openai_api_key=st.secrets["OPENAI_KEY"],
             temperature=0.0,
             streaming=True
