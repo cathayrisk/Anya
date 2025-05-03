@@ -11,19 +11,7 @@ import re
 import sys
 import io
 from datetime import datetime
-import time
-from langchain_core.callbacks.base import BaseCallbackHandler
 
-class StreamlitLLMCallbackHandler(BaseCallbackHandler):
-    def __init__(self, response_placeholder):
-        self.response_placeholder = response_placeholder
-        self.text = ""
-
-    def on_llm_new_token(self, token, **kwargs):
-        self.text += token
-        self.response_placeholder.markdown(self.text)
-        time.sleep(0.02)  # 模擬打字速度
-        
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
@@ -138,7 +126,7 @@ def websearch(state):
     return state
 
 #############################################################################
-# 4. Generation function that streams LLM tokens using writer (for LangGraph custom streaming)
+# 4. Generation function that calls Groq LLM, optionally includes websearch content
 #############################################################################
 def generate(state: GraphState) -> GraphState:
     question = state["question"]
@@ -346,6 +334,26 @@ for message in st.session_state.messages:
 
 app = initialize_app(model_name=st.session_state.selected_model)
 
+#############################################################################
+# 6. Streamlit Callback Handler for LLM token streaming
+#############################################################################
+from langchain_core.callbacks.base import BaseCallbackHandler
+
+class StreamlitLLMCallbackHandler(BaseCallbackHandler):
+    def __init__(self, response_placeholder):
+        self.response_placeholder = response_placeholder
+        self.text = ""
+
+    def on_llm_new_token(self, token, **kwargs):
+        self.text += token
+        self.response_placeholder.markdown(self.text)
+
+#############################################################################
+# 7. Main chat input and streaming logic
+#############################################################################
+import io
+import sys
+
 if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
@@ -361,14 +369,12 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
 
             with st.spinner("Thinking...", show_time=True):
                 st_callback = StreamlitLLMCallbackHandler(response_placeholder)
-                response = app.invoke(
-                    {"question": user_input},
-                    config={"callbacks": [st_callback]}
-                )
-                if isinstance(response, dict) and "generation" in response:
-                    final_answer = response["generation"]
-                else:
-                    final_answer = str(response)
+                # 用 stream() 而不是 invoke()，並傳入 callback handler
+                for _ in app.stream({"question": user_input}, config={"callbacks": [st_callback]}):
+                    pass  # streaming 交給 callback handler
+
+                # 最終答案
+                final_answer = st_callback.text
 
             st.session_state.messages.append({"role": "assistant", "content": final_answer or "No response generated."})
 
