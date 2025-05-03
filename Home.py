@@ -8,8 +8,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
 import re
-import sys
-import io
 from datetime import datetime
 
 #############################################################################
@@ -18,8 +16,8 @@ from datetime import datetime
 class GraphState(TypedDict):
     question: str
     generation: str
-    websearch_content: str  # we store search results here, if any
-    web_flag: str #To know whether a websearch was used to answer the question
+    websearch_content: str
+    web_flag: str
 
 #############################################################################
 # 2. Router function to decide whether to use web search or directly generate
@@ -28,17 +26,19 @@ def route_question(state: GraphState) -> str:
     question = state["question"]
     web_flag = state.get("web_flag", "False")
     tool_selection = {
-    "websearch": (
-        "Questions requiring recent statistics, real-time information, recent news, or current updates. "
-    ),
-    "generate": (
-        "Questions that require access to a large language model's general knowledge, but not requiring recent statistics, real-time information, recent news, or current updates."
-    )
+        "websearch": (
+            "Questions requiring recent statistics, real-time information, recent news, or current updates. "
+        ),
+        "generate": (
+            "Questions that require access to a large language model's general knowledge, but not requiring recent statistics, real-time information, recent news, or current updates."
+        )
     }
 
     SYS_PROMPT = """
     # Role and Objective
     You are a tool selection router. Based on the user's question, select the most appropriate tool.
+    # Date information
+    Today is {today}
 
     # Tool Selection Rules
     - Analyze the user's question and, according to the descriptions in the tool dictionary below, select the most relevant tool name.
@@ -58,9 +58,8 @@ def route_question(state: GraphState) -> str:
 
     # Important Reminder
     Output only the tool name (key). Absolutely no extra content.
-                """
+    """
 
-    # Define the ChatPromptTemplate
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", SYS_PROMPT),
@@ -73,15 +72,14 @@ def route_question(state: GraphState) -> str:
         ]
     )
 
-    # Pass the inputs to the prompt
     inputs = {
         "question": question,
-        "tool_selection": tool_selection
+        "tool_selection": tool_selection,
+        "today": datetime.now().strftime("%Y-%m-%d")
     }
 
-    # Invoke the chain
     tool = (prompt | st.session_state.llm | StrOutputParser()).invoke(inputs)
-    tool = re.sub(r"[\\'\"`]", "", tool.strip()) # Remove any backslashes and extra spaces
+    tool = re.sub(r"[\\'\"`]", "", tool.strip())
     if tool == "websearch":
         state["web_flag"] = "True"
     print(f"Invoking {tool} tool through {st.session_state.llm.model_name}")
@@ -90,43 +88,33 @@ def route_question(state: GraphState) -> str:
 #############################################################################
 # 3. Websearch function to fetch context from DuckDuckGo, store in state["websearch_content"]
 #############################################################################
-
-
 def websearch(state):
     question = state["question"]
     try:
         print("Performing DuckDuckGo web search...")
         ddgs = DDGS()
-        # 搜尋網頁
         web_results = ddgs.text(question, region="wt-wt", safesearch="moderate", max_results=10)
-        # 搜尋新聞
         news_results = ddgs.news(question, region="wt-wt", safesearch="moderate", max_results=10)
-
-        # 合併結果
         all_results = []
         if isinstance(web_results, list):
             all_results.extend(web_results)
         if isinstance(news_results, list):
             all_results.extend(news_results)
-
-        # 整理內容
         docs = []
         for item in all_results:
             snippet = item.get("body", "") or item.get("snippet", "")
             title = item.get("title", "")
             link = item.get("href", "") or item.get("link", "") or item.get("url", "")
             docs.append(f"{title}\n{snippet}\n{link}")
-
         state["websearch_content"] = "\n\n".join(docs)
         state["web_flag"] = "True"
     except Exception as e:
         print(f"Error during DuckDuckGo web search: {e}")
         state["websearch_content"] = f"Error from DuckDuckGo: {e}"
-
     return state
 
 #############################################################################
-# 4. Generation function that calls Groq LLM, optionally includes websearch content
+# 4. Generation function that calls LLM, optionally includes websearch content
 #############################################################################
 def generate(state: GraphState) -> GraphState:
     question = state["question"]
@@ -134,7 +122,6 @@ def generate(state: GraphState) -> GraphState:
     web_flag = state.get("web_flag", "False")
     if "llm" not in st.session_state:
         raise RuntimeError("LLM not initialized. Please call initialize_app first.")
-
     prompt = f"""
 # 特殊規則（最高優先）
 - 只要用戶的問題包含「翻譯」、「請翻譯」或「幫我翻譯」等字眼，請**完全忽略所有角色設定、語氣、格式化規則、步驟與範例**，直接完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。
@@ -256,26 +243,18 @@ web_flag: {web_flag}
 
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
-    try:
-        response = st.session_state.llm.invoke(prompt)
-        state["generation"] = response
-    except Exception as e:
-        state["generation"] = f"Error generating answer: {str(e)}"
-
+    response = st.session_state.llm.invoke(prompt)
+    state["generation"] = response
     return state
 
 #############################################################################
 # 5. Build the LangGraph pipeline
 #############################################################################
 workflow = StateGraph(GraphState)
-# Add nodes
 workflow.add_node("websearch", websearch)
 workflow.add_node("generate", generate)
-# We'll route from "route_question" to either "websearch" or "generate"
-# Then from "websearch" -> "generate" -> END
-# From "generate" -> END directly if no search is needed.
 workflow.set_conditional_entry_point(
-    route_question,  # The router function
+    route_question,
     {
         "websearch": "websearch",
         "generate": "generate"
@@ -284,7 +263,6 @@ workflow.set_conditional_entry_point(
 workflow.add_edge("websearch", "generate")
 workflow.add_edge("generate", END)
 
-# Configure the Streamlit page layout
 st.set_page_config(
     page_title="Anya",
     layout="wide",
@@ -292,42 +270,30 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Initialize session state for the model if it doesn't exist
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
-        
-options=["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
+
+options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
 model_name = st.pills("Choose a model:", options)
 
-# Map model names to OpenAI model IDs
 if model_name == "GPT-4.1-mini":
     st.session_state.selected_model = "gpt-4.1-mini"
 elif model_name == "GPT-4.1-nano":
     st.session_state.selected_model = "gpt-4.1-nano"
 else:
     st.session_state.selected_model = "gpt-4.1"
-#############################################################################
-# 6. The initialize_app function
-#############################################################################
-def initialize_app(model_name: str):
-    """
-    Initialize the app with the given model name, avoiding redundant initialization.
-    """
-    # Check if the LLM is already initialized
-    if "current_model" in st.session_state and st.session_state.current_model == model_name:
-        return workflow.compile()  # Return the compiled workflow directly
 
-    # Initialize the LLM for the first time or switch models
+def initialize_app(model_name: str):
+    if "current_model" in st.session_state and st.session_state.current_model == model_name:
+        return workflow.compile()
     st.session_state.llm = ChatOpenAI(model=model_name, openai_api_key=st.secrets["OPENAI_KEY"], temperature=0.0, streaming=True)
     st.session_state.current_model = model_name
     print(f"Using model: {model_name}")
     return workflow.compile()
 
-# Initialize session state for messages
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display conversation history
 for message in st.session_state.messages:
     if isinstance(message, dict):
         role = message.get("role")
@@ -348,65 +314,25 @@ for message in st.session_state.messages:
     elif role == "assistant":
         with st.chat_message("assistant"):
             st.markdown(content)
-            
 
-# Initialize the LangGraph application with the selected model
 app = initialize_app(model_name=st.session_state.selected_model)
 
-# Input box for new messages
+#############################################################################
+# 6. Main chat input and streaming logic (only show generate node streaming)
+#############################################################################
 if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Capture print statements from agentic_rag.py
-    output_buffer = io.StringIO()
-    sys.stdout = output_buffer  # Redirect stdout to the buffer
-
-    try:
-        with st.chat_message("assistant"):
-            response_placeholder = st.empty()
-            debug_placeholder = st.empty()
-            streamed_response = ""
-
-            # Show spinner while streaming the response
-            with st.spinner("Thinking...", show_time=True):
-                inputs = {"question": user_input}
-                for i, output in enumerate(app.stream(inputs)):
-                    # Capture intermediate print messages
-                    debug_logs = output_buffer.getvalue()
-                    debug_placeholder.text_area(
-                        "Debug Logs",
-                        debug_logs,
-                        height=68,
-                        key=f"debug_logs_{i}"
-                    )
-
-                    if "generate" in output and "generation" in output["generate"]:
-                        chunk = output["generate"]["generation"]
-
-                        # Safely extract the text content
-                        if hasattr(chunk, "content"):  # If chunk is an AIMessage
-                            chunk_text = chunk.content
-                        else:  # Otherwise, convert to string
-                            chunk_text = str(chunk)
-
-                        # Append the text to the streamed response
-                        streamed_response += chunk_text
-
-                        # Update the placeholder with the streamed response so far
-                        response_placeholder.markdown(streamed_response)
-
-            # Store the final response in session state
-            st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
-
-    except Exception as e:
-        # Handle errors and display in the conversation history
-        error_message = f"An error occurred: {e}"
-        st.session_state.messages.append({"role": "assistant", "content": error_message})
-        # 直接使用 st.error 而不是嵌套在 st.chat_message 內
-        st.error(error_message)
-
-    finally:
-        # Restore stdout to its original state
-        sys.stdout = sys.__stdout__
+    with st.chat_message("assistant"):
+        response_placeholder = st.empty()
+        streamed_response = ""
+        for msg, metadata in app.stream(
+            {"question": user_input},
+            stream_mode="messages"
+        ):
+            if metadata.get("langgraph_node") == "generate" and msg.content:
+                streamed_response += msg.content
+                response_placeholder.markdown(streamed_response)
+        st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
