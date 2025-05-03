@@ -2,10 +2,12 @@ import os
 import streamlit as st
 from datetime import datetime
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START
 from langgraph.prebuilt import tools_condition, ToolNode
+from dataclasses import dataclass, field
+from typing import List, Any
 import inspect
 from typing import Callable, TypeVar
 import asyncio
@@ -210,11 +212,16 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
             setattr(st_cb, method_name, add_streamlit_context(method_func))
     return st_cb
 
-# --- 8. LangGraph Agent 架構 ---
+# --- 8. State 定義 ---
+@dataclass
+class MyState:
+    messages: List[Any] = field(default_factory=list)
+    memories: List[Any] = field(default_factory=list)
+
+# --- 9. LangGraph Agent 架構 ---
 tools = [ddgs_search, upsert_memory]
 llm = st.session_state.llm.bind_tools(tools)
 
-# System message
 def get_sys_msg(memories):
     if memories:
         mem_str = "\n".join(
@@ -225,16 +232,15 @@ def get_sys_msg(memories):
         mem_block = ""
     return SystemMessage(content=ANYA_SYSTEM_PROMPT + mem_block + f"\nSystem Time: {datetime.now().isoformat()}")
 
-# Assistant node（只用 state["memories"]，不碰 session_state）
-def assistant(state):
-    sys_msg = get_sys_msg(state["memories"])
-    ai_msg = llm.invoke([sys_msg] + state["messages"])
-    return {"messages": state["messages"] + [ai_msg], "memories": state["memories"]}
+def assistant(state: MyState):
+    sys_msg = get_sys_msg(state.memories)
+    ai_msg = llm.invoke([sys_msg] + state.messages)
+    return MyState(
+        messages=state.messages + [ai_msg],
+        memories=state.memories
+    )
 
-# --- 9. Build LangGraph ---
-from langgraph.graph import MessagesState
-
-builder = StateGraph({"messages": list, "memories": list})
+builder = StateGraph(MyState)
 builder.add_node("assistant", assistant)
 builder.add_node("tools", ToolNode(tools))
 builder.add_edge(START, "assistant")
@@ -279,26 +285,22 @@ if prompt := st.chat_input("Say something..."):
     with st.chat_message("assistant"):
         st_callback = get_streamlit_cb(st.container())
         # 將 messages 和 memories 一起傳給 graph
-        state = {
-            "messages": st.session_state.messages,
-            "memories": st.session_state.memories[-10:]  # 只帶入最近10條記憶
-        }
+        state = MyState(
+            messages=st.session_state.messages,
+            memories=st.session_state.memories[-10:]  # 只帶入最近10條記憶
+        )
         response = asyncio.run(
             run_graph_stream(graph, state, st_callback)
         )
-        if isinstance(response, dict) and "messages" in response and response["messages"]:
+        if isinstance(response, MyState) and response.messages:
             # 保留完整歷史（短期記憶：只保留最後30則）
-            st.session_state.messages = response["messages"][-30:]
+            st.session_state.messages = response.messages[-30:]
             # 處理 tool message 產生的新記憶
-            for m in response["messages"]:
+            for m in response.messages:
                 if getattr(m, "role", None) == "tool":
-                    # 嘗試將 tool 回傳內容 parse 成 dict
-                    try:
-                        mem = m.content
-                        if isinstance(mem, dict) and "content" in mem:
-                            st.session_state.memories.append(mem)
-                    except Exception:
-                        pass
+                    mem = m.content
+                    if isinstance(mem, dict) and "content" in mem:
+                        st.session_state.memories.append(mem)
             # 只保留最後30條記憶
             st.session_state.memories = st.session_state.memories[-30:]
             # 顯示最後一個 assistant 回覆
