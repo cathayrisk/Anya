@@ -347,13 +347,12 @@ class StreamlitLLMCallbackHandler(BaseCallbackHandler):
     def on_llm_new_token(self, token, **kwargs):
         self.text += token
         self.response_placeholder.markdown(self.text)
+        time.sleep(0.2)  # 模擬打字速度
+        
 
 #############################################################################
 # 7. Main chat input and streaming logic
 #############################################################################
-import io
-import sys
-
 if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
