@@ -194,6 +194,7 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.text += token
             self.token_placeholder.markdown(self.text)
+            time.sleep(0.03)  # 模擬打字速度
 
     fn_return_type = TypeVar('fn_return_type')
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
@@ -273,6 +274,8 @@ for message in st.session_state.messages:
 
 if prompt := st.chat_input("Say something..."):
     st.session_state.messages.append(HumanMessage(content=prompt))
+    # 保留短期記憶：只保留最後30則
+    st.session_state.messages = st.session_state.messages[-30:]
     with st.chat_message("user"):
         st.write(prompt)
     with st.chat_message("assistant"):
@@ -281,11 +284,13 @@ if prompt := st.chat_input("Say something..."):
             run_graph_stream(graph, st.session_state.messages, st_callback)
         )
         if isinstance(response, dict) and "messages" in response and response["messages"]:
-            # 保留完整歷史
-            st.session_state.messages = response["messages"]
+            # 保留完整歷史（短期記憶：只保留最後30則）
+            st.session_state.messages = response["messages"][-30:]
             # 顯示最後一個 assistant 回覆
-            final_answer = [m for m in response["messages"] if getattr(m, "role", None) == "assistant"]
-            if final_answer:
+            final_answer = [m for m in st.session_state.messages if getattr(m, "role", None) == "assistant"]
+            if final_answer and getattr(final_answer[-1], "content", None):
                 st.write(final_answer[-1].content)
+            else:
+                st.write("（本輪 assistant 沒有產生回應）")
         else:
             st.write("No response generated.")
