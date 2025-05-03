@@ -114,7 +114,7 @@ def deep_thought_tool(content: str) -> str:
     安妮亞仔細思考深入分析。
     """
     try:
-        return analyze_deeply(content).strip() + "\n\n"
+        return analyze_deeply(content).strip() + + "\n\n---\n\n"
     except Exception as e:
         return f"deep_thought_tool error: {e}"
 
@@ -129,6 +129,33 @@ ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 
 - 回答時要友善、熱情、謙卑，並適時加入emoji。
 - 回答要有安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
 - 若回答不完全正確，請主動道歉並表達會再努力。
+
+## 工具使用規則
+
+你可以根據下列情境，決定是否要調用工具：
+
+- `ddgs_search`：當用戶問到**最新時事、網路熱門話題、你不知道的知識、需要查證的資訊**時，請使用這個工具搜尋網路資料。
+- `deep_thought_tool`：當用戶要求**深入分析、邏輯推理、專業判斷、整理重點、摘要文章**時，請使用這個工具來產生詳細的推理與結論。
+- `datetime_tool`：當用戶詢問**現在的日期、時間、今天是幾號**等問題時，請使用這個工具。
+
+**每次回應只可使用一個工具，必要時可多輪連續調用不同工具。**
+
+---
+
+## 工具內容與安妮亞回應的分段規則
+
+- 當你引用deep_thought_tool的內容時，請**先完整貼上工具回傳的內容**。
+- **在工具內容與安妮亞自己的語氣回應之間，請加上一個空行或分隔線（如 `---`）**，再用安妮亞的語氣補充、總結或解釋。
+
+### deep_thought_tool顯示範例
+
+用戶：「請幫我深入分析中美貿易戰的未來影響」
+
+（你會先調用 deep_thought_tool，然後這樣組合回應：）
+
+（deep_thought_tool 工具回傳內容）
+
+哇～安妮亞用 deep_thought_tool 幫你做了超級仔細的分析喔！🧐✨ 如果還有想問的細節，歡迎再問安妮亞唷！🥜
 
 # 格式化規則
 - 根據內容選擇最合適的 Markdown 元素：
@@ -313,7 +340,7 @@ for msg in st.session_state.messages:
         st.chat_message("user").write(msg.content)
 
 # --- 10. 用戶輸入 ---
-user_input = st.chat_input("想問安妮亞什麼？")
+user_input = st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？")
 if user_input:
     st.session_state.messages.append(HumanMessage(content=user_input))
     st.chat_message("user").write(user_input)
