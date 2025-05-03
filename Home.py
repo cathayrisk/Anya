@@ -14,6 +14,13 @@ import inspect
 from typing import Callable, TypeVar, Any, Dict
 import asyncio
 
+st.set_page_config(
+    page_title="Anya",
+    layout="wide",
+    page_icon="🥜",
+    initial_sidebar_state="collapsed"
+)
+
 # --- 1. Streamlit session_state 初始化 ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
