@@ -270,21 +270,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = "GPT-4.1"
-
-app = initialize_app(model_name=st.session_state.selected_model)
-
-options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
-model_name = st.pills("Choose a model:", options)
-
-if model_name == "GPT-4.1-mini":
-    st.session_state.selected_model = "gpt-4.1-mini"
-elif model_name == "GPT-4.1-nano":
-    st.session_state.selected_model = "gpt-4.1-nano"
-else:
-    st.session_state.selected_model = "gpt-4.1"
-
 def initialize_app(model_name: str):
     if "llm" not in st.session_state or st.session_state.current_model != model_name:
         st.session_state.llm = ChatOpenAI(
@@ -321,6 +306,20 @@ for message in st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(content)
 
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "GPT-4.1"
+
+app = initialize_app(model_name=st.session_state.selected_model)
+
+options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
+model_name = st.pills("Choose a model:", options)
+
+if model_name == "GPT-4.1-mini":
+    st.session_state.selected_model = "gpt-4.1-mini"
+elif model_name == "GPT-4.1-nano":
+    st.session_state.selected_model = "gpt-4.1-nano"
+else:
+    st.session_state.selected_model = "gpt-4.1"
 
 
 #############################################################################
