@@ -296,8 +296,7 @@ async def run_graph_stream(graph, messages, st_callback):
 st.set_page_config(
     page_title="Anya",
     layout="wide",
-    page_icon="🥜",
-    initial_sidebar_state="collapsed"
+    page_icon="🥜"
 )
 
 with st.expander("🧠 記憶內容 (Memory)", expanded=False):
