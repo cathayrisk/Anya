@@ -251,4 +251,3 @@ if user_input:
         # 取出 AI 回覆
         ai_msg = response["messages"][-1]
         st.session_state.messages.append(ai_msg)
-        st.write(ai_msg.content)
