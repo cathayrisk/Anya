@@ -7,6 +7,7 @@ from langchain_core.messages import AIMessage, HumanMessage, AnyMessage
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END, add_messages
+from langchain_core.callbacks.base import BaseCallbackHandler
 from datetime import datetime
 import re
 import inspect
@@ -102,7 +103,7 @@ class Configuration:
 
 # --- 8. Streaming Callback Handler ---
 def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
-    class StreamHandler(BaseCallbackHandler): 
+    class StreamHandler(BaseCallbackHandler):
         def __init__(self, container: st.delta_generator.DeltaGenerator, initial_text: str = ""):
             self.container = container
             self.token_placeholder = self.container.empty()
@@ -183,7 +184,13 @@ builder.add_edge("store_memory", "call_model")
 graph = builder.compile()
 
 # --- 11. Streamlit UI ---
-st.title("DDGS Agent Demo (with Streaming & Memory)")
+# Configure the Streamlit page layout
+st.set_page_config(
+    page_title="Anya",
+    layout="wide",
+    page_icon="🥜",
+    initial_sidebar_state="collapsed"
+)
 
 with st.expander("🧠 記憶內容 (Memory)", expanded=False):
     if st.session_state.memories:
