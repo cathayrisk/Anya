@@ -19,10 +19,20 @@ class GraphState(TypedDict):
     websearch_content: str
     web_flag: str
 
+def ensure_llm():
+    if "llm" not in st.session_state or st.session_state.current_model != st.session_state.selected_model:
+        st.session_state.llm = ChatOpenAI(
+            model=st.session_state.selected_model,
+            openai_api_key=st.secrets["OPENAI_KEY"],
+            temperature=0.0,
+            streaming=True
+        )
+        st.session_state.current_model = st.session_state.selected_model
 #############################################################################
 # 2. Router function to decide whether to use web search or directly generate
 #############################################################################
 def route_question(state: GraphState) -> str:
+    ensure_llm()
     question = state["question"]
     web_flag = state.get("web_flag", "False")
     tool_selection = {
@@ -117,6 +127,7 @@ def websearch(state):
 # 4. Generation function that calls LLM, optionally includes websearch content
 #############################################################################
 def generate(state: GraphState) -> GraphState:
+    ensure_llm()
     question = state["question"]
     context = state.get("websearch_content", "")
     web_flag = state.get("web_flag", "False")
@@ -284,15 +295,6 @@ else:
     st.session_state.selected_model = "gpt-4.1"
 
 def initialize_app(model_name: str):
-    if "llm" not in st.session_state or st.session_state.current_model != model_name:
-        st.session_state.llm = ChatOpenAI(
-            model=model_name,
-            openai_api_key=st.secrets["OPENAI_KEY"],
-            temperature=0.0,
-            streaming=True
-        )
-        st.session_state.current_model = model_name
-        print(f"Using model: {model_name}")
     return workflow.compile()
 
 app = initialize_app(model_name=st.session_state.selected_model)
