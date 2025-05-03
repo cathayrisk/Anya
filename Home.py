@@ -2,12 +2,10 @@ import os
 import streamlit as st
 from datetime import datetime
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph, START
-from langgraph.prebuilt import tools_condition, ToolNode
-from dataclasses import dataclass, field
-from typing import List, Any
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
 import inspect
 from typing import Callable, TypeVar
 import asyncio
@@ -22,23 +20,15 @@ st.set_page_config(
 
 # --- 1. Streamlit session_state 初始化 ---
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = [AIMessage(content="嗨嗨～安妮亞來了！👋 有什麼想問安妮亞的嗎？")]
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "gpt-4.1"
 if "current_model" not in st.session_state:
     st.session_state.current_model = None
 if "llm" not in st.session_state:
     st.session_state.llm = None
-if "memories" not in st.session_state:
-    st.session_state.memories = []  # list of dict: {"content": ..., "context": ..., "time": ...}
 
-# --- 2. Model pills UI ---
-options = ["gpt-4.1", "gpt-4.1-mini"]
-model_name = st.pills("Choose a model:", options)
-if model_name and model_name != st.session_state.selected_model:
-    st.session_state.selected_model = model_name
-
-# --- 3. LLM 初始化 ---
+# --- 2. LLM 初始化 ---
 def ensure_llm():
     if (
         st.session_state.llm is None
@@ -54,10 +44,10 @@ def ensure_llm():
 
 ensure_llm()
 
-# --- 4. DDGS 搜尋工具 ---
+# --- 3. 工具定義 ---
 @tool
 def ddgs_search(query: str) -> str:
-    """Search the web using DuckDuckGo and return the top results."""
+    """DuckDuckGo 搜尋。"""
     from duckduckgo_search import DDGS
     ddgs = DDGS()
     results = ddgs.text(query, region="wt-wt", safesearch="moderate", max_results=5)
@@ -68,16 +58,17 @@ def ddgs_search(query: str) -> str:
         for r in results
     )
 
-# --- 5. 記憶 upsert 工具（只回傳 dict，不直接寫 session_state） ---
 @tool
-def upsert_memory(content: str, context: str = "") -> dict:
-    """Return a memory dict to be appended by the main thread."""
-    return {
-        "content": content,
-        "context": context,
-        "time": datetime.now().isoformat()
-    }
+def upsert_memory(content: str, context: str = "") -> str:
+    """記憶功能（僅回傳字串，主程式可擴充記憶管理）。"""
+    return f"記憶已儲存：{content}"
 
+@tool
+def datetime_tool() -> str:
+    """確認當前的日期和時間。"""
+    return datetime.now().isoformat()
+
+tools = [ddgs_search, upsert_memory, datetime_tool]
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 **若用戶要求翻譯，請暫時不用安妮亞的語氣，直接正式逐句翻譯。**
@@ -183,7 +174,39 @@ https://example.com/2
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
 
-# --- 7. Streaming Callback Handler ---
+# --- 5. 綁定工具 ---
+llm = st.session_state.llm.bind_tools(tools)
+llm_with_tools = llm
+
+# --- 6. LangGraph Agent ---
+def call_model(state: MessagesState):
+    # 保留所有歷史訊息
+    messages = state["messages"]
+    # 系統提示只加在最前面
+    sys_msg = SystemMessage(content=ANYA_SYSTEM_PROMPT)
+    # 呼叫 LLM
+    response = llm_with_tools.invoke([sys_msg] + messages)
+    return {"messages": messages + [response]}
+
+tool_node = ToolNode(tools)
+
+def call_tools(state: MessagesState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    return END
+
+# --- 7. Workflow ---
+workflow = StateGraph(MessagesState)
+workflow.add_node("LLM", call_model)
+workflow.add_edge(START, "LLM")
+workflow.add_node("tools", tool_node)
+workflow.add_conditional_edges("LLM", call_tools)
+workflow.add_edge("tools", "LLM")
+agent = workflow.compile()
+
+# --- 8. Streamlit Callback Handler ---
 def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
     from langchain_core.callbacks.base import BaseCallbackHandler
     class StreamHandler(BaseCallbackHandler):
@@ -195,8 +218,7 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.text += token
             self.token_placeholder.markdown(self.text)
-            time.sleep(0.03)  # 模擬打字速度
-
+            time.sleep(0.03)
     fn_return_type = TypeVar('fn_return_type')
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
         ctx = st.runtime.scriptrunner.get_script_run_ctx()
@@ -205,128 +227,28 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
             add_script_run_ctx(ctx=ctx)
             return fn(*args, **kwargs)
         return wrapper
-
     st_cb = StreamHandler(parent_container)
     for method_name, method_func in inspect.getmembers(st_cb, predicate=inspect.ismethod):
         if method_name.startswith('on_'):
             setattr(st_cb, method_name, add_streamlit_context(method_func))
     return st_cb
 
-# --- 8. State 定義 ---
-@dataclass
-class MyState:
-    messages: List[Any] = field(default_factory=list)
-    memories: List[Any] = field(default_factory=list)
+# --- 9. UI 顯示歷史 ---
+for msg in st.session_state.messages:
+    if isinstance(msg, AIMessage):
+        st.chat_message("assistant").write(msg.content)
+    elif isinstance(msg, HumanMessage):
+        st.chat_message("user").write(msg.content)
 
-# --- 9. LangGraph Agent 架構 ---
-tools = [ddgs_search, upsert_memory]
-llm = st.session_state.llm.bind_tools(tools)
-
-def get_sys_msg(memories):
-    if memories:
-        mem_str = "\n".join(
-            f"- {m['content']} ({m['context']}) [{m['time'][:19]}]" for m in memories
-        )
-        mem_block = f"\n\nUser memories:\n{mem_str}\n"
-    else:
-        mem_block = ""
-    return SystemMessage(content=ANYA_SYSTEM_PROMPT + mem_block + f"\nSystem Time: {datetime.now().isoformat()}")
-
-def assistant(state: MyState):
-    sys_msg = get_sys_msg(state.memories)
-    ai_msg = llm.invoke([sys_msg] + state.messages)
-    return MyState(
-        messages=state.messages + [ai_msg],
-        memories=state.memories
-    )
-
-builder = StateGraph(MyState)
-builder.add_node("assistant", assistant)
-builder.add_node("tools", ToolNode(tools))
-builder.add_edge(START, "assistant")
-builder.add_conditional_edges("assistant", tools_condition)
-builder.add_edge("tools", "assistant")
-graph = builder.compile()
-
-# --- 10. Streaming async function ---
-async def run_graph_stream(graph, state, st_callback):
-    response = None
-    async for chunk in graph.astream(
-        state,
-        config={"callbacks": [st_callback]}
-    ):
-        response = chunk
-    return response
-
-# --- 11. Streamlit UI ---
-
-with st.expander("🧠 記憶內容 (Memory)", expanded=False):
-    if st.session_state.memories:
-        for m in st.session_state.memories[-10:][::-1]:
-            st.markdown(f"- **{m['content']}**  \n_Context_: {m['context']}  \n_Time_: {m['time'][:19]}")
-    else:
-        st.info("目前沒有記憶。")
-
-# 顯示所有歷史訊息
-for message in st.session_state.messages:
-    if hasattr(message, "role") and message.role == "assistant":
-        st.chat_message("assistant").write(getattr(message, "content", ""))
-    elif hasattr(message, "role") and message.role == "user":
-        st.chat_message("user").write(getattr(message, "content", ""))
-    elif hasattr(message, "role") and message.role == "tool":
-        st.chat_message("assistant").write(f"【工具回應】{getattr(message, 'content', '')}")
-
-if prompt := st.chat_input("Say something..."):
-    st.session_state.messages.append(HumanMessage(content=prompt))
-    # 保留短期記憶：只保留最後30則
-    st.session_state.messages = st.session_state.messages[-30:]
-    with st.chat_message("user"):
-        st.write(prompt)
+# --- 10. 用戶輸入 ---
+user_input = st.chat_input("想問安妮亞什麼？")
+if user_input:
+    st.session_state.messages.append(HumanMessage(content=user_input))
+    st.chat_message("user").write(user_input)
     with st.chat_message("assistant"):
         st_callback = get_streamlit_cb(st.container())
-        # 將 messages 和 memories 一起傳給 graph
-        state = MyState(
-            messages=st.session_state.messages,
-            memories=st.session_state.memories[-10:]  # 只帶入最近10條記憶
-        )
-        response = asyncio.run(
-            run_graph_stream(graph, state, st_callback)
-        )
-
-        # 支援 dataclass 或 dict
-        def get_messages(response):
-            if hasattr(response, "messages"):
-                return response.messages
-            elif isinstance(response, dict) and "messages" in response:
-                return response["messages"]
-            return []
-
-        def get_memories(response):
-            if hasattr(response, "memories"):
-                return response.memories
-            elif isinstance(response, dict) and "memories" in response:
-                return response["memories"]
-            return []
-
-        messages = get_messages(response)
-        memories = get_memories(response)
-
-        if messages:
-            # 保留完整歷史（短期記憶：只保留最後30則）
-            st.session_state.messages = messages[-30:]
-            # 處理 tool message 產生的新記憶
-            for m in messages:
-                if getattr(m, "role", None) == "tool":
-                    mem = m.content
-                    if isinstance(mem, dict) and "content" in mem:
-                        st.session_state.memories.append(mem)
-            # 只保留最後30條記憶
-            st.session_state.memories = st.session_state.memories[-30:]
-            # 顯示最後一個 assistant 回覆
-            final_answer = [m for m in st.session_state.messages if getattr(m, "role", None) == "assistant"]
-            if final_answer and getattr(final_answer[-1], "content", None):
-                st.write(final_answer[-1].content)
-            else:
-                st.write("（本輪 assistant 沒有產生回應）")
-        else:
-            st.write("No response generated.")
+        response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
+        # 取出 AI 回覆
+        ai_msg = response["messages"][-1]
+        st.session_state.messages.append(ai_msg)
+        st.write(ai_msg.content)
