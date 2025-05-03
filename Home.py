@@ -22,6 +22,7 @@ class StreamlitLLMCallbackHandler(BaseCallbackHandler):
     def on_llm_new_token(self, token, **kwargs):
         self.text += token
         self.response_placeholder.markdown(self.text)
+        time.sleep(0.02)  # 模擬打字速度
         
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
