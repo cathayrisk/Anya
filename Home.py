@@ -6,8 +6,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, AnyMessage
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import StateGraph, END, add_messages
 from langchain_core.callbacks.base import BaseCallbackHandler
+from langgraph.graph import StateGraph, END, add_messages
 from datetime import datetime
 import re
 import inspect
@@ -25,7 +25,8 @@ if "llm" not in st.session_state:
     st.session_state.llm = None
 if "memories" not in st.session_state:
     st.session_state.memories = []  # list of dict: {"content": ..., "context": ..., "time": ...}
-        
+
+# --- 2. Model pills UI ---
 options=["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
 model_name = st.pills("Choose a model:", options)
 
@@ -36,6 +37,9 @@ elif model_name == "GPT-4.1-nano":
     st.session_state.selected_model = "gpt-4.1-nano"
 else:
     st.session_state.selected_model = "gpt-4.1"
+    
+if model_name and model_name != st.session_state.selected_model:
+    st.session_state.selected_model = model_name
 
 # --- 3. LLM 初始化 ---
 def ensure_llm():
@@ -112,7 +116,6 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.text += token
             self.token_placeholder.markdown(self.text)
-            time.sleep(0.03)  # 模擬打字速度
 
     fn_return_type = TypeVar('fn_return_type')
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
@@ -184,7 +187,7 @@ builder.add_edge("store_memory", "call_model")
 graph = builder.compile()
 
 # --- 11. Streamlit UI ---
-
+st.title("DDGS Agent Demo (with Streaming & Memory)")
 
 with st.expander("🧠 記憶內容 (Memory)", expanded=False):
     if st.session_state.memories:
@@ -205,13 +208,15 @@ if prompt := st.chat_input("Say something..."):
         st.write(prompt)
     with st.chat_message("assistant"):
         st_callback = get_streamlit_cb(st.container())
+        response = None
         # streaming with callback handler
-        response = asyncio.run(
-            graph.invoke(
+        for chunk in asyncio.run(
+            graph.astream(
                 {"messages": st.session_state.messages},
                 config={"callbacks": [st_callback]}
             )
-        )
+        ):
+            response = chunk
         # 取得最終答案
         if isinstance(response, dict) and "messages" in response and response["messages"]:
             final_answer = response["messages"][-1].content
