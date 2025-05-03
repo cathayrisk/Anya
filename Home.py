@@ -292,11 +292,30 @@ if prompt := st.chat_input("Say something..."):
         response = asyncio.run(
             run_graph_stream(graph, state, st_callback)
         )
-        if isinstance(response, MyState) and response.messages:
+
+        # 支援 dataclass 或 dict
+        def get_messages(response):
+            if hasattr(response, "messages"):
+                return response.messages
+            elif isinstance(response, dict) and "messages" in response:
+                return response["messages"]
+            return []
+
+        def get_memories(response):
+            if hasattr(response, "memories"):
+                return response.memories
+            elif isinstance(response, dict) and "memories" in response:
+                return response["memories"]
+            return []
+
+        messages = get_messages(response)
+        memories = get_memories(response)
+
+        if messages:
             # 保留完整歷史（短期記憶：只保留最後30則）
-            st.session_state.messages = response.messages[-30:]
+            st.session_state.messages = messages[-30:]
             # 處理 tool message 產生的新記憶
-            for m in response.messages:
+            for m in messages:
                 if getattr(m, "role", None) == "tool":
                     mem = m.content
                     if isinstance(mem, dict) and "content" in mem:
