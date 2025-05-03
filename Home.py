@@ -288,9 +288,6 @@ def get_streamlit_cb(parent_container, status=None):
             if self.status:
                 self.status.update(label="工具查詢完成！✨", state="complete")
 
-        def on_llm_end(self, *args, **kwargs):
-            if self.status:
-                self.status.update(label="安妮亞正在整理答案...🥜", state="running")
     fn_return_type = TypeVar('fn_return_type')
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
         ctx = st.runtime.scriptrunner.get_script_run_ctx()
