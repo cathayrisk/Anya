@@ -7,12 +7,10 @@ from duckduckgo_search import DDGS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.callbacks.base import BaseCallbackHandler
-from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 import re
+import sys
+import io
 from datetime import datetime
-import inspect
-from typing import Callable, TypeVar, Any, Dict
 
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
@@ -42,7 +40,7 @@ def route_question(state: GraphState) -> str:
     # Role and Objective
     You are a tool selection router. Based on the user's question, select the most appropriate tool.
     # Date information
-    #Today is {datetime.now().strftime("%Y-%m-%d")}
+    Today is {datetime.now().strftime("%Y-%m-%d")}
 
     # Tool Selection Rules
     - Analyze the user's question and, according to the descriptions in the tool dictionary below, select the most relevant tool name.
@@ -94,6 +92,8 @@ def route_question(state: GraphState) -> str:
 #############################################################################
 # 3. Websearch function to fetch context from DuckDuckGo, store in state["websearch_content"]
 #############################################################################
+
+
 def websearch(state):
     question = state["question"]
     try:
@@ -128,7 +128,7 @@ def websearch(state):
     return state
 
 #############################################################################
-# 4. Generation function that calls LLM, optionally includes websearch content
+# 4. Generation function that calls Groq LLM, optionally includes websearch content
 #############################################################################
 def generate(state: GraphState) -> GraphState:
     question = state["question"]
@@ -138,51 +138,32 @@ def generate(state: GraphState) -> GraphState:
         raise RuntimeError("LLM not initialized. Please call initialize_app first.")
 
     prompt = f"""
+# 特殊規則（最高優先）
+- 只要用戶的問題包含「翻譯」、「請翻譯」或「幫我翻譯」等字眼，請**完全忽略所有角色設定、語氣、格式化規則、步驟與範例**，直接完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。
+
 # 角色與目標
 你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 **若用戶要求翻譯，請暫時不用安妮亞的語氣，直接正式逐句翻譯。**
 
 #今天的日期
-#Today is {datetime.now().strftime("%Y-%m-%d")}
+Today is {datetime.now().strftime("%Y-%m-%d")}
 
-# 回答語言與風格
-- 請務必以正體中文回應，並遵循台灣用語習慣。
-- 回答時要友善、熱情、謙卑，並適時加入emoji。
-- 回答要有安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
-- 若回答不完全正確，請主動道歉並表達會再努力。
+# 指令
+- 回答時務必使用正體中文，並遵循台灣用語。
+- 若是在討論法律、醫療、財經、學術等重要嚴肅主題，或是使用者要求要認真、正式或者是嚴肅回答的內容，請使用正式的語氣。
+- 其他問題請以安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
+- 適時加入可愛的emoji（如🥜、😆、🤩、✨等）。
+- 若有數學公式，請用雙重美元符號`$$`包圍Latex表達式。
+- 若web_flag為'True'，請在答案最後以「## 來源」Markdown標題列出所有參考網址，每行一個。
+- 若收到一篇文章或長內容，且用戶沒有要求翻譯，請用條列式摘要重點，並自動分段加上小標題。
+- 多層次資訊請用巢狀清單。
+- 步驟請用有序清單，重點用粗體，摘要用引用，表格用於比較。
+- 請確保Markdown語法正確，方便直接渲染。
 - 若無法根據context回答，請用引用格式並說「安妮亞不知道這個答案～」。
+- 請勿捏造資訊，僅根據提供的context與自身常識回答。
+- 每一題都要根據內容靈活選擇並組合上述格式，不可只用單一格式。
 
 # 格式化規則
-- 根據內容選擇最合適的 Markdown 元素（如：摘要用引用、步驟用有序清單、比較用表格、重點用粗體）。
-- 內容較長時，請自動分段並加上小標題。
-- 多層次資訊請用巢狀清單。
-- 數學公式請用 $$ 包圍 LaTeX。
-
-# 工具使用規則
-1. 僅在必要時使用工具。
-2. 一次回應只可使用一個工具。
-3. 工具選擇規則如下：
-    - Datetime：需要知道當前時間時使用。不可與 deep_thought_tool 同時使用。
-    - deep_thought_tool：用戶要求仔細思考時使用。不可與 search_web 同時使用。
-    - search_web：用戶詢問當前事件或你不知道答案時使用。不可與 deep_thought_tool 同時使用。
-4. 如果資訊不足以使用工具，請主動謙卑地詢問主人補充資訊，不要猜測或捏造答案。
-
-# 文章分析
-- 如果主人貼一篇文章給多比，請協助分析內容，並以正體中文整理摘要。
-
-# 數學公式
-- 請務必使用雙重美元符號 $$ 包圍 LaTeX 表達式，以顯示數學公式。
-
-# 回答步驟
-1. 先分析主人的問題。
-2. 決定是否需要使用工具。
-3. 若需使用工具，先謙卑地說明原因再調用工具。
-4. 工具回應後，請用多比的語氣總結或補充說明。
-
-# 《SPY×FAMILY 間諜家家酒》彩蛋模式
-- 若不是在討論法律、醫療、財經、學術等重要嚴肅主題，安妮亞可在回答中穿插《SPY×FAMILY 間諜家家酒》中安妮亞的可愛趣味元素，讓回應更有安妮亞的氛圍。
-
-# 格式化範例
 - 根據內容選擇最合適的 Markdown 元素：
     - 摘要用引用（`>`）
     - 步驟用有序清單（`1. 2. 3.`）
@@ -280,18 +261,26 @@ web_flag: {web_flag}
 
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
-    response = st.session_state.llm.invoke(prompt)
-    state["generation"] = response
+    try:
+        response = st.session_state.llm.invoke(prompt)
+        state["generation"] = response
+    except Exception as e:
+        state["generation"] = f"Error generating answer: {str(e)}"
+
     return state
 
 #############################################################################
 # 5. Build the LangGraph pipeline
 #############################################################################
 workflow = StateGraph(GraphState)
+# Add nodes
 workflow.add_node("websearch", websearch)
 workflow.add_node("generate", generate)
+# We'll route from "route_question" to either "websearch" or "generate"
+# Then from "websearch" -> "generate" -> END
+# From "generate" -> END directly if no search is needed.
 workflow.set_conditional_entry_point(
-    route_question,
+    route_question,  # The router function
     {
         "websearch": "websearch",
         "generate": "generate"
@@ -300,6 +289,7 @@ workflow.set_conditional_entry_point(
 workflow.add_edge("websearch", "generate")
 workflow.add_edge("generate", END)
 
+# Configure the Streamlit page layout
 st.set_page_config(
     page_title="Anya",
     layout="wide",
@@ -307,30 +297,42 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# Initialize session state for the model if it doesn't exist
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
-
+        
 options=["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
 model_name = st.pills("Choose a model:", options)
 
+# Map model names to OpenAI model IDs
 if model_name == "GPT-4.1-mini":
     st.session_state.selected_model = "gpt-4.1-mini"
 elif model_name == "GPT-4.1-nano":
     st.session_state.selected_model = "gpt-4.1-nano"
 else:
     st.session_state.selected_model = "gpt-4.1"
-
+#############################################################################
+# 6. The initialize_app function
+#############################################################################
 def initialize_app(model_name: str):
+    """
+    Initialize the app with the given model name, avoiding redundant initialization.
+    """
+    # Check if the LLM is already initialized
     if "current_model" in st.session_state and st.session_state.current_model == model_name:
-        return workflow.compile()
+        return workflow.compile()  # Return the compiled workflow directly
+
+    # Initialize the LLM for the first time or switch models
     st.session_state.llm = ChatOpenAI(model=model_name, openai_api_key=st.secrets["OPENAI_KEY"], temperature=0.0, streaming=True)
     st.session_state.current_model = model_name
     print(f"Using model: {model_name}")
     return workflow.compile()
 
+# Initialize session state for messages
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Display conversation history
 for message in st.session_state.messages:
     if isinstance(message, dict):
         role = message.get("role")
@@ -351,70 +353,65 @@ for message in st.session_state.messages:
     elif role == "assistant":
         with st.chat_message("assistant"):
             st.markdown(content)
+            
 
+# Initialize the LangGraph application with the selected model
 app = initialize_app(model_name=st.session_state.selected_model)
 
-#############################################################################
-# 6. Streamlit Callback Handler for LLM token streaming and tool calling
-#############################################################################
-def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator) -> BaseCallbackHandler:
-    class StreamHandler(BaseCallbackHandler):
-        def __init__(self, container: st.delta_generator.DeltaGenerator, initial_text: str = ""):
-            self.container = container
-            self.thoughts_placeholder = self.container.container()
-            self.tool_output_placeholder = None
-            self.token_placeholder = self.container.empty()
-            self.text = initial_text
-
-        def on_llm_new_token(self, token: str, **kwargs) -> None:
-            self.text += token
-            self.token_placeholder.write(self.text)
-
-        def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs: Any) -> None:
-            with self.thoughts_placeholder:
-                status_placeholder = st.empty()
-                with status_placeholder.status("Calling Tool...", expanded=True) as s:
-                    st.write("called ", serialized["name"])
-                    st.write("tool description: ", serialized["description"])
-                    st.write("tool input: ")
-                    st.code(input_str)
-                    st.write("tool output: ")
-                    self.tool_output_placeholder = st.empty()
-                    s.update(label="Completed Calling Tool!", expanded=False)
-
-        def on_tool_end(self, output: Any, **kwargs: Any) -> Any:
-            if self.tool_output_placeholder:
-                self.tool_output_placeholder.code(output.content)
-
-    fn_return_type = TypeVar('fn_return_type')
-    ctx = get_script_run_ctx()  # 只取一次 context
-    def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
-        def wrapper(*args, **kwargs) -> fn_return_type:
-            add_script_run_ctx(ctx=ctx)
-            return fn(*args, **kwargs)
-        return wrapper
-
-    st_cb = StreamHandler(parent_container)
-    for method_name, method_func in inspect.getmembers(st_cb, predicate=inspect.ismethod):
-        if method_name.startswith('on_'):
-            setattr(st_cb, method_name, add_streamlit_context(method_func))
-    return st_cb
-#############################################################################
-# 7. Main chat input and streaming logic
-#############################################################################
+# Input box for new messages
 if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    with st.chat_message("assistant"):
-        st_callback = get_streamlit_cb(st.container())
-        response = app.invoke(
-            {"question": user_input},
-            config={"callbacks": [st_callback]}
-        )
-        if isinstance(response, dict) and "generation" in response:
-            final_answer = response["generation"]
-        else:
-            final_answer = str(response)
-        st.session_state.messages.append({"role": "assistant", "content": final_answer or "No response generated."})
+    # Capture print statements from agentic_rag.py
+    output_buffer = io.StringIO()
+    sys.stdout = output_buffer  # Redirect stdout to the buffer
+
+    try:
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty()
+            debug_placeholder = st.empty()
+            streamed_response = ""
+
+            # Show spinner while streaming the response
+            with st.spinner("Thinking...", show_time=True):
+                inputs = {"question": user_input}
+                for i, output in enumerate(app.stream(inputs)):
+                    # Capture intermediate print messages
+                    debug_logs = output_buffer.getvalue()
+                    debug_placeholder.text_area(
+                        "Debug Logs",
+                        debug_logs,
+                        height=68,
+                        key=f"debug_logs_{i}"
+                    )
+
+                    if "generate" in output and "generation" in output["generate"]:
+                        chunk = output["generate"]["generation"]
+
+                        # Safely extract the text content
+                        if hasattr(chunk, "content"):  # If chunk is an AIMessage
+                            chunk_text = chunk.content
+                        else:  # Otherwise, convert to string
+                            chunk_text = str(chunk)
+
+                        # Append the text to the streamed response
+                        streamed_response += chunk_text
+
+                        # Update the placeholder with the streamed response so far
+                        response_placeholder.markdown(streamed_response)
+
+            # Store the final response in session state
+            st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
+
+    except Exception as e:
+        # Handle errors and display in the conversation history
+        error_message = f"An error occurred: {e}"
+        st.session_state.messages.append({"role": "assistant", "content": error_message})
+        # 直接使用 st.error 而不是嵌套在 st.chat_message 內
+        st.error(error_message)
+
+    finally:
+        # Restore stdout to its original state
+        sys.stdout = sys.__stdout__
