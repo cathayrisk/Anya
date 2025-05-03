@@ -404,12 +404,10 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
 
     with st.chat_message("assistant"):
         st_callback = get_streamlit_cb(st.container())
-        response = app.invoke(
+        response = app.stream(
             {"question": user_input},
             config={"callbacks": {"generate": [st_callback]}}
         )
-        if isinstance(response, dict) and "generation" in response:
-            final_answer = response["generation"]
-        else:
-            final_answer = str(response)
+        # 取得最終答案
+        final_answer = st_callback.text
         st.session_state.messages.append({"role": "assistant", "content": final_answer or "No response generated."})
