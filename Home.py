@@ -10,6 +10,33 @@ from langchain_core.messages import AIMessage, HumanMessage
 import re
 from datetime import datetime
 
+def initialize_app(model_name: str):
+    if "llm" not in st.session_state or st.session_state.current_model != model_name:
+        st.session_state.llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=st.secrets["OPENAI_KEY"],
+            temperature=0.0,
+            streaming=True
+        )
+        st.session_state.current_model = model_name
+        print(f"Using model: {model_name}")
+    return workflow.compile()
+
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "GPT-4.1"
+
+options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
+model_name = st.pills("Choose a model:", options)
+
+if model_name == "GPT-4.1-mini":
+    st.session_state.selected_model = "gpt-4.1-mini"
+elif model_name == "GPT-4.1-nano":
+    st.session_state.selected_model = "gpt-4.1-nano"
+else:
+    st.session_state.selected_model = "gpt-4.1"
+
+app = initialize_app(model_name=st.session_state.selected_model)
+
 #############################################################################
 # 1. Define the GraphState (minimal fields: question, generation, websearch_content)
 #############################################################################
@@ -270,17 +297,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-def initialize_app(model_name: str):
-    if "llm" not in st.session_state or st.session_state.current_model != model_name:
-        st.session_state.llm = ChatOpenAI(
-            model=model_name,
-            openai_api_key=st.secrets["OPENAI_KEY"],
-            temperature=0.0,
-            streaming=True
-        )
-        st.session_state.current_model = model_name
-        print(f"Using model: {model_name}")
-    return workflow.compile()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -305,22 +321,6 @@ for message in st.session_state.messages:
     elif role == "assistant":
         with st.chat_message("assistant"):
             st.markdown(content)
-
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = "GPT-4.1"
-
-app = initialize_app(model_name=st.session_state.selected_model)
-
-options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
-model_name = st.pills("Choose a model:", options)
-
-if model_name == "GPT-4.1-mini":
-    st.session_state.selected_model = "gpt-4.1-mini"
-elif model_name == "GPT-4.1-nano":
-    st.session_state.selected_model = "gpt-4.1-nano"
-else:
-    st.session_state.selected_model = "gpt-4.1"
-
 
 #############################################################################
 # 6. Main chat input and streaming logic (only show generate node streaming)
