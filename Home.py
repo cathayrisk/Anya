@@ -293,11 +293,6 @@ async def run_graph_stream(graph, messages, st_callback):
     return response
 
 # --- 12. Streamlit UI ---
-st.set_page_config(
-    page_title="Anya",
-    layout="wide",
-    page_icon="🥜"
-)
 
 with st.expander("🧠 記憶內容 (Memory)", expanded=False):
     if st.session_state.memories:
