@@ -273,6 +273,8 @@ st.set_page_config(
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
 
+app = initialize_app(model_name=st.session_state.selected_model)
+
 options = ["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
 model_name = st.pills("Choose a model:", options)
 
@@ -284,11 +286,15 @@ else:
     st.session_state.selected_model = "gpt-4.1"
 
 def initialize_app(model_name: str):
-    if "current_model" in st.session_state and st.session_state.current_model == model_name:
-        return workflow.compile()
-    st.session_state.llm = ChatOpenAI(model=model_name, openai_api_key=st.secrets["OPENAI_KEY"], temperature=0.0, streaming=True)
-    st.session_state.current_model = model_name
-    print(f"Using model: {model_name}")
+    if "llm" not in st.session_state or st.session_state.current_model != model_name:
+        st.session_state.llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=st.secrets["OPENAI_KEY"],
+            temperature=0.0,
+            streaming=True
+        )
+        st.session_state.current_model = model_name
+        print(f"Using model: {model_name}")
     return workflow.compile()
 
 if "messages" not in st.session_state:
@@ -315,7 +321,7 @@ for message in st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(content)
 
-app = initialize_app(model_name=st.session_state.selected_model)
+
 
 #############################################################################
 # 6. Main chat input and streaming logic (only show generate node streaming)
