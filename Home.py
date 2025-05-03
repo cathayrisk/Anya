@@ -92,8 +92,6 @@ def route_question(state: GraphState) -> str:
 #############################################################################
 # 3. Websearch function to fetch context from DuckDuckGo, store in state["websearch_content"]
 #############################################################################
-
-
 def websearch(state):
     question = state["question"]
     try:
@@ -273,14 +271,10 @@ web_flag: {web_flag}
 # 5. Build the LangGraph pipeline
 #############################################################################
 workflow = StateGraph(GraphState)
-# Add nodes
 workflow.add_node("websearch", websearch)
 workflow.add_node("generate", generate)
-# We'll route from "route_question" to either "websearch" or "generate"
-# Then from "websearch" -> "generate" -> END
-# From "generate" -> END directly if no search is needed.
 workflow.set_conditional_entry_point(
-    route_question,  # The router function
+    route_question,
     {
         "websearch": "websearch",
         "generate": "generate"
@@ -289,7 +283,6 @@ workflow.set_conditional_entry_point(
 workflow.add_edge("websearch", "generate")
 workflow.add_edge("generate", END)
 
-# Configure the Streamlit page layout
 st.set_page_config(
     page_title="Anya",
     layout="wide",
@@ -297,42 +290,30 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Initialize session state for the model if it doesn't exist
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = "GPT-4.1"
-        
+
 options=["GPT-4.1", "GPT-4.1-mini", "GPT-4.1-nano"]
 model_name = st.pills("Choose a model:", options)
 
-# Map model names to OpenAI model IDs
 if model_name == "GPT-4.1-mini":
     st.session_state.selected_model = "gpt-4.1-mini"
 elif model_name == "GPT-4.1-nano":
     st.session_state.selected_model = "gpt-4.1-nano"
 else:
     st.session_state.selected_model = "gpt-4.1"
-#############################################################################
-# 6. The initialize_app function
-#############################################################################
-def initialize_app(model_name: str):
-    """
-    Initialize the app with the given model name, avoiding redundant initialization.
-    """
-    # Check if the LLM is already initialized
-    if "current_model" in st.session_state and st.session_state.current_model == model_name:
-        return workflow.compile()  # Return the compiled workflow directly
 
-    # Initialize the LLM for the first time or switch models
+def initialize_app(model_name: str):
+    if "current_model" in st.session_state and st.session_state.current_model == model_name:
+        return workflow.compile()
     st.session_state.llm = ChatOpenAI(model=model_name, openai_api_key=st.secrets["OPENAI_KEY"], temperature=0.0, streaming=True)
     st.session_state.current_model = model_name
     print(f"Using model: {model_name}")
     return workflow.compile()
 
-# Initialize session state for messages
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display conversation history
 for message in st.session_state.messages:
     if isinstance(message, dict):
         role = message.get("role")
@@ -353,20 +334,16 @@ for message in st.session_state.messages:
     elif role == "assistant":
         with st.chat_message("assistant"):
             st.markdown(content)
-            
 
-# Initialize the LangGraph application with the selected model
 app = initialize_app(model_name=st.session_state.selected_model)
 
-# Input box for new messages
 if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Capture print statements from agentic_rag.py
     output_buffer = io.StringIO()
-    sys.stdout = output_buffer  # Redirect stdout to the buffer
+    sys.stdout = output_buffer
 
     try:
         with st.chat_message("assistant"):
@@ -374,44 +351,27 @@ if user_input := st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？"):
             debug_placeholder = st.empty()
             streamed_response = ""
 
-            # Show spinner while streaming the response
             with st.spinner("Thinking...", show_time=True):
                 inputs = {"question": user_input}
-                for i, output in enumerate(app.stream(inputs)):
-                    # Capture intermediate print messages
+                # 只 streaming generate node 的 token
+                for msg, metadata in app.stream(inputs, stream_mode="messages"):
                     debug_logs = output_buffer.getvalue()
                     debug_placeholder.text_area(
                         "Debug Logs",
                         debug_logs,
                         height=68,
-                        key=f"debug_logs_{i}"
+                        key=f"debug_logs_{id(msg)}"
                     )
-
-                    if "generate" in output and "generation" in output["generate"]:
-                        chunk = output["generate"]["generation"]
-
-                        # Safely extract the text content
-                        if hasattr(chunk, "content"):  # If chunk is an AIMessage
-                            chunk_text = chunk.content
-                        else:  # Otherwise, convert to string
-                            chunk_text = str(chunk)
-
-                        # Append the text to the streamed response
-                        streamed_response += chunk_text
-
-                        # Update the placeholder with the streamed response so far
+                    # 只顯示 generate node 的 token
+                    if metadata.get("langgraph_node") == "generate" and msg.content:
+                        streamed_response += msg.content
                         response_placeholder.markdown(streamed_response)
 
-            # Store the final response in session state
             st.session_state.messages.append({"role": "assistant", "content": streamed_response or "No response generated."})
 
     except Exception as e:
-        # Handle errors and display in the conversation history
         error_message = f"An error occurred: {e}"
         st.session_state.messages.append({"role": "assistant", "content": error_message})
-        # 直接使用 st.error 而不是嵌套在 st.chat_message 內
         st.error(error_message)
-
     finally:
-        # Restore stdout to its original state
         sys.stdout = sys.__stdout__
