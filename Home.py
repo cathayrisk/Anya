@@ -110,6 +110,9 @@ def analyze_deeply(input_question: str) -> str:
 
 @tool
 def deep_thought_tool(content: str) -> str:
+    """
+    安妮亞仔細思考深入分析。
+    """
     try:
         return analyze_deeply(content).strip() + "\n\n"
     except Exception as e:
