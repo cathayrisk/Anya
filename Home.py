@@ -4,7 +4,7 @@ from datetime import datetime
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langgraph.graph import MessagesState, StateGraph, START
+from langgraph.graph import StateGraph, START
 from langgraph.prebuilt import tools_condition, ToolNode
 import inspect
 from typing import Callable, TypeVar
@@ -66,17 +66,14 @@ def ddgs_search(query: str) -> str:
         for r in results
     )
 
-# --- 5. 記憶 upsert 工具 ---
+# --- 5. 記憶 upsert 工具（只回傳 dict，不直接寫 session_state） ---
 @tool
-def upsert_memory(content: str, context: str = "") -> str:
-    """Store a memory for the user. The content should be a key fact or user preference."""
-    mem = {
+def upsert_memory(content: str, context: str = "") -> dict:
+    """Return a memory dict to be appended by the main thread."""
+    return {
         "content": content,
         "context": context,
         "time": datetime.now().isoformat()
-    }
-    st.session_state.memories.append(mem)
-    return f"記憶已儲存：{content}"
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
@@ -217,9 +214,7 @@ tools = [ddgs_search, upsert_memory]
 llm = st.session_state.llm.bind_tools(tools)
 
 # System message
-def get_sys_msg():
-    # 將記憶加到 system prompt
-    memories = st.session_state.memories[-10:]  # 只取最近10條
+def get_sys_msg(memories):
     if memories:
         mem_str = "\n".join(
             f"- {m['content']} ({m['context']}) [{m['time'][:19]}]" for m in memories
@@ -229,15 +224,16 @@ def get_sys_msg():
         mem_block = ""
     return SystemMessage(content=ANYA_SYSTEM_PROMPT + mem_block + f"\nSystem Time: {datetime.now().isoformat()}")
 
-# Assistant node
-def assistant(state: MessagesState):
-    sys_msg = get_sys_msg()
+# Assistant node（只用 state["memories"]，不碰 session_state）
+def assistant(state):
+    sys_msg = get_sys_msg(state["memories"])
     ai_msg = llm.invoke([sys_msg] + state["messages"])
-    # 關鍵：append 新 assistant message 到歷史
-    return {"messages": state["messages"] + [ai_msg]}
+    return {"messages": state["messages"] + [ai_msg], "memories": state["memories"]}
 
 # --- 9. Build LangGraph ---
-builder = StateGraph(MessagesState)
+from langgraph.graph import MessagesState
+
+builder = StateGraph({"messages": list, "memories": list})
 builder.add_node("assistant", assistant)
 builder.add_node("tools", ToolNode(tools))
 builder.add_edge(START, "assistant")
@@ -246,10 +242,10 @@ builder.add_edge("tools", "assistant")
 graph = builder.compile()
 
 # --- 10. Streaming async function ---
-async def run_graph_stream(graph, messages, st_callback):
+async def run_graph_stream(graph, state, st_callback):
     response = None
     async for chunk in graph.astream(
-        {"messages": messages},
+        state,
         config={"callbacks": [st_callback]}
     ):
         response = chunk
@@ -281,12 +277,29 @@ if prompt := st.chat_input("Say something..."):
         st.write(prompt)
     with st.chat_message("assistant"):
         st_callback = get_streamlit_cb(st.container())
+        # 將 messages 和 memories 一起傳給 graph
+        state = {
+            "messages": st.session_state.messages,
+            "memories": st.session_state.memories[-10:]  # 只帶入最近10條記憶
+        }
         response = asyncio.run(
-            run_graph_stream(graph, st.session_state.messages, st_callback)
+            run_graph_stream(graph, state, st_callback)
         )
         if isinstance(response, dict) and "messages" in response and response["messages"]:
             # 保留完整歷史（短期記憶：只保留最後30則）
             st.session_state.messages = response["messages"][-30:]
+            # 處理 tool message 產生的新記憶
+            for m in response["messages"]:
+                if getattr(m, "role", None) == "tool":
+                    # 嘗試將 tool 回傳內容 parse 成 dict
+                    try:
+                        mem = m.content
+                        if isinstance(mem, dict) and "content" in mem:
+                            st.session_state.memories.append(mem)
+                    except Exception:
+                        pass
+            # 只保留最後30條記憶
+            st.session_state.memories = st.session_state.memories[-30:]
             # 顯示最後一個 assistant 回覆
             final_answer = [m for m in st.session_state.messages if getattr(m, "role", None) == "assistant"]
             if final_answer and getattr(final_answer[-1], "content", None):
