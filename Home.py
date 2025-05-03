@@ -259,12 +259,14 @@ web_flag: {web_flag}
 
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
-    try:
-        response = st.session_state.llm.invoke(prompt)
-        state["generation"] = response
-    except Exception as e:
-        state["generation"] = f"Error generating answer: {str(e)}"
-
+    # 這裡用 streaming
+    response = ""
+    for chunk in st.session_state.llm.stream(prompt):
+        if hasattr(chunk, "content"):
+            response += chunk.content
+        else:
+            response += str(chunk)
+    state["generation"] = response
     return state
 
 #############################################################################
