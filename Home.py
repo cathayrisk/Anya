@@ -4,13 +4,12 @@ from datetime import datetime
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_core.prompts import PromptTemplate
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 import inspect
 from typing import Callable, TypeVar
-import asyncio
 import time
-from langchain_core.tools import tool
 
 st.set_page_config(
     page_title="Anya",
@@ -46,51 +45,78 @@ def ensure_llm():
 ensure_llm()
 
 # --- 3. 工具定義 ---
+
 @tool
 def ddgs_search(query: str) -> str:
-    """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳更豐富的內容）。"""
+    """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳 markdown 條列格式並附來源）。"""
     try:
         from duckduckgo_search import DDGS
         ddgs = DDGS()
-        # 搜尋網頁
-        web_results = ddgs.text(query, region="wt-wt", safesearch="moderate", max_results=10)
-        # 搜尋新聞
-        news_results = ddgs.news(query, region="wt-wt", safesearch="moderate", max_results=10)
-
-        # 合併結果
+        web_results = ddgs.text(query, region="wt-wt", safesearch="moderate", max_results=5)
+        news_results = ddgs.news(query, region="wt-wt", safesearch="moderate", max_results=5)
         all_results = []
         if isinstance(web_results, list):
             all_results.extend(web_results)
         if isinstance(news_results, list):
             all_results.extend(news_results)
-
-        # 整理內容
         docs = []
+        sources = []
         for item in all_results:
-            snippet = item.get("body", "") or item.get("snippet", "")
-            title = item.get("title", "")
+            title = item.get("title", "無標題")
             link = item.get("href", "") or item.get("link", "") or item.get("url", "")
-            docs.append(f"{title}\n{snippet}\n{link}")
-
+            snippet = item.get("body", "") or item.get("snippet", "")
+            docs.append(f"- [{title}]({link})\n  > {snippet}")
+            if link:
+                sources.append(link)
         if not docs:
             return "No results found."
-
-        return "\n\n".join(docs)
+        markdown_content = "\n".join(docs)
+        source_block = "\n\n## 來源\n" + "\n".join(sources)
+        return markdown_content + source_block
     except Exception as e:
-        print(f"Error during DuckDuckGo web search: {e}")
         return f"Error from DuckDuckGo: {e}"
-
-@tool
-def upsert_memory(content: str, context: str = "") -> str:
-    """記憶功能（僅回傳字串，主程式可擴充記憶管理）。"""
-    return f"記憶已儲存：{content}"
 
 @tool
 def datetime_tool() -> str:
     """確認當前的日期和時間。"""
     return datetime.now().isoformat()
 
-tools = [ddgs_search, upsert_memory, datetime_tool]
+# 你的 deep_thought_tool
+def analyze_deeply(input_question: str) -> str:
+    """使用OpenAI的模型來深入分析問題並返回結果。"""
+    prompt_template = PromptTemplate(
+        template="""請分析以下問題，並以正體中文提供詳細的結論和理由，請依據事實分析，不考慮資料的時間因素：
+
+問題：{input_question}
+
+指導方針：
+1. 描述問題的背景和相關資訊。
+2. 直接給出你的結論，並提供支持該結論的理由。
+3. 如果有不確定的地方，請明確指出。
+4. 確保你的回答是詳細且有條理的。
+""",
+        input_variables=["input_question"],
+    )
+    llmo1 = ChatOpenAI(
+        openai_api_key=st.secrets["OPENAI_KEY"],
+        model="o4-mini",
+        streaming=True,
+    )
+    prompt = prompt_template.format(input_question=input_question)
+    result = llmo1.invoke(prompt)
+    # 包裝成 content 屬性
+    class OutputWrapper:
+        def __init__(self, content):
+            self.content = content
+    return OutputWrapper(result)
+
+@tool
+def deep_thought_tool(content: str) -> str:
+    """安妮亞仔細思考深入分析。"""
+    return analyze_deeply(content)
+
+tools = [ddgs_search, deep_thought_tool, datetime_tool]
+
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 **若用戶要求翻譯，請暫時不用安妮亞的語氣，直接正式逐句翻譯。**
@@ -202,11 +228,8 @@ llm_with_tools = llm
 
 # --- 6. LangGraph Agent ---
 def call_model(state: MessagesState):
-    # 保留所有歷史訊息
     messages = state["messages"]
-    # 系統提示只加在最前面
     sys_msg = SystemMessage(content=ANYA_SYSTEM_PROMPT)
-    # 呼叫 LLM
     response = llm_with_tools.invoke([sys_msg] + messages)
     return {"messages": messages + [response]}
 
@@ -228,19 +251,46 @@ workflow.add_conditional_edges("LLM", call_tools)
 workflow.add_edge("tools", "LLM")
 agent = workflow.compile()
 
-# --- 8. Streamlit Callback Handler ---
-def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
+# --- 8. 進階 spinner/狀態切換 callback ---
+def get_streamlit_cb(parent_container, status=None):
     from langchain_core.callbacks.base import BaseCallbackHandler
     class StreamHandler(BaseCallbackHandler):
-        def __init__(self, container: st.delta_generator.DeltaGenerator, initial_text: str = ""):
+        def __init__(self, container, status=None):
             self.container = container
+            self.status = status
             self.token_placeholder = self.container.empty()
-            self.text = initial_text
+            self.text = ""
+
+        def on_llm_start(self, *args, **kwargs):
+            if self.status:
+                self.status.update(label="安妮亞正在分析你的問題...🧠", state="running")
 
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.text += token
             self.token_placeholder.markdown(self.text)
-            time.sleep(0.03)
+
+        def on_tool_start(self, serialized, input_str, **kwargs):
+            if self.status:
+                tool_name = serialized.get("name", "")
+                tool_emoji = {
+                    "ddgs_search": "🔍",
+                    "deep_thought_tool": "🧠",
+                    "datetime_tool": "⏰"
+                }.get(tool_name, "🛠️")
+                tool_desc = {
+                    "ddgs_search": "搜尋網路資料",
+                    "deep_thought_tool": "深入分析資料",
+                    "datetime_tool": "查詢時間"
+                }.get(tool_name, "執行工具")
+                self.status.update(label=f"安妮亞正在{tool_desc}...{tool_emoji}", state="running")
+
+        def on_tool_end(self, output, **kwargs):
+            if self.status:
+                self.status.update(label="工具查詢完成！✨", state="complete")
+
+        def on_llm_end(self, *args, **kwargs):
+            if self.status:
+                self.status.update(label="安妮亞正在整理答案...🥜", state="running")
     fn_return_type = TypeVar('fn_return_type')
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
         ctx = st.runtime.scriptrunner.get_script_run_ctx()
@@ -249,7 +299,7 @@ def get_streamlit_cb(parent_container: st.delta_generator.DeltaGenerator):
             add_script_run_ctx(ctx=ctx)
             return fn(*args, **kwargs)
         return wrapper
-    st_cb = StreamHandler(parent_container)
+    st_cb = StreamHandler(parent_container, status=status)
     for method_name, method_func in inspect.getmembers(st_cb, predicate=inspect.ismethod):
         if method_name.startswith('on_'):
             setattr(st_cb, method_name, add_streamlit_context(method_func))
@@ -268,8 +318,8 @@ if user_input:
     st.session_state.messages.append(HumanMessage(content=user_input))
     st.chat_message("user").write(user_input)
     with st.chat_message("assistant"):
-        st_callback = get_streamlit_cb(st.container())
+        status = st.status("安妮亞正在思考...", expanded=True)
+        st_callback = get_streamlit_cb(st.container(), status=status)
         response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
-        # 取出 AI 回覆
         ai_msg = response["messages"][-1]
         st.session_state.messages.append(ai_msg)
