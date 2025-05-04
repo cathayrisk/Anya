@@ -13,7 +13,6 @@ import time
 import re
 import requests
 from openai import OpenAI
-import traceback
 
 
 st.set_page_config(
@@ -67,7 +66,7 @@ def meta_optimize_prompt(simple_prompt: str, goal: str) -> str:
     return response.choices[0].message.content.strip()
 
 # === 產生查詢（中英文） ===
-def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
+def generate_queries(topic: str, model="gpt-4o-mini") -> List[str]:
     simple_prompt = f"""請針對「{topic}」這個主題，分別用繁體中文與英文各產生三個適合用於網路搜尋的查詢關鍵字，並以如下 JSON 格式回覆：
 {{
     "zh": ["查詢1", "查詢2", "查詢3"],
@@ -90,7 +89,7 @@ def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
     return queries["zh"] + queries["en"]
 
 # === 查詢摘要 ===
-def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
+def auto_summarize(text: str, model="gpt-4o-mini") -> str:
     simple_prompt = f"請用繁體中文摘要以下內容，重點條列，100字內：\n{text}"
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生精簡且重點明確的摘要")
     response = client.chat.completions.create(
@@ -101,7 +100,7 @@ def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
 
 
 # === 報告規劃（推理模型） ===
-def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
+def plan_report(topic: str, search_summaries: str, model="o3-mini") -> str:
     simple_prompt = f"""你是一位專業技術寫手，請針對「{topic}」這個主題，根據以下網路搜尋摘要，規劃一份報告結構（包含章節標題與簡要說明），以繁體中文回覆。請用條列式，章節數量 3-5 個。
 搜尋摘要：
 {search_summaries}
@@ -113,16 +112,15 @@ def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
     )
     return response.choices[0].message.content.strip()
     
-# 3. 解析章節
+# === 解析章節（可用 LLM 或正則，這裡用簡單正則） ===
 def parse_sections(plan: str) -> List[Dict[str, str]]:
     # 假設格式為：1. 標題：說明
     pattern = r"\d+\.\s*([^\n：:]+)[：:]\s*([^\n]+)"
     matches = re.findall(pattern, plan)
     return [{"title": m[0].strip(), "desc": m[1].strip()} for m in matches]
 
-
 # === 章節查詢產生 ===
-def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini") -> List[str]:
+def section_queries(section_title: str, section_desc: str, model="gpt-4o-mini") -> List[str]:
     simple_prompt = f"""針對章節「{section_title}」({section_desc})，請分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
 {{
     "zh": ["查詢1", "查詢2"],
@@ -154,7 +152,7 @@ def auto_summarize(text: str, model="gpt-4.1-mini"):
     return response.choices[0].message.content.strip()
 
 # === 章節內容撰寫 ===
-def section_write(section_title: str, section_desc: str, search_summary: str, model="gpt-4.1-mini") -> str:
+def section_write(section_title: str, section_desc: str, search_summary: str, model="gpt-4o-mini") -> str:
     simple_prompt = f"""請根據章節「{section_title}」({section_desc})與以下搜尋摘要，撰寫 150-200 字內容，繁體中文，並在文末列出引用來源（markdown 格式）。
 搜尋摘要：
 {search_summary}
@@ -193,7 +191,7 @@ def section_grade(section_title: str, section_content: str, model="gpt-4o-mini")
         return {"grade": "pass", "follow_up_queries": []}
 
 # === 反思流程（最多2次） ===
-def reflect_report(report: str, model="o4-mini") -> str:
+def reflect_report(report: str, model="o3-mini") -> str:
     simple_prompt = f"""請檢查以下報告的邏輯、正確性與完整性，若有問題請列出需補充的章節與查詢關鍵字，否則回覆 "OK"。
 {report}
 """
@@ -283,8 +281,8 @@ def deep_research_pipeline(topic: str) -> Dict[str, Any]:
     }
     return output
 
-@tool
-def deep_research_pipeline_tool(topic: str):
+# === Tool 包裝，方便 agent 調用 ===
+def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
     """
     針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
     """
