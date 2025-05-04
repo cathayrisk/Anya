@@ -13,6 +13,8 @@ import time
 import re
 import requests
 from openai import OpenAI
+import traceback
+
 
 st.set_page_config(
     page_title="Anya",
