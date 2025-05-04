@@ -1,3 +1,4 @@
+
 import os
 import streamlit as st
 from datetime import datetime
@@ -13,7 +14,6 @@ import time
 import re
 import requests
 from openai import OpenAI
-
 
 st.set_page_config(
     page_title="Anya",
@@ -59,7 +59,7 @@ def meta_optimize_prompt(simple_prompt: str, goal: str) -> str:
     {simple_prompt}
     只回傳優化後的 prompt。
     """
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model="o4-mini",
         messages=[{"role": "user", "content": meta_prompt}]
     )
@@ -74,7 +74,7 @@ def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
 }}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且具針對性的查詢關鍵字")
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -92,12 +92,11 @@ def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
 def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
     simple_prompt = f"請用繁體中文摘要以下內容，重點條列，100字內：\n{text}"
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生精簡且重點明確的摘要")
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
     return response.choices[0].message.content.strip()
-
 
 # === 報告規劃（推理模型） ===
 def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
@@ -106,12 +105,12 @@ def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
 {search_summaries}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化且明確的報告章節規劃")
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
     return response.choices[0].message.content.strip()
-    
+
 # === 解析章節（可用 LLM 或正則，這裡用簡單正則） ===
 def parse_sections(plan: str) -> List[Dict[str, str]]:
     # 假設格式為：1. 標題：說明
@@ -128,7 +127,7 @@ def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini")
 }}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且聚焦的章節查詢關鍵字")
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -142,15 +141,6 @@ def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini")
         queries = json.loads(content)
     return queries["zh"] + queries["en"]
 
-# 5. 查詢摘要?
-def auto_summarize(text: str, model="gpt-4.1-mini"):
-    prompt = f"請用繁體中文摘要以下內容，重點條列，200字內：\n{text}"
-    response = client.responses.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content.strip()
-
 # === 章節內容撰寫 ===
 def section_write(section_title: str, section_desc: str, search_summary: str, model="gpt-4.1-mini") -> str:
     simple_prompt = f"""請根據章節「{section_title}」({section_desc})與以下搜尋摘要，撰寫 150-200 字內容，繁體中文，並在文末列出引用來源（markdown 格式）。
@@ -158,7 +148,7 @@ def section_write(section_title: str, section_desc: str, search_summary: str, mo
 {search_summary}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化、具來源引用、條列清楚的章節內容")
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -181,7 +171,7 @@ def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini"
 {section_content}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹評分並產生具體補強建議")
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -196,7 +186,7 @@ def reflect_report(report: str, model="o4-mini") -> str:
 {report}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹檢查報告並產生具體補強建議")
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -206,7 +196,6 @@ def reflect_report(report: str, model="o4-mini") -> str:
 def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
     return "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
 
-# 7. 主流程
 # === 主流程（含推理鏈追蹤） ===
 def deep_research_pipeline(topic: str) -> Dict[str, Any]:
     logs = []
@@ -281,13 +270,13 @@ def deep_research_pipeline(topic: str) -> Dict[str, Any]:
     }
     return output
 
-# === Tool 包裝，方便 agent 調用 ===
+@tool
 def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
     """
     針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
     """
     return deep_research_pipeline(topic)
-
+    
 @tool
 def ddgs_search(query: str) -> str:
     """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳 markdown 條列格式並附來源）。"""
@@ -396,7 +385,7 @@ def get_webpage_answer(query: str) -> str:
     except Exception as e:
         return f"AI 回答時發生錯誤：{e}"
 
-tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, deep_research_pipeline_tool]
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer]
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
