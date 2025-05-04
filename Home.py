@@ -121,9 +121,8 @@ def plan_report(topic, search_summaries, model="o4-mini"):
     )
     return response.output_text
     
-# 3. 解析章節（正則）
+# 3. 解析章節
 def parse_sections(plan: str):
-    # 解析格式：1. 章節標題\n    - 小標題1：細節說明
     section_pattern = r"\d+\.\s*([^\n]+)"
     sub_pattern = r"-\s*([^\n：:]+)[：:]\s*([^\n]+)"
     sections = []
@@ -155,13 +154,12 @@ def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
     try:
         queries = json.loads(content)
     except Exception:
-        import re
         content = re.sub(r"[\u4e00-\u9fff]+：", "", content)
         content = content.replace("'", '"')
         queries = json.loads(content)
     return queries["zh"] + queries["en"]
 
-# 5. 查詢摘要
+# 5. 查詢摘要?
 def auto_summarize(text: str, model="gpt-4.1-mini"):
     prompt = f"請用繁體中文摘要以下內容，重點條列，200字內：\n{text}"
     response = client.chat.completions.create(
@@ -170,17 +168,18 @@ def auto_summarize(text: str, model="gpt-4.1-mini"):
     )
     return response.choices[0].message.content.strip()
 
-# 6. 章節撰寫（明確要求引用來源、細節）
-def section_write(section_title, section_desc, search_summary, model="gpt-4.1-mini"):
+# 5. 章節撰寫（直接用多筆查詢結果）
+def section_write(section_title, section_desc, search_results, model="gpt-4.1-mini"):
     prompt = f"""
 # Role and Objective
-你是一位專業技術寫手，根據下方章節主題、說明與搜尋摘要，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
+你是一位專業技術寫手，根據下方章節主題、說明與「多筆網路查詢結果」，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
 
 # Instructions
 - 內容需至少600字，並涵蓋：具體數據、真實案例、國際比較、產業現況、技術細節、未來趨勢、挑戰與解決方案。
+- 必須根據下方每一筆查詢結果，整合出完整內容。
 - 每個小標題下必須有2-3段具體說明。
 - 條列重點只能放在章節結尾，正文必須是完整段落。
-- 文末請用「## 來源」列出所有引用來源（Markdown格式）。
+- 文末請用「## 來源」列出所有引用來源（Markdown格式），來源必須來自下方查詢結果。
 - 請勿省略細節，若有多個觀點請分段說明。
 - 請勿重複內容，避免空泛敘述。
 - 請用繁體中文撰寫。
@@ -191,8 +190,8 @@ def section_write(section_title, section_desc, search_summary, model="gpt-4.1-mi
 # 章節說明
 {section_desc}
 
-# 搜尋摘要
-{search_summary}
+# 多筆查詢結果（每筆都要參考）
+{search_results}
 """
     response = client.chat.completions.create(
         model=model,
@@ -226,7 +225,7 @@ def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini"
     except:
         return {"grade": "pass", "follow_up_queries": []}
 
-# 7. 反思流程（推理模型）
+# 6. 反思流程（推理模型）
 def reflect_report(report: str, model="o4-mini"):
     prompt = f"""Formatting re-enabled
 # Role and Objective
@@ -235,6 +234,7 @@ def reflect_report(report: str, model="o4-mini"):
 # Instructions
 - 請逐一檢查每個章節是否有小標題，且每個小標題下是否有2-3句具體細節說明。
 - 檢查內容是否涵蓋數據、案例、國際觀點、技術細節、未來趨勢等豐富面向。
+- 檢查是否有明確引用來源。
 - 若有內容過於簡略、遺漏重要面向，請明確指出需補充的章節、小標題與建議查詢關鍵字。
 - 若內容已足夠豐富且無明顯遺漏，請回覆 "OK"。
 - 請用繁體中文回覆。
@@ -253,6 +253,7 @@ def reflect_report(report: str, model="o4-mini"):
 def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
     return "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
 
+# 7. 主流程
 def deep_research_pipeline(topic):
     logs = []
     # 1. 產生查詢
@@ -264,18 +265,14 @@ def deep_research_pipeline(topic):
         result = ddgs_search(q)
         all_results.append(result)
     logs.append({"step": "search", "results": all_results})
-    # 3. 自動摘要
-    all_text = "\n\n".join(all_results)
-    search_summary = auto_summarize(all_text)
-    logs.append({"step": "auto_summarize", "summary": search_summary})
-    # 4. 規劃章節
+    # 3. 規劃章節
+    search_summary = "\n\n".join(all_results)
     plan = plan_report(topic, search_summary)
     logs.append({"step": "plan_report", "plan": plan})
-    # 5. 章節分段查詢/撰寫/評分/補充
+    # 4. 章節分段查詢/撰寫
     sections = parse_sections(plan)
     section_contents = []
     for section in sections:
-        # 多輪查詢與補充
         s_queries = []
         for sub in section["subtitles"]:
             sub_queries = section_queries(sub["subtitle"], sub["desc"])
@@ -283,8 +280,13 @@ def deep_research_pipeline(topic):
         s_results = []
         for q in s_queries:
             s_results.append(ddgs_search(q))
-        s_summary = auto_summarize("\n\n".join(s_results))
-        content = section_write(section["title"], "；".join([f"{sub['subtitle']}：{sub['desc']}" for sub in section["subtitles"]]), s_summary)
+        # 直接合併所有查詢結果（不要摘要）
+        search_results = "\n\n".join(s_results)
+        content = section_write(
+            section["title"],
+            "；".join([f"{sub['subtitle']}：{sub['desc']}" for sub in section["subtitles"]]),
+            search_results
+        )
         section_contents.append({
             "title": section["title"],
             "content": content
@@ -293,13 +295,13 @@ def deep_research_pipeline(topic):
             "step": "section",
             "section": section["title"],
             "queries": s_queries,
-            "summary": s_summary,
+            "search_results": search_results,
             "content": content
         })
-    # 6. 組合報告
+    # 5. 組合報告
     report = "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
     logs.append({"step": "combine_report", "report": report})
-    # 7. 反思流程（最多2次）
+    # 6. 反思流程（最多2次）
     for i in range(2):
         reflection = reflect_report(report)
         logs.append({"step": "reflection", "round": i+1, "reflection": reflection})
@@ -308,7 +310,7 @@ def deep_research_pipeline(topic):
         else:
             # 若需補充，可根據 reflection 產生新查詢與補充內容（可進一步自動化）
             pass
-    # 8. 結構化輸出
+    # 7. 結構化輸出
     output = {
         "topic": topic,
         "plan": plan,
@@ -317,7 +319,6 @@ def deep_research_pipeline(topic):
         "logs": logs
     }
     return output
-
 @tool
 def deep_research_pipeline_tool(topic: str):
     """
