@@ -8,10 +8,11 @@ from langchain_core.prompts import PromptTemplate
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 import inspect
-from typing import Callable, TypeVar
+from typing import Callable, TypeVar, List, Dict, Any
 import time
 import re
 import requests
+from openai import OpenAI
 
 st.set_page_config(
     page_title="Anya",
@@ -47,7 +48,234 @@ def ensure_llm():
 ensure_llm()
 
 # --- 3. 工具定義 ---
+# === OpenAI 初始化 ===
+client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
+# === Meta Prompting 工具 ===
+def meta_optimize_prompt(simple_prompt: str, goal: str) -> str:
+    meta_prompt = f"""
+    請優化以下 prompt，使其能更有效達成「{goal}」，並符合 prompt engineering 最佳實踐。
+    {simple_prompt}
+    只回傳優化後的 prompt。
+    """
+    response = client.chat.completions.create(
+        model="o4-mini",
+        messages=[{"role": "user", "content": meta_prompt}]
+    )
+    return response.choices[0].message.content.strip()
+
+# === 產生查詢（中英文） ===
+def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
+    simple_prompt = f"""請針對「{topic}」這個主題，分別用繁體中文與英文各產生三個適合用於網路搜尋的查詢關鍵字，並以如下 JSON 格式回覆：
+{{
+    "zh": ["查詢1", "查詢2", "查詢3"],
+    "en": ["query1", "query2", "query3"]
+}}
+"""
+    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且具針對性的查詢關鍵字")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": optimized_prompt}]
+    )
+    content = response.choices[0].message.content
+    try:
+        queries = json.loads(content)
+    except Exception:
+        import re
+        content = re.sub(r"[\u4e00-\u9fff]+：", "", content)
+        content = content.replace("'", '"')
+        queries = json.loads(content)
+    return queries["zh"] + queries["en"]
+
+# === 查詢摘要 ===
+def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
+    simple_prompt = f"請用繁體中文摘要以下內容，重點條列，100字內：\n{text}"
+    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生精簡且重點明確的摘要")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": optimized_prompt}]
+    )
+    return response.choices[0].message.content.strip()
+
+# === 報告規劃（推理模型） ===
+def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
+    simple_prompt = f"""你是一位專業技術寫手，請針對「{topic}」這個主題，根據以下網路搜尋摘要，規劃一份報告結構（包含章節標題與簡要說明），以繁體中文回覆。請用條列式，章節數量 3-5 個。
+搜尋摘要：
+{search_summaries}
+"""
+    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化且明確的報告章節規劃")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": optimized_prompt}]
+    )
+    return response.choices[0].message.content.strip()
+
+# === 解析章節（可用 LLM 或正則，這裡用簡單正則） ===
+def parse_sections(plan: str) -> List[Dict[str, str]]:
+    # 假設格式為：1. 標題：說明
+    pattern = r"\d+\.\s*([^\n：:]+)[：:]\s*([^\n]+)"
+    matches = re.findall(pattern, plan)
+    return [{"title": m[0].strip(), "desc": m[1].strip()} for m in matches]
+
+# === 章節查詢產生 ===
+def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini") -> List[str]:
+    simple_prompt = f"""針對章節「{section_title}」({section_desc})，請分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
+{{
+    "zh": ["查詢1", "查詢2"],
+    "en": ["query1", "query2"]
+}}
+"""
+    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且聚焦的章節查詢關鍵字")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": optimized_prompt}]
+    )
+    content = response.choices[0].message.content
+    try:
+        queries = json.loads(content)
+    except Exception:
+        import re
+        content = re.sub(r"[\u4e00-\u9fff]+：", "", content)
+        content = content.replace("'", '"')
+        queries = json.loads(content)
+    return queries["zh"] + queries["en"]
+
+# === 章節內容撰寫 ===
+def section_write(section_title: str, section_desc: str, search_summary: str, model="gpt-4.1-mini") -> str:
+    simple_prompt = f"""請根據章節「{section_title}」({section_desc})與以下搜尋摘要，撰寫 150-200 字內容，繁體中文，並在文末列出引用來源（markdown 格式）。
+搜尋摘要：
+{search_summary}
+"""
+    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化、具來源引用、條列清楚的章節內容")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": optimized_prompt}]
+    )
+    return response.choices[0].message.content.strip()
+
+# === 來源提取 ===
+def extract_sources(content: str) -> List[str]:
+    # 假設來源格式為 markdown link
+    return re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', content)
+
+# === 章節內容評分與補強建議 ===
+def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini") -> Dict[str, Any]:
+    simple_prompt = f"""請評分以下章節內容是否完整、正確、可讀性佳，若不及格請列出需補充的查詢關鍵字（中英文各一），回傳 JSON 格式：
+{{
+    "grade": "pass" 或 "fail",
+    "follow_up_queries": ["查詢1", "query2"]
+}}
+章節：{section_title}
+內容：
+{section_content}
+"""
+    optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹評分並產生具體補強建議")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": optimized_prompt}]
+    )
+    try:
+        return json.loads(response.choices[0].message.content)
+    except:
+        return {"grade": "pass", "follow_up_queries": []}
+
+# === 反思流程（最多2次） ===
+def reflect_report(report: str, model="o3-mini") -> str:
+    simple_prompt = f"""請檢查以下報告的邏輯、正確性與完整性，若有問題請列出需補充的章節與查詢關鍵字，否則回覆 "OK"。
+{report}
+"""
+    optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹檢查報告並產生具體補強建議")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": optimized_prompt}]
+    )
+    return response.choices[0].message.content.strip()
+
+# === 組合章節 ===
+def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
+    return "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
+
+# === 主流程（含推理鏈追蹤） ===
+def deep_research_pipeline(topic: str) -> Dict[str, Any]:
+    logs = []
+    # 1. 產生查詢
+    queries = generate_queries(topic)
+    logs.append({"step": "generate_queries", "queries": queries})
+    # 2. 查詢所有 query
+    all_results = []
+    for q in queries:
+        result = ddgs_search(q)
+        all_results.append({"query": q, "result": result})
+    logs.append({"step": "search", "results": all_results})
+    # 3. 自動摘要
+    all_text = "\n\n".join([r["result"] for r in all_results])
+    search_summary = auto_summarize(all_text)
+    logs.append({"step": "auto_summarize", "summary": search_summary})
+    # 4. 規劃章節
+    plan = plan_report(topic, search_summary)
+    logs.append({"step": "plan_report", "plan": plan})
+    # 5. 章節分段查詢/撰寫/評分/補充
+    sections = parse_sections(plan)
+    section_contents = []
+    for section in sections:
+        for round in range(2):  # 多輪查詢與補充，最多2輪
+            s_queries = section_queries(section["title"], section["desc"])
+            s_results = []
+            for q in s_queries:
+                s_results.append(ddgs_search(q))
+            s_summary = auto_summarize("\n\n".join(s_results))
+            content = section_write(section["title"], section["desc"], s_summary)
+            grade = section_grade(section["title"], content)
+            logs.append({
+                "step": "section",
+                "section": section["title"],
+                "round": round+1,
+                "queries": s_queries,
+                "summary": s_summary,
+                "content": content,
+                "grade": grade
+            })
+            if grade["grade"] == "pass":
+                sources = extract_sources(content)
+                section_contents.append({
+                    "title": section["title"],
+                    "desc": section["desc"],
+                    "content": content,
+                    "sources": sources
+                })
+                break
+            else:
+                # 若不及格，補充查詢
+                s_queries = grade["follow_up_queries"]
+    # 6. 組合報告
+    report = combine_sections(section_contents)
+    logs.append({"step": "combine_report", "report": report})
+    # 7. 反思流程（最多2次）
+    for i in range(2):
+        reflection = reflect_report(report)
+        logs.append({"step": "reflection", "round": i+1, "reflection": reflection})
+        if reflection.strip().upper() == "OK":
+            break
+        else:
+            # 若需補充，可根據 reflection 產生新查詢與補充內容（可進一步自動化）
+            pass
+    # 8. 結構化輸出
+    output = {
+        "topic": topic,
+        "plan": plan,
+        "sections": section_contents,
+        "report": report,
+        "logs": logs
+    }
+    return output
+
+@tool
+def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
+    """
+    針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
+    """
+    return deep_research_pipeline(topic)
+    
 @tool
 def ddgs_search(query: str) -> str:
     """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳 markdown 條列格式並附來源）。"""
@@ -173,17 +401,17 @@ ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 
 你可以根據下列情境，決定是否要調用工具：
 
 - `ddgs_search`：當用戶問到**最新時事、網路熱門話題、你不知道的知識、需要查證的資訊**時，請使用這個工具搜尋網路資料。
-- `deep_thought_tool`：當用戶要求**深入分析、邏輯推理、專業判斷、整理重點、摘要文章**時，請使用這個工具來產生詳細的推理與結論。
+- `deep_thought_tool`：當用戶要求**針對單一問題、單一主題或單篇文章**進行深入分析、邏輯推理、專業判斷、整理重點或摘要時，請使用這個工具來產生詳細的推理與結論。
 - `datetime_tool`：當用戶詢問**現在的日期、時間、今天是幾號**等問題時，請使用這個工具。
 - `get_webpage_answer`：當用戶提供網址要求**自動取得網頁內容並回答問題**等問題時，請使用這個工具。
-
+- `deep_research_pipeline_tool`：當用戶要求**針對某個主題產生完整、深入、有條理的研究報告**（例如：「請幫我做一份深度研究」、「請產生完整報告」、「我要一份有條理的深度分析」），就使用這個工具。
 **每次回應只可使用一個工具，必要時可多輪連續調用不同工具。**
 
 ---
 
 ## 工具內容與安妮亞回應的分段規則
 
-- 當你引用deep_thought_tool、get_webpage_answer的內容時，請**在工具內容與安妮亞自己的語氣回應之間，請加上一個空行或分隔線（如 `---`）**，再用安妮亞的語氣總結或解釋。
+- 當你引用deep_thought_tool、get_webpage_answer、deep_research_pipeline_tool的內容時，請**在工具內容與安妮亞自己的語氣回應之間，請加上一個空行或分隔線（如 `---`）**，再用安妮亞的語氣總結或解釋。
 
 ### deep_thought_tool顯示範例
 
@@ -345,12 +573,14 @@ def get_streamlit_cb(parent_container, status=None):
                     "deep_thought_tool": "🧠",
                     "datetime_tool": "⏰",
                     "get_webpage_answer": "📄",
+                    "deep_research_pipeline_tool": "📚",
                 }.get(tool_name, "🛠️")
                 tool_desc = {
                     "ddgs_search": "搜尋網路資料",
                     "deep_thought_tool": "深入分析資料",
                     "datetime_tool": "查詢時間",
                     "get_webpage_answer": "取得網頁重點",
+                    "deep_research_pipeline_tool": "產生深度研究報告",
                 }.get(tool_name, "執行工具")
                 self.status.update(label=f"安妮亞正在{tool_desc}...{tool_emoji}", state="running")
 
