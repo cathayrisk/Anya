@@ -14,6 +14,7 @@ import time
 import re
 import requests
 from openai import OpenAI
+import traceback
 
 st.set_page_config(
     page_title="Anya",
@@ -98,59 +99,106 @@ def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
     )
     return response.choices[0].message.content.strip()
 
-# === 報告規劃（推理模型） ===
-def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
-    simple_prompt = f"""你是一位專業技術寫手，請針對「{topic}」這個主題，根據以下網路搜尋摘要，規劃一份報告結構（包含章節標題與簡要說明），以繁體中文回覆。請用條列式，章節數量 3-5 個。
-搜尋摘要：
+# 2. 章節規劃（推理模型）
+def plan_report(topic, search_summaries, model="o4-mini"):
+    prompt = f"""Formatting re-enabled
+# Role and Objective
+你是一位專業技術寫手，目標是針對「{topic}」這個主題，根據下方搜尋摘要，規劃一份完整、深入、結構化的研究報告。
+
+# Instructions
+- 報告需包含5-7個章節，每章節需有明確標題。
+- 每個章節**必須包含2-4個小標題**（子議題），每個小標題下要有2-3句細節說明。
+- 小標題可涵蓋：產業現況、技術細節、國際比較、未來趨勢、挑戰、解決方案、案例、數據等。
+- 章節規劃要有邏輯順序，內容要有層次。
+- 請用繁體中文條列式回覆，格式如下：
+
+# Output Format
+1. 章節標題
+    - 小標題1：細節說明
+    - 小標題2：細節說明
+    - 小標題3：細節說明
+2. 章節標題
+    - 小標題1：細節說明
+    - 小標題2：細節說明
+    - 小標題3：細節說明
+...
+
+# 搜尋摘要
 {search_summaries}
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化且明確的報告章節規劃")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        reasoning={"effort": "medium", "summary": "auto"},
+        input=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content.strip()
+    return response.output_text
 
-# === 解析章節（可用 LLM 或正則，這裡用簡單正則） ===
-def parse_sections(plan: str) -> List[Dict[str, str]]:
-    # 假設格式為：1. 標題：說明
-    pattern = r"\d+\.\s*([^\n：:]+)[：:]\s*([^\n]+)"
-    matches = re.findall(pattern, plan)
-    return [{"title": m[0].strip(), "desc": m[1].strip()} for m in matches]
+# 3. 解析章節
+def parse_sections(plan: str):
+    section_pattern = r"\d+\.\s*([^\n]+)"
+    sub_pattern = r"-\s*([^\n：:]+)[：:]\s*([^\n]+)"
+    sections = []
+    section_blocks = re.split(r"\d+\.\s*", plan)[1:]
+    for block in section_blocks:
+        lines = block.strip().split("\n")
+        title = lines[0].strip()
+        subs = []
+        for line in lines[1:]:
+            m = re.match(sub_pattern, line.strip())
+            if m:
+                subs.append({"subtitle": m.group(1).strip(), "desc": m.group(2).strip()})
+        sections.append({"title": title, "subtitles": subs})
+    return sections
 
-# === 章節查詢產生 ===
-def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini") -> List[str]:
-    simple_prompt = f"""針對章節「{section_title}」({section_desc})，請分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
+# 4. 章節查詢產生
+def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
+    prompt = f"""請針對章節「{section_title}」({section_desc})，分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
 {{
     "zh": ["查詢1", "查詢2"],
     "en": ["query1", "query2"]
 }}
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且聚焦的章節查詢關鍵字")
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        messages=[{"role": "user", "content": prompt}]
     )
     content = response.choices[0].message.content
     try:
         queries = json.loads(content)
     except Exception:
-        import re
         content = re.sub(r"[\u4e00-\u9fff]+：", "", content)
         content = content.replace("'", '"')
         queries = json.loads(content)
     return queries["zh"] + queries["en"]
 
-# === 章節內容撰寫 ===
-def section_write(section_title: str, section_desc: str, search_summary: str, model="gpt-4.1-mini") -> str:
-    simple_prompt = f"""請根據章節「{section_title}」({section_desc})與以下搜尋摘要，撰寫 150-200 字內容，繁體中文，並在文末列出引用來源（markdown 格式）。
-搜尋摘要：
-{search_summary}
+# 5. 章節撰寫（直接用多筆查詢結果）
+def section_write(section_title, section_desc, search_results, model="gpt-4.1-mini"):
+    prompt = f"""
+# Role and Objective
+你是一位專業技術寫手，根據下方章節主題、說明與「多筆網路查詢結果」，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
+
+# Instructions
+- 內容需至少600字，並涵蓋：具體數據、真實案例、國際比較、產業現況、技術細節、未來趨勢、挑戰與解決方案。
+- 必須根據下方每一筆查詢結果，整合出完整內容。
+- 每個小標題下必須有2-3段具體說明。
+- 條列重點只能放在章節結尾，正文必須是完整段落。
+- 文末請用「## 來源」列出所有引用來源（Markdown格式），來源必須來自下方查詢結果。
+- 請勿省略細節，若有多個觀點請分段說明。
+- 請勿重複內容，避免空泛敘述。
+- 請用繁體中文撰寫。
+
+# 章節主題
+{section_title}
+
+# 章節說明
+{section_desc}
+
+# 多筆查詢結果（每筆都要參考）
+{search_results}
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化、具來源引用、條列清楚的章節內容")
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
 
@@ -180,102 +228,158 @@ def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini"
     except:
         return {"grade": "pass", "follow_up_queries": []}
 
-# === 反思流程（最多2次） ===
-def reflect_report(report: str, model="o4-mini") -> str:
-    simple_prompt = f"""請檢查以下報告的邏輯、正確性與完整性，若有問題請列出需補充的章節與查詢關鍵字，否則回覆 "OK"。
+# 6. 反思流程（推理模型）
+def reflect_report(report: str, model="o4-mini"):
+    prompt = f"""Formatting re-enabled
+# Role and Objective
+你是一位專業審稿人，目標是檢查下方報告的邏輯、正確性、完整性與內容豐富度。
+
+# Instructions
+- 請逐一檢查每個章節是否有小標題，且每個小標題下是否有2-3句具體細節說明。
+- 檢查內容是否涵蓋數據、案例、國際觀點、技術細節、未來趨勢等豐富面向。
+- 檢查是否有明確引用來源。
+- 若有內容過於簡略、遺漏重要面向，請明確指出需補充的章節、小標題與建議查詢關鍵字。
+- 若內容已足夠豐富且無明顯遺漏，請回覆 "OK"。
+- 請用繁體中文回覆。
+
+# 報告內容
 {report}
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹檢查報告並產生具體補強建議")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        reasoning={"effort": "medium", "summary": "auto"},
+        input=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content.strip()
+    return response.output_text
 
 # === 組合章節 ===
 def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
     return "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
 
 # === 主流程（含推理鏈追蹤） ===
-def deep_research_pipeline(topic: str) -> Dict[str, Any]:
+def deep_research_pipeline(topic):
     logs = []
-    # 1. 產生查詢
-    queries = generate_queries(topic)
-    logs.append({"step": "generate_queries", "queries": queries})
-    # 2. 查詢所有 query
-    all_results = []
-    for q in queries:
-        result = ddgs_search(q)
-        all_results.append({"query": q, "result": result})
-    logs.append({"step": "search", "results": all_results})
-    # 3. 自動摘要
-    all_text = "\n\n".join([r["result"] for r in all_results])
-    search_summary = auto_summarize(all_text)
-    logs.append({"step": "auto_summarize", "summary": search_summary})
-    # 4. 規劃章節
-    plan = plan_report(topic, search_summary)
-    logs.append({"step": "plan_report", "plan": plan})
-    # 5. 章節分段查詢/撰寫/評分/補充
-    sections = parse_sections(plan)
-    section_contents = []
-    for section in sections:
-        for round in range(2):  # 多輪查詢與補充，最多2輪
-            s_queries = section_queries(section["title"], section["desc"])
-            s_results = []
-            for q in s_queries:
-                s_results.append(ddgs_search(q))
-            s_summary = auto_summarize("\n\n".join(s_results))
-            content = section_write(section["title"], section["desc"], s_summary)
-            grade = section_grade(section["title"], content)
-            logs.append({
-                "step": "section",
-                "section": section["title"],
-                "round": round+1,
-                "queries": s_queries,
-                "summary": s_summary,
-                "content": content,
-                "grade": grade
-            })
-            if grade["grade"] == "pass":
-                sources = extract_sources(content)
+    try:
+        # 1. 產生查詢
+        try:
+            queries = section_queries(topic, topic)
+            logs.append({"step": "generate_queries", "queries": queries})
+        except Exception as e:
+            logs.append({"step": "generate_queries", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "產生查詢失敗", "logs": logs}
+
+        # 2. 查詢所有 query
+        all_results = []
+        try:
+            for q in queries:
+                try:
+                    result = ddgs_search(q)
+                    all_results.append(result)
+                except Exception as e:
+                    logs.append({"step": "search", "query": q, "error": str(e), "traceback": traceback.format_exc()})
+                    all_results.append(f"查詢失敗: {q}")
+            logs.append({"step": "search", "results": all_results})
+        except Exception as e:
+            logs.append({"step": "search", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "查詢失敗", "logs": logs}
+
+        # 3. 規劃章節
+        try:
+            search_summary = "\n\n".join(all_results)
+            plan = plan_report(topic, search_summary)
+            logs.append({"step": "plan_report", "plan": plan})
+        except Exception as e:
+            logs.append({"step": "plan_report", "error": str(e), "traceback": traceback.format_exc(), "search_summary": search_summary})
+            return {"error": "章節規劃失敗", "logs": logs}
+
+        # 4. 章節分段查詢/撰寫
+        try:
+            sections = parse_sections(plan)
+            section_contents = []
+            for section in sections:
+                s_queries = []
+                for sub in section["subtitles"]:
+                    try:
+                        sub_queries = section_queries(sub["subtitle"], sub["desc"])
+                        s_queries.extend(sub_queries)
+                    except Exception as e:
+                        logs.append({"step": "section_queries", "subtitle": sub["subtitle"], "desc": sub["desc"], "error": str(e), "traceback": traceback.format_exc()})
+                s_results = []
+                for q in s_queries:
+                    try:
+                        s_results.append(ddgs_search(q))
+                    except Exception as e:
+                        logs.append({"step": "section_search", "query": q, "error": str(e), "traceback": traceback.format_exc()})
+                        s_results.append(f"查詢失敗: {q}")
+                search_results = "\n\n".join(s_results)
+                try:
+                    content = section_write(
+                        section["title"],
+                        "；".join([f"{sub['subtitle']}：{sub['desc']}" for sub in section["subtitles"]]),
+                        search_results
+                    )
+                except Exception as e:
+                    logs.append({"step": "section_write", "section": section["title"], "error": str(e), "traceback": traceback.format_exc(), "search_results": search_results})
+                    content = f"章節內容產生失敗: {section['title']}"
                 section_contents.append({
                     "title": section["title"],
-                    "desc": section["desc"],
-                    "content": content,
-                    "sources": sources
+                    "content": content
                 })
-                break
-            else:
-                # 若不及格，補充查詢
-                s_queries = grade["follow_up_queries"]
-    # 6. 組合報告
-    report = combine_sections(section_contents)
-    logs.append({"step": "combine_report", "report": report})
-    # 7. 反思流程（最多2次）
-    for i in range(2):
-        reflection = reflect_report(report)
-        logs.append({"step": "reflection", "round": i+1, "reflection": reflection})
-        if reflection.strip().upper() == "OK":
-            break
-        else:
-            # 若需補充，可根據 reflection 產生新查詢與補充內容（可進一步自動化）
-            pass
-    # 8. 結構化輸出
-    output = {
-        "topic": topic,
-        "plan": plan,
-        "sections": section_contents,
-        "report": report,
-        "logs": logs
-    }
-    return output
+                logs.append({
+                    "step": "section",
+                    "section": section["title"],
+                    "queries": s_queries,
+                    "search_results": search_results,
+                    "content": content
+                })
+        except Exception as e:
+            logs.append({"step": "section_loop", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "章節分段查詢/撰寫失敗", "logs": logs}
 
+        # 5. 組合報告
+        try:
+            report = "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
+            logs.append({"step": "combine_report", "report": report})
+        except Exception as e:
+            logs.append({"step": "combine_report", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "組合報告失敗", "logs": logs}
+
+        # 6. 反思流程（最多2次）
+        for i in range(2):
+            try:
+                reflection = reflect_report(report)
+                logs.append({"step": "reflection", "round": i+1, "reflection": reflection})
+                if reflection.strip().upper() == "OK":
+                    break
+                else:
+                    # 若需補充，可根據 reflection 產生新查詢與補充內容（可進一步自動化）
+                    pass
+            except Exception as e:
+                logs.append({"step": "reflection", "round": i+1, "error": str(e), "traceback": traceback.format_exc()})
+                break
+
+        # 7. 結構化輸出
+        output = {
+            "topic": topic,
+            "plan": plan,
+            "sections": section_contents,
+            "report": report,
+            "logs": logs
+        }
+        return output
+
+    except Exception as e:
+        logs.append({"step": "pipeline_outer", "error": str(e), "traceback": traceback.format_exc()})
+        return {"error": "pipeline_outer_error", "logs": logs}
 @tool
 def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
     """
     針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
     """
-    return deep_research_pipeline(topic)
+    try:
+        return deep_research_pipeline(topic)
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
     
 @tool
 def ddgs_search(query: str) -> str:
