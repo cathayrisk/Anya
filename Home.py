@@ -256,69 +256,118 @@ def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
 # 7. 主流程
 def deep_research_pipeline(topic):
     logs = []
-    # 1. 產生查詢
-    queries = section_queries(topic, topic)
-    logs.append({"step": "generate_queries", "queries": queries})
-    # 2. 查詢所有 query
-    all_results = []
-    for q in queries:
-        result = ddgs_search(q)
-        all_results.append(result)
-    logs.append({"step": "search", "results": all_results})
-    # 3. 規劃章節
-    search_summary = "\n\n".join(all_results)
-    plan = plan_report(topic, search_summary)
-    logs.append({"step": "plan_report", "plan": plan})
-    # 4. 章節分段查詢/撰寫
-    sections = parse_sections(plan)
-    section_contents = []
-    for section in sections:
-        s_queries = []
-        for sub in section["subtitles"]:
-            sub_queries = section_queries(sub["subtitle"], sub["desc"])
-            s_queries.extend(sub_queries)
-        s_results = []
-        for q in s_queries:
-            s_results.append(ddgs_search(q))
-        # 直接合併所有查詢結果（不要摘要）
-        search_results = "\n\n".join(s_results)
-        content = section_write(
-            section["title"],
-            "；".join([f"{sub['subtitle']}：{sub['desc']}" for sub in section["subtitles"]]),
-            search_results
-        )
-        section_contents.append({
-            "title": section["title"],
-            "content": content
-        })
-        logs.append({
-            "step": "section",
-            "section": section["title"],
-            "queries": s_queries,
-            "search_results": search_results,
-            "content": content
-        })
-    # 5. 組合報告
-    report = "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
-    logs.append({"step": "combine_report", "report": report})
-    # 6. 反思流程（最多2次）
-    for i in range(2):
-        reflection = reflect_report(report)
-        logs.append({"step": "reflection", "round": i+1, "reflection": reflection})
-        if reflection.strip().upper() == "OK":
-            break
-        else:
-            # 若需補充，可根據 reflection 產生新查詢與補充內容（可進一步自動化）
-            pass
-    # 7. 結構化輸出
-    output = {
-        "topic": topic,
-        "plan": plan,
-        "sections": section_contents,
-        "report": report,
-        "logs": logs
-    }
-    return output
+    try:
+        # 1. 產生查詢
+        try:
+            queries = section_queries(topic, topic)
+            logs.append({"step": "generate_queries", "queries": queries})
+        except Exception as e:
+            logs.append({"step": "generate_queries", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "產生查詢失敗", "logs": logs}
+
+        # 2. 查詢所有 query
+        all_results = []
+        try:
+            for q in queries:
+                try:
+                    result = ddgs_search(q)
+                    all_results.append(result)
+                except Exception as e:
+                    logs.append({"step": "search", "query": q, "error": str(e), "traceback": traceback.format_exc()})
+                    all_results.append(f"查詢失敗: {q}")
+            logs.append({"step": "search", "results": all_results})
+        except Exception as e:
+            logs.append({"step": "search", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "查詢失敗", "logs": logs}
+
+        # 3. 規劃章節
+        try:
+            search_summary = "\n\n".join(all_results)
+            plan = plan_report(topic, search_summary)
+            logs.append({"step": "plan_report", "plan": plan})
+        except Exception as e:
+            logs.append({"step": "plan_report", "error": str(e), "traceback": traceback.format_exc(), "search_summary": search_summary})
+            return {"error": "章節規劃失敗", "logs": logs}
+
+        # 4. 章節分段查詢/撰寫
+        try:
+            sections = parse_sections(plan)
+            section_contents = []
+            for section in sections:
+                s_queries = []
+                for sub in section["subtitles"]:
+                    try:
+                        sub_queries = section_queries(sub["subtitle"], sub["desc"])
+                        s_queries.extend(sub_queries)
+                    except Exception as e:
+                        logs.append({"step": "section_queries", "subtitle": sub["subtitle"], "desc": sub["desc"], "error": str(e), "traceback": traceback.format_exc()})
+                s_results = []
+                for q in s_queries:
+                    try:
+                        s_results.append(ddgs_search(q))
+                    except Exception as e:
+                        logs.append({"step": "section_search", "query": q, "error": str(e), "traceback": traceback.format_exc()})
+                        s_results.append(f"查詢失敗: {q}")
+                search_results = "\n\n".join(s_results)
+                try:
+                    content = section_write(
+                        section["title"],
+                        "；".join([f"{sub['subtitle']}：{sub['desc']}" for sub in section["subtitles"]]),
+                        search_results
+                    )
+                except Exception as e:
+                    logs.append({"step": "section_write", "section": section["title"], "error": str(e), "traceback": traceback.format_exc(), "search_results": search_results})
+                    content = f"章節內容產生失敗: {section['title']}"
+                section_contents.append({
+                    "title": section["title"],
+                    "content": content
+                })
+                logs.append({
+                    "step": "section",
+                    "section": section["title"],
+                    "queries": s_queries,
+                    "search_results": search_results,
+                    "content": content
+                })
+        except Exception as e:
+            logs.append({"step": "section_loop", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "章節分段查詢/撰寫失敗", "logs": logs}
+
+        # 5. 組合報告
+        try:
+            report = "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
+            logs.append({"step": "combine_report", "report": report})
+        except Exception as e:
+            logs.append({"step": "combine_report", "error": str(e), "traceback": traceback.format_exc()})
+            return {"error": "組合報告失敗", "logs": logs}
+
+        # 6. 反思流程（最多2次）
+        for i in range(2):
+            try:
+                reflection = reflect_report(report)
+                logs.append({"step": "reflection", "round": i+1, "reflection": reflection})
+                if reflection.strip().upper() == "OK":
+                    break
+                else:
+                    # 若需補充，可根據 reflection 產生新查詢與補充內容（可進一步自動化）
+                    pass
+            except Exception as e:
+                logs.append({"step": "reflection", "round": i+1, "error": str(e), "traceback": traceback.format_exc()})
+                break
+
+        # 7. 結構化輸出
+        output = {
+            "topic": topic,
+            "plan": plan,
+            "sections": section_contents,
+            "report": report,
+            "logs": logs
+        }
+        return output
+
+    except Exception as e:
+        logs.append({"step": "pipeline_outer", "error": str(e), "traceback": traceback.format_exc()})
+        return {"error": "pipeline_outer_error", "logs": logs}
 
 @tool
 def deep_research_pipeline_tool(topic: str):
