@@ -88,28 +88,39 @@ def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
     return queries["zh"] + queries["en"]
 
 # === 查詢摘要 ===
-def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
-    simple_prompt = f"請用繁體中文摘要以下內容，重點條列，100字內：\n{text}"
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生精簡且重點明確的摘要")
+def auto_summarize(text: str, model="gpt-4.1-mini"):
+    prompt = f"請用繁體中文摘要以下內容，重點條列，200字內：\n{text}"
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
 
 # === 報告規劃（推理模型） ===
-def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
-    simple_prompt = f"""你是一位專業技術寫手，請針對「{topic}」這個主題，根據以下網路搜尋摘要，規劃一份報告結構（包含章節標題與簡要說明），以繁體中文回覆。請用條列式，章節數量 3-5 個。
-搜尋摘要：
+def plan_report(topic, search_summaries, model="o4-mini"):
+    prompt = f"""
+# Role and Objective
+你是一位專業報告寫手，目標是針對「{topic}」這個主題，根據下方搜尋摘要，規劃一份完整、深入、結構化的研究報告。
+
+# Instructions
+- 報告需包含5-7個章節，每章節需有明確標題與詳細說明。
+- 每章節需涵蓋：產業現況、技術細節、國際比較、未來趨勢、挑戰與解決方案等面向。
+- 章節規劃要有邏輯順序，內容要有層次。
+- 請用繁體中文條列式回覆。
+
+# 搜尋摘要
 {search_summaries}
+
+# Output Format
+1. 章節標題：章節說明
+2. 章節標題：章節說明
+...
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化且明確的報告章節規劃")
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
-
 # === 解析章節（可用 LLM 或正則，這裡用簡單正則） ===
 def parse_sections(plan: str) -> List[Dict[str, str]]:
     # 假設格式為：1. 標題：說明
@@ -118,17 +129,16 @@ def parse_sections(plan: str) -> List[Dict[str, str]]:
     return [{"title": m[0].strip(), "desc": m[1].strip()} for m in matches]
 
 # === 章節查詢產生 ===
-def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini") -> List[str]:
-    simple_prompt = f"""針對章節「{section_title}」({section_desc})，請分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
+def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
+    prompt = f"""請針對章節「{section_title}」({section_desc})，分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
 {{
     "zh": ["查詢1", "查詢2"],
     "en": ["query1", "query2"]
 }}
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且聚焦的章節查詢關鍵字")
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        messages=[{"role": "user", "content": prompt}]
     )
     content = response.choices[0].message.content
     try:
@@ -141,15 +151,54 @@ def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini")
     return queries["zh"] + queries["en"]
 
 # === 章節內容撰寫 ===
-def section_write(section_title: str, section_desc: str, search_summary: str, model="gpt-4.1-mini") -> str:
-    simple_prompt = f"""請根據章節「{section_title}」({section_desc})與以下搜尋摘要，撰寫 150-200 字內容，繁體中文，並在文末列出引用來源（markdown 格式）。
-搜尋摘要：
+def section_write(section_title, section_desc, search_summary, model="gpt-4.1-mini"):
+    prompt = f"""
+# Role and Objective
+你是一位專業報告寫手，目標是根據下方章節主題與摘要，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
+
+# Instructions
+- 內容需至少400字，並涵蓋：具體數據、案例、國際比較、產業現況、技術細節、未來趨勢、挑戰與解決方案。
+- 章節內容需有明確小標題（Markdown格式），每個小標題下要有2-3段說明。
+- 章節結尾請用條列式列出3-5個重點。
+- 文末請用「## 來源」列出所有引用來源（Markdown格式）。
+- 請勿省略細節，若有多個觀點請分段說明。
+- 請勿重複內容，避免空泛敘述。
+- 請用繁體中文撰寫。
+
+# Reasoning Steps
+1. 先分析章節主題與摘要，規劃內容架構。
+2. 依據摘要與外部知識，逐步撰寫每個小標題下的內容。
+3. 條列重點，並整理所有引用來源。
+
+# 章節主題
+{section_title}
+
+# 章節說明
+{section_desc}
+
+# 搜尋摘要
 {search_summary}
+
+# Output Format
+## 小標題1
+段落內容...
+
+## 小標題2
+段落內容...
+
+...
+
+- 重點1
+- 重點2
+- 重點3
+
+## 來源
+- [來源標題](來源網址)
+- ...
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化、具來源引用、條列清楚的章節內容")
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
 
