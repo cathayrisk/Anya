@@ -87,16 +87,7 @@ def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
         queries = json.loads(content)
     return queries["zh"] + queries["en"]
 
-# === 查詢摘要 ===
-def auto_summarize(text: str, model="gpt-4.1-mini"):
-    prompt = f"請用繁體中文摘要以下內容，重點條列，200字內：\n{text}"
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content.strip()
-
-# === 報告規劃（推理模型） ===
+# 2. 章節規劃（推理模型）
 def plan_report(topic, search_summaries, model="o4-mini"):
     prompt = f"""Formatting re-enabled
 # Role and Objective
@@ -130,14 +121,25 @@ def plan_report(topic, search_summaries, model="o4-mini"):
     )
     return response.output_text
     
-# === 解析章節（可用 LLM 或正則，這裡用簡單正則） ===
-def parse_sections(plan: str) -> List[Dict[str, str]]:
-    # 假設格式為：1. 標題：說明
-    pattern = r"\d+\.\s*([^\n：:]+)[：:]\s*([^\n]+)"
-    matches = re.findall(pattern, plan)
-    return [{"title": m[0].strip(), "desc": m[1].strip()} for m in matches]
+# 3. 解析章節（正則）
+def parse_sections(plan: str):
+    # 解析格式：1. 章節標題\n    - 小標題1：細節說明
+    section_pattern = r"\d+\.\s*([^\n]+)"
+    sub_pattern = r"-\s*([^\n：:]+)[：:]\s*([^\n]+)"
+    sections = []
+    section_blocks = re.split(r"\d+\.\s*", plan)[1:]
+    for block in section_blocks:
+        lines = block.strip().split("\n")
+        title = lines[0].strip()
+        subs = []
+        for line in lines[1:]:
+            m = re.match(sub_pattern, line.strip())
+            if m:
+                subs.append({"subtitle": m.group(1).strip(), "desc": m.group(2).strip()})
+        sections.append({"title": title, "subtitles": subs})
+    return sections
 
-# === 章節查詢產生 ===
+# 4. 章節查詢產生
 def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
     prompt = f"""請針對章節「{section_title}」({section_desc})，分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
 {{
@@ -159,37 +161,29 @@ def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
         queries = json.loads(content)
     return queries["zh"] + queries["en"]
 
-# === 章節內容撰寫 ===
+# 5. 查詢摘要
+def auto_summarize(text: str, model="gpt-4.1-mini"):
+    prompt = f"請用繁體中文摘要以下內容，重點條列，200字內：\n{text}"
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content.strip()
+
+# 6. 章節撰寫（明確要求引用來源、細節）
 def section_write(section_title, section_desc, search_summary, model="gpt-4.1-mini"):
     prompt = f"""
 # Role and Objective
-你是一位專業技術寫手，目標是根據下方章節主題與摘要，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
+你是一位專業技術寫手，根據下方章節主題、說明與搜尋摘要，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
 
 # Instructions
 - 內容需至少600字，並涵蓋：具體數據、真實案例、國際比較、產業現況、技術細節、未來趨勢、挑戰與解決方案。
-- 每個小標題下**必須有2-3段具體說明**，每段至少80字。
+- 每個小標題下必須有2-3段具體說明。
 - 條列重點只能放在章節結尾，正文必須是完整段落。
 - 文末請用「## 來源」列出所有引用來源（Markdown格式）。
 - 請勿省略細節，若有多個觀點請分段說明。
 - 請勿重複內容，避免空泛敘述。
 - 請用繁體中文撰寫。
-
-# Example
-## 醫療影像輔助診斷
-醫療影像分析是AI在醫療應用中最成熟的領域之一。以肺癌篩檢為例，AI模型能夠自動辨識X光片上的微小結節，協助醫師早期發現病灶。根據2022年美國放射學會的研究，AI輔助診斷系統將漏診率降低了25%，大幅提升診斷準確度。
-
-除了肺癌，AI也廣泛應用於乳癌、腦部腫瘤等影像判讀。以台大醫院為例，2023年導入AI判讀乳房攝影，發現可疑病灶的靈敏度提升至92%。此外，AI還能協助分流病患，讓急重症個案優先處理，提升醫療資源分配效率。
-
-國際上，英國NHS、韓國首爾大學醫院等也積極推動AI影像診斷，並結合雲端平台進行跨院資料共享。未來，隨著多模態影像與臨床資料整合，AI將能提供更全面的診斷建議。
-
-- AI輔助診斷提升準確率
-- 可協助分流與資源分配
-- 國際間積極導入AI影像系統
-
-## 來源
-- [Radiological Society of North America](https://www.rsna.org/)
-- [台大醫院AI醫療專案](https://www.ntuh.gov.tw/)
-- [NHS AI in Health and Care](https://www.nhsx.nhs.uk/)
 
 # 章節主題
 {section_title}
@@ -232,7 +226,7 @@ def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini"
     except:
         return {"grade": "pass", "follow_up_queries": []}
 
-# === 反思流程（最多2次） ===
+# 7. 反思流程（推理模型）
 def reflect_report(report: str, model="o4-mini"):
     prompt = f"""Formatting re-enabled
 # Role and Objective
@@ -259,20 +253,19 @@ def reflect_report(report: str, model="o4-mini"):
 def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
     return "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
 
-# === 主流程（含推理鏈追蹤） ===
-def deep_research_pipeline(topic: str) -> Dict[str, Any]:
+def deep_research_pipeline(topic):
     logs = []
     # 1. 產生查詢
-    queries = generate_queries(topic)
+    queries = section_queries(topic, topic)
     logs.append({"step": "generate_queries", "queries": queries})
     # 2. 查詢所有 query
     all_results = []
     for q in queries:
         result = ddgs_search(q)
-        all_results.append({"query": q, "result": result})
+        all_results.append(result)
     logs.append({"step": "search", "results": all_results})
     # 3. 自動摘要
-    all_text = "\n\n".join([r["result"] for r in all_results])
+    all_text = "\n\n".join(all_results)
     search_summary = auto_summarize(all_text)
     logs.append({"step": "auto_summarize", "summary": search_summary})
     # 4. 規劃章節
@@ -282,37 +275,29 @@ def deep_research_pipeline(topic: str) -> Dict[str, Any]:
     sections = parse_sections(plan)
     section_contents = []
     for section in sections:
-        for round in range(2):  # 多輪查詢與補充，最多2輪
-            s_queries = section_queries(section["title"], section["desc"])
-            s_results = []
-            for q in s_queries:
-                s_results.append(ddgs_search(q))
-            s_summary = auto_summarize("\n\n".join(s_results))
-            content = section_write(section["title"], section["desc"], s_summary)
-            grade = section_grade(section["title"], content)
-            logs.append({
-                "step": "section",
-                "section": section["title"],
-                "round": round+1,
-                "queries": s_queries,
-                "summary": s_summary,
-                "content": content,
-                "grade": grade
-            })
-            if grade["grade"] == "pass":
-                sources = extract_sources(content)
-                section_contents.append({
-                    "title": section["title"],
-                    "desc": section["desc"],
-                    "content": content,
-                    "sources": sources
-                })
-                break
-            else:
-                # 若不及格，補充查詢
-                s_queries = grade["follow_up_queries"]
+        # 多輪查詢與補充
+        s_queries = []
+        for sub in section["subtitles"]:
+            sub_queries = section_queries(sub["subtitle"], sub["desc"])
+            s_queries.extend(sub_queries)
+        s_results = []
+        for q in s_queries:
+            s_results.append(ddgs_search(q))
+        s_summary = auto_summarize("\n\n".join(s_results))
+        content = section_write(section["title"], "；".join([f"{sub['subtitle']}：{sub['desc']}" for sub in section["subtitles"]]), s_summary)
+        section_contents.append({
+            "title": section["title"],
+            "content": content
+        })
+        logs.append({
+            "step": "section",
+            "section": section["title"],
+            "queries": s_queries,
+            "summary": s_summary,
+            "content": content
+        })
     # 6. 組合報告
-    report = combine_sections(section_contents)
+    report = "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
     logs.append({"step": "combine_report", "report": report})
     # 7. 反思流程（最多2次）
     for i in range(2):
@@ -334,7 +319,7 @@ def deep_research_pipeline(topic: str) -> Dict[str, Any]:
     return output
 
 @tool
-def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
+def deep_research_pipeline_tool(topic: str):
     """
     針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
     """
