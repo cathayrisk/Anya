@@ -10,6 +10,8 @@ from langgraph.prebuilt import ToolNode, tools_condition
 import inspect
 from typing import Callable, TypeVar
 import time
+import re
+import requests
 
 st.set_page_config(
     page_title="Anya",
@@ -117,7 +119,44 @@ def deep_thought_tool(content: str) -> str:
     except Exception as e:
         return f"deep_thought_tool error: {e}"
 
-tools = [ddgs_search, deep_thought_tool, datetime_tool]
+@tool
+def get_webpage_answer(query: str) -> str:
+    """
+    根據用戶的問題與網址，自動取得網頁內容並回答問題。
+    請輸入格式如：「請幫我總結 https://example.com 這篇文章的重點」
+    """
+    # 1. 抽取網址與問題
+    url_match = re.search(r'(https?://[^\s]+)', query)
+    url = url_match.group(1) if url_match else None
+    question = query.replace(url, '').strip() if url else query
+    if not url:
+        return "未偵測到網址，請提供正確的網址。"
+    # 2. 取得 Jina Reader 內容
+    jina_url = f"https://r.jina.ai/{url}"
+    try:
+        resp = requests.get(jina_url, timeout=15)
+        if resp.status_code != 200:
+            return "無法取得網頁內容，請確認網址是否正確。"
+        content = resp.text
+    except Exception as e:
+        return f"取得網頁內容時發生錯誤：{e}"
+    # 3. 直接在這裡初始化 LLM
+    try:
+        llmurl = ChatOpenAI(
+            openai_api_key=st.secrets["OPENAI_KEY"],  # 或用os.environ["OPENAI_API_KEY"]
+            model="gpt-4.1-mini",  # 你可以根據需求選擇模型
+            streaming=False,
+        )
+        prompt = f"""請根據以下網頁內容，針對問題「{question}」以條列式摘要重點，並用正體中文回答：
+
+{content}
+"""
+        result = llmurl.invoke(prompt)
+        return str(result)
+    except Exception as e:
+        return f"AI 回答時發生錯誤：{e}"
+
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer]
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
@@ -136,6 +175,7 @@ ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 
 - `ddgs_search`：當用戶問到**最新時事、網路熱門話題、你不知道的知識、需要查證的資訊**時，請使用這個工具搜尋網路資料。
 - `deep_thought_tool`：當用戶要求**深入分析、邏輯推理、專業判斷、整理重點、摘要文章**時，請使用這個工具來產生詳細的推理與結論。
 - `datetime_tool`：當用戶詢問**現在的日期、時間、今天是幾號**等問題時，請使用這個工具。
+- `get_webpage_answer`：當用戶提供網址要求**自動取得網頁內容並回答問題**等問題時，請使用這個工具。
 
 **每次回應只可使用一個工具，必要時可多輪連續調用不同工具。**
 
@@ -143,7 +183,7 @@ ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 
 
 ## 工具內容與安妮亞回應的分段規則
 
-- 當你引用deep_thought_tool的內容時，請**在工具內容與安妮亞自己的語氣回應之間，請加上一個空行或分隔線（如 `---`）**，再用安妮亞的語氣總結或解釋。
+- 當你引用deep_thought_tool、get_webpage_answer的內容時，請**在工具內容與安妮亞自己的語氣回應之間，請加上一個空行或分隔線（如 `---`）**，再用安妮亞的語氣總結或解釋。
 
 ### deep_thought_tool顯示範例
 
@@ -303,12 +343,14 @@ def get_streamlit_cb(parent_container, status=None):
                 tool_emoji = {
                     "ddgs_search": "🔍",
                     "deep_thought_tool": "🧠",
-                    "datetime_tool": "⏰"
+                    "datetime_tool": "⏰",
+                    "get_webpage_answer": "📄",
                 }.get(tool_name, "🛠️")
                 tool_desc = {
                     "ddgs_search": "搜尋網路資料",
                     "deep_thought_tool": "深入分析資料",
-                    "datetime_tool": "查詢時間"
+                    "datetime_tool": "查詢時間",
+                    "get_webpage_answer": "取得網頁重點",
                 }.get(tool_name, "執行工具")
                 self.status.update(label=f"安妮亞正在{tool_desc}...{tool_emoji}", state="running")
 
