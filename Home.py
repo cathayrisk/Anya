@@ -385,7 +385,7 @@ def get_webpage_answer(query: str) -> str:
     except Exception as e:
         return f"AI 回答時發生錯誤：{e}"
 
-tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer]
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, deep_research_pipeline_tool]
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
