@@ -98,29 +98,38 @@ def auto_summarize(text: str, model="gpt-4.1-mini"):
 
 # === 報告規劃（推理模型） ===
 def plan_report(topic, search_summaries, model="o4-mini"):
-    prompt = f"""
+    prompt = f"""Formatting re-enabled
 # Role and Objective
-你是一位專業報告寫手，目標是針對「{topic}」這個主題，根據下方搜尋摘要，規劃一份完整、深入、結構化的研究報告。
+你是一位專業技術寫手，目標是針對「{topic}」這個主題，根據下方搜尋摘要，規劃一份完整、深入、結構化的研究報告。
 
 # Instructions
-- 報告需包含5-7個章節，每章節需有明確標題與詳細說明。
-- 每章節需涵蓋：產業現況、技術細節、國際比較、未來趨勢、挑戰與解決方案等面向。
+- 報告需包含5-7個章節，每章節需有明確標題。
+- 每個章節**必須包含2-4個小標題**（子議題），每個小標題下要有2-3句細節說明。
+- 小標題可涵蓋：產業現況、技術細節、國際比較、未來趨勢、挑戰、解決方案、案例、數據等。
 - 章節規劃要有邏輯順序，內容要有層次。
-- 請用繁體中文條列式回覆。
+- 請用繁體中文條列式回覆，格式如下：
+
+# Output Format
+1. 章節標題
+    - 小標題1：細節說明
+    - 小標題2：細節說明
+    - 小標題3：細節說明
+2. 章節標題
+    - 小標題1：細節說明
+    - 小標題2：細節說明
+    - 小標題3：細節說明
+...
 
 # 搜尋摘要
 {search_summaries}
-
-# Output Format
-1. 章節標題：章節說明
-2. 章節標題：章節說明
-...
 """
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
-        messages=[{"role": "user", "content": prompt}]
+        reasoning={"effort": "medium", "summary": "auto"},
+        input=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content.strip()
+    return response.output_text
+    
 # === 解析章節（可用 LLM 或正則，這裡用簡單正則） ===
 def parse_sections(plan: str) -> List[Dict[str, str]]:
     # 假設格式為：1. 標題：說明
@@ -154,21 +163,33 @@ def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
 def section_write(section_title, section_desc, search_summary, model="gpt-4.1-mini"):
     prompt = f"""
 # Role and Objective
-你是一位專業報告寫手，目標是根據下方章節主題與摘要，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
+你是一位專業技術寫手，目標是根據下方章節主題與摘要，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
 
 # Instructions
-- 內容需至少400字，並涵蓋：具體數據、案例、國際比較、產業現況、技術細節、未來趨勢、挑戰與解決方案。
-- 章節內容需有明確小標題（Markdown格式），每個小標題下要有2-3段說明。
-- 章節結尾請用條列式列出3-5個重點。
+- 內容需至少600字，並涵蓋：具體數據、真實案例、國際比較、產業現況、技術細節、未來趨勢、挑戰與解決方案。
+- 每個小標題下**必須有2-3段具體說明**，每段至少80字。
+- 條列重點只能放在章節結尾，正文必須是完整段落。
 - 文末請用「## 來源」列出所有引用來源（Markdown格式）。
 - 請勿省略細節，若有多個觀點請分段說明。
 - 請勿重複內容，避免空泛敘述。
 - 請用繁體中文撰寫。
 
-# Reasoning Steps
-1. 先分析章節主題與摘要，規劃內容架構。
-2. 依據摘要與外部知識，逐步撰寫每個小標題下的內容。
-3. 條列重點，並整理所有引用來源。
+# Example
+## 醫療影像輔助診斷
+醫療影像分析是AI在醫療應用中最成熟的領域之一。以肺癌篩檢為例，AI模型能夠自動辨識X光片上的微小結節，協助醫師早期發現病灶。根據2022年美國放射學會的研究，AI輔助診斷系統將漏診率降低了25%，大幅提升診斷準確度。
+
+除了肺癌，AI也廣泛應用於乳癌、腦部腫瘤等影像判讀。以台大醫院為例，2023年導入AI判讀乳房攝影，發現可疑病灶的靈敏度提升至92%。此外，AI還能協助分流病患，讓急重症個案優先處理，提升醫療資源分配效率。
+
+國際上，英國NHS、韓國首爾大學醫院等也積極推動AI影像診斷，並結合雲端平台進行跨院資料共享。未來，隨著多模態影像與臨床資料整合，AI將能提供更全面的診斷建議。
+
+- AI輔助診斷提升準確率
+- 可協助分流與資源分配
+- 國際間積極導入AI影像系統
+
+## 來源
+- [Radiological Society of North America](https://www.rsna.org/)
+- [台大醫院AI醫療專案](https://www.ntuh.gov.tw/)
+- [NHS AI in Health and Care](https://www.nhsx.nhs.uk/)
 
 # 章節主題
 {section_title}
@@ -178,23 +199,6 @@ def section_write(section_title, section_desc, search_summary, model="gpt-4.1-mi
 
 # 搜尋摘要
 {search_summary}
-
-# Output Format
-## 小標題1
-段落內容...
-
-## 小標題2
-段落內容...
-
-...
-
-- 重點1
-- 重點2
-- 重點3
-
-## 來源
-- [來源標題](來源網址)
-- ...
 """
     response = client.chat.completions.create(
         model=model,
@@ -229,16 +233,27 @@ def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini"
         return {"grade": "pass", "follow_up_queries": []}
 
 # === 反思流程（最多2次） ===
-def reflect_report(report: str, model="o3-mini") -> str:
-    simple_prompt = f"""請檢查以下報告的邏輯、正確性與完整性，若有問題請列出需補充的章節與查詢關鍵字，否則回覆 "OK"。
+def reflect_report(report: str, model="o4-mini"):
+    prompt = f"""Formatting re-enabled
+# Role and Objective
+你是一位專業審稿人，目標是檢查下方報告的邏輯、正確性、完整性與內容豐富度。
+
+# Instructions
+- 請逐一檢查每個章節是否有小標題，且每個小標題下是否有2-3句具體細節說明。
+- 檢查內容是否涵蓋數據、案例、國際觀點、技術細節、未來趨勢等豐富面向。
+- 若有內容過於簡略、遺漏重要面向，請明確指出需補充的章節、小標題與建議查詢關鍵字。
+- 若內容已足夠豐富且無明顯遺漏，請回覆 "OK"。
+- 請用繁體中文回覆。
+
+# 報告內容
 {report}
 """
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹檢查報告並產生具體補強建議")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
+        reasoning={"effort": "medium", "summary": "auto"},
+        input=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content.strip()
+    return response.output_text
 
 # === 組合章節 ===
 def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
