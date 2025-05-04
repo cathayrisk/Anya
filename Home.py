@@ -319,13 +319,20 @@ def deep_research_pipeline(topic):
         "logs": logs
     }
     return output
+#@tool
+#def deep_research_pipeline_tool(topic: str):
+#    """
+#    針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
+#    """
+#    return deep_research_pipeline(topic)
+
 @tool
 def deep_research_pipeline_tool(topic: str):
-    """
-    針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
-    """
-    return deep_research_pipeline(topic)
-    
+    print(f"=== [DEBUG] deep_research_pipeline_tool called with topic: {topic}")
+    result = deep_research_pipeline(topic)
+    print(f"=== [DEBUG] deep_research_pipeline_tool result: {result['report'][:500]}...")  # 只顯示前500字
+    return result
+
 @tool
 def ddgs_search(query: str) -> str:
     """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳 markdown 條列格式並附來源）。"""
