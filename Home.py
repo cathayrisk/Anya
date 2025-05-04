@@ -59,7 +59,7 @@ def meta_optimize_prompt(simple_prompt: str, goal: str) -> str:
     {simple_prompt}
     只回傳優化後的 prompt。
     """
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model="o4-mini",
         messages=[{"role": "user", "content": meta_prompt}]
     )
@@ -74,7 +74,7 @@ def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
 }}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且具針對性的查詢關鍵字")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -92,7 +92,7 @@ def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
 def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
     simple_prompt = f"請用繁體中文摘要以下內容，重點條列，100字內：\n{text}"
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生精簡且重點明確的摘要")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -106,7 +106,7 @@ def plan_report(topic: str, search_summaries: str, model="o4-mini") -> str:
 {search_summaries}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化且明確的報告章節規劃")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -128,7 +128,7 @@ def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini")
 }}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且聚焦的章節查詢關鍵字")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -145,7 +145,7 @@ def section_queries(section_title: str, section_desc: str, model="gpt-4.1-mini")
 # 5. 查詢摘要?
 def auto_summarize(text: str, model="gpt-4.1-mini"):
     prompt = f"請用繁體中文摘要以下內容，重點條列，200字內：\n{text}"
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -158,7 +158,7 @@ def section_write(section_title: str, section_desc: str, search_summary: str, mo
 {search_summary}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生結構化、具來源引用、條列清楚的章節內容")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -181,7 +181,7 @@ def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini"
 {section_content}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹評分並產生具體補強建議")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
@@ -196,7 +196,7 @@ def reflect_report(report: str, model="o4-mini") -> str:
 {report}
 """
     optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹檢查報告並產生具體補強建議")
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
         messages=[{"role": "user", "content": optimized_prompt}]
     )
