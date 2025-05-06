@@ -668,7 +668,7 @@ def get_streamlit_cb(parent_container, status=None):
 
         def on_llm_start(self, *args, **kwargs):
             if self.status:
-                self.status.update(label="安妮亞正在分析你的問題...🧠", state="running")
+                self.status.update(label="安妮亞正在分析你的問題...🧐", state="running")
 
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.text += token
@@ -679,7 +679,7 @@ def get_streamlit_cb(parent_container, status=None):
                 tool_name = serialized.get("name", "")
                 tool_emoji = {
                     "ddgs_search": "🔍",
-                    "deep_thought_tool": "🧠",
+                    "deep_thought_tool": "🤔",
                     "datetime_tool": "⏰",
                     "get_webpage_answer": "📄",
                     "deep_research_pipeline_tool": "📚",
