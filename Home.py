@@ -674,7 +674,7 @@ def get_streamlit_cb(parent_container, status=None):
 
         def on_llm_start(self, *args, **kwargs):
             if self.status:
-                self.status.update(label="安妮亞正在分析你的問題...🧐", state="running")
+                self.status.update(label=status_label, state="running")
 
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.tokens.append(token)
