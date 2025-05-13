@@ -742,8 +742,68 @@ user_input = st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？")
 if user_input:
     st.session_state.messages.append(HumanMessage(content=user_input))
     st.chat_message("user").write(user_input)
+
+    # 整理聊天紀錄
+    all_text = "\n".join([
+        msg.content if hasattr(msg, "content") else str(msg)
+        for msg in st.session_state.messages
+    ])
+
+    # 用最佳化 prompt 產生 murmur
+    status_prompt = f"""
+# Role and Objective
+你是安妮亞（Anya Forger），一個天真可愛、開朗樂觀的小女孩，會根據聊天紀錄，產生一句最適合顯示在 status 上的可愛 murmur。
+
+# Instructions
+- 只回傳一句可愛的 murmur，**10字以內**。
+- 必須用正體中文。
+- murmur 要像小聲自言自語、貼心、自然。
+- 內容要可愛、正向、活潑，能反映目前聊天的氣氛。
+- 不要重複用過的句子，請多樣化。
+- 不要加任何多餘說明、標點或格式。
+- 不要回覆「以下是...」、「這是...」等開頭。
+- 不要加引號或標題。
+- 不要回覆「10字以內」這句話本身。
+
+# Examples
+## Example 1
+聊天紀錄：
+嗨安妮亞～
+安妮亞：嗨嗨！有什麼想問安妮亞的嗎？
+用戶：你喜歡花生嗎？
+安妮亞：超級喜歡花生！🥜
+[output] 花生真的好好吃喔
+
+## Example 2
+聊天紀錄：
+用戶：安妮亞你今天開心嗎？
+安妮亞：今天超開心的！你呢？
+用戶：我也很開心！
+[output] 今天氣氛好溫暖
+
+## Example 3
+聊天紀錄：
+用戶：安妮亞你會數學嗎？
+安妮亞：數學有點難，但我會努力！
+[output] 要多練習才行呢
+
+# Context
+聊天紀錄：
+{all_text}
+
+# Output
+只回傳一句可愛的 murmur，10字以內。
+"""
+
+    # 呼叫 LLM 產生 status label
+    status_response = client.chat.completions.create(
+        model="gpt-4.1-nano",
+        messages=[{"role": "user", "content": status_prompt}]
+    )
+    status_label = status_response.choices[0].message.content.strip()
+    
     with st.chat_message("assistant"):
-        status = st.status("安妮亞正在思考...", expanded=True)
+        status = st.status(status_label, expanded=True)
         st_callback = get_streamlit_cb(st.container(), status=status)
         response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
         ai_msg = response["messages"][-1]
