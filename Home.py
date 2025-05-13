@@ -14,6 +14,7 @@ import re
 import requests
 from openai import OpenAI
 import traceback
+from langchain_core.callbacks.base import BaseCallbackHandler
 
 st.set_page_config(
     page_title="Anya",
@@ -657,83 +658,84 @@ agent = workflow.compile()
 
 # --- 8. 進階 spinner/狀態切換 callback ---
 def get_streamlit_cb(parent_container, status=None):
-    from langchain_core.callbacks.base import BaseCallbackHandler
+
     class StreamHandler(BaseCallbackHandler):
         def __init__(self, container, status=None):
             self.container = container
             self.status = status
             self.token_placeholder = self.container.empty()
-            self.text = ""
-            self.cursor_symbol = "✨"  
+            self.tokens = []
+            self.cursor_symbol = "✨"
+            self.cursor_visible = True
+
+        @property
+        def text(self):
+            return ''.join(self.tokens)
 
         def on_llm_start(self, *args, **kwargs):
             if self.status:
                 self.status.update(label="安妮亞正在分析你的問題...🧐", state="running")
 
-    @property
-    def text(self):
-        return ''.join(self.tokens)
+        def on_llm_new_token(self, token: str, **kwargs) -> None:
+            self.tokens.append(token)
+            self.cursor_visible = not self.cursor_visible
+            # 魔法emoji游標
+            cursor = (
+                f'<span class="magic-cursor">{self.cursor_symbol}</span>'
+                if self.cursor_visible else
+                f'<span class="magic-cursor" style="opacity:0;">{self.cursor_symbol}</span>'
+            )
 
-    def on_llm_new_token(self, token: str, **kwargs) -> None:
-        self.tokens.append(token)
-        self.cursor_visible = not self.cursor_visible
-        # 魔法emoji游標
-        cursor = (
-            f'<span class="magic-cursor">{self.cursor_symbol}</span>'
-            if self.cursor_visible else
-            f'<span class="magic-cursor" style="opacity:0;">{self.cursor_symbol}</span>'
-        )
+            # 魔法動畫CSS
+            magic_style = """
+            <style>
+            @keyframes pulseGrowInA8 {
+              0% {
+                opacity: 0;
+                transform: scale(0.1) rotate(-10deg);
+                text-shadow: 0 0 32px #fff, 0 0 64px #f0f;
+              }
+              40% {
+                opacity: 1;
+                transform: scale(1.8) rotate(8deg);
+                text-shadow: 0 0 24px #f0f, 0 0 32px #0ff;
+              }
+              60% {
+                transform: scale(0.8) rotate(-6deg);
+              }
+              80% {
+                transform: scale(1.15) rotate(3deg);
+              }
+              100% {
+                opacity: 1;
+                transform: scale(1) rotate(0deg);
+                text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
+              }
+            }
+            .pulse-grow-ina8 {
+              animation: pulseGrowInA8 1.2s cubic-bezier(.68,-0.55,.27,1.55);
+              display: inline-block;
+              color: #fff;
+              text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
+            }
+            .magic-cursor {
+              display: inline-block;
+              font-size: 1.3em;
+              vertical-align: -0.1em;
+              transition: opacity 0.2s;
+            }
+            </style>
+            """
 
-        # 魔法動畫CSS
-        magic_style = """
-        <style>
-        @keyframes pulseGrowInA8 {
-          0% {
-            opacity: 0;
-            transform: scale(0.1) rotate(-10deg);
-            text-shadow: 0 0 32px #fff, 0 0 64px #f0f;
-          }
-          40% {
-            opacity: 1;
-            transform: scale(1.8) rotate(8deg);
-            text-shadow: 0 0 24px #f0f, 0 0 32px #0ff;
-          }
-          60% {
-            transform: scale(0.8) rotate(-6deg);
-          }
-          80% {
-            transform: scale(1.15) rotate(3deg);
-          }
-          100% {
-            opacity: 1;
-            transform: scale(1) rotate(0deg);
-            text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
-          }
-        }
-        .pulse-grow-ina8 {
-          animation: pulseGrowInA8 1.2s cubic-bezier(.68,-0.55,.27,1.55);
-          display: inline-block;
-          color: #fff;
-          text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
-        }
-        .magic-cursor {
-          display: inline-block;
-          font-size: 1.3em;
-          vertical-align: -0.1em;
-          transition: opacity 0.2s;
-        }
-        </style>
-        """
+            safe_text = ''.join(self.tokens[:-1])
+            pulse_grow_token = f'<span class="pulse-grow-ina8">{self.tokens[-1]}</span>'
 
-        safe_text = ''.join(self.tokens[:-1])
-        pulse_grow_token = f'<span class="pulse-grow-ina8">{self.tokens[-1]}</span>'
+            self.token_placeholder.markdown(
+                magic_style + safe_text + pulse_grow_token + cursor,
+                unsafe_allow_html=True
+            )
+            time.sleep(0.05)
 
-        self.message_container.markdown(
-            magic_style + safe_text + pulse_grow_token + cursor,
-            unsafe_allow_html=True
-        )
-        time.sleep(0.05)
-        
         def on_llm_end(self, response, **kwargs) -> None:
             # 結束時移除游標
             self.token_placeholder.markdown(self.text, unsafe_allow_html=True)
