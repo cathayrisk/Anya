@@ -665,6 +665,8 @@ def get_streamlit_cb(parent_container, status=None):
             self.status = status
             self.token_placeholder = self.container.empty()
             self.tokens = []
+            self.cursor_symbol = " "
+            self.cursor_visible = True
 
         @property
         def text(self):
