@@ -686,37 +686,24 @@ def get_streamlit_cb(parent_container, status=None):
                 f'<span class="magic-cursor" style="opacity:0;">{self.cursor_symbol}</span>'
             )
 
-            # 魔法動畫CSS
+            # 低調發光漸現動畫CSS
             magic_style = """
             <style>
-            @keyframes pulseGrowInA8 {
+            @keyframes softGlowIn {
               0% {
                 opacity: 0;
-                transform: scale(0.1) rotate(-10deg);
-                text-shadow: 0 0 32px #fff, 0 0 64px #f0f;
-              }
-              40% {
-                opacity: 1;
-                transform: scale(1.8) rotate(8deg);
-                text-shadow: 0 0 24px #f0f, 0 0 32px #0ff;
-              }
-              60% {
-                transform: scale(0.8) rotate(-6deg);
-              }
-              80% {
-                transform: scale(1.15) rotate(3deg);
+                text-shadow: 0 0 16px #fff, 0 0 32px #f0f;
               }
               100% {
                 opacity: 1;
-                transform: scale(1) rotate(0deg);
-                text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
+                text-shadow: 0 0 4px #f0f, 0 0 8px #0ff;
               }
             }
-            .pulse-grow-ina8 {
-              animation: pulseGrowInA8 1.2s cubic-bezier(.68,-0.55,.27,1.55);
+            .soft-glow-in {
+              animation: softGlowIn 0.8s;
               display: inline-block;
               color: #fff;
-              text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
+              text-shadow: 0 0 4px #f0f, 0 0 8px #0ff;
             }
             .magic-cursor {
               display: inline-block;
@@ -728,10 +715,10 @@ def get_streamlit_cb(parent_container, status=None):
             """
 
             safe_text = ''.join(self.tokens[:-1])
-            pulse_grow_token = f'<span class="pulse-grow-ina8">{self.tokens[-1]}</span>'
+            soft_glow_token = f'<span class="soft-glow-in">{self.tokens[-1]}</span>'
 
             self.token_placeholder.markdown(
-                magic_style + safe_text + pulse_grow_token + cursor,
+                magic_style + safe_text + soft_glow_token + cursor,
                 unsafe_allow_html=True
             )
             time.sleep(0.05)
