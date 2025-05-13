@@ -682,7 +682,7 @@ def get_streamlit_cb(parent_container, status=None):
             cursor = self.cursor_symbol if self.cursor_visible else " "
             safe_text = ''.join(self.tokens[:-1])
             # 先用emoji顯示新字
-            emoji_token = "🌸"
+            emoji_token = "🐾"
             self.token_placeholder.markdown(safe_text + emoji_token + cursor)
             time.sleep(0.03)
             # 再換成正常字
