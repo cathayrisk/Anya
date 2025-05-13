@@ -738,75 +738,7 @@ for msg in st.session_state.messages:
         st.chat_message("user").write(msg.content)
 
 # --- 10. 用戶輸入 ---
-# 1. 先設一個預設提示
-default_prompt = "wakuwaku！要跟安妮亞分享什麼嗎？🥜"
-chat_input_label = default_prompt
-
-# 2. 嘗試用 LLM 產生 murmur
-try:
-    all_text = "\n".join([
-        msg.content if hasattr(msg, "content") else str(msg)
-        for msg in st.session_state.messages
-    ])
-    chat_input_prompt = f"""
-# Role and Objective
-你是安妮亞（Anya Forger），一個天真可愛、開朗樂觀的小女孩，會根據聊天紀錄，產生一句最適合當作輸入框提示的可愛 murmur，最後加上一個可愛 emoji。
-
-# Instructions
-- 只回傳一句可愛的 murmur，10字以內，最後加上一個可愛 emoji。
-- 這句話要適合當作聊天輸入框的提示語，引導用戶輸入。
-- 必須用正體中文。
-- murmur 要像小聲自言自語、貼心、自然。
-- 內容要可愛、正向、活潑，能反映目前聊天的氣氛。
-- emoji 要和 murmur 氣氛搭配，可以是花生、愛心、星星、花朵等。
-- 不要重複用過的句子，請多樣化。
-- 不要加任何多餘說明、標點或格式。
-- 不要回覆「以下是...」、「這是...」等開頭。
-- 不要加引號或標題。
-- 不要回覆「10字以內」這句話本身。
-
-# Examples
-## Example 1
-聊天紀錄：
-嗨安妮亞～
-安妮亞：嗨嗨！有什麼想問安妮亞的嗎？
-用戶：你喜歡花生嗎？
-安妮亞：超級喜歡花生！🥜
-[output] 想聊花生嗎🥜
-
-## Example 2
-聊天紀錄：
-用戶：安妮亞你今天開心嗎？
-安妮亞：今天超開心的！你呢？
-用戶：我也很開心！
-[output] 一起開心聊聊吧💖
-
-## Example 3
-聊天紀錄：
-用戶：安妮亞你會數學嗎？
-安妮亞：數學有點難，但我會努力！
-[output] 有什麼想問的呢✨
-
-# Context
-聊天紀錄：
-{all_text}
-
-# Output
-只回傳一句適合當輸入框提示的 murmur，10字以內，最後加上一個可愛 emoji。
-"""
-    chat_input_response = client.chat.completions.create(
-        model="gpt-4.1-nano",
-        messages=[{"role": "user", "content": chat_input_prompt}]
-    )
-    label = chat_input_response.choices[0].message.content.strip()
-    if label:
-        chat_input_label = label
-except Exception as e:
-    chat_input_label = default_prompt
-    st.toast(f"產生輸入提示失敗：{e}")
-
-# 3. 顯示 chat_input
-user_input = st.chat_input(chat_input_label)
+user_input = st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？")
 if user_input:
     st.session_state.messages.append(HumanMessage(content=user_input))
     st.chat_message("user").write(user_input)
