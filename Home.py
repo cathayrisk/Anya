@@ -665,8 +665,6 @@ def get_streamlit_cb(parent_container, status=None):
             self.status = status
             self.token_placeholder = self.container.empty()
             self.tokens = []
-            self.cursor_symbol = "✨"
-            self.cursor_visible = True
 
         @property
         def text(self):
@@ -682,12 +680,12 @@ def get_streamlit_cb(parent_container, status=None):
             cursor = self.cursor_symbol if self.cursor_visible else " "
             safe_text = ''.join(self.tokens[:-1])
             # 先用emoji顯示新字
-            emoji_token = "🌟"
+            emoji_token = "🌸"
             self.token_placeholder.markdown(safe_text + emoji_token + cursor)
-            time.sleep(0.08)
+            time.sleep(0.05)
             # 再換成正常字
             self.token_placeholder.markdown(''.join(self.tokens) + cursor)
-            time.sleep(0.05)
+            time.sleep(0.03)
 
         def on_llm_end(self, response, **kwargs) -> None:
             # 結束時移除游標
