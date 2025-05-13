@@ -684,10 +684,10 @@ def get_streamlit_cb(parent_container, status=None):
             # 先用emoji顯示新字
             emoji_token = "🌸"
             self.token_placeholder.markdown(safe_text + emoji_token + cursor)
-            time.sleep(0.05)
+            time.sleep(0.03)
             # 再換成正常字
             self.token_placeholder.markdown(''.join(self.tokens) + cursor)
-            time.sleep(0.03)
+            time.sleep(0.01)
 
         def on_llm_end(self, response, **kwargs) -> None:
             # 結束時移除游標
