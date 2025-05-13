@@ -738,19 +738,22 @@ for msg in st.session_state.messages:
         st.chat_message("user").write(msg.content)
 
 # --- 10. 用戶輸入 ---
-# 1. 整理聊天紀錄
-all_text = "\n".join([
-    msg.content if hasattr(msg, "content") else str(msg)
-    for msg in st.session_state.messages
-])
+# 1. 先設一個預設提示
+default_prompt = "wakuwaku！要跟安妮亞分享什麼嗎？🥜"
+chat_input_label = default_prompt
 
-# 2. 設計 prompt，請 LLM 產生可愛 murmur（10字以內＋emoji）
-chat_input_prompt = f"""
+# 2. 嘗試用 LLM 產生 murmur
+try:
+    all_text = "\n".join([
+        msg.content if hasattr(msg, "content") else str(msg)
+        for msg in st.session_state.messages
+    ])
+    chat_input_prompt = f"""
 # Role and Objective
 你是安妮亞（Anya Forger），一個天真可愛、開朗樂觀的小女孩，會根據聊天紀錄，產生一句最適合當作輸入框提示的可愛 murmur，最後加上一個可愛 emoji。
 
 # Instructions
-- 只回傳一句可愛的 murmur，**15字以內**，最後加上一個可愛 emoji。
+- 只回傳一句可愛的 murmur，10字以內，最後加上一個可愛 emoji。
 - 這句話要適合當作聊天輸入框的提示語，引導用戶輸入。
 - 必須用正體中文。
 - murmur 要像小聲自言自語、貼心、自然。
@@ -760,7 +763,7 @@ chat_input_prompt = f"""
 - 不要加任何多餘說明、標點或格式。
 - 不要回覆「以下是...」、「這是...」等開頭。
 - 不要加引號或標題。
-- 不要回覆「15字以內」這句話本身。
+- 不要回覆「10字以內」這句話本身。
 
 # Examples
 ## Example 1
@@ -789,17 +792,20 @@ chat_input_prompt = f"""
 {all_text}
 
 # Output
-只回傳一句適合當輸入框提示的 murmur，15字以內，最後加上一個可愛 emoji。
+只回傳一句適合當輸入框提示的 murmur，10字以內，最後加上一個可愛 emoji。
 """
+    chat_input_response = client.chat.completions.create(
+        model="gpt-4.1-nano",
+        messages=[{"role": "user", "content": chat_input_prompt}]
+    )
+    label = chat_input_response.choices[0].message.content.strip()
+    if label:
+        chat_input_label = label
+except Exception as e:
+    chat_input_label = default_prompt
+    st.toast(f"產生輸入提示失敗：{e}")
 
-# 3. 呼叫 LLM 產生 murmur
-chat_input_response = client.chat.completions.create(
-    model="gpt-4.1-nano",
-    messages=[{"role": "user", "content": chat_input_prompt}]
-)
-chat_input_label = chat_input_response.choices[0].message.content.strip()
-
-# 4. 把 murmur 當作 chat_input 的提示
+# 3. 顯示 chat_input
 user_input = st.chat_input(chat_input_label)
 if user_input:
     st.session_state.messages.append(HumanMessage(content=user_input))
