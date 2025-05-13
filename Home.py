@@ -658,8 +658,6 @@ agent = workflow.compile()
 # --- 8. 進階 spinner/狀態切換 callback ---
 def get_streamlit_cb(parent_container, status=None):
     from langchain_core.callbacks.base import BaseCallbackHandler
-    import time
-
     class StreamHandler(BaseCallbackHandler):
         def __init__(self, container, status=None):
             self.container = container
@@ -672,30 +670,56 @@ def get_streamlit_cb(parent_container, status=None):
             if self.status:
                 self.status.update(label="安妮亞正在分析你的問題...🧐", state="running")
 
-        def on_llm_new_token(self, token: str, **kwargs) -> None:
-            self.text += token
-            # 魔法游標HTML+CSS
-            cursor_html = f"""
-            <span class="magic-cursor">{self.cursor_symbol}</span>
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        # 只讓新出現的 token 有動畫
+        if len(token) > 0:
+            animated_token = f'<span class="magic-text">{token}</span>'
+        else:
+            animated_token = ""
+        # 之前的字用普通顯示
+        html = (
+            self.text
+            + animated_token
+            + f'<span class="magic-cursor">{self.cursor_symbol}</span>'
+            + """
             <style>
-            .magic-cursor {{
+            .magic-text {
+                animation: magic-appear 0.5s;
+                color: #fff;
+                text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
+            }
+            @keyframes magic-appear {
+                0% {
+                    opacity: 0;
+                    transform: scale(1.5) rotate(-10deg);
+                    text-shadow: 0 0 32px #fff, 0 0 64px #f0f;
+                }
+                100% {
+                    opacity: 1;
+                    transform: scale(1) rotate(0deg);
+                    text-shadow: 0 0 8px #f0f, 0 0 16px #0ff, 0 0 24px #ff0;
+                }
+            }
+            .magic-cursor {
                 display: inline-block;
                 animation: blink-move 1s infinite;
                 font-size: 1.5em;
-            }}
-            @keyframes blink-move {{
-                0% {{ opacity: 1; transform: translateY(0) scale(1);}}
-                20% {{ opacity: 0.5; transform: translateY(-3px) scale(1.2);}}
-                40% {{ opacity: 1; transform: translateY(0) scale(1);}}
-                60% {{ opacity: 0.7; transform: translateY(3px) scale(0.9);}}
-                80% {{ opacity: 1; transform: translateY(0) scale(1);}}
-                100% {{ opacity: 1; transform: translateY(0) scale(1);}}
-            }}
+            }
+            @keyframes blink-move {
+                0% { opacity: 1; transform: translateY(0) scale(1);}
+                20% { opacity: 0.5; transform: translateY(-3px) scale(1.2);}
+                40% { opacity: 1; transform: translateY(0) scale(1);}
+                60% { opacity: 0.7; transform: translateY(3px) scale(0.9);}
+                80% { opacity: 1; transform: translateY(0) scale(1);}
+                100% { opacity: 1; transform: translateY(0) scale(1);}
+            }
             </style>
             """
-            self.token_placeholder.markdown(self.text + cursor_html, unsafe_allow_html=True)
-            time.sleep(0.03)  # 模擬打字速度
-
+        )
+        self.token_placeholder.markdown(html, unsafe_allow_html=True)
+        self.text += token
+        time.sleep(0.03)
+        
         def on_llm_end(self, response, **kwargs) -> None:
             # 結束時移除游標
             self.token_placeholder.markdown(self.text, unsafe_allow_html=True)
