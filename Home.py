@@ -671,17 +671,11 @@ def get_streamlit_cb(parent_container, status=None):
                 self.status.update(label="安妮亞正在分析你的問題...🧐", state="running")
 
     def on_llm_new_token(self, token: str, **kwargs) -> None:
-        # 只讓新出現的 token 有動畫
-        if len(token) > 0:
-            animated_token = f'<span class="magic-text">{token}</span>'
-        else:
-            animated_token = ""
-        # 之前的字用普通顯示
+        # 顯示時，self.text是已經出現的字，token是新字
         html = (
-            self.text
-            + animated_token
-            + f'<span class="magic-cursor">{self.cursor_symbol}</span>'
-            + """
+            f'{self.text}<span class="magic-text">{token}</span>'
+            f'<span class="magic-cursor">{self.cursor_symbol}</span>'
+            """
             <style>
             .magic-text {
                 animation: magic-appear 0.5s;
@@ -717,8 +711,9 @@ def get_streamlit_cb(parent_container, status=None):
             """
         )
         self.token_placeholder.markdown(html, unsafe_allow_html=True)
-        self.text += token
+        # 等動畫跑完再把新字加進self.text
         time.sleep(0.03)
+        self.text += token
         
         def on_llm_end(self, response, **kwargs) -> None:
             # 結束時移除游標
