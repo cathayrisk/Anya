@@ -1,4 +1,3 @@
-
 import os
 import streamlit as st
 from datetime import datetime
@@ -659,12 +658,15 @@ agent = workflow.compile()
 # --- 8. 進階 spinner/狀態切換 callback ---
 def get_streamlit_cb(parent_container, status=None):
     from langchain_core.callbacks.base import BaseCallbackHandler
+    import time
+
     class StreamHandler(BaseCallbackHandler):
         def __init__(self, container, status=None):
             self.container = container
             self.status = status
             self.token_placeholder = self.container.empty()
             self.text = ""
+            self.cursor_symbol = "✨"  
 
         def on_llm_start(self, *args, **kwargs):
             if self.status:
@@ -672,7 +674,31 @@ def get_streamlit_cb(parent_container, status=None):
 
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.text += token
-            self.token_placeholder.markdown(self.text)
+            # 魔法游標HTML+CSS
+            cursor_html = f"""
+            <span class="magic-cursor">{self.cursor_symbol}</span>
+            <style>
+            .magic-cursor {{
+                display: inline-block;
+                animation: blink-move 1s infinite;
+                font-size: 1.5em;
+            }}
+            @keyframes blink-move {{
+                0% {{ opacity: 1; transform: translateY(0) scale(1);}}
+                20% {{ opacity: 0.5; transform: translateY(-3px) scale(1.2);}}
+                40% {{ opacity: 1; transform: translateY(0) scale(1);}}
+                60% {{ opacity: 0.7; transform: translateY(3px) scale(0.9);}}
+                80% {{ opacity: 1; transform: translateY(0) scale(1);}}
+                100% {{ opacity: 1; transform: translateY(0) scale(1);}}
+            }}
+            </style>
+            """
+            self.token_placeholder.markdown(self.text + cursor_html, unsafe_allow_html=True)
+            time.sleep(0.03)  # 模擬打字速度
+
+        def on_llm_end(self, response, **kwargs) -> None:
+            # 結束時移除游標
+            self.token_placeholder.markdown(self.text, unsafe_allow_html=True)
 
         def on_tool_start(self, serialized, input_str, **kwargs):
             if self.status:
@@ -682,20 +708,20 @@ def get_streamlit_cb(parent_container, status=None):
                     "deep_thought_tool": "🤔",
                     "datetime_tool": "⏰",
                     "get_webpage_answer": "📄",
-                    "deep_research_pipeline_tool": "📚",
                 }.get(tool_name, "🛠️")
                 tool_desc = {
                     "ddgs_search": "搜尋網路資料",
                     "deep_thought_tool": "深入分析資料",
                     "datetime_tool": "查詢時間",
                     "get_webpage_answer": "取得網頁重點",
-                    "deep_research_pipeline_tool": "產生深度研究報告",
                 }.get(tool_name, "執行工具")
                 self.status.update(label=f"安妮亞正在{tool_desc}...{tool_emoji}", state="running")
 
         def on_tool_end(self, output, **kwargs):
             if self.status:
                 self.status.update(label="工具查詢完成！✨", state="complete")
+
+    return StreamHandler(parent_container, status)
 
     fn_return_type = TypeVar('fn_return_type')
     def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
