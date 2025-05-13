@@ -679,48 +679,14 @@ def get_streamlit_cb(parent_container, status=None):
         def on_llm_new_token(self, token: str, **kwargs) -> None:
             self.tokens.append(token)
             self.cursor_visible = not self.cursor_visible
-            # 魔法emoji游標
-            cursor = (
-                f'<span class="magic-cursor">{self.cursor_symbol}</span>'
-                if self.cursor_visible else
-                f'<span class="magic-cursor" style="opacity:0;">{self.cursor_symbol}</span>'
-            )
-
-            # 低調發光漸現動畫CSS
-            magic_style = """
-            <style>
-            @keyframes softGlowIn {
-              0% {
-                opacity: 0;
-                text-shadow: 0 0 16px #fff, 0 0 32px #f0f;
-              }
-              100% {
-                opacity: 1;
-                text-shadow: 0 0 4px #f0f, 0 0 8px #0ff;
-              }
-            }
-            .soft-glow-in {
-              animation: softGlowIn 0.8s;
-              display: inline-block;
-              color: #fff;
-              text-shadow: 0 0 4px #f0f, 0 0 8px #0ff;
-            }
-            .magic-cursor {
-              display: inline-block;
-              font-size: 1.3em;
-              vertical-align: -0.1em;
-              transition: opacity 0.2s;
-            }
-            </style>
-            """
-
+            cursor = self.cursor_symbol if self.cursor_visible else " "
             safe_text = ''.join(self.tokens[:-1])
-            soft_glow_token = f'<span class="soft-glow-in">{self.tokens[-1]}</span>'
-
-            self.token_placeholder.markdown(
-                magic_style + safe_text + soft_glow_token + cursor,
-                unsafe_allow_html=True
-            )
+            # 先用emoji顯示新字
+            emoji_token = "🌟"
+            self.token_placeholder.markdown(safe_text + emoji_token + cursor)
+            time.sleep(0.08)
+            # 再換成正常字
+            self.token_placeholder.markdown(''.join(self.tokens) + cursor)
             time.sleep(0.05)
 
         def on_llm_end(self, response, **kwargs) -> None:
