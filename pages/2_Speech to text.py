@@ -125,7 +125,7 @@ client = OpenAI()
 # 初始化 LangChain 的 ChatOpenAI 模型
 llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.0, streaming=True)
 
-judge_llm = ChatOpenAI(model="gpt-4.1", temperature=0.0)
+judge_llm = ChatOpenAI(model="gpt-4.1-nano", temperature=0.0)
 
 def split_sentences(text):
     """
@@ -207,7 +207,7 @@ def transcribe_chunk(chunk, index):
         chunk.export(temp_mp3_file.name, format="mp3")
         with open(temp_mp3_file.name, "rb") as audio_file:
             transcription = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",
+                model="gpt-4o-mini-transcribe",
                 file=audio_file,
                 response_format="text",
                 prompt="This audio contains a discussion or presentation. Always preserve the original language of each sentence. If a sentence is in English, output it in English; if in Chinese, output it in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate or alter the language. The audio may cover various topics such as updates, feedback, or informative lectures."
