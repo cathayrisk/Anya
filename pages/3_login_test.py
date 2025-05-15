@@ -1,7 +1,14 @@
 import streamlit as st
 from st_login_form import login_form
 
-client = login_form()
+client = login_form(
+    title="會員登入",
+    user_tablename="users",
+    username_col="username",
+    password_col="password",
+    allow_guest=False,
+    allow_create=False
+)
 
 if st.session_state["authenticated"]:
     if st.session_state["username"]:
