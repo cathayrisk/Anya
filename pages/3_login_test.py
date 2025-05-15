@@ -18,7 +18,6 @@ def get_usernames():
 username_list = get_usernames()
 
 with st.sidebar:
-    st.header("用戶登入")
     if not st.session_state.get("authenticated"):
         selected_username = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
         if selected_username:
