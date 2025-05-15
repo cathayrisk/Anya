@@ -18,7 +18,7 @@ def get_usernames():
 username_list = get_usernames()
 
 with st.sidebar:
-    st.header("用戶登入 / 主題管理")
+    st.header("用戶登入與主題管理")
     # 1. 用戶登入區
     if not st.session_state.get("authenticated"):
         selected_username = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
@@ -37,46 +37,41 @@ with st.sidebar:
         else:
             st.info("請先選擇登入帳號")
     else:
-        st.markdown(f"**歡迎 {st.session_state['username']}！**")
-        # 2. 聊天主題管理區
-        st.subheader("聊天主題管理")
-        threads = supabase.table("threads").select("*").eq("user_id", st.session_state["user_id"]).order("created_at").execute().data
-        thread_titles = [t["title"] for t in threads]
-        thread_ids = [t["thread_id"] for t in threads]
-        if thread_titles:
-            selected_idx = st.radio("選擇聊天主題", range(len(thread_titles)), format_func=lambda i: thread_titles[i], key="thread_selector")
-            selected_thread_id = thread_ids[selected_idx]
-            selected_thread_title = thread_titles[selected_idx]
-            st.session_state["thread_id"] = selected_thread_id
-            st.session_state["thread"] = selected_thread_title
-            st.success(f"目前主題：{selected_thread_title}")
-        else:
-            st.session_state["thread_id"] = None
-            st.session_state["thread"] = None
-            st.info("尚無主題，請新增。")
-        # 新增主題
-        st.markdown("##### ➕ 新增主題")
-        new_title = st.text_input("新主題名稱", key="new_thread_title")
-        if st.button("建立", key="create_thread_btn") and new_title:
-            supabase.table("threads").insert({
-                "user_id": st.session_state["user_id"],
-                "title": new_title,
-                "created_at": datetime.now().isoformat()
-            }).execute()
-            st.success("已建立新主題！請重新選擇。")
-            st.rerun()
-        # 刪除主題
-        if st.session_state.get("thread_id"):
-            if st.button("🗑️ 刪除本主題", key="delete_thread_btn"):
-                supabase.table("threads").delete().eq("thread_id", st.session_state["thread_id"]).eq("user_id", st.session_state["user_id"]).execute()
-                st.success("已刪除主題！")
+        st.success(f"已登入：{st.session_state['username']}")
+        # 2. 聊天主題管理區（用 expander 收納）
+        with st.expander("聊天主題管理", expanded=True):
+            threads = supabase.table("threads").select("*").eq("user_id", st.session_state["user_id"]).order("created_at").execute().data
+            thread_titles = [t["title"] for t in threads]
+            thread_ids = [t["thread_id"] for t in threads]
+            if thread_titles:
+                selected_idx = st.radio("選擇聊天主題", range(len(thread_titles)), format_func=lambda i: thread_titles[i], key="thread_selector")
+                selected_thread_id = thread_ids[selected_idx]
+                selected_thread_title = thread_titles[selected_idx]
+                st.session_state["thread_id"] = selected_thread_id
+                st.session_state["thread"] = selected_thread_title
+                st.success(f"目前主題：{selected_thread_title}")
+            else:
                 st.session_state["thread_id"] = None
                 st.session_state["thread"] = None
+                st.info("尚無主題，請新增。")
+            # 新增主題
+            new_title = st.text_input("新主題名稱", key="new_thread_title")
+            if st.button("建立", key="create_thread_btn") and new_title:
+                supabase.table("threads").insert({
+                    "user_id": st.session_state["user_id"],
+                    "title": new_title,
+                    "created_at": datetime.now().isoformat()
+                }).execute()
+                st.success("已建立新主題！請重新選擇。")
                 st.rerun()
-        # 登出
-        if st.button("登出", key="logout_btn"):
-            st.session_state.clear()
-            st.rerun()
+            # 刪除主題
+            if st.session_state.get("thread_id"):
+                if st.button("🗑️ 刪除本主題", key="delete_thread_btn"):
+                    supabase.table("threads").delete().eq("thread_id", st.session_state["thread_id"]).eq("user_id", st.session_state["user_id"]).execute()
+                    st.success("已刪除主題！")
+                    st.session_state["thread_id"] = None
+                    st.session_state["thread"] = None
+                    st.rerun()
 
 # 主畫面提示
 if not st.session_state.get("authenticated"):
