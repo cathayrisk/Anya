@@ -47,3 +47,4 @@ openpyxl
 # Web page processing tools
 bs4
 lxml
+st-login-form
