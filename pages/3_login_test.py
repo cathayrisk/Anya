@@ -43,36 +43,25 @@ with st.sidebar:
             thread_titles = [t["title"] for t in threads]
             thread_ids = [t["thread_id"] for t in threads]
 
-            # 主題選擇（用 selectbox 或 pills）
+            # 主題選擇
             if thread_titles:
-                col1, col2 = st.columns([3,1])
-                with col1:
-                    selected_idx = st.selectbox(
-                        "選擇聊天主題",
-                        range(len(thread_titles)),
-                        format_func=lambda i: thread_titles[i],
-                        key="thread_selector"
-                    )
-                    selected_thread_id = thread_ids[selected_idx]
-                    selected_thread_title = thread_titles[selected_idx]
-                    st.session_state["thread_id"] = selected_thread_id
-                    st.session_state["thread"] = selected_thread_title
-                with col2:
-                    # 刪除主題按鈕（用icon+確認）
-                    if st.button("🗑️", key="delete_thread_btn", help="刪除目前主題"):
-                        if st.confirm("確定要刪除這個主題嗎？"):
-                            supabase.table("threads").delete().eq("thread_id", st.session_state["thread_id"]).eq("user_id", st.session_state["user_id"]).execute()
-                            st.success("已刪除主題！")
-                            st.session_state["thread_id"] = None
-                            st.session_state["thread"] = None
-                            st.rerun()
+                selected_idx = st.selectbox(
+                    "選擇聊天主題",
+                    range(len(thread_titles)),
+                    format_func=lambda i: thread_titles[i],
+                    key="thread_selector"
+                )
+                selected_thread_id = thread_ids[selected_idx]
+                selected_thread_title = thread_titles[selected_idx]
+                st.session_state["thread_id"] = selected_thread_id
+                st.session_state["thread"] = selected_thread_title
                 st.caption(f"目前主題：{selected_thread_title}")
             else:
                 st.session_state["thread_id"] = None
                 st.session_state["thread"] = None
                 st.info("尚無主題，請新增。")
 
-            # 新增主題（用一行輸入＋icon按鈕）
+            # 新增主題
             st.markdown("##### ➕ 新增主題")
             col3, col4 = st.columns([3,1])
             with col3:
@@ -86,6 +75,29 @@ with st.sidebar:
                     }).execute()
                     st.success("已建立新主題！請重新選擇。")
                     st.rerun()
+
+            # 刪除主題（單獨一區塊，只有選擇主題時才顯示）
+            if st.session_state.get("thread_id"):
+                st.markdown("---")
+                st.markdown("#### 危險操作")
+                if st.button("🗑️ 刪除目前主題", key="delete_thread_btn", help="刪除目前選擇的主題"):
+                    st.session_state["show_delete_confirm"] = True
+
+                # 二次確認
+                if st.session_state.get("show_delete_confirm"):
+                    st.warning(f"確定要刪除主題「{st.session_state['thread']}」嗎？此操作無法復原！")
+                    col_del1, col_del2 = st.columns(2)
+                    with col_del1:
+                        if st.button("確定刪除", key="confirm_delete_btn"):
+                            supabase.table("threads").delete().eq("thread_id", st.session_state["thread_id"]).eq("user_id", st.session_state["user_id"]).execute()
+                            st.success("已刪除主題！")
+                            st.session_state["thread_id"] = None
+                            st.session_state["thread"] = None
+                            st.session_state["show_delete_confirm"] = False
+                            st.rerun()
+                    with col_del2:
+                        if st.button("取消", key="cancel_delete_btn"):
+                            st.session_state["show_delete_confirm"] = False
 
 # 主畫面提示
 if not st.session_state.get("authenticated"):
