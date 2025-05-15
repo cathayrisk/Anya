@@ -54,7 +54,6 @@ with st.sidebar:
                 selected_thread_title = thread_titles[selected_idx]
                 st.session_state["thread_id"] = selected_thread_id
                 st.session_state["thread"] = selected_thread_title
-                st.caption(f"目前主題：{selected_thread_title}")
             else:
                 st.session_state["thread_id"] = None
                 st.session_state["thread"] = None
