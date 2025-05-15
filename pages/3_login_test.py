@@ -18,7 +18,6 @@ def get_usernames():
 username_list = get_usernames()
 
 with st.sidebar:
-    st.header("用戶登入與主題管理")
     # 1. 用戶登入區
     if not st.session_state.get("authenticated"):
         selected_username = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
@@ -37,7 +36,6 @@ with st.sidebar:
         else:
             st.info("請先選擇登入帳號")
     else:
-        st.success(f"已登入：{st.session_state['username']}")
         # 2. 聊天主題管理區（用 expander 收納）
         with st.expander("聊天主題管理", expanded=True):
             threads = supabase.table("threads").select("*").eq("user_id", st.session_state["user_id"]).order("created_at").execute().data
@@ -49,7 +47,6 @@ with st.sidebar:
                 selected_thread_title = thread_titles[selected_idx]
                 st.session_state["thread_id"] = selected_thread_id
                 st.session_state["thread"] = selected_thread_title
-                st.success(f"目前主題：{selected_thread_title}")
             else:
                 st.session_state["thread_id"] = None
                 st.session_state["thread"] = None
