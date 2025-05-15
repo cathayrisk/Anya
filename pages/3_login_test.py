@@ -21,7 +21,6 @@ with st.sidebar:
     st.header("管理面板")
     with st.popover("用戶/主題管理", icon=":material/manage_accounts:"):
         # --- 用戶登入 ---
-        st.markdown("#### 選擇用戶")
         selected_username = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
         if selected_username:
             user_row = supabase.table("users").select("password").eq("username", selected_username).single().execute().data
