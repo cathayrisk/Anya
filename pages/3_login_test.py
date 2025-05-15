@@ -19,8 +19,7 @@ username_list = get_usernames()
 
 # sidebar popover：用戶登入＋主題管理
 with st.sidebar:
-    st.header("管理面板")
-    with st.popover("用戶/主題管理", icon=":material_manage_accounts:"):
+    with st.popover("用戶/主題管理", icon=":material/manage_accounts:"):
         # --- 用戶登入 ---
         st.markdown("#### 選擇用戶")
         user = st.segmented_control("選擇用戶", username_list, key="user_selector")
