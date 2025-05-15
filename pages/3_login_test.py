@@ -17,22 +17,18 @@ def get_usernames():
     return [u["username"] for u in users]
 username_list = get_usernames()
 
-# sidebar popover：用戶登入＋主題管理
 with st.sidebar:
     with st.popover("用戶/主題管理", icon=":material/manage_accounts:"):
         # --- 用戶登入 ---
         st.markdown("#### 選擇用戶")
-        user = st.segmented_control("選擇用戶", username_list, key="user_selector")
-        user_row = supabase.table("users").select("*").eq("username", user).execute().data
+        user = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
+        user_row = supabase.table("users").select("username, password").eq("username", user).execute().data
         if user_row:
-            user_id = user_row[0]["user_id"]
-            if st.session_state.get("user_id") != user_id:
-                st.session_state.user_id = user_id
+            if st.session_state.get("username") != user:
                 st.session_state.username = user
                 st.session_state.authenticated = False
                 st.session_state.thread_id = None
                 st.rerun()
-            # 密碼驗證
             if not st.session_state.get("authenticated"):
                 password = st.text_input("請輸入密碼", type="password", key="pw_input")
                 if st.button("登入", key="login_btn"):
@@ -43,15 +39,14 @@ with st.sidebar:
                     else:
                         st.error("密碼錯誤，請再試一次")
         else:
-            st.session_state.user_id = None
-            st.session_state.authenticated = False
             st.session_state.username = None
+            st.session_state.authenticated = False
             st.session_state.thread_id = None
 
         # --- 主題管理 ---
         if st.session_state.get("authenticated"):
             st.markdown("#### 聊天主題管理")
-            threads = supabase.table("threads").select("*").eq("user_id", st.session_state.user_id).order("created_at").execute().data
+            threads = supabase.table("threads").select("*").eq("username", st.session_state.username).order("created_at").execute().data
             thread_titles = [t["title"] for t in threads]
             if threads:
                 thread_idx = st.radio("選擇聊天主題", thread_titles, key="thread_selector")
@@ -67,7 +62,7 @@ with st.sidebar:
                 new_title = st.text_input("新主題名稱", key="new_thread_title")
                 if st.button("建立", key="create_thread_btn") and new_title:
                     supabase.table("threads").insert({
-                        "user_id": st.session_state.user_id,
+                        "username": st.session_state.username,
                         "title": new_title,
                         "created_at": datetime.now().isoformat()
                     }).execute()
@@ -82,7 +77,7 @@ with st.sidebar:
         else:
             st.info("請先登入用戶。")
 
-# 主畫面完全乾淨，僅根據狀態顯示提示
+# 主畫面提示
 if not st.session_state.get("authenticated"):
     st.info("請在側邊欄登入用戶")
 elif not st.session_state.get("thread_id"):
