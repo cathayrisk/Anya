@@ -78,8 +78,6 @@ with st.sidebar:
 
             # 刪除主題（單獨一區塊，只有選擇主題時才顯示）
             if st.session_state.get("thread_id"):
-                st.markdown("---")
-                st.markdown("#### 危險操作")
                 if st.button("🗑️ 刪除目前主題", key="delete_thread_btn", help="刪除目前選擇的主題"):
                     st.session_state["show_delete_confirm"] = True
 
