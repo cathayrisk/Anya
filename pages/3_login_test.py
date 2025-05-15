@@ -18,7 +18,7 @@ def get_usernames():
 username_list = get_usernames()
 
 with st.sidebar:
-    with st.popover("用戶/主題管理", icon=":material/manage_accounts:"):
+    with st.expander("用戶/主題管理", icon=":material/manage_accounts:"):
         # --- 用戶登入 ---
         selected_username = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
         if selected_username:
