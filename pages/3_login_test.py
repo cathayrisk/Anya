@@ -19,8 +19,8 @@ username_list = get_usernames()
 
 with st.sidebar:
     st.header("用戶登入")
-    selected_username = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
     if not st.session_state.get("authenticated"):
+        selected_username = st.pills("選擇用戶", username_list, selection_mode="single", key="user_selector")
         if selected_username:
             user_row = supabase.table("users").select("user_id, password").eq("username", selected_username).single().execute().data
             password = st.text_input("請輸入密碼", type="password", key="pw_input")
@@ -81,7 +81,7 @@ with st.sidebar:
                     with col_del2:
                         if st.button("取消", key="cancel_delete_btn"):
                             st.session_state["show_delete_confirm"] = False
-            
+
             # 新增主題
             st.markdown("##### ➕ 新增主題")
             col3, col4 = st.columns([3,1])
@@ -96,7 +96,6 @@ with st.sidebar:
                     }).execute()
                     st.success("已建立新主題！請重新選擇。")
                     st.rerun()
-
 
 # 主畫面提示
 if not st.session_state.get("authenticated"):
