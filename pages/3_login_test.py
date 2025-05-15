@@ -61,21 +61,6 @@ with st.sidebar:
                 st.session_state["thread"] = None
                 st.info("尚無主題，請新增。")
 
-            # 新增主題
-            st.markdown("##### ➕ 新增主題")
-            col3, col4 = st.columns([3,1])
-            with col3:
-                new_title = st.text_input("新主題名稱", key="new_thread_title", label_visibility="collapsed", placeholder="輸入主題名稱")
-            with col4:
-                if st.button("➕", key="create_thread_btn") and new_title:
-                    supabase.table("threads").insert({
-                        "user_id": st.session_state["user_id"],
-                        "title": new_title,
-                        "created_at": datetime.now().isoformat()
-                    }).execute()
-                    st.success("已建立新主題！請重新選擇。")
-                    st.rerun()
-
             # 刪除主題（單獨一區塊，只有選擇主題時才顯示）
             if st.session_state.get("thread_id"):
                 if st.button("🗑️ 刪除目前主題", key="delete_thread_btn", help="刪除目前選擇的主題"):
@@ -96,6 +81,22 @@ with st.sidebar:
                     with col_del2:
                         if st.button("取消", key="cancel_delete_btn"):
                             st.session_state["show_delete_confirm"] = False
+            
+            # 新增主題
+            st.markdown("##### ➕ 新增主題")
+            col3, col4 = st.columns([3,1])
+            with col3:
+                new_title = st.text_input("新主題名稱", key="new_thread_title", label_visibility="collapsed", placeholder="輸入主題名稱")
+            with col4:
+                if st.button("➕", key="create_thread_btn") and new_title:
+                    supabase.table("threads").insert({
+                        "user_id": st.session_state["user_id"],
+                        "title": new_title,
+                        "created_at": datetime.now().isoformat()
+                    }).execute()
+                    st.success("已建立新主題！請重新選擇。")
+                    st.rerun()
+
 
 # 主畫面提示
 if not st.session_state.get("authenticated"):
