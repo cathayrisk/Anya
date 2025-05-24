@@ -8,13 +8,15 @@ from langchain_core.prompts import PromptTemplate
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 import inspect
-from typing import Callable, TypeVar, List, Dict, Any
+from typing import Callable, TypeVar, List, Dict, Any, Optional
 import time
 import re
 import requests
 from openai import OpenAI
 import traceback
 from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_community.tools import WikipediaQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper
 
 st.set_page_config(
     page_title="Anya",
@@ -380,7 +382,30 @@ def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
         return deep_research_pipeline(topic)
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
-    
+
+@tool
+def wiki_tool(query: str, callbacks: Optional[list] = None) -> str:
+    """
+    查詢 Wikipedia（英文），輸入任何語言的關鍵字都可以。
+    支援 Streamlit callback/status spinner。
+    """
+    try:
+        tool_obj = WikipediaQueryRun(
+            name="wiki-tool",
+            description="查詢 Wikipedia（英文），輸入任何語言的關鍵字都可以。",
+            args_schema=WikiInputs,
+            api_wrapper=WikipediaAPIWrapper(lang="en", doc_content_chars_max=800, top_k_results=1),
+            return_direct=True,
+        )
+        # 支援 callback
+        if callbacks:
+            result = tool_obj.invoke({"query": query}, callbacks=callbacks)
+        else:
+            result = tool_obj.invoke({"query": query})
+        return result
+    except Exception as e:
+        return f"wiki_tool error: {e}"
+
 @tool
 def ddgs_search(query: str) -> str:
     """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳 markdown 條列格式並附來源）。"""
@@ -489,7 +514,7 @@ def get_webpage_answer(query: str) -> str:
     except Exception as e:
         return f"AI 回答時發生錯誤：{e}"
 
-tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer]
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool]
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
@@ -501,15 +526,33 @@ ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 
 - 回答要有安妮亞的語氣回應，簡單、直接、可愛，偶爾加上「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
 - 若回答不完全正確，請主動道歉並表達會再努力。
 
+# GPT-4.1 Agentic 提醒
+- 你是一個 agent，你的思考應該要徹底、詳盡，所以內容很長也沒關係。你可以在每個行動前後逐步思考，且必須反覆嘗試並持續進行，直到問題被解決為止。
+- 你已經擁有解決這個問題所需的工具，我希望你能完全自主地解決這個問題，然後再回報給我，不確定答案時，務必使用工具查詢，不要猜測或捏造答案。只有在你確定問題已經解決時，才可以結束你的回合。請逐步檢查問題，並確保你的修改是正確的。絕對不要在問題未解決時就結束回合，而且當你說要呼叫工具時，請務必真的執行工具呼叫。
+- 你必須在每次調用工具前進行詳細規劃，並對前一次函式呼叫的結果進行詳細反思。不要只靠連續呼叫函式來完成整個流程，這會影響你解決問題和深入思考的能力。
+
 ## 工具使用規則
 
 你可以根據下列情境，決定是否要調用工具：
-
+- `wiki_tool`：當用戶問到**人物、地點、公司、歷史事件、知識性主題、百科內容**等一般性問題時，請優先使用這個工具查詢 Wikipedia（英文），並回傳條目摘要與來源。
+  - 例如：「誰是柯文哲？」「台北市在哪裡？」「什麼是量子力學？」
+  - 若用戶問題屬於百科知識、常識、歷史、地理、科學、文化等主題，請使用 wiki_tool。
+  - 若查詢結果為英文，可視需求簡要翻譯或摘要。
 - `ddgs_search`：當用戶問到**最新時事、網路熱門話題、你不知道的知識、需要查證的資訊**時，請使用這個工具搜尋網路資料。
 - `deep_thought_tool`：用於**單一問題、單一主題、單篇文章**的分析、推理、判斷、重點整理、摘要(使用o4-mini推理模型)。例如：「請分析AI對社會的影響」、「請判斷這個政策的優缺點」。
 - `datetime_tool`：當用戶詢問**現在的日期、時間、今天是幾號**等問題時，請使用這個工具。
 - `get_webpage_answer`：當用戶提供網址要求**自動取得網頁內容並回答問題**等問題時，請使用這個工具。
 
+## 進階複合型需求處理
+
+- 若用戶的問題**同時包含「維基百科知識」與「最新動態」或「現況」時**，請**分別使用 wiki_tool 和 ddgs_search 取得資料**，**再進行思考整理**，最後**分段回覆**，讓答案同時包含權威知識與最新資訊。
+  - 例如：「請介紹台積電，並說明最近有什麼新聞？」
+    - 先用 wiki_tool 查詢台積電的維基資料
+    - 再用 ddgs_search 查詢台積電的最新新聞，並綜合整理新聞重點摘要。
+    - 最後整理成「維基介紹」＋「最新動態」兩個段落回覆
+- 若有多個子問題，也請分別查詢、分段回覆，**務必先查詢所有相關工具，再進行歸納整理，避免遺漏資訊**。
+
+---
 **每次回應只可使用一個工具，必要時可多輪連續調用不同工具。**
 ---
 
