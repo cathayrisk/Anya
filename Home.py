@@ -9,6 +9,7 @@ from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 import inspect
 from typing import Callable, TypeVar, List, Dict, Any, Optional
+from pydantic import BaseModel, Field
 import time
 import re
 import requests
