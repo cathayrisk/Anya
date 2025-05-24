@@ -764,12 +764,14 @@ def get_streamlit_cb(parent_container, status=None):
                     "deep_thought_tool": "🤔",
                     "datetime_tool": "⏰",
                     "get_webpage_answer": "📄",
+                    "wiki-tool": "📚",
                 }.get(tool_name, "🛠️")
                 tool_desc = {
                     "ddgs_search": "搜尋網路資料",
                     "deep_thought_tool": "深入分析資料",
                     "datetime_tool": "查詢時間",
                     "get_webpage_answer": "取得網頁重點",
+                    "wiki-tool": "查詢維基百科",
                 }.get(tool_name, "執行工具")
                 self.status.update(label=f"安妮亞正在{tool_desc}...{tool_emoji}", state="running")
 
