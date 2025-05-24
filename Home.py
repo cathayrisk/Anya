@@ -389,10 +389,9 @@ def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 @tool
-def wiki_tool(query: str, callbacks: Optional[list] = None) -> str:
+def wiki_tool(query: str) -> str:
     """
     查詢 Wikipedia（英文），輸入任何語言的關鍵字都可以。
-    支援 Streamlit callback/status spinner。
     """
     try:
         tool_obj = WikipediaQueryRun(
@@ -402,11 +401,7 @@ def wiki_tool(query: str, callbacks: Optional[list] = None) -> str:
             api_wrapper=WikipediaAPIWrapper(lang="en", doc_content_chars_max=800, top_k_results=1),
             return_direct=True,
         )
-        # 支援 callback
-        if callbacks:
-            result = tool_obj.invoke({"query": query}, callbacks=callbacks)
-        else:
-            result = tool_obj.invoke({"query": query})
+        result = tool_obj.invoke({"query": query})
         return result
     except Exception as e:
         return f"wiki_tool error: {e}"
