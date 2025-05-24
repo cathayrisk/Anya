@@ -35,6 +35,10 @@ if "current_model" not in st.session_state:
 if "llm" not in st.session_state:
     st.session_state.llm = None
 
+# 定義 WikiInputs
+class WikiInputs(BaseModel):
+    query: str = Field(description="要查詢的關鍵字")
+
 # --- 2. LLM 初始化 ---
 def ensure_llm():
     if (
