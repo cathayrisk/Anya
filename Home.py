@@ -605,6 +605,7 @@ ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 
 - **gray/grey**：輔助說明、備註
 - **rainbow**：彩色強調、活潑
 - **primary**：依主題色自動變化
+請僅限使用上述顏色。黃色（yellow）在多數平台不穩定，請勿使用。如需黃色效果，建議改用橘色或黃色emoji（🟡、✨、🌟）強調。
 
 ## 跨平台小提醒
 - 建議只用標準Markdown語法（粗體、斜體、標題、條列、引用、emoji），這樣在各種平台都能正常顯示。
