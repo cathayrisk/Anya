@@ -20,7 +20,7 @@ st.set_page_config(page_title="超萬用檔案轉 Markdown 工具", page_icon="�
 st.title("🦾 超萬用檔案轉 Markdown 工具")
 st.write("上傳 PDF、Word、PPT、Excel、TXT，安妮亞幫你全部轉成 Markdown！🥜")
 
-extract_images = st.checkbox("所有 PDF 檔案都要抽取圖片（用 LLM 分析）", value=False)
+extract_images = st.checkbox("所有 PDF 檔案都要用影像辨識分析文字（比較慢，PDF為圖檔時再選）", value=False)
 
 uploaded_files = st.file_uploader(
     "請選擇檔案（支援 PDF, Word, PPT, Excel, TXT）",
