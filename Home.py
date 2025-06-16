@@ -545,12 +545,12 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
     input_variables=["input_question"],
 )
 
-# 3. Reasoning模型參數
-REASONING_MODEL = "o4-mini"
-REASONING_EFFORT = "medium"
-REASONING_SUMMARY = "auto"
-MAX_OUTPUT_TOKENS = 80000
-    
+    # 3. Reasoning模型參數
+    REASONING_MODEL = "o4-mini"
+    REASONING_EFFORT = "medium"
+    REASONING_SUMMARY = "auto"
+    MAX_OUTPUT_TOKENS = 80000
+
     reasoning = {
         "effort": REASONING_EFFORT,
         "summary": REASONING_SUMMARY
