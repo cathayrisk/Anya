@@ -518,9 +518,9 @@ def get_webpage_answer(query: str) -> str:
 
 def analyze_programming_question_with_tools(input_question: str) -> Dict[str, Any]:
 
-# 2. 通用Prompt設計
-prompt_template = PromptTemplate(
-    template="""Formatting re-enabled
+    # 2. 通用Prompt設計
+    prompt_template = PromptTemplate(
+        template="""Formatting re-enabled
 ---
 你是一位精通各種程式語言（如Python、Matlab、JavaScript、C++、R等）的專業程式助理，請針對下列程式設計相關問題進行專業解釋、修改、最佳化或教學，並以正體中文詳細說明。
 - 如果需要查詢最新資料，請主動使用「DuckDuckGo 搜尋」工具。
