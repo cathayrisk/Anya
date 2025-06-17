@@ -514,16 +514,11 @@ def get_webpage_answer(query: str) -> str:
     except Exception as e:
         return f"AI 回答時發生錯誤：{e}"
 
-
-
 def analyze_programming_question_with_tools(input_question: str) -> Dict[str, Any]:
-
-    # 2. 通用Prompt設計
     prompt_template = PromptTemplate(
         template="""Formatting re-enabled
 ---
 你是一位精通各種程式語言（如Python、Matlab、JavaScript、C++、R等）的專業程式助理，請針對下列程式設計相關問題進行專業解釋、修改、最佳化或教學，並以正體中文詳細說明。
-- 如果需要查詢最新資料，請主動使用「DuckDuckGo 搜尋」工具。
 - 如果是程式碼，請逐行解釋並加上註解。
 - 如果需要修改程式，請根據指示修改並說明修改原因。
 - 如果有錯誤訊息，請分析原因並給出修正建議。
@@ -542,21 +537,19 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
 4. **常見錯誤與排除方法**（如有）
 5. **補充說明或延伸學習建議**
 """,
-    input_variables=["input_question"],
-)
+        input_variables=["input_question"],
+    )
 
-    # 3. Reasoning模型參數
     REASONING_MODEL = "o4-mini"
     REASONING_EFFORT = "medium"
     REASONING_SUMMARY = "detailed"
-    MAX_OUTPUT_TOKENS = 80000
+    MAX_OUTPUT_TOKENS = 32000  # 建議不要太大
 
     reasoning = {
         "effort": REASONING_EFFORT,
         "summary": REASONING_SUMMARY
     }
 
-    # 初始化 LLM
     llm = ChatOpenAI(
         model=REASONING_MODEL,
         openai_api_key=st.secrets["OPENAI_KEY"],
@@ -571,7 +564,6 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
     prompt = prompt_template.format(input_question=input_question)
     response = llm.invoke(prompt)
 
-    # 取得推理摘要
     reasoning_summary = []
     try:
         summary_blocks = response.additional_kwargs.get("reasoning", {}).get("summary", [])
@@ -579,25 +571,14 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
     except Exception as e:
         reasoning_summary = [f"無法取得推理摘要：{e}"]
 
-    # 處理工具調用結果
-    tool_outputs = response.additional_kwargs.get("tool_outputs", [])
-    tool_output_md = ""
-    if tool_outputs:
-        tool_output_md = "\n\n## 🔎 工具查詢結果\n"
-        for tool_output in tool_outputs:
-            # tool_output["result"] 會是ddgs_search的回傳內容
-            tool_output_md += f"{tool_output.get('result', '')}\n"
-
     return {
         "reasoning_summary": reasoning_summary,
-        "answer": str(response),
-        "tool_output_md": tool_output_md
+        "answer": str(response)
     }
 
-# 4. Tool包裝
-def programming_reasoning_tool_with_search(content: str) -> str:
+def programming_reasoning_tool(content: str) -> str:
     """
-    通用程式設計推理型Agent Tool，支援function calling與DuckDuckGo搜尋，會先回推理摘要、工具查詢結果，再回主答案，並用Markdown格式美美地顯示！
+    通用程式設計推理型Agent Tool，會先回推理摘要，再回主答案，並用Markdown格式美美地顯示！
     """
     try:
         result = analyze_programming_question_with_tools(content)
@@ -607,21 +588,19 @@ def programming_reasoning_tool_with_search(content: str) -> str:
         else:
             reasoning_md = "## 🧠 推理摘要\n> 無推理摘要"
 
-        tool_output_md = result.get("tool_output_md", "")
         answer = result.get("answer", "")
         answer_md = f"\n\n---\n\n## 📝 主答案\n{answer}\n"
 
-        return reasoning_md + tool_output_md + answer_md
+        return reasoning_md + answer_md
     except Exception as e:
-        return f"programming_reasoning_tool_with_search error: {e}"
+        return f"programming_reasoning_tool error: {e}"
 
-# 5. Tool註冊
 @tool
 def programming_tool(content: str) -> str:
     """
-    通用程式設計推理型Agent Tool，支援function calling與DuckDuckGo搜尋，會先回推理摘要、工具查詢結果，再回主答案，並用Markdown格式美美地顯示！
+    通用程式設計推理型Agent Tool，會先回推理摘要，再回主答案，並用Markdown格式美美地顯示！
     """
-    return programming_reasoning_tool_with_search(content)
+    return programming_reasoning_tool(content)
 
 tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool]
 
