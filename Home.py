@@ -542,7 +542,7 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
 
     REASONING_MODEL = "o4-mini"
     REASONING_EFFORT = "medium"
-    REASONING_SUMMARY = "detailed"
+    REASONING_SUMMARY = "auto"
     MAX_OUTPUT_TOKENS = 32000  # 建議不要太大
 
     reasoning = {
