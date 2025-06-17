@@ -548,7 +548,7 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
     # 3. Reasoning模型參數
     REASONING_MODEL = "o4-mini"
     REASONING_EFFORT = "medium"
-    REASONING_SUMMARY = "auto"
+    REASONING_SUMMARY = "detailed"
     MAX_OUTPUT_TOKENS = 80000
 
     reasoning = {
@@ -568,11 +568,8 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
         },
     )
 
-    # 綁定工具
-    llm_with_tools = llm.bind_tools([ddgs_search])
-
     prompt = prompt_template.format(input_question=input_question)
-    response = llm_with_tools.invoke(prompt)
+    response = llm.invoke(prompt)
 
     # 取得推理摘要
     reasoning_summary = []
