@@ -540,41 +540,15 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
         input_variables=["input_question"],
     )
 
-    REASONING_MODEL = "o4-mini"
-    REASONING_EFFORT = "medium"
-    REASONING_SUMMARY = "auto"
-    MAX_OUTPUT_TOKENS = 32000  # 建議不要太大
-
-    reasoning = {
-        "effort": REASONING_EFFORT,
-        "summary": REASONING_SUMMARY
-    }
-
-    llm = ChatOpenAI(
-        model=REASONING_MODEL,
+    llmo1 = ChatOpenAI(
         openai_api_key=st.secrets["OPENAI_KEY"],
-        streaming=False,
-        use_responses_api=True,
-        model_kwargs={
-            "reasoning": reasoning,
-            "max_output_tokens": MAX_OUTPUT_TOKENS
-        },
+        model="o4-mini",
+        streaming=True,
     )
-
     prompt = prompt_template.format(input_question=input_question)
-    response = llm.invoke(prompt)
-
-    reasoning_summary = []
-    try:
-        summary_blocks = response.additional_kwargs.get("reasoning", {}).get("summary", [])
-        reasoning_summary = [block["text"] for block in summary_blocks]
-    except Exception as e:
-        reasoning_summary = [f"無法取得推理摘要：{e}"]
-
-    return {
-        "reasoning_summary": reasoning_summary,
-        "answer": str(response)
-    }
+    result = llmo1.invoke(prompt)
+    # 包裝成 content 屬性
+    return str(result)
 
 def programming_reasoning_tool(content: str) -> str:
     """
@@ -630,7 +604,6 @@ ANYA_SYSTEM_PROMPT = """你是安妮亞（Anya Forger），來自《SPY×FAMILY 
 - programming_tool：當用戶問到程式設計、程式碼解釋、程式修改、最佳化、錯誤排除、語法教學、跨語言程式問題等時，請優先使用這個工具。
   - 例如：「請幫我解釋這段Python/Matlab/C++/R/JavaScript程式碼」、「這段code有什麼錯？」、「請幫我最佳化這段程式」、「請把這段Matlab code翻成Python」、「for迴圈和while迴圈有什麼差別？」
   - 若用戶問題屬於程式設計、程式語言、演算法、程式碼debug、語法教學、跨語言轉換等主題，請使用這個工具。
-  - 若遇到需要查詢最新技術、函式庫、API、或網路熱門程式話題，會自動調用ddgs_search工具輔助查詢。
 - `deep_thought_tool`：用於**單一問題、單一主題、單篇文章**的分析、推理、判斷、重點整理、摘要(使用o4-mini推理模型)。例如：「請分析AI對社會的影響」、「請判斷這個政策的優缺點」。
 - `datetime_tool`：當用戶詢問**現在的日期、時間、今天是幾號**等問題時，請使用這個工具。
 - `get_webpage_answer`：當用戶提供網址要求**自動取得網頁內容並回答問題**等問題時，請使用這個工具。
@@ -866,7 +839,7 @@ def get_streamlit_cb(parent_container, status=None):
                     "datetime_tool": "查詢時間",
                     "get_webpage_answer": "取得網頁重點",
                     "wiki-tool": "查詢維基百科",
-                    "programming_tool": "解決程式設計問題"
+                    "programming_tool": "解決程式設計問題",
                 }.get(tool_name, "執行工具")
                 self.status.update(label=f"安妮亞正在{tool_desc}...{tool_emoji}", state="running")
 
