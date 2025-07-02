@@ -1,5 +1,6 @@
 import streamlit as st
 from supabase import create_client, Client
+import traceback
 
 # 你的Supabase專案資訊
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
