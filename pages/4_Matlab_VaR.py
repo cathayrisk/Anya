@@ -28,11 +28,6 @@ if uploaded_file is not None:
             st.error(f"上傳失敗：{res.error}")
         else:
             st.success("上傳成功！")
-            public_url = supabase.storage.from_(BUCKET).get_public_url(res.full_path)
-            st.markdown(f"**檔案網址：** [{public_url['data']['publicUrl']}]({public_url['data']['publicUrl']})")
-            # 如果是圖片可以預覽
-            if content_type.startswith("image/"):
-                st.image(public_url['data']['publicUrl'], caption="預覽", use_column_width=True)
     except Exception as e:
         st.error(f"Exception: {e}")
         st.text(traceback.format_exc())
