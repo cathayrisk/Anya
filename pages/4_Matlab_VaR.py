@@ -19,14 +19,17 @@ if uploaded_file is not None:
     content_type = uploaded_file.type or "application/octet-stream"
 
     with st.spinner("上傳中..."):
-        res = supabase.storage.from_(BUCKET).upload(file_name, file_bytes, {"content-type": content_type})
-
-    st.write(res)  # 這裡會印出完整回傳內容
-    if res and res.get("error"):
-        st.error(f"上傳失敗：{res['error']['message']}")
-    elif res and res.get("data"):
-        st.success("上傳成功！")
-        public_url = supabase.storage.from_(BUCKET).get_public_url(file_name)
-        st.markdown(f"**檔案網址：** [{public_url['data']['publicUrl']}]({public_url['data']['publicUrl']})")
-    else:
-        st.error("上傳失敗，請檢查 bucket 名稱、權限設定或檔案格式。")
+        try:
+            res = supabase.storage.from_(BUCKET).upload(file_name, file_bytes, {"content-type": content_type})
+            st.write(res)
+            if res and res.get("error"):
+                st.error(f"上傳失敗：{res['error']['message']}")
+            elif res and res.get("data"):
+                st.success("上傳成功！")
+                public_url = supabase.storage.from_(BUCKET).get_public_url(file_name)
+                st.markdown(f"**檔案網址：** [{public_url['data']['publicUrl']}]({public_url['data']['publicUrl']})")
+            else:
+                st.error("上傳失敗，請檢查 bucket 名稱、權限設定或檔案格式。")
+        except Exception as e:
+            st.error(f"Exception: {e}")
+            st.text(traceback.format_exc())
