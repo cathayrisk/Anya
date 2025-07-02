@@ -4,6 +4,7 @@ from supabase import create_client, Client
 # 你的Supabase專案資訊
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+BUCKET = "matlabvar"  # 你的bucket名稱
 
 # 初始化Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
