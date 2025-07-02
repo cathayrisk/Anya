@@ -12,6 +12,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 st.title("Supabase Storage 檔案上傳工具 🥜")
 
 uploaded_file = st.file_uploader("請選擇要上傳的檔案", type=None)
+uploaded_file = st.file_uploader("請選擇要上傳的檔案", type=None)
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
@@ -21,14 +22,12 @@ if uploaded_file is not None:
     with st.spinner("上傳中..."):
         res = supabase.storage.from_(BUCKET).upload(file_name, file_bytes, {"content-type": content_type})
 
+    st.write(res)
     if res and res.get("error"):
         st.error(f"上傳失敗：{res['error']['message']}")
     elif res and res.get("data"):
         st.success("上傳成功！")
         public_url = supabase.storage.from_(BUCKET).get_public_url(file_name)
         st.markdown(f"**檔案網址：** [{public_url['data']['publicUrl']}]({public_url['data']['publicUrl']})")
-        # 如果是圖片才顯示預覽
-        if content_type.startswith("image/"):
-            st.image(public_url['data']['publicUrl'], caption="預覽", use_column_width=True)
     else:
         st.error("上傳失敗，請檢查 bucket 名稱、權限設定或檔案格式。")
