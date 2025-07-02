@@ -14,18 +14,21 @@ st.title("Supabase Storage 檔案上傳工具 🥜")
 uploaded_file = st.file_uploader("請選擇要上傳的檔案", type=None)
 
 if uploaded_file is not None:
-    # 取得檔案內容
     file_bytes = uploaded_file.getvalue()
     file_name = uploaded_file.name
+    content_type = uploaded_file.type or "application/octet-stream"
 
-    # 上傳到Supabase Storage
     with st.spinner("上傳中..."):
-        res = supabase.storage.from_(BUCKET).upload(file_name, file_bytes, {"content-type": uploaded_file.type})
-    if res.get("error"):
+        res = supabase.storage.from_(BUCKET).upload(file_name, file_bytes, {"content-type": content_type})
+
+    if res and res.get("error"):
         st.error(f"上傳失敗：{res['error']['message']}")
-    else:
+    elif res and res.get("data"):
         st.success("上傳成功！")
-        # 取得公開網址
         public_url = supabase.storage.from_(BUCKET).get_public_url(file_name)
         st.markdown(f"**檔案網址：** [{public_url['data']['publicUrl']}]({public_url['data']['publicUrl']})")
-        st.image(public_url['data']['publicUrl'], caption="預覽", use_column_width=True)
+        # 如果是圖片才顯示預覽
+        if content_type.startswith("image/"):
+            st.image(public_url['data']['publicUrl'], caption="預覽", use_column_width=True)
+    else:
+        st.error("上傳失敗，請檢查 bucket 名稱、權限設定或檔案格式。")
