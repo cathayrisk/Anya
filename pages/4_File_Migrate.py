@@ -12,7 +12,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 st.title("Supabase Storage 檔案上傳工具 🥜")
 
-uploaded_file = st.file_uploader("請選擇要上傳的檔案", type=None, key="file_uploader_1")
+uploaded_file = st.file_uploader("請選擇要上傳的檔案", type=None, key="file_uploader_1", accept_multiple_files=True)
 
 if uploaded_file is not None:
     file_bytes = uploaded_file.getvalue()
