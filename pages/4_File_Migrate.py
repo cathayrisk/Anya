@@ -10,7 +10,7 @@ BUCKET = "matlabvar"  # 你的bucket名稱
 # 初始化Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-st.title("Supabase Storage 檔案上傳工具 🥜")
+st.title("檔案逃難上傳工具 🥜")
 
 uploaded_files = st.file_uploader(
     "請選擇要上傳的檔案", 
