@@ -22,7 +22,8 @@ pymupdf4llm
 
 # Web tools and research
 wikipedia
-duckduckgo-search
+#duckduckgo-search
+ddgs
 beautifulsoup4
 requests
 
