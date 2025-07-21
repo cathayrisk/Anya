@@ -445,13 +445,13 @@ def datetime_tool() -> str:
 def analyze_deeply(input_question: str) -> str:
     """使用OpenAI的模型來深入分析問題並返回結果。"""
     prompt_template = PromptTemplate(
-        template="""請分析以下問題，並以正體中文提供詳細的結論和理由，請依據事實分析，不考慮資料的時間因素：
+        template="""Formatting re-enabled 請分析以下問題，並以正體中文提供詳細的結論和理由，請依據事實分析，不考慮資料的時間因素：
 
 問題：{input_question}
 
 指導方針：
 1. 描述問題的背景和相關資訊。
-2. 直接給出你的結論，並提供支持該結論的理由。
+2. 直接給出你的結論，並深入分析提供支持該結論的理由。
 3. 如果有不確定的地方，請明確指出。
 4. 確保你的回答是詳細且有條理的。
 """,
