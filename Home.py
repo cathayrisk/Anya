@@ -459,7 +459,7 @@ def analyze_deeply(input_question: str) -> str:
     )
     llmo1 = ChatOpenAI(
         openai_api_key=st.secrets["OPENAI_KEY"],
-        model="o4-mini",
+        model="o4-mini-deep-research-2025-06-26",
         streaming=True,
     )
     prompt = prompt_template.format(input_question=input_question)
@@ -505,7 +505,7 @@ def get_webpage_answer(query: str) -> str:
             model="gpt-4.1-mini",  # 你可以根據需求選擇模型
             streaming=False,
         )
-        prompt = f"""請根據以下網頁內容，針對問題「{question}」以條列式摘要重點，並用正體中文回答：
+        prompt = f"""請根據以下網頁內容，針對問題「{question}」的要求進行回應，並用正體中文回答：
 
 {content}
 """
