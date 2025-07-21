@@ -459,7 +459,7 @@ def analyze_deeply(input_question: str) -> str:
     )
     llmo1 = ChatOpenAI(
         openai_api_key=st.secrets["OPENAI_KEY"],
-        model="o4-mini-deep-research-2025-06-26",
+        model="o4-mini",
         streaming=True,
     )
     prompt = prompt_template.format(input_question=input_question)
