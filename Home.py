@@ -952,7 +952,7 @@ if user_input:
     status_label = status_response.choices[0].message.content.strip()
     
     with st.chat_message("assistant"):
-        status = st.status(status_label, expanded=True)
+        status = st.status(status_label)
         st_callback = get_streamlit_cb(st.container(), status=status)
         response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
         ai_msg = response["messages"][-1]
