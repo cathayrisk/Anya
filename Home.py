@@ -657,7 +657,7 @@ ANYA_SYSTEM_PROMPT = """# Agentic Reminders
 
 # Markdown格式與emoji/顏色用法說明
 ## 基本原則
-- 請根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度花俏。  
+- 請根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度使用彩色文字。  
 - 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。  
 
 ## 功能與語法
