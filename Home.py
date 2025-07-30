@@ -18,6 +18,7 @@ import traceback
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
+from ddgs import DDGS
 
 st.set_page_config(
     page_title="Anya",
@@ -410,7 +411,7 @@ def wiki_tool(query: str) -> str:
 def ddgs_search(query: str) -> str:
     """DuckDuckGo 搜尋（同時查詢網頁與新聞，回傳 markdown 條列格式並附來源）。"""
     try:
-        from duckduckgo_search import DDGS
+        #from duckduckgo_search import DDGS
         ddgs = DDGS()
         web_results = ddgs.text(query, region="wt-wt", safesearch="moderate", max_results=5)
         news_results = ddgs.news(query, region="wt-wt", safesearch="moderate", max_results=5)
