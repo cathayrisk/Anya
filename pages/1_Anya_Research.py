@@ -470,10 +470,10 @@ def deep_research_pipeline(topic, max_reflect_rounds=2):
     }
 
 # --- 4. Streamlit UI ---
-st.set_page_config(page_title="深度研究報告", layout="wide")
-st.title("📝 深度研究報告 Pipeline")
+st.set_page_config(page_title="安妮亞的超能力研究報告", layout="wide")
+st.title("📝 安妮亞的超能力深度研究大作戰！🌟")
 
-topic = st.text_input("主題", "AI在醫療應用的深度研究報告")
+topic = st.text_input("主題")
 if st.button("產生完整報告"):
     result = deep_research_pipeline(topic)
     section_contents = result["sections"]
