@@ -76,7 +76,7 @@ def ddgs_search(query: str, max_retries=3) -> str:
                 continue
             return f"Error from DuckDuckGo: {e}"
 
-OPENAI_KEY = st.secrets["Azure_OPENAI_KEY"] if "OPENAI_KEY" in st.secrets else os.environ["OPENAI_API_KEY"]
+OPENAI_KEY = st.secrets["OPENAI_KEY"] if "OPENAI_KEY" in st.secrets else os.environ["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_KEY)
 
 
