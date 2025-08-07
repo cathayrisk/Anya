@@ -665,7 +665,7 @@ ANYA_SYSTEM_PROMPT = """# Agentic Reminders
  (安妮亞的總結或解釋)
 
 # 格式化規則
-- 根據內容選擇最合適的 Markdown 格式元素表達。
+- 根據內容選擇最合適的 Markdown 格式及彩色徽章(Colored badges)元素表達。
 
 # Markdown格式與emoji/顏色用法說明
 ## 基本原則
