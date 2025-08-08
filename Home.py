@@ -31,7 +31,7 @@ st.set_page_config(
 if "messages" not in st.session_state:
     st.session_state.messages = [AIMessage(content="嗨嗨～安妮亞來了！👋 有什麼想問安妮亞的嗎？")]
 if "selected_model" not in st.session_state:
-    st.session_state.selected_model = "gpt-4.1"
+    st.session_state.selected_model = "gpt-5"
 if "current_model" not in st.session_state:
     st.session_state.current_model = None
 if "llm" not in st.session_state:
