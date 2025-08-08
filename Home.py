@@ -75,7 +75,7 @@ def meta_optimize_prompt(simple_prompt: str, goal: str) -> str:
     return response.choices[0].message.content.strip()
 
 # === 產生查詢（中英文） ===
-def generate_queries(topic: str, model="gpt-5-mini") -> List[str]:
+def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
     simple_prompt = f"""請針對「{topic}」這個主題，分別用繁體中文與英文各產生三個適合用於網路搜尋的查詢關鍵字，並以如下 JSON 格式回覆：
 {{
     "zh": ["查詢1", "查詢2", "查詢3"],
@@ -98,7 +98,7 @@ def generate_queries(topic: str, model="gpt-5-mini") -> List[str]:
     return queries["zh"] + queries["en"]
 
 # === 查詢摘要 ===
-def auto_summarize(text: str, model="gpt-5-mini") -> str:
+def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
     simple_prompt = f"請用繁體中文摘要以下內容，重點條列，100字內：\n{text}"
     optimized_prompt = meta_optimize_prompt(simple_prompt, "產生精簡且重點明確的摘要")
     response = client.chat.completions.create(
@@ -159,7 +159,7 @@ def parse_sections(plan: str):
     return sections
 
 # 4. 章節查詢產生
-def section_queries(section_title, section_desc, model="gpt-5-mini"):
+def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
     prompt = f"""請針對章節「{section_title}」({section_desc})，分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
 {{
     "zh": ["查詢1", "查詢2"],
@@ -180,7 +180,7 @@ def section_queries(section_title, section_desc, model="gpt-5-mini"):
     return queries["zh"] + queries["en"]
 
 # 5. 章節撰寫（直接用多筆查詢結果）
-def section_write(section_title, section_desc, search_results, model="gpt-5-mini"):
+def section_write(section_title, section_desc, search_results, model="gpt-4.1-mini"):
     prompt = f"""
 # Role and Objective
 你是一位專業技術寫手，根據下方章節主題、說明與「多筆網路查詢結果」，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
@@ -216,7 +216,7 @@ def extract_sources(content: str) -> List[str]:
     return re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', content)
 
 # === 章節內容評分與補強建議 ===
-def section_grade(section_title: str, section_content: str, model="gpt-5-mini") -> Dict[str, Any]:
+def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini") -> Dict[str, Any]:
     simple_prompt = f"""請評分以下章節內容是否完整、正確、可讀性佳，若不及格請列出需補充的查詢關鍵字（中英文各一），回傳 JSON 格式：
 {{
     "grade": "pass" 或 "fail",
@@ -503,7 +503,7 @@ def get_webpage_answer(query: str) -> str:
     try:
         llmurl = ChatOpenAI(
             openai_api_key=st.secrets["OPENAI_KEY"],  # 或用os.environ["OPENAI_API_KEY"]
-            model="gpt-5-mini",  # 你可以根據需求選擇模型
+            model="gpt-4.1-mini",  # 你可以根據需求選擇模型
             streaming=False,
         )
         prompt = f"""請根據以下網頁內容，針對問題「{question}」的要求進行回應，並用正體中文回答：
@@ -958,7 +958,7 @@ if user_input:
 
     # 呼叫 LLM 產生 status label
     status_response = client.chat.completions.create(
-        model="gpt-5-nano",
+        model="gpt-4.1-nano",
         messages=[{"role": "user", "content": status_prompt}]
     )
     status_label = status_response.choices[0].message.content.strip()
