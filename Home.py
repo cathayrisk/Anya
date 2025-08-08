@@ -50,7 +50,7 @@ def ensure_llm():
         st.session_state.llm = ChatOpenAI(
             model=st.session_state.selected_model,
             openai_api_key=st.secrets["OPENAI_KEY"],
-            temperature=0.0,
+            #temperature=0.0,
             streaming=True,
         )
         st.session_state.current_model = st.session_state.selected_model
