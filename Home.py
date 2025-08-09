@@ -460,8 +460,8 @@ def analyze_deeply(input_question: str) -> str:
     )
     llmo1 = ChatOpenAI(
         openai_api_key=st.secrets["OPENAI_KEY"],
-        model="o4-mini",
-        streaming=True,
+        model="gpt-5",
+        #streaming=True,
     )
     prompt = prompt_template.format(input_question=input_question)
     result = llmo1.invoke(prompt)
