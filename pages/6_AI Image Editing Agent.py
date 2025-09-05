@@ -61,6 +61,8 @@ for message in st.session_state.messages:
             st.image(message["image"])
             
 def pil_to_image_upload(img, fmt="PNG"):
+    if img.mode == "CMYK":
+        img = img.convert("RGB")
     buf = BytesIO()
     img.save(buf, format=fmt)
     buf.seek(0)
