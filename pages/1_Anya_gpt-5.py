@@ -147,42 +147,6 @@ def get_webpage_answer(query: str) -> str:
     except Exception as e:
         return f"AI 回答時發生錯誤：{e}"
 
-def analyze_programming_question_with_tools(input_question: str) -> Dict[str, Any]:
-    prompt_template = PromptTemplate(
-        template="""Formatting re-enabled
----
-你是一位精通各種程式語言（如Python、Matlab、JavaScript、C++、R等）的專業程式助理，請針對下列程式設計相關問題進行專業解釋、修改、最佳化或教學，並以正體中文詳細說明。
-- 如果是程式碼，請逐行解釋並加上註解。
-- 如果需要修改程式，請根據指示修改並說明修改原因。
-- 如果有錯誤訊息，請分析原因並給出修正建議。
-- 如果是語法或函數問題，請用白話文解釋並舉例。
-- 請根據事實推理，不要假設未提及的內容。
-
----
-問題：
-{input_question}
----
-
-請依下列格式回答：
-1. **問題背景與重點摘要**
-2. **詳細解釋或修改後的程式碼**
-3. **說明與教學**
-4. **常見錯誤與排除方法**（如有）
-5. **補充說明或延伸學習建議**
-""",
-        input_variables=["input_question"],
-    )
-
-    llmo1 = ChatOpenAI(
-        openai_api_key=st.secrets["OPENAI_KEY"],
-        model="o4-mini",
-        streaming=True,
-    )
-    prompt = prompt_template.format(input_question=input_question)
-    result = llmo1.invoke(prompt)
-    # 包裝成 content 屬性
-    return str(result)
-
 
 tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool]
 
