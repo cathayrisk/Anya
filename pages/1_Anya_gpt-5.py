@@ -183,33 +183,8 @@ def analyze_programming_question_with_tools(input_question: str) -> Dict[str, An
     # 包裝成 content 屬性
     return str(result)
 
-def programming_reasoning_tool(content: str) -> str:
-    """
-    通用程式設計推理型Agent Tool，會先回推理摘要，再回主答案，並用Markdown格式美美地顯示！
-    """
-    try:
-        result = analyze_programming_question_with_tools(content)
-        reasoning_blocks = result.get("reasoning_summary", [])
-        if reasoning_blocks:
-            reasoning_md = "## 🧠 推理摘要\n" + "\n".join([f"> {block}" for block in reasoning_blocks])
-        else:
-            reasoning_md = "## 🧠 推理摘要\n> 無推理摘要"
 
-        answer = result.get("answer", "")
-        answer_md = f"\n\n---\n\n## 📝 主答案\n{answer}\n"
-
-        return reasoning_md + answer_md
-    except Exception as e:
-        return f"programming_reasoning_tool error: {e}"
-
-@tool
-def programming_tool(content: str) -> str:
-    """
-    通用程式設計推理型Agent Tool，會先回推理摘要，再回主答案，並用Markdown格式美美地顯示！
-    """
-    return programming_reasoning_tool(content)
-
-tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool]
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool]
 
 # === 4. 定義系統提示與 LLM模型 ===
 ANYA_SYSTEM_PROMPT = """# Agentic Reminders
