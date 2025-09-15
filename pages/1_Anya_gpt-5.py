@@ -69,7 +69,147 @@ def wiki_tool(query: str) -> str:
     except Exception as e:
         return f"wiki_tool error: {e}"
 
-tools = [ddgs_search, wiki_tool]
+@tool
+def datetime_tool() -> str:
+    """確認當前的日期和時間。"""
+    return datetime.now().isoformat()
+
+# 你的 deep_thought_tool
+def analyze_deeply(input_question: str) -> str:
+    """使用OpenAI的模型來深入分析問題並返回結果。"""
+    prompt_template = PromptTemplate(
+        template="""Formatting re-enabled 請分析以下問題，並以正體中文提供詳細的結論和理由，請依據事實分析，不考慮資料的時間因素：
+
+問題：{input_question}
+
+指導方針：
+1. 描述問題的背景和相關資訊。
+2. 直接給出你的結論，並深入分析提供支持該結論的理由。
+3. 如果有不確定的地方，請明確指出。
+4. 確保你的回答是詳細且有條理的。
+""",
+        input_variables=["input_question"],
+    )
+    llmo1 = ChatOpenAI(
+        openai_api_key=st.secrets["OPENAI_KEY"],
+        model="gpt-5",
+        #streaming=True,
+    )
+    prompt = prompt_template.format(input_question=input_question)
+    result = llmo1.invoke(prompt)
+    # 包裝成 content 屬性
+    return str(result)
+
+@tool
+def deep_thought_tool(content: str) -> str:
+    """
+    安妮亞仔細思考深入分析。
+    """
+    try:
+        return analyze_deeply(content).strip() + "\n\n---\n\n"
+    except Exception as e:
+        return f"deep_thought_tool error: {e}"
+
+@tool
+def get_webpage_answer(query: str) -> str:
+    """
+    根據用戶的問題與網址，自動取得網頁內容並回答問題。
+    請輸入格式如：「請幫我總結 https://example.com 這篇文章的重點」
+    """
+    # 1. 抽取網址與問題
+    url_match = re.search(r'(https?://[^\s]+)', query)
+    url = url_match.group(1) if url_match else None
+    question = query.replace(url, '').strip() if url else query
+    if not url:
+        return "未偵測到網址，請提供正確的網址。"
+    # 2. 取得 Jina Reader 內容
+    jina_url = f"https://r.jina.ai/{url}"
+    try:
+        resp = requests.get(jina_url, timeout=15)
+        if resp.status_code != 200:
+            return "無法取得網頁內容，請確認網址是否正確。"
+        content = resp.text
+    except Exception as e:
+        return f"取得網頁內容時發生錯誤：{e}"
+    # 3. 直接在這裡初始化 LLM
+    try:
+        llmurl = ChatOpenAI(
+            openai_api_key=st.secrets["OPENAI_KEY"],  # 或用os.environ["OPENAI_API_KEY"]
+            model="gpt-4.1-mini",  # 你可以根據需求選擇模型
+            streaming=False,
+        )
+        prompt = f"""請根據以下網頁內容，針對問題「{question}」的要求進行回應，並用正體中文回答：
+
+{content}
+"""
+        result = llmurl.invoke(prompt)
+        return str(result)
+    except Exception as e:
+        return f"AI 回答時發生錯誤：{e}"
+
+def analyze_programming_question_with_tools(input_question: str) -> Dict[str, Any]:
+    prompt_template = PromptTemplate(
+        template="""Formatting re-enabled
+---
+你是一位精通各種程式語言（如Python、Matlab、JavaScript、C++、R等）的專業程式助理，請針對下列程式設計相關問題進行專業解釋、修改、最佳化或教學，並以正體中文詳細說明。
+- 如果是程式碼，請逐行解釋並加上註解。
+- 如果需要修改程式，請根據指示修改並說明修改原因。
+- 如果有錯誤訊息，請分析原因並給出修正建議。
+- 如果是語法或函數問題，請用白話文解釋並舉例。
+- 請根據事實推理，不要假設未提及的內容。
+
+---
+問題：
+{input_question}
+---
+
+請依下列格式回答：
+1. **問題背景與重點摘要**
+2. **詳細解釋或修改後的程式碼**
+3. **說明與教學**
+4. **常見錯誤與排除方法**（如有）
+5. **補充說明或延伸學習建議**
+""",
+        input_variables=["input_question"],
+    )
+
+    llmo1 = ChatOpenAI(
+        openai_api_key=st.secrets["OPENAI_KEY"],
+        model="o4-mini",
+        streaming=True,
+    )
+    prompt = prompt_template.format(input_question=input_question)
+    result = llmo1.invoke(prompt)
+    # 包裝成 content 屬性
+    return str(result)
+
+def programming_reasoning_tool(content: str) -> str:
+    """
+    通用程式設計推理型Agent Tool，會先回推理摘要，再回主答案，並用Markdown格式美美地顯示！
+    """
+    try:
+        result = analyze_programming_question_with_tools(content)
+        reasoning_blocks = result.get("reasoning_summary", [])
+        if reasoning_blocks:
+            reasoning_md = "## 🧠 推理摘要\n" + "\n".join([f"> {block}" for block in reasoning_blocks])
+        else:
+            reasoning_md = "## 🧠 推理摘要\n> 無推理摘要"
+
+        answer = result.get("answer", "")
+        answer_md = f"\n\n---\n\n## 📝 主答案\n{answer}\n"
+
+        return reasoning_md + answer_md
+    except Exception as e:
+        return f"programming_reasoning_tool error: {e}"
+
+@tool
+def programming_tool(content: str) -> str:
+    """
+    通用程式設計推理型Agent Tool，會先回推理摘要，再回主答案，並用Markdown格式美美地顯示！
+    """
+    return programming_reasoning_tool(content)
+
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool]
 
 # === 4. 定義系統提示與 LLM模型 ===
 ANYA_SYSTEM_PROMPT = """# Agentic Reminders
