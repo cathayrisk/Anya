@@ -14,7 +14,7 @@ st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout=
 
 # === 2. Session State ===
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    st.session_state.chat_history = [AIMessage(content="嗨嗨～安妮亞大升級了！👋 有什麼想問安妮亞的嗎？")]
 if "pending_ai" not in st.session_state:
     st.session_state.pending_ai = False
 if "pending_content" not in st.session_state:
@@ -345,7 +345,7 @@ def get_streamlit_cb(parent_container, status=None):
             self.status = status
             self.token_placeholder = self.container.empty()
             self.tokens = []
-            self.cursor_symbol = "｜"
+            self.cursor_symbol = "🌸"
             self.cursor_visible = True
 
         @property
