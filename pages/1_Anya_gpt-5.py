@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain.agents import initialize_agent, AgentType
 
 # === 1. 設定 Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
@@ -339,7 +340,12 @@ llm = ChatOpenAI(
     model="gpt-5",
     temperature=0,
     openai_api_key=st.secrets["OPENAI_KEY"],
-).bind_tools(tools)
+)
+agent = initialize_agent(
+    tools,
+    llm,
+    agent=AgentType.OPENAI_FUNCTIONS
+)
 
 # === 5. 打字機特效 Callback ===
 def get_streamlit_cb(parent_container, status=None):
