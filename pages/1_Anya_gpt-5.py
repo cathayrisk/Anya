@@ -367,7 +367,7 @@ if st.session_state.pending_ai and st.session_state.pending_content:
             st.rerun()
 
 # === 8. 使用者輸入框，支援文字+多圖 ===
-prompt = st.chat_input("wakuwaku！你要跟安妮亞分享什麼嗎？", accept_file="multiple", file_type=["jpg", "jpeg", "png"])
+prompt = st.chat_input("wakuwaku！安妮亞可以幫你看圖說故事嚕！", accept_file="multiple", file_type=["jpg", "jpeg", "png"])
 if prompt:
     user_text = prompt.text.strip() if prompt.text else ""
     images_for_history = []
