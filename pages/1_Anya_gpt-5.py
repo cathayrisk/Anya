@@ -422,7 +422,19 @@ if st.session_state.pending_ai and st.session_state.pending_content:
             sys_msg = {"role": "system", "content": ANYA_SYSTEM_PROMPT}
             response = llm.invoke([sys_msg] + messages_blocks, config={"callbacks": [cb]})
 
-            ai_text = response.content if hasattr(response, "content") else str(response)
+            ### robust 提取 response text ###
+            ai_text = ""
+            if hasattr(response, "content") and response.content:
+                ai_text = response.content
+            elif hasattr(response, "messages") and response.messages:
+                result_blocks = []
+                for block in response.messages:
+                    if block.get("type") == "text":
+                        result_blocks.append(block.get("text", ""))
+                ai_text = "\n".join(result_blocks) if result_blocks else str(response)
+            else:
+                ai_text = str(response)
+                
             # 儲存進歷史
             st.session_state.chat_history.append({
                 "role": "assistant",
