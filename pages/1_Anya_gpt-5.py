@@ -14,7 +14,11 @@ st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout=
 
 # === 2. Session State ===
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = [{"role": "assistant", "content": "嗨嗨～安妮亞大升級了！👋 有什麼想問安妮亞的嗎？"}]
+    st.session_state.chat_history = [{
+        "role": "assistant",
+        "text": "嗨嗨～安妮亞大升級了！👋 有什麼想問安妮亞的嗎？",
+        "images": []
+    }]
 if "pending_ai" not in st.session_state:
     st.session_state.pending_ai = False
 if "pending_content" not in st.session_state:
