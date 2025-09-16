@@ -410,7 +410,21 @@ if st.session_state.pending_ai and st.session_state.pending_content:
             messages_blocks.append({"role": item["role"], "content": blocks})
     # 加這輪 user 輸入
     messages_blocks.append({"role": "user", "content": st.session_state.pending_content})
+    system_prompt = SystemMessage(content=ANYA_SYSTEM_PROMPT)
+    history_msgs = []
+    for item in st.session_state.chat_history:
+        if item["role"] == "user":
+            history_msgs.append(HumanMessage(content=item.get("text", "")))
+        elif item["role"] == "assistant":
+            history_msgs.append(AIMessage(content=item.get("text", "")))
+    # 最後這一輪
+    latest_user = HumanMessage(content=st.session_state.pending_content[0]["text"]) \
+        if st.session_state.pending_content and st.session_state.pending_content[0].get("text") \
+        else None
+    if latest_user:
+        history_msgs.append(latest_user)
 
+    all_msgs = [system_prompt] + history_msgs
     # spinner/狀態條callback
     with st.chat_message("assistant"):
         status = st.status("安妮亞馬上回覆你！", expanded=False)
@@ -420,20 +434,10 @@ if st.session_state.pending_ai and st.session_state.pending_content:
 
             # 系統role
             sys_msg = {"role": "system", "content": ANYA_SYSTEM_PROMPT}
-            response = llm.invoke([sys_msg] + messages_blocks, config={"callbacks": [cb]})
+            response = llm.invoke(all_msgs, config={"callbacks": [cb]})
 
             ### robust 提取 response text ###
-            ai_text = ""
-            if hasattr(response, "content") and response.content:
-                ai_text = response.content
-            elif hasattr(response, "messages") and response.messages:
-                result_blocks = []
-                for block in response.messages:
-                    if block.get("type") == "text":
-                        result_blocks.append(block.get("text", ""))
-                ai_text = "\n".join(result_blocks) if result_blocks else str(response)
-            else:
-                ai_text = str(response)
+            ai_text = response.content if hasattr(response, "content") else str(response)
                 
             # 儲存進歷史
             st.session_state.chat_history.append({
