@@ -67,9 +67,19 @@ client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 @tool
 def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> str:
     """
-    用OpenAI Vision Responses API做OCR辨識，回傳純文字markdown。
+    用OpenAI Vision Responses API做OCR辨識，回傳純文字markdown。自動檢查mime type。
     """
+    # 有時 agent傳進來的未必是png
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        fmt = img.format.lower()  # 'png'、'jpeg'、'webp'、'gif'
+        mime = f"image/{fmt}"
+    except Exception:
+        mime = "image/png"  # 預設安全fallback
+
     base64_img = base64.b64encode(image_bytes).decode()
+    img_url = f"data:{mime};base64,{base64_img}"
+
     response = client.responses.create(
         model="gpt-4.1-mini",
         input=[
@@ -81,7 +91,7 @@ def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> 
                     "Format your answer in Markdown (no code block or triple backticks). "
                     "Do not add any explanations or commentary."
                 },
-                {"type": "input_image", "image_url": f"data:image/png;base64,{base64_img}", "detail": "high"}
+                {"type": "input_image", "image_url": img_url, "detail": "high"}
             ]}
         ]
     )
@@ -611,20 +621,27 @@ if user_prompt:
     images_for_history = []
 
     for f in user_prompt.files:
-        f.seek(0)
-        imgbytes = f.read()
         try:
-            img = Image.open(io.BytesIO(imgbytes))
-            fmt = img.format.lower()  # png/jpeg
-            mime = f"image/{fmt}"
-        except Exception:
-            mime = f.type
+            # 1. 取出正確的bytes
+            f.seek(0)
+            imgbytes = f.read()
+            if not imgbytes or len(imgbytes) < 10:
+                st.warning(f"{f.name} 檔案內容是空的，請重新上傳喔！")
+                continue
 
-        # base64 encode正確
+            # 2. 驗證：確保真的能被PIL打開
+            img = Image.open(io.BytesIO(imgbytes))
+            fmt = img.format.lower()  # e.g. 'png' or 'jpeg'
+            mime = f"image/{fmt}"
+        except Exception as e:
+            st.warning(f"{f.name} 不是有效圖片檔，錯誤: {e}")
+            continue
+
+        # 3. base64 encode
         b64 = base64.b64encode(imgbytes).decode()
-        # 準確的圖片URL
         img_url = f"data:{mime};base64,{b64}"
-        # 丟給 content_blocks or openai tool
+
+        # 4. 組給 content_blocks 或 tool
         content_blocks.append({
             "type": "image_url",
             "image_url": {"url": img_url, "file_name": f.name}
