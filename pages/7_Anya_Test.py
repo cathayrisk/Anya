@@ -6,7 +6,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_core.prompts import PromptTemplate
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 import inspect
 from typing import Callable, TypeVar, List, Dict, Any, Optional
 from pydantic import BaseModel, Field
@@ -30,7 +30,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# --- 1. Streamlit session_state 初始化 ---
+# ========== Session State ==========
 if "messages" not in st.session_state:
     st.session_state.messages = [AIMessage(content="嗨嗨～安妮亞來了！👋 有什麼想問安妮亞的嗎？")]
 if "selected_model" not in st.session_state:
@@ -40,11 +40,11 @@ if "current_model" not in st.session_state:
 if "llm" not in st.session_state:
     st.session_state.llm = None
 
-# 定義 WikiInputs
+# ========== Wiki Tool Schema ==========
 class WikiInputs(BaseModel):
     query: str = Field(description="要查詢的關鍵字")
 
-# --- 2. LLM 初始化 ---
+# ========== LLM 初始化 ==========
 def ensure_llm():
     if (
         st.session_state.llm is None
@@ -57,7 +57,6 @@ def ensure_llm():
             streaming=True,
         )
         st.session_state.current_model = st.session_state.selected_model
-
 ensure_llm()
 
 # --- 3. 工具定義 ---
@@ -67,40 +66,53 @@ client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 @tool
 def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> str:
     """
-    用OpenAI Vision Responses API做OCR辨識，回傳純文字markdown。自動檢查mime type。
+    用OpenAI Vision Responses API做OCR辨識，回傳純文字markdown。
+    防呆：自動檢查型態、圖片長度、內容、格式。
     """
-    assert isinstance(image_bytes, bytes)
-    assert len(image_bytes) > 10
-    st.write(f"tool got bytes, len={len(image_bytes)}")
+    # -- 安全檢查 --
     if not isinstance(image_bytes, bytes):
-        image_bytes = bytes(image_bytes)
-    # 偵測實際格式
+        try:
+            image_bytes = bytes(image_bytes)
+        except Exception:
+            return f"圖片內容型態錯誤，無法處理！file_name={file_name}"
+
+    if not image_bytes or len(image_bytes) < 32:
+        return f"上傳的圖片資料異常（長度太短），檔名：{file_name}"
+
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        fmt = img.format.lower()  # 'png', 'jpeg', etc.
+        fmt = img.format.lower()
         mime = f"image/{fmt}"
-    except Exception:
-        mime = "image/png"
+        if fmt not in ["png", "jpeg", "jpg", "webp", "gif"]:
+            return f"不支援的圖片格式：{fmt}（請使用jpg/png/webp/gif）"
+    except Exception as e:
+        return f"圖片格式解析失敗，檔名：{file_name}；原因：{e}"
     base64_img = base64.b64encode(image_bytes).decode()
     img_url = f"data:{mime};base64,{base64_img}"
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": "You are an OCR-like data extraction tool that extracts text from images."},
-            {"role": "user", "content": [
-                {"type": "input_text", "text":
-                    "Please extract all visible text from the image, including any small print or footnotes. "
-                    "Ensure no text is omitted, and provide a verbatim transcription of the document. "
-                    "Format your answer in Markdown (no code block or triple backticks). "
-                    "Do not add any explanations or commentary."
-                },
-                {"type": "input_image", "image_url": img_url, "detail": "high"}
-            ]}
-        ]
-    )
-    result = f"---\nfile_name: {file_name}\n---\n{response.output_text.strip()}\n"
-    return result
+    # -- Call OpenAI Vision --
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {"role": "system", "content": "You are an OCR-like data extraction tool that extracts text from images."},
+                {"role": "user", "content": [
+                    {"type": "input_text", "text":
+                        "Please extract all visible text from the image, including any small print or footnotes. "
+                        "Ensure no text is omitted, and provide a verbatim transcription of the document. "
+                        "Format your answer in Markdown (no code block or triple backticks). "
+                        "Do not add any explanations or commentary."
+                    },
+                    {"type": "input_image", "image_url": img_url, "detail": "high"}
+                ]}
+            ],
+            timeout=45  # 加強timeout
+        )
+        ocr_result = response.output_text.strip()
+    except Exception as e:
+        return f"OCR服務遠端失敗，請稍後再試。\n原始錯誤：{e}\n檔名：{file_name}"
+
+    return f"---\nfile_name: {file_name}\n---\n{ocr_result}\n"
 
 @tool
 def wiki_tool(query: str) -> str:
@@ -614,37 +626,40 @@ for msg in st.session_state.messages:
 user_prompt = st.chat_input(
     "wakuwaku！要跟安妮亞分享什麼嗎？（可上傳多張圖）",
     accept_file="multiple",
-    file_type=["jpg", "jpeg", "png"]
+    file_type=["jpg", "jpeg", "png", "webp", "gif"]
 )
 if user_prompt:
-    # --- 1. 組 content_blocks ---
     content_blocks = []
     user_text = user_prompt.text.strip() if user_prompt.text else ""
     if user_text:
         content_blocks.append({"type": "text", "text": user_text})
     images_for_history = []
-
     for f in user_prompt.files:
+        # -- 確保每次都從頭 --
         f.seek(0)
         imgbytes = f.read()
-        # 再次檢查非空且為bytes
-        if not imgbytes or len(imgbytes) < 10:
-            st.warning(f"{f.name} 是空的或錯誤檔案")
+        img_sz_mb = len(imgbytes)/1024/1024
+        if not imgbytes or img_sz_mb < 0.01:
+            st.warning(f"{f.name} 是空的或資料量過少（{img_sz_mb:.2f}MB）")
             continue
+        # -- 格式驗證 --
         try:
             img = Image.open(io.BytesIO(imgbytes))
             fmt = img.format.lower()
+            if fmt not in ["png", "jpeg", "jpg", "webp", "gif"]:
+                st.warning(f"{f.name} 格式 {fmt} 不支援，只能 jpg/png/gif/webp")
+                continue
             mime = f"image/{fmt}"
-        except Exception:
-            mime = f.type
+        except Exception as e:
+            st.warning(f"{f.name} 圖片內容不正確：{e}")
+            continue
         b64 = base64.b64encode(imgbytes).decode()
         content_blocks.append({
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}", "file_name": f.name}
         })
         images_for_history.append((f.name, imgbytes))
-
-    # --- 2. 儲存進 messages history 使用 content_blocks ---
+    # -- append用戶內容到歷史 --
     st.session_state.messages.append(HumanMessage(content=content_blocks))
     st.chat_message("user").write(user_text)
     for fn, imgbytes in images_for_history:
