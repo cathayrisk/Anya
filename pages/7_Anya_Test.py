@@ -2,54 +2,66 @@ import streamlit as st
 from PIL import Image
 import base64
 import io
+from datetime import datetime
 from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import ToolNode
+import inspect
+from typing import Callable, TypeVar
+import time
 
-# 初始化 OpenAI
+# ==== Streamlit 基本設定、state ====
+st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [AIMessage(content="嗨嗨～安妮亞來了！👋 有什麼想問安妮亞的嗎？")]
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = "gpt-4.1"
+if "current_model" not in st.session_state:
+    st.session_state.current_model = None
+if "llm" not in st.session_state:
+    st.session_state.llm = None
+
+# ==== OpenAI 物件 ====
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
-st.set_page_config(page_title="多圖多任務AI", page_icon="🥜", layout="wide")
-st.title("🥜 多圖 & 多任務 Vision AI DEMO")
+# ==== 前處理工具：統一圖片格式 & base64 ====
+def process_upload_file(file):
+    file.seek(0)
+    img_bytes = file.read()
+    if not img_bytes or len(img_bytes) < 32:
+        return None
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        fmt = img.format.lower()
+        mime = f"image/{fmt}"
+        if fmt not in ["png","jpeg","jpg","webp","gif"]:
+            return None
+        b64 = base64.b64encode(img_bytes).decode()
+        return {"bytes": img_bytes, "file_name": file.name, "fmt": fmt, "mime": mime, "b64": b64}
+    except Exception:
+        return None
 
-### =================  1️⃣ 統一前處理 ================= ###
-def prepare_image_assets(files):
-    assets = []
-    for uf in files:
-        uf.seek(0)
-        img_bytes = uf.read()
-        if not img_bytes or len(img_bytes) < 32:
-            st.warning(f"{uf.name} 資料太小，略過")
-            continue
-        try:
-            img = Image.open(io.BytesIO(img_bytes))
-            fmt = img.format.lower()
-            mime = f"image/{fmt}"
-            if fmt not in ["png","jpeg","jpg","webp","gif"]:
-                st.warning(f"{uf.name} 格式 {fmt} 不支援（略過）")
-                continue
-            b64 = base64.b64encode(img_bytes).decode()
-            assets.append({
-                "bytes": img_bytes,
-                "file_name": uf.name,
-                "fmt": fmt,
-                "mime": mime,
-                "b64": b64,
-                "pil_image": img
-            })
-        except Exception as e:
-            st.warning(f"{uf.name} 讀取錯誤：{e}")
-            continue
-    return assets
+# ==== OCR工具範例，可複製一份再寫其他多圖tool ====
+@tool
+def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> str:
+    # OCR工具：AI辨識圖片（必須傳統過格式+型態檢查後的bytes）
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        fmt = img.format.lower()
+        mime = f"image/{fmt}"
+    except Exception as e:
+        return f"解析圖片失敗：{e}"
 
-### =================  2️⃣ 各種AI工具DEMO def ================= ###
-def ocr_tool(image_asset):
-    """ Vision OCR辨識 """
-    img_url = f"data:{image_asset['mime']};base64,{image_asset['b64']}"
+    img_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
     try:
         response = client.responses.create(
             model="gpt-4.1-mini",
             input=[
-                {"role": "system", "content":
-                    "You are an OCR-like data extraction tool that extracts text from images."},
+                {"role": "system", "content": "You are an OCR-like data extraction tool that extracts text from images."},
                 {"role": "user", "content": [
                     {"type": "input_text", "text":
                         "Please extract all visible text from the image, including any small print or footnotes. "
@@ -62,49 +74,129 @@ def ocr_tool(image_asset):
             ],
             timeout=45
         )
-        return response.output_text.strip()
+        return f"---\nfile_name: {file_name}\n---\n{response.output_text.strip()}\n"
     except Exception as e:
-        return f"OCR 失敗：{e}"
+        return f"OCR失敗，請檢查API/圖片格式：{e}"
 
-def dummy_caption_tool(image_asset):
-    """假裝 Caption 任務（可換成真AI）"""
-    # 這裡只是示範，可以串 Stable Diffusion, Gemini 等API
-    return f"這是 {image_asset['file_name']} 的假caption描述（請換成自己的API）"
+# ==== 你其他的工具，例如ddgs_search、wiki_tool都可以這樣註冊 ====
+@tool
+def echo_tool(text:str) -> str:
+    return f"你輸入的內容是：{text}"
 
-### =================  3️⃣ 主流程 UI ================= ###
-uploaded_files = st.file_uploader(
-    "請選擇多張圖片（jpg/png/webp/gif，max單張10MB）",
-    type=["jpg","jpeg","png","gif","webp"],
-    accept_multiple_files=True
+tools = [image_ocr_tool, echo_tool] # <-- 你需要的所有@tool都可以加進來
+
+# ==== LangGraph Agent 設定 ====
+ANYA_SYSTEM_PROMPT = """你是安妮亞，請根據用戶給的純文字和/或圖片提出適當的回答，可以自動判斷需呼叫OCR或進行其他回答。"""
+
+llm = st.session_state.llm or ChatOpenAI(
+    model=st.session_state.selected_model,
+    openai_api_key=st.secrets["OPENAI_KEY"],
+    temperature=0.0,
+    streaming=True,
+)
+llm_with_tools = llm.bind_tools(tools)
+
+def call_model(state: MessagesState):
+    messages = state["messages"]
+    sys_msg = SystemMessage(content=ANYA_SYSTEM_PROMPT)
+    response = llm_with_tools.invoke([sys_msg] + messages)
+    return {"messages": messages + [response]}
+
+tool_node = ToolNode(tools)
+def call_tools(state: MessagesState):
+    messages = state["messages"]
+    last_message = messages[-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    return END
+
+workflow = StateGraph(MessagesState)
+workflow.add_node("LLM", call_model)
+workflow.add_edge(START, "LLM")
+workflow.add_node("tools", tool_node)
+workflow.add_conditional_edges("LLM", call_tools)
+workflow.add_edge("tools", "LLM")
+agent = workflow.compile()
+
+# ==== 美美地顯示歷史 ====
+for msg in st.session_state.messages:
+    if isinstance(msg, AIMessage):
+        st.chat_message("assistant").write(msg.content)
+    elif isinstance(msg, HumanMessage):
+        # 處理content型態，有多圖的話也一樣順
+        if isinstance(msg.content, str):
+            st.chat_message("user").write(msg.content)
+        elif isinstance(msg.content, list):
+            with st.chat_message("user"):
+                for block in msg.content:
+                    if block.get("type") == "text":
+                        st.write(block["text"])
+                    elif block.get("type") == "image_url":
+                        info = block["image_url"]
+                        st.image(info["url"], caption=info.get("file_name", ""), width=220)
+
+# ==== 輸入區：文字輸入 + 支援多圖輸入 ====
+user_prompt = st.chat_input(
+    "wakuwaku！安妮亞可以幫你看圖說故事嚕！",
+    accept_file="multiple",
+    file_type=["jpg", "jpeg", "png"]
 )
 
-if uploaded_files:
-    assets = prepare_image_assets(uploaded_files)
-    st.markdown(f"### 共預處理成功 {len(assets)} 張圖片")
-    for idx, asset in enumerate(assets,1):
-        with st.expander(f"第{idx}張：{asset['file_name']}"):
-            # 顯示縮圖＋格式
-            st.image(asset["pil_image"], width=280, caption=asset["file_name"])
-            st.markdown(f"**格式:** {asset['fmt']} **大小：**{len(asset['bytes'])//1024}KB")
+if user_prompt:
+    # 1. 組 content_blocks
+    content_blocks = []
+    user_text = user_prompt.text.strip() if user_prompt.text else ""
+    if user_text:
+        content_blocks.append({"type": "text", "text": user_text})
 
-            # OCR按鈕
-            if st.button(f"OCR辨識", key=f"OCR_btn_{idx}"):
-                with st.spinner("提取中..."):
-                    ocr_text = ocr_tool(asset)
-                    st.markdown("#### 📋 Vision OCR 結果")
-                    st.write(ocr_text)
+    images_for_history = []
+    if hasattr(user_prompt, "files"):
+        for f in user_prompt.files:
+            asset = process_upload_file(f)
+            if asset:
+                dataurl = f"data:{asset['mime']};base64,{asset['b64']}"
+                content_blocks.append({"type": "image_url", "image_url": {
+                    "url": dataurl, "file_name": asset["file_name"]
+                }})
+                images_for_history.append((asset["file_name"], asset["bytes"])) # 方便顯示縮圖
+            else:
+                st.warning(f"{getattr(f,'name','檔案')} 格式不支援或內容異常～")
 
-            # Caption按鈕
-            if st.button(f"圖片Caption", key=f"cap_btn_{idx}"):
-                with st.spinner("產生中..."):
-                    cap = dummy_caption_tool(asset)
-                    st.markdown("#### 🖼️ Caption 結果")
-                    st.write(cap)
+    # 2. append到messages
+    if content_blocks:
+        st.session_state.messages.append(HumanMessage(content=content_blocks))
+        # UI顯示
+        with st.chat_message("user"):
+            for block in content_blocks:
+                if block.get("type") == "text":
+                    st.write(block["text"])
+                elif block.get("type") == "image_url":
+                    info = block["image_url"]
+                    st.image(info["url"], caption=info.get("file_name", ""), width=220)
 
-    # Bonus：全部自動OCR
-    if len(assets)>0 and st.button("全部自動OCR"):
-        with st.spinner("全部圖片自動Batch OCR中..."):
-            all_ocr = [ocr_tool(asset) for asset in assets]
-            for asset, res in zip(assets, all_ocr):
-                st.markdown(f"---\n**{asset['file_name']} OCR結果:**")
-                st.write(res)
+    # 3. murmur & agent運作
+    all_text = []
+    for msg in st.session_state.messages:
+        if hasattr(msg, "content"):
+            if isinstance(msg.content, str):
+                all_text.append(msg.content)
+            elif isinstance(msg.content, list):
+                for part in msg.content:
+                    if part.get("type") == "text":
+                        all_text.append(part["text"])
+    all_text = "\n".join(all_text)
+
+    status_prompt = f"""你是安妮亞，請根據聊天紀錄自言自語一句可愛 murmur（15字內）。{all_text}"""
+    status_response = client.chat.completions.create(
+        model="gpt-4.1-nano",
+        messages=[{"role": "user", "content": status_prompt}]
+    )
+    status_label = status_response.choices[0].message.content.strip()
+
+    with st.chat_message("assistant"):
+        status = st.status(status_label)
+        # 如果你有 get_streamlit_cb 可以加進agent回呼（這裡可略過）
+        response = agent.invoke({"messages": st.session_state.messages})
+        ai_msg = response["messages"][-1]
+        st.session_state.messages.append(ai_msg)
+        status.update(label="安妮亞回答完畢！🎉", state="complete")
