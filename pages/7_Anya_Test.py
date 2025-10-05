@@ -69,14 +69,18 @@ def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> 
     """
     用OpenAI Vision Responses API做OCR辨識，回傳純文字markdown。自動檢查mime type。
     """
-    # 有時 agent傳進來的未必是png
+    assert isinstance(image_bytes, bytes)
+    assert len(image_bytes) > 10
+    st.write(f"tool got bytes, len={len(image_bytes)}")
+    if not isinstance(image_bytes, bytes):
+        image_bytes = bytes(image_bytes)
+    # 偵測實際格式
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        fmt = img.format.lower()  # 'png'、'jpeg'、'webp'、'gif'
+        fmt = img.format.lower()  # 'png', 'jpeg', etc.
         mime = f"image/{fmt}"
     except Exception:
-        mime = "image/png"  # 預設安全fallback
-
+        mime = "image/png"
     base64_img = base64.b64encode(image_bytes).decode()
     img_url = f"data:{mime};base64,{base64_img}"
 
@@ -620,31 +624,23 @@ if user_prompt:
         content_blocks.append({"type": "text", "text": user_text})
     images_for_history = []
 
-    for f in user_prompt.files:
-        try:
-            # 1. 取出正確的bytes
-            f.seek(0)
-            imgbytes = f.read()
-            if not imgbytes or len(imgbytes) < 10:
-                st.warning(f"{f.name} 檔案內容是空的，請重新上傳喔！")
-                continue
-
-            # 2. 驗證：確保真的能被PIL打開
-            img = Image.open(io.BytesIO(imgbytes))
-            fmt = img.format.lower()  # e.g. 'png' or 'jpeg'
-            mime = f"image/{fmt}"
-        except Exception as e:
-            st.warning(f"{f.name} 不是有效圖片檔，錯誤: {e}")
+    for f in prompt.files:
+        f.seek(0)
+        imgbytes = f.read()
+        # 再次檢查非空且為bytes
+        if not imgbytes or len(imgbytes) < 10:
+            st.warning(f"{f.name} 是空的或錯誤檔案")
             continue
-
-        # 3. base64 encode
+        try:
+            img = Image.open(io.BytesIO(imgbytes))
+            fmt = img.format.lower()
+            mime = f"image/{fmt}"
+        except Exception:
+            mime = f.type
         b64 = base64.b64encode(imgbytes).decode()
-        img_url = f"data:{mime};base64,{b64}"
-
-        # 4. 組給 content_blocks 或 tool
         content_blocks.append({
             "type": "image_url",
-            "image_url": {"url": img_url, "file_name": f.name}
+            "image_url": {"url": f"data:{mime};base64,{b64}", "file_name": f.name}
         })
         images_for_history.append((f.name, imgbytes))
 
