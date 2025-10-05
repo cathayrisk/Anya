@@ -51,28 +51,32 @@ def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> 
     """
     AI OCR圖片識別工具，輸入圖片bytes與檔名，回傳圖中文字結果。
     """
+    import streamlit as st  # 放在function內避免import循環(保險作法)
     # 1. 型態/格式嚴格驗證
     try:
         img = Image.open(io.BytesIO(image_bytes))
         fmt = img.format.lower()
         assert fmt in ["png", "jpeg", "jpg", "webp", "gif"], f"不支援{fmt}格式"
         mime = f"image/{fmt}"
+        st.write(f"[Debug] PIL驗證OK, 格式: {fmt}, 檔名: {file_name}")
     except Exception as e:
+        st.error(f"[Debug][PIL驗證失敗] {file_name}: {e}")
         return f"[錯誤] 解析圖片失敗({file_name})：{e}"
 
     # 2. base64 encode嚴格捕捉
     try:
         b64str = base64.b64encode(image_bytes).decode()
         img_url = f"data:{mime};base64,{b64str}"
-        # For debugging: 可加print或日誌檢查
-        # print(f"debug-dataurl: {img_url[:60]}...")  # 可選
+        st.write(f"[Debug] base64 encode OK, len:{len(b64str)} dataurl(前60): {img_url[:60]}...")
     except Exception as e:
+        st.error(f"[Debug][Base64失敗] {file_name}: {e}")
         return f"[錯誤] 圖片base64編碼失敗({file_name})：{e}"
 
-    # 3. 呼叫Vision API，完整異常保護+快慢log
+    # 3. 呼叫 Vision API（完整 debug log）
     import time
     t0 = time.time()
     try:
+        st.write(f"[Debug] Vision API呼叫開始, model=gpt-4.1-mini")
         response = client.responses.create(
             model="gpt-4.1-mini",
             input=[
@@ -87,15 +91,18 @@ def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> 
                     {"type": "input_image", "image_url": img_url, "detail": "high"}
                 ]}
             ],
-            timeout=40  # 記得設適度timeout
+            timeout=40
         )
         t1 = time.time()
         elapsed = round(t1 - t0, 2)
         result = response.output_text.strip()
+        st.write(f"[Debug] Vision API Response: ({file_name}) {result[:60]}...  耗時 {elapsed} 秒")
         if not result or "error" in result.lower():
+            st.error(f"[Debug] API回傳空or錯誤({file_name})")
             return f"[錯誤] API回傳空或無法辨識({file_name})，耗時{elapsed}秒"
         return f"---\nfile_name: {file_name}\n---\n{result}\n（耗時：{elapsed} 秒）"
     except Exception as e:
+        st.error(f"[Debug][Vision API失敗] {file_name}: {e}")
         return f"[錯誤] Vision API調用失敗({file_name})：{e}"
 
 @tool
