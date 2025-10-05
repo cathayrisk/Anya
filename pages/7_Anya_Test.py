@@ -20,6 +20,7 @@ from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
 import base64
+from io import BytesIO
 
 st.set_page_config(
     page_title="Anya",
