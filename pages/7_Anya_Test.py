@@ -579,9 +579,11 @@ if user_prompt:
     status_label = status_response.choices[0].message.content.strip()
 
     with st.chat_message("assistant"):
+        ai_placeholder = st.empty()  # 預留聊天泡泡
         status = st.status(status_label)
         # 如果你有 get_streamlit_cb 可以加進agent回呼（這裡可略過）
         response = agent.invoke({"messages": st.session_state.messages})
         ai_msg = response["messages"][-1]
         st.session_state.messages.append(ai_msg)
+        ai_placeholder.write(ai_msg.content)
         status.update(label="安妮亞回答完畢！🎉", state="complete")
