@@ -624,7 +624,7 @@ if user_prompt:
         content_blocks.append({"type": "text", "text": user_text})
     images_for_history = []
 
-    for f in prompt.files:
+    for f in user_prompt.files:
         f.seek(0)
         imgbytes = f.read()
         # 再次檢查非空且為bytes
