@@ -635,7 +635,7 @@ if user_prompt:
     st.session_state.messages.append(HumanMessage(content=content_blocks))
     st.chat_message("user").write(user_text)
     for fn, imgbytes in images_for_history:
-        st.image(BytesIO(imgbytes), caption=fn, width=220)
+        st.image(imgbytes, caption=fn, width=220)
 
     # --- 3. 產 murmur ---
     all_text = []
