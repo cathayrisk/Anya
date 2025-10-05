@@ -20,7 +20,8 @@ from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
 import base64
-from io import BytesIO
+from PIL import Image
+import io
 
 st.set_page_config(
     page_title="Anya",
@@ -608,16 +609,25 @@ if user_prompt:
     if user_text:
         content_blocks.append({"type": "text", "text": user_text})
     images_for_history = []
+
     for f in user_prompt.files:
+        f.seek(0)
         imgbytes = f.read()
-        mime = f.type
+        try:
+            img = Image.open(io.BytesIO(imgbytes))
+            fmt = img.format.lower()  # png/jpeg
+            mime = f"image/{fmt}"
+        except Exception:
+            mime = f.type
+
+        # base64 encode正確
         b64 = base64.b64encode(imgbytes).decode()
+        # 準確的圖片URL
+        img_url = f"data:{mime};base64,{b64}"
+        # 丟給 content_blocks or openai tool
         content_blocks.append({
             "type": "image_url",
-            "image_url": {
-                "url": f"data:{mime};base64,{b64}",
-                "file_name": f.name     # 幫助 LLM 理解圖片名稱
-            }
+            "image_url": {"url": img_url, "file_name": f.name}
         })
         images_for_history.append((f.name, imgbytes))
 
