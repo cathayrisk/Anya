@@ -608,7 +608,7 @@ if user_prompt:
         content_blocks.append({"type": "text", "text": user_text})
     images_for_history = []
     for f in user_prompt.files:
-        imgbytes = f.getbuffer()
+        imgbytes = f.read()
         mime = f.type
         b64 = base64.b64encode(imgbytes).decode()
         content_blocks.append({
