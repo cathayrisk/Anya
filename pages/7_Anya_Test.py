@@ -10,7 +10,7 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode
 import inspect
-from typing import Callable, TypeVar
+from typing import Callable, TypeVar, Dict
 import time
 
 # ==== Streamlit 基本設定、state ====
