@@ -579,8 +579,8 @@ if user_prompt:
     status_label = status_response.choices[0].message.content.strip()
 
     with st.chat_message("assistant"):
-        ai_placeholder = st.empty()  # 預留聊天泡泡
         status = st.status(status_label)
+        ai_placeholder = st.empty()  # 預留聊天泡泡
         # 如果你有 get_streamlit_cb 可以加進agent回呼（這裡可略過）
         response = agent.invoke({"messages": st.session_state.messages})
         ai_msg = response["messages"][-1]
