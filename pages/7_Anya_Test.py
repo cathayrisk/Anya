@@ -48,7 +48,7 @@ def process_upload_file(file):
 # ==== OCR工具範例，可複製一份再寫其他多圖tool ====
 @tool
 def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> str:
-    # OCR工具：AI辨識圖片（必須傳統過格式+型態檢查後的bytes）
+    """AI OCR圖片識別工具，輸入圖片bytes與檔名，回傳圖中文字結果。"""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         fmt = img.format.lower()
