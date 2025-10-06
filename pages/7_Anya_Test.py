@@ -8,10 +8,21 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langgraph.prebuilt import ToolNode
 import inspect
 from typing import Callable, TypeVar, List, Dict, Any, Optional
 import time
+
+from langchain_core.prompts import PromptTemplate
+from langgraph.prebuilt import ToolNode, tools_condition
+from pydantic import BaseModel, Field
+import re
+import requests
+import traceback
+from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_community.tools import WikipediaQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper
+from ddgs import DDGS
+
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
