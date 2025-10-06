@@ -1,33 +1,32 @@
-import os
 import streamlit as st
+from PIL import Image
+import base64
+import io
 from datetime import datetime
+from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_core.prompts import PromptTemplate
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langgraph.prebuilt import ToolNode, tools_condition
 import inspect
 from typing import Callable, TypeVar, List, Dict, Any, Optional
-from pydantic import BaseModel, Field
 import time
+
+from langchain_core.prompts import PromptTemplate
+from langgraph.prebuilt import ToolNode, tools_condition
+from pydantic import BaseModel, Field
 import re
 import requests
-from openai import OpenAI
 import traceback
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
 
-st.set_page_config(
-    page_title="Anya",
-    layout="wide",
-    page_icon="🥜",
-    initial_sidebar_state="collapsed"
-)
 
-# --- 1. Streamlit session_state 初始化 ---
+# ==== Streamlit 基本設定、state ====
+st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
+
 if "messages" not in st.session_state:
     st.session_state.messages = [AIMessage(content="嗨嗨～安妮亞來了！👋 有什麼想問安妮亞的嗎？")]
 if "selected_model" not in st.session_state:
@@ -37,357 +36,85 @@ if "current_model" not in st.session_state:
 if "llm" not in st.session_state:
     st.session_state.llm = None
 
-# 定義 WikiInputs
-class WikiInputs(BaseModel):
-    query: str = Field(description="要查詢的關鍵字")
-
-# --- 2. LLM 初始化 ---
-def ensure_llm():
-    if (
-        st.session_state.llm is None
-        or st.session_state.current_model != st.session_state.selected_model
-    ):
-        st.session_state.llm = ChatOpenAI(
-            model=st.session_state.selected_model,
-            openai_api_key=st.secrets["OPENAI_KEY"],
-            temperature=0.0,
-            streaming=True,
-        )
-        st.session_state.current_model = st.session_state.selected_model
-
-ensure_llm()
-
-# --- 3. 工具定義 ---
-# === OpenAI 初始化 ===
+# ==== OpenAI 物件 ====
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
-# === Meta Prompting 工具 ===
-def meta_optimize_prompt(simple_prompt: str, goal: str) -> str:
-    meta_prompt = f"""
-    請優化以下 prompt，使其能更有效達成「{goal}」，並符合 prompt engineering 最佳實踐。
-    {simple_prompt}
-    只回傳優化後的 prompt。
-    """
-    response = client.chat.completions.create(
-        model="o4-mini",
-        messages=[{"role": "user", "content": meta_prompt}]
-    )
-    return response.choices[0].message.content.strip()
-
-# === 產生查詢（中英文） ===
-def generate_queries(topic: str, model="gpt-4.1-mini") -> List[str]:
-    simple_prompt = f"""請針對「{topic}」這個主題，分別用繁體中文與英文各產生三個適合用於網路搜尋的查詢關鍵字，並以如下 JSON 格式回覆：
-{{
-    "zh": ["查詢1", "查詢2", "查詢3"],
-    "en": ["query1", "query2", "query3"]
-}}
-"""
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生多元且具針對性的查詢關鍵字")
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
-    )
-    content = response.choices[0].message.content
+# ==== 前處理工具：統一圖片格式 & base64 ====
+def process_upload_file(file):
+    file.seek(0)
+    img_bytes = file.read()
+    if not img_bytes or len(img_bytes) < 32:
+        return None
     try:
-        queries = json.loads(content)
+        img = Image.open(io.BytesIO(img_bytes))
+        fmt = img.format.lower()
+        mime = f"image/{fmt}"
+        if fmt not in ["png","jpeg","jpg","webp","gif"]:
+            return None
+        b64 = base64.b64encode(img_bytes).decode()
+        return {"bytes": img_bytes, "file_name": file.name, "fmt": fmt, "mime": mime, "b64": b64}
     except Exception:
-        import re
-        content = re.sub(r"[\u4e00-\u9fff]+：", "", content)
-        content = content.replace("'", '"')
-        queries = json.loads(content)
-    return queries["zh"] + queries["en"]
+        return None
 
-# === 查詢摘要 ===
-def auto_summarize(text: str, model="gpt-4.1-mini") -> str:
-    simple_prompt = f"請用繁體中文摘要以下內容，重點條列，100字內：\n{text}"
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "產生精簡且重點明確的摘要")
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
-    )
-    return response.choices[0].message.content.strip()
-
-# 2. 章節規劃（推理模型）
-def plan_report(topic, search_summaries, model="o4-mini"):
-    prompt = f"""Formatting re-enabled
-# Role and Objective
-你是一位專業技術寫手，目標是針對「{topic}」這個主題，根據下方搜尋摘要，規劃一份完整、深入、結構化的研究報告。
-
-# Instructions
-- 報告需包含5-7個章節，每章節需有明確標題。
-- 每個章節**必須包含2-4個小標題**（子議題），每個小標題下要有2-3句細節說明。
-- 小標題可涵蓋：產業現況、技術細節、國際比較、未來趨勢、挑戰、解決方案、案例、數據等。
-- 章節規劃要有邏輯順序，內容要有層次。
-- 請用繁體中文條列式回覆，格式如下：
-
-# Output Format
-1. 章節標題
-    - 小標題1：細節說明
-    - 小標題2：細節說明
-    - 小標題3：細節說明
-2. 章節標題
-    - 小標題1：細節說明
-    - 小標題2：細節說明
-    - 小標題3：細節說明
-...
-
-# 搜尋摘要
-{search_summaries}
-"""
-    response = client.responses.create(
-        model=model,
-        reasoning={"effort": "medium", "summary": "auto"},
-        input=[{"role": "user", "content": prompt}]
-    )
-    return response.output_text
-
-# 3. 解析章節
-def parse_sections(plan: str):
-    section_pattern = r"\d+\.\s*([^\n]+)"
-    sub_pattern = r"-\s*([^\n：:]+)[：:]\s*([^\n]+)"
-    sections = []
-    section_blocks = re.split(r"\d+\.\s*", plan)[1:]
-    for block in section_blocks:
-        lines = block.strip().split("\n")
-        title = lines[0].strip()
-        subs = []
-        for line in lines[1:]:
-            m = re.match(sub_pattern, line.strip())
-            if m:
-                subs.append({"subtitle": m.group(1).strip(), "desc": m.group(2).strip()})
-        sections.append({"title": title, "subtitles": subs})
-    return sections
-
-# 4. 章節查詢產生
-def section_queries(section_title, section_desc, model="gpt-4.1-mini"):
-    prompt = f"""請針對章節「{section_title}」({section_desc})，分別用繁體中文與英文各產生兩個適合用於網路搜尋的查詢關鍵字，回傳 JSON 格式：
-{{
-    "zh": ["查詢1", "查詢2"],
-    "en": ["query1", "query2"]
-}}
-"""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    content = response.choices[0].message.content
-    try:
-        queries = json.loads(content)
-    except Exception:
-        content = re.sub(r"[\u4e00-\u9fff]+：", "", content)
-        content = content.replace("'", '"')
-        queries = json.loads(content)
-    return queries["zh"] + queries["en"]
-
-# 5. 章節撰寫（直接用多筆查詢結果）
-def section_write(section_title, section_desc, search_results, model="gpt-4.1-mini"):
-    prompt = f"""
-# Role and Objective
-你是一位專業技術寫手，根據下方章節主題、說明與「多筆網路查詢結果」，撰寫一段內容豐富、結構清晰、具體詳實的章節內容。
-
-# Instructions
-- 內容需至少600字，並涵蓋：具體數據、真實案例、國際比較、產業現況、技術細節、未來趨勢、挑戰與解決方案。
-- 必須根據下方每一筆查詢結果，整合出完整內容。
-- 每個小標題下必須有2-3段具體說明。
-- 條列重點只能放在章節結尾，正文必須是完整段落。
-- 文末請用「## 來源」列出所有引用來源（Markdown格式），來源必須來自下方查詢結果。
-- 請勿省略細節，若有多個觀點請分段說明。
-- 請勿重複內容，避免空泛敘述。
-- 請用繁體中文撰寫。
-
-# 章節主題
-{section_title}
-
-# 章節說明
-{section_desc}
-
-# 多筆查詢結果（每筆都要參考）
-{search_results}
-"""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content.strip()
-
-# === 來源提取 ===
-def extract_sources(content: str) -> List[str]:
-    # 假設來源格式為 markdown link
-    return re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', content)
-
-# === 章節內容評分與補強建議 ===
-def section_grade(section_title: str, section_content: str, model="gpt-4.1-mini") -> Dict[str, Any]:
-    simple_prompt = f"""請評分以下章節內容是否完整、正確、可讀性佳，若不及格請列出需補充的查詢關鍵字（中英文各一），回傳 JSON 格式：
-{{
-    "grade": "pass" 或 "fail",
-    "follow_up_queries": ["查詢1", "query2"]
-}}
-章節：{section_title}
-內容：
-{section_content}
-"""
-    optimized_prompt = meta_optimize_prompt(simple_prompt, "嚴謹評分並產生具體補強建議")
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": optimized_prompt}]
-    )
-    try:
-        return json.loads(response.choices[0].message.content)
-    except:
-        return {"grade": "pass", "follow_up_queries": []}
-
-# 6. 反思流程（推理模型）
-def reflect_report(report: str, model="o4-mini"):
-    prompt = f"""Formatting re-enabled
-# Role and Objective
-你是一位專業審稿人，目標是檢查下方報告的邏輯、正確性、完整性與內容豐富度。
-
-# Instructions
-- 請逐一檢查每個章節是否有小標題，且每個小標題下是否有2-3句具體細節說明。
-- 檢查內容是否涵蓋數據、案例、國際觀點、技術細節、未來趨勢等豐富面向。
-- 檢查是否有明確引用來源。
-- 若有內容過於簡略、遺漏重要面向，請明確指出需補充的章節、小標題與建議查詢關鍵字。
-- 若內容已足夠豐富且無明顯遺漏，請回覆 "OK"。
-- 請用繁體中文回覆。
-
-# 報告內容
-{report}
-"""
-    response = client.responses.create(
-        model=model,
-        reasoning={"effort": "medium", "summary": "auto"},
-        input=[{"role": "user", "content": prompt}]
-    )
-    return response.output_text
-
-# === 組合章節 ===
-def combine_sections(section_contents: List[Dict[str, Any]]) -> str:
-    return "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
-
-# === 主流程（含推理鏈追蹤） ===
-def deep_research_pipeline(topic):
-    logs = []
-    try:
-        # 1. 產生查詢
-        try:
-            queries = section_queries(topic, topic)
-            logs.append({"step": "generate_queries", "queries": queries})
-        except Exception as e:
-            logs.append({"step": "generate_queries", "error": str(e), "traceback": traceback.format_exc()})
-            return {"error": "產生查詢失敗", "logs": logs}
-
-        # 2. 查詢所有 query
-        all_results = []
-        try:
-            for q in queries:
-                try:
-                    result = ddgs_search(q)
-                    all_results.append(result)
-                except Exception as e:
-                    logs.append({"step": "search", "query": q, "error": str(e), "traceback": traceback.format_exc()})
-                    all_results.append(f"查詢失敗: {q}")
-            logs.append({"step": "search", "results": all_results})
-        except Exception as e:
-            logs.append({"step": "search", "error": str(e), "traceback": traceback.format_exc()})
-            return {"error": "查詢失敗", "logs": logs}
-
-        # 3. 規劃章節
-        try:
-            search_summary = "\n\n".join(all_results)
-            plan = plan_report(topic, search_summary)
-            logs.append({"step": "plan_report", "plan": plan})
-        except Exception as e:
-            logs.append({"step": "plan_report", "error": str(e), "traceback": traceback.format_exc(), "search_summary": search_summary})
-            return {"error": "章節規劃失敗", "logs": logs}
-
-        # 4. 章節分段查詢/撰寫
-        try:
-            sections = parse_sections(plan)
-            section_contents = []
-            for section in sections:
-                s_queries = []
-                for sub in section["subtitles"]:
-                    try:
-                        sub_queries = section_queries(sub["subtitle"], sub["desc"])
-                        s_queries.extend(sub_queries)
-                    except Exception as e:
-                        logs.append({"step": "section_queries", "subtitle": sub["subtitle"], "desc": sub["desc"], "error": str(e), "traceback": traceback.format_exc()})
-                s_results = []
-                for q in s_queries:
-                    try:
-                        s_results.append(ddgs_search(q))
-                    except Exception as e:
-                        logs.append({"step": "section_search", "query": q, "error": str(e), "traceback": traceback.format_exc()})
-                        s_results.append(f"查詢失敗: {q}")
-                search_results = "\n\n".join(s_results)
-                try:
-                    content = section_write(
-                        section["title"],
-                        "；".join([f"{sub['subtitle']}：{sub['desc']}" for sub in section["subtitles"]]),
-                        search_results
-                    )
-                except Exception as e:
-                    logs.append({"step": "section_write", "section": section["title"], "error": str(e), "traceback": traceback.format_exc(), "search_results": search_results})
-                    content = f"章節內容產生失敗: {section['title']}"
-                section_contents.append({
-                    "title": section["title"],
-                    "content": content
-                })
-                logs.append({
-                    "step": "section",
-                    "section": section["title"],
-                    "queries": s_queries,
-                    "search_results": search_results,
-                    "content": content
-                })
-        except Exception as e:
-            logs.append({"step": "section_loop", "error": str(e), "traceback": traceback.format_exc()})
-            return {"error": "章節分段查詢/撰寫失敗", "logs": logs}
-
-        # 5. 組合報告
-        try:
-            report = "\n\n".join([f"## {s['title']}\n\n{s['content']}" for s in section_contents])
-            logs.append({"step": "combine_report", "report": report})
-        except Exception as e:
-            logs.append({"step": "combine_report", "error": str(e), "traceback": traceback.format_exc()})
-            return {"error": "組合報告失敗", "logs": logs}
-
-        # 6. 反思流程（最多2次）
-        for i in range(2):
-            try:
-                reflection = reflect_report(report)
-                logs.append({"step": "reflection", "round": i+1, "reflection": reflection})
-                if reflection.strip().upper() == "OK":
-                    break
-                else:
-                    # 若需補充，可根據 reflection 產生新查詢與補充內容（可進一步自動化）
-                    pass
-            except Exception as e:
-                logs.append({"step": "reflection", "round": i+1, "error": str(e), "traceback": traceback.format_exc()})
-                break
-
-        # 7. 結構化輸出
-        output = {
-            "topic": topic,
-            "plan": plan,
-            "sections": section_contents,
-            "report": report,
-            "logs": logs
-        }
-        return output
-
-    except Exception as e:
-        logs.append({"step": "pipeline_outer", "error": str(e), "traceback": traceback.format_exc()})
-        return {"error": "pipeline_outer_error", "logs": logs}
+# ==== OCR工具範例，可複製一份再寫其他多圖tool ====
 @tool
-def deep_research_pipeline_tool(topic: str) -> Dict[str, Any]:
+def image_ocr_tool(image_bytes: bytes, file_name: str = "uploaded_file.png") -> str:
     """
-    針對指定主題自動進行多步深度研究，回傳結構化報告（含章節、內容、來源、推理鏈）。
+    AI OCR圖片識別工具，輸入圖片bytes與檔名，回傳圖中文字結果。
     """
+    import streamlit as st  # 放在function內避免import循環(保險作法)
+    # 1. 型態/格式嚴格驗證
     try:
-        return deep_research_pipeline(topic)
+        img = Image.open(io.BytesIO(image_bytes))
+        fmt = img.format.lower()
+        assert fmt in ["png", "jpeg", "jpg", "webp", "gif"], f"不支援{fmt}格式"
+        mime = f"image/{fmt}"
+        st.write(f"[Debug] PIL驗證OK, 格式: {fmt}, 檔名: {file_name}")
     except Exception as e:
-        return {"error": str(e), "traceback": traceback.format_exc()}
+        st.error(f"[Debug][PIL驗證失敗] {file_name}: {e}")
+        return f"[錯誤] 解析圖片失敗({file_name})：{e}"
+
+    # 2. base64 encode嚴格捕捉
+    try:
+        b64str = base64.b64encode(image_bytes).decode()
+        img_url = f"data:{mime};base64,{b64str}"
+        st.write(f"[Debug] base64 encode OK, len:{len(b64str)} dataurl(前60): {img_url[:60]}...")
+    except Exception as e:
+        st.error(f"[Debug][Base64失敗] {file_name}: {e}")
+        return f"[錯誤] 圖片base64編碼失敗({file_name})：{e}"
+
+    # 3. 呼叫 Vision API（完整 debug log）
+    import time
+    t0 = time.time()
+    try:
+        st.write(f"[Debug] Vision API呼叫開始, model=gpt-4.1-mini")
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {"role": "system", "content": "You are an OCR-like data extraction tool that extracts text from images."},
+                {"role": "user", "content": [
+                    {"type": "input_text", "text":
+                        "Please extract all visible text from the image, including any small print or footnotes. "
+                        "Ensure no text is omitted, and provide a verbatim transcription of the document. "
+                        "Format your answer in Markdown (no code block or triple backticks). "
+                        "Do not add any explanations or commentary."
+                    },
+                    {"type": "input_image", "image_url": img_url, "detail": "high"}
+                ]}
+            ],
+            timeout=40
+        )
+        t1 = time.time()
+        elapsed = round(t1 - t0, 2)
+        result = response.output_text.strip()
+        st.write(f"[Debug] Vision API Response: ({file_name}) {result[:60]}...  耗時 {elapsed} 秒")
+        if not result or "error" in result.lower():
+            st.error(f"[Debug] API回傳空or錯誤({file_name})")
+            return f"[錯誤] API回傳空或無法辨識({file_name})，耗時{elapsed}秒"
+        return f"---\nfile_name: {file_name}\n---\n{result}\n（耗時：{elapsed} 秒）"
+    except Exception as e:
+        st.error(f"[Debug][Vision API失敗] {file_name}: {e}")
+        return f"[錯誤] Vision API調用失敗({file_name})：{e}"
 
 @tool
 def wiki_tool(query: str) -> str:
@@ -783,11 +510,14 @@ https://example.com/2
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
 
-# --- 5. 綁定工具 ---
-llm = st.session_state.llm.bind_tools(tools)
-llm_with_tools = llm
+llm = st.session_state.llm or ChatOpenAI(
+    model=st.session_state.selected_model,
+    openai_api_key=st.secrets["OPENAI_KEY"],
+    temperature=0.0,
+    streaming=True,
+)
+llm_with_tools = llm.bind_tools(tools)
 
-# --- 6. LangGraph Agent ---
 def call_model(state: MessagesState):
     messages = state["messages"]
     sys_msg = SystemMessage(content=ANYA_SYSTEM_PROMPT)
@@ -795,7 +525,6 @@ def call_model(state: MessagesState):
     return {"messages": messages + [response]}
 
 tool_node = ToolNode(tools)
-
 def call_tools(state: MessagesState):
     messages = state["messages"]
     last_message = messages[-1]
@@ -803,7 +532,6 @@ def call_tools(state: MessagesState):
         return "tools"
     return END
 
-# --- 7. Workflow ---
 workflow = StateGraph(MessagesState)
 workflow.add_node("LLM", call_model)
 workflow.add_edge(START, "LLM")
@@ -811,6 +539,23 @@ workflow.add_node("tools", tool_node)
 workflow.add_conditional_edges("LLM", call_tools)
 workflow.add_edge("tools", "LLM")
 agent = workflow.compile()
+
+# ==== 美美地顯示歷史 ====
+for msg in st.session_state.messages:
+    if isinstance(msg, AIMessage):
+        st.chat_message("assistant").write(msg.content)
+    elif isinstance(msg, HumanMessage):
+        # 處理content型態，有多圖的話也一樣順
+        if isinstance(msg.content, str):
+            st.chat_message("user").write(msg.content)
+        elif isinstance(msg.content, list):
+            with st.chat_message("user"):
+                for block in msg.content:
+                    if block.get("type") == "text":
+                        st.write(block["text"])
+                    elif block.get("type") == "image_url":
+                        info = block["image_url"]
+                        st.image(info["url"], caption=info.get("file_name", ""), width=220)
 
 # --- 8. 進階 spinner/狀態切換 callback ---
 def get_streamlit_cb(parent_container, status=None):
@@ -890,26 +635,57 @@ def get_streamlit_cb(parent_container, status=None):
             setattr(st_cb, method_name, add_streamlit_context(method_func))
     return st_cb
 
-# --- 9. UI 顯示歷史 ---
-for msg in st.session_state.messages:
-    if isinstance(msg, AIMessage):
-        st.chat_message("assistant").write(msg.content)
-    elif isinstance(msg, HumanMessage):
-        st.chat_message("user").write(msg.content)
+# ==== 輸入區：文字輸入 + 支援多圖輸入 ====
+user_prompt = st.chat_input(
+    "wakuwaku！安妮亞可以幫你看圖說故事嚕！",
+    accept_file="multiple",
+    file_type=["jpg", "jpeg", "png"]
+)
 
-# --- 10. 用戶輸入 ---
-user_input = st.chat_input("wakuwaku！要跟安妮亞分享什麼嗎？")
-if user_input:
-    st.session_state.messages.append(HumanMessage(content=user_input))
-    st.chat_message("user").write(user_input)
+if user_prompt:
+    # 1. 組 content_blocks
+    content_blocks = []
+    user_text = user_prompt.text.strip() if user_prompt.text else ""
+    if user_text:
+        content_blocks.append({"type": "text", "text": user_text})
 
-    # 整理聊天紀錄
-    all_text = "\n".join([
-        msg.content if hasattr(msg, "content") else str(msg)
-        for msg in st.session_state.messages
-    ])
+    images_for_history = []
+    if hasattr(user_prompt, "files"):
+        for f in user_prompt.files:
+            asset = process_upload_file(f)
+            if asset:
+                dataurl = f"data:{asset['mime']};base64,{asset['b64']}"
+                content_blocks.append({"type": "image_url", "image_url": {
+                    "url": dataurl, "file_name": asset["file_name"]
+                }})
+                images_for_history.append((asset["file_name"], asset["bytes"])) # 方便顯示縮圖
+            else:
+                st.warning(f"{getattr(f,'name','檔案')} 格式不支援或內容異常～")
 
-    # 用最佳化 prompt 產生 murmur
+    # 2. append到messages
+    if content_blocks:
+        st.session_state.messages.append(HumanMessage(content=content_blocks))
+        # UI顯示
+        with st.chat_message("user"):
+            for block in content_blocks:
+                if block.get("type") == "text":
+                    st.write(block["text"])
+                elif block.get("type") == "image_url":
+                    info = block["image_url"]
+                    st.image(info["url"], caption=info.get("file_name", ""), width=220)
+
+    # 3. murmur & agent運作
+    all_text = []
+    for msg in st.session_state.messages:
+        if hasattr(msg, "content"):
+            if isinstance(msg.content, str):
+                all_text.append(msg.content)
+            elif isinstance(msg.content, list):
+                for part in msg.content:
+                    if part.get("type") == "text":
+                        all_text.append(part["text"])
+    all_text = "\n".join(all_text)
+
     status_prompt = f"""
 # Role and Objective
 你是安妮亞（Anya Forger），一個天真可愛、開朗樂觀的小女孩，會根據聊天紀錄，產生一句最適合顯示在 status 上的可愛 murmur，並在最後加上一個可愛 emoji。
@@ -955,16 +731,15 @@ if user_input:
 # Output
 只回傳一句可愛的 murmur，15字以內，最後加上一個可愛 emoji。
 """
-
-    # 呼叫 LLM 產生 status label
     status_response = client.chat.completions.create(
         model="gpt-4.1-nano",
         messages=[{"role": "user", "content": status_prompt}]
     )
     status_label = status_response.choices[0].message.content.strip()
-    
+
     with st.chat_message("assistant"):
         status = st.status(status_label)
+        # 如果你有 get_streamlit_cb 可以加進agent回呼（這裡可略過）
         st_callback = get_streamlit_cb(st.container(), status=status)
         response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
         ai_msg = response["messages"][-1]
