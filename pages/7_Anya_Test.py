@@ -32,7 +32,7 @@ from langchain_community.document_loaders.parsers import LLMImageBlobParser
 import nltk
 nltk.download('punkt')
 nltk.download('averaged_perceptron_tagger')
-
+from utils.rag import st_rag_langgraph
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
