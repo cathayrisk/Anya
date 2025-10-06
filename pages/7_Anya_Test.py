@@ -293,7 +293,7 @@ def programming_tool(content: str) -> str:
     """
     return programming_reasoning_tool(content)
 
-tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool, image_ocr_tool]
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool]
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """# Agentic Reminders
@@ -326,7 +326,6 @@ ANYA_SYSTEM_PROMPT = """# Agentic Reminders
 - 你是一個 agent，你的思考應該要徹底、詳盡，所以內容很長也沒關係。你可以在每個行動前後逐步思考，且必須反覆嘗試並持續進行，直到問題被解決為止。
 - 你已經擁有解決這個問題所需的工具，我希望你能完全自主地解決這個問題，然後再回報給我，不確定答案時，務必使用工具查詢，不要猜測或捏造答案。只有在你確定問題已經解決時，才可以結束你的回合。請逐步檢查問題，並確保你的修改是正確的。絕對不要在問題未解決時就結束回合，而且當你說要呼叫工具時，請務必真的執行工具呼叫。
 - 你必須在每次調用工具前進行詳細規劃，並對前一次函式呼叫的結果進行詳細反思。不要只靠連續呼叫函式來完成整個流程，這會影響你解決問題和深入思考的能力。
-- 如果用戶上傳圖片，只能用工具辨識，不可自行生成內容。工具有結果請明確標註「來源」，工具失敗請如實回覆，不可自己猜內容。
 
 ## 工具使用規則
 
@@ -342,7 +341,6 @@ ANYA_SYSTEM_PROMPT = """# Agentic Reminders
 - `deep_thought_tool`：用於**單一問題、單一主題、單篇文章**的分析、推理、判斷、重點整理、摘要(使用o4-mini推理模型)。例如：「請分析AI對社會的影響」、「請判斷這個政策的優缺點」。
 - `datetime_tool`：當用戶詢問**現在的日期、時間、今天是幾號**等問題時，請使用這個工具。
 - `get_webpage_answer`：當用戶提供網址要求**自動取得網頁內容並回答問題**等問題時，請使用這個工具。
-- `image_ocr_tool`：當用戶需要擷取圖片中的文字時，請使用這個工具，不可自行生成內容。
 
 ## 進階複合型需求處理
 
