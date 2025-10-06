@@ -686,6 +686,7 @@ if user_prompt:
         status = st.status(status_label)
         ai_placeholder = st.empty()  # 預留聊天泡泡
         # 如果你有 get_streamlit_cb 可以加進agent回呼（這裡可略過）
+        st_callback = get_streamlit_cb(st.container(), status=status)
         response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
         #response = agent.invoke({"messages": st.session_state.messages})
         ai_msg = response["messages"][-1]
