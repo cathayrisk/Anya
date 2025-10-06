@@ -3,6 +3,7 @@ from PIL import Image
 import base64
 import io
 import os
+import tempfile
 from datetime import datetime
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
