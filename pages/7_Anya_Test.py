@@ -695,12 +695,12 @@ if user_prompt:
 
     with st.chat_message("assistant"):
         status = st.status(status_label)
-        ai_placeholder = st.empty()  # 預留聊天泡泡
+        #ai_placeholder = st.empty()  # 預留聊天泡泡
         # 如果你有 get_streamlit_cb 可以加進agent回呼（這裡可略過）
         st_callback = get_streamlit_cb(st.container(), status=status)
         response = agent.invoke({"messages": st.session_state.messages}, config={"callbacks": [st_callback]})
         #response = agent.invoke({"messages": st.session_state.messages})
         ai_msg = response["messages"][-1]
         st.session_state.messages.append(ai_msg)
-        ai_placeholder.write(ai_msg.content)
+        #ai_placeholder.write(ai_msg.content)
         status.update(label="安妮亞回答完畢！🎉", state="complete")
