@@ -689,7 +689,18 @@ if user_input:
 
                 # 判斷文件型別，這裡同你原本流程
                 if file_ext == ".pdf":
-                    loader = PyMuPDFLoader(tmp_path)
+                    loader_kwargs = {}
+                    if extract_images:
+                        loader_kwargs["extract_images"] = True
+                        loader_kwargs["images_parser"] = LLMImageBlobParser(
+                            model=ChatOpenAI(
+                                openai_api_key=st.secrets["OPENAI_KEY"],
+                                model="gpt-4.1-mini",
+                                max_tokens=max_tokens
+                            ),
+                            prompt=custom_prompt
+                        )
+                    loader = PyMuPDF4LLMLoader(tmp_path, **loader_kwargs)
                 elif file_ext in [".docx", ".doc"]:
                     loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
                 elif file_ext == ".pptx":
