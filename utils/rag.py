@@ -13,7 +13,7 @@ from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain.schema import Document
-from tavily import TavilyClient
+#from tavily import TavilyClient
 import nltk
 for pkg in ['punkt', 'averaged_perceptron_tagger']:
     try:
