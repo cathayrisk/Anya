@@ -2,6 +2,7 @@ import streamlit as st
 from PIL import Image
 import base64
 import io
+import os
 from datetime import datetime
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
