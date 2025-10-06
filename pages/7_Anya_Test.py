@@ -23,6 +23,16 @@ from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
 
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
+from langchain_community.document_loaders.word_document import UnstructuredWordDocumentLoader
+from langchain_community.document_loaders.powerpoint import UnstructuredPowerPointLoader
+from langchain_community.document_loaders.excel import UnstructuredExcelLoader
+from langchain_community.document_loaders import TextLoader
+from langchain_community.document_loaders.parsers import LLMImageBlobParser
+import nltk
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
@@ -636,33 +646,82 @@ def get_streamlit_cb(parent_container, status=None):
     return st_cb
 
 # ==== 輸入區：文字輸入 + 支援多圖輸入 ====
-user_prompt = st.chat_input(
+user_input = st.chat_input(
     "wakuwaku！安妮亞可以幫你看圖說故事嚕！",
     accept_file="multiple",
-    file_type=["jpg", "jpeg", "png"]
+    file_type=["jpg", "jpeg", "png", "pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt"]
 )
 
-if user_prompt:
-    # 1. 組 content_blocks
+if user_input:
+    # 1. 讀取文字內容
+    user_text = user_input.text.strip() if hasattr(user_input, "text") and user_input.text else ""
+
+    # 2. 分類處理上傳檔案
     content_blocks = []
-    user_text = user_prompt.text.strip() if user_prompt.text else ""
+    file_blocks = []
+
+    # 圖片/文件副檔名
+    image_exts = [".jpg", ".jpeg", ".png"]
+    doc_exts = [".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".xls", ".txt"]
+
+    if hasattr(user_input, "files"):
+        for f in user_input.files:
+            file_ext = os.path.splitext(f.name)[1].lower()
+
+            if file_ext in image_exts:
+                # --- 圖片處理邏輯 ---
+                asset = process_upload_file(f)
+                if asset:
+                    dataurl = f"data:{asset['mime']};base64,{asset['b64']}"
+                    content_blocks.append({"type": "image_url", "image_url": {
+                        "url": dataurl, "file_name": asset["file_name"]
+                    }})
+                    st.image(asset["bytes"], caption=asset["file_name"])
+                else:
+                    st.warning(f"{f.name} 格式不支援或內容異常～")
+            elif file_ext in doc_exts:
+                # --- 文件處理邏輯 ---
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+                    tmp.write(f.read())
+                    tmp_path = tmp.name
+
+                # 判斷文件型別，這裡同你原本流程
+                if file_ext == ".pdf":
+                    loader = PyMuPDFLoader(tmp_path)
+                elif file_ext in [".docx", ".doc"]:
+                    loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
+                elif file_ext == ".pptx":
+                    loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
+                elif file_ext in [".xlsx", ".xls"]:
+                    loader = UnstructuredExcelLoader(tmp_path, mode="single")
+                elif file_ext == ".txt":
+                    loader = TextLoader(tmp_path)
+                else:
+                    st.warning(f"不支援的檔案格式：{f.name}")
+                    continue
+
+                docs = loader.load()
+                if not docs:
+                    st.warning(f"檔案 {f.name} 沒有任何可讀內容，請換個檔案！")
+                    continue
+
+                # 分段與嵌入
+                splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=30)
+                splits = splitter.split_documents(docs)
+                embd = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=st.secrets["OPENAI_KEY"])
+                if st.session_state.get("vectorstore") is None:
+                    st.session_state["vectorstore"] = FAISS.from_documents(splits, embd)
+                else:
+                    st.session_state["vectorstore"].add_documents(splits)
+                st.success(f"檔案 {f.name} 已嵌入知識庫！")
+            else:
+                st.warning(f"檔案類型不支援：{f.name}")
+
+    # 有文字內容也加進去
     if user_text:
         content_blocks.append({"type": "text", "text": user_text})
 
-    images_for_history = []
-    if hasattr(user_prompt, "files"):
-        for f in user_prompt.files:
-            asset = process_upload_file(f)
-            if asset:
-                dataurl = f"data:{asset['mime']};base64,{asset['b64']}"
-                content_blocks.append({"type": "image_url", "image_url": {
-                    "url": dataurl, "file_name": asset["file_name"]
-                }})
-                images_for_history.append((asset["file_name"], asset["bytes"])) # 方便顯示縮圖
-            else:
-                st.warning(f"{getattr(f,'name','檔案')} 格式不支援或內容異常～")
-
-    # 2. append到messages
+    # 這裡你可以決定如何組合 content_blocks 到訊息歷史
     if content_blocks:
         st.session_state.messages.append(HumanMessage(content=content_blocks))
         # UI顯示
