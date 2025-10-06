@@ -26,6 +26,7 @@ from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
 
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_community.document_loaders.word_document import UnstructuredWordDocumentLoader
 from langchain_community.document_loaders.powerpoint import UnstructuredPowerPointLoader
 from langchain_community.document_loaders.excel import UnstructuredExcelLoader
@@ -689,18 +690,7 @@ if user_input:
 
                 # 判斷文件型別，這裡同你原本流程
                 if file_ext == ".pdf":
-                    loader_kwargs = {}
-                    if extract_images:
-                        loader_kwargs["extract_images"] = True
-                        loader_kwargs["images_parser"] = LLMImageBlobParser(
-                            model=ChatOpenAI(
-                                openai_api_key=st.secrets["OPENAI_KEY"],
-                                model="gpt-4.1-mini",
-                                max_tokens=max_tokens
-                            ),
-                            prompt=custom_prompt
-                        )
-                    loader = PyMuPDF4LLMLoader(tmp_path, **loader_kwargs)
+                    loader = PyMuPDFLoader(tmp_path)
                 elif file_ext in [".docx", ".doc"]:
                     loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
                 elif file_ext == ".pptx":
