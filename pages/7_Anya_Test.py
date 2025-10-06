@@ -546,6 +546,84 @@ for msg in st.session_state.messages:
                         info = block["image_url"]
                         st.image(info["url"], caption=info.get("file_name", ""), width=220)
 
+# --- 8. 進階 spinner/狀態切換 callback ---
+def get_streamlit_cb(parent_container, status=None):
+
+    class StreamHandler(BaseCallbackHandler):
+        def __init__(self, container, status=None):
+            self.container = container
+            self.status = status
+            self.token_placeholder = self.container.empty()
+            self.tokens = []
+            self.cursor_symbol = " "
+            self.cursor_visible = True
+
+        @property
+        def text(self):
+            return ''.join(self.tokens)
+
+        def on_llm_start(self, *args, **kwargs):
+            if self.status:
+                self.status.update(label=status_label, state="running")
+
+        def on_llm_new_token(self, token: str, **kwargs) -> None:
+            self.tokens.append(token)
+            self.cursor_visible = not self.cursor_visible
+            cursor = self.cursor_symbol if self.cursor_visible else " "
+            safe_text = ''.join(self.tokens[:-1])
+            # 先用emoji顯示新字
+            emoji_token = "🌸"
+            self.token_placeholder.markdown(safe_text + emoji_token + cursor)
+            time.sleep(0.03)
+            # 再換成正常字
+            self.token_placeholder.markdown(''.join(self.tokens) + cursor)
+            time.sleep(0.01)
+
+        def on_llm_end(self, response, **kwargs) -> None:
+            # 結束時移除游標
+            self.token_placeholder.markdown(self.text, unsafe_allow_html=True)
+
+        def on_tool_start(self, serialized, input_str, **kwargs):
+            if self.status:
+                tool_name = serialized.get("name", "")
+                tool_emoji = {
+                    "ddgs_search": "🔍",
+                    "deep_thought_tool": "🤔",
+                    "datetime_tool": "⏰",
+                    "get_webpage_answer": "📄",
+                    "wiki-tool": "📚",
+                    "programming_tool": "💻",  # 新增這行
+                }.get(tool_name, "🛠️")
+                tool_desc = {
+                    "ddgs_search": "搜尋網路資料",
+                    "deep_thought_tool": "深入分析資料",
+                    "datetime_tool": "查詢時間",
+                    "get_webpage_answer": "取得網頁重點",
+                    "wiki-tool": "查詢維基百科",
+                    "programming_tool": "解決程式設計問題",
+                }.get(tool_name, "執行工具")
+                self.status.update(label=f"安妮亞正在{tool_desc}...{tool_emoji}", state="running")
+
+        def on_tool_end(self, output, **kwargs):
+            if self.status:
+                self.status.update(label="工具查詢完成！✨", state="complete")
+
+    return StreamHandler(parent_container, status)
+
+    fn_return_type = TypeVar('fn_return_type')
+    def add_streamlit_context(fn: Callable[..., fn_return_type]) -> Callable[..., fn_return_type]:
+        ctx = st.runtime.scriptrunner.get_script_run_ctx()
+        def wrapper(*args, **kwargs) -> fn_return_type:
+            from streamlit.runtime.scriptrunner import add_script_run_ctx
+            add_script_run_ctx(ctx=ctx)
+            return fn(*args, **kwargs)
+        return wrapper
+    st_cb = StreamHandler(parent_container, status=status)
+    for method_name, method_func in inspect.getmembers(st_cb, predicate=inspect.ismethod):
+        if method_name.startswith('on_'):
+            setattr(st_cb, method_name, add_streamlit_context(method_func))
+    return st_cb
+
 # ==== 輸入區：文字輸入 + 支援多圖輸入 ====
 user_prompt = st.chat_input(
     "wakuwaku！安妮亞可以幫你看圖說故事嚕！",
