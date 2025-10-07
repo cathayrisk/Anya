@@ -707,23 +707,29 @@ if user_input:
                 else:
                     st.warning(f"不支援的檔案格式：{f.name}")
                     continue
+                    
+                if file_ext in doc_exts:
+                    docs = loader.load()
+                    if not docs:
+                        st.warning(f"檔案 {f.name} 沒有任何可讀內容，請換個檔案！")
+                        continue
 
-                docs = loader.load()
-                if not docs:
-                    st.warning(f"檔案 {f.name} 沒有任何可讀內容，請換個檔案！")
-                    continue
-
-                # 分段與嵌入
-                splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=30)
-                splits = splitter.split_documents(docs)
-                embd = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=st.secrets["OPENAI_KEY"])
-                if st.session_state.get("vectorstore") is None:
-                    st.session_state["vectorstore"] = FAISS.from_documents(splits, embd)
+                    # 分段與嵌入
+                    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=30)
+                    splits = splitter.split_documents(docs)
+                    if not splits:
+                        st.warning(f"檔案 {f.name} 分段後內容為空，請確認檔案是否有實際資料！")
+                        continue
+                    
+                    embd = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=st.secrets["OPENAI_KEY"])
+                    if st.session_state.get("vectorstore") is None:
+                        st.session_state["vectorstore"] = FAISS.from_documents(splits, embd)
+                    else:
+                        st.session_state["vectorstore"].add_documents(splits)
+                    st.success(f"檔案 {f.name} 已嵌入知識庫！")
                 else:
-                    st.session_state["vectorstore"].add_documents(splits)
-                st.success(f"檔案 {f.name} 已嵌入知識庫！")
-            else:
-                st.warning(f"檔案類型不支援：{f.name}")
+                    st.warning(f"檔案類型不支援：{f.name}")
+                    continue
 
     # 有文字內容也加進去
     if user_text:
