@@ -23,9 +23,9 @@ from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
 from agents import function_tool
-from agents.planner_agent import WebSearchItem, WebSearchPlan, planner_agent
-from agents.search_agent import search_agent
-from agents.writer_agent import ReportData, writer_agent
+from Anya.agents.planner_agent import WebSearchItem, WebSearchPlan, planner_agent
+from Anya.agents.search_agent import search_agent
+from Anya.agents.writer_agent import ReportData, writer_agent
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
