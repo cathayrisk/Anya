@@ -725,6 +725,7 @@ if user_prompt:
     # 3. 產生 murmur 狀態字串
     all_text = []
     for m in st.session_state.messages:
+        m = to_ui_dict(m)
         c = m.get("content")
         if isinstance(c, str):
             all_text.append(c)
