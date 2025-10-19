@@ -22,7 +22,10 @@ from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
-
+from agents import function_tool
+from .agents.planner_agent import WebSearchItem, WebSearchPlan, planner_agent
+from .agents.search_agent import search_agent
+from .agents.writer_agent import ReportData, writer_agent
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
@@ -304,7 +307,24 @@ def programming_tool(content: str) -> str:
     """
     return programming_reasoning_tool(content)
 
-tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool]
+@function_tool(
+    name_override="research_tool",
+    description_override="根據用戶問題自動規劃、搜尋、整合並產生研究報告"
+)
+async def research_tool(user_query: str) -> str:
+    # 這裡就是你原本的 research_workflow
+    plan_result = await Runner.run(planner_agent, user_query)
+    search_plan = plan_result.final_output.searches
+
+    search_tasks = [Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}") for item in search_plan]
+    search_results = [str((await t).final_output) for t in asyncio.as_completed(search_tasks)]
+
+    writer_input = f"Original query: {user_query}\nSummarized search results: {search_results}"
+    report = await Runner.run(writer_agent, writer_input)
+
+    return str(report.final_output.markdown_report)
+
+tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool, research_tool]
 
 # --- 6. System Prompt ---
 ANYA_SYSTEM_PROMPT = """# Agentic Reminders
