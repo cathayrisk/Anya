@@ -41,6 +41,9 @@ if "llm" not in st.session_state:
 # ==== OpenAI 物件 ====
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
+class WikiInputs(BaseModel):
+    query: str = Field(description="查詢關鍵字")
+    
 # ==== 前處理工具：reasearch Agents====
 # ---planner_agent
 planner_agent_PROMPT = (
@@ -384,29 +387,42 @@ def programming_tool(content: str) -> str:
     return programming_reasoning_tool(content)
 
 @tool("research_tool")
-async def research_tool(user_query: str) -> str:
-    """專業的研究工具，根據用戶問題自動規劃、搜尋、整合並產生研究報告，並用Markdown格式美美地顯示！"""
-    plan_result = await Runner.run(planner_agent, user_query)
-    search_plan = plan_result.final_output.searches
-
-    tasks = [
-        Runner.run(
-            search_agent,
-            f"Search term: {item.query}\nReason: {item.reason}"
-        )
-        for item in search_plan
-    ]
-    search_results = []
-    for fut in asyncio.as_completed(tasks):
-        r = await fut
-        search_results.append(str(r.final_output))
-
-    writer_input = (
-        f"Original query: {user_query}\n"
-        f"Summarized search results: {search_results}"
-    )
-    report = await Runner.run(writer_agent, writer_input)
-    return str(report.final_output.markdown_report)
+def research_tool(user_query: str, status=None) -> str:
+    import asyncio
+    try:
+        if status:
+            status.update(label="規劃搜尋關鍵字中...", state="running")
+        async def inner():
+            plan_result = await Runner.run(planner_agent, user_query)
+            if status:
+                status.update(label="進行多組網路搜尋...", state="running")
+            search_plan = plan_result.final_output.searches
+            tasks = [
+                Runner.run(
+                    search_agent,
+                    f"Search term: {item.query}\nReason: {item.reason}"
+                )
+                for item in search_plan
+            ]
+            search_results = []
+            for fut in asyncio.as_completed(tasks):
+                r = await fut
+                search_results.append(str(r.final_output))
+            if status:
+                status.update(label="彙整報告中...", state="running")
+            writer_input = (
+                f"Original query: {user_query}\n"
+                f"Summarized search results: {search_results}"
+            )
+            report = await Runner.run(writer_agent, writer_input)
+            if status:
+                status.update(label="完成！", state="complete")
+            return str(report.final_output.markdown_report)
+        return asyncio.run(inner())
+    except Exception as e:
+        if status:
+            status.update(label=f"出錯了：{e}", state="error")
+        return f"[錯誤] research_tool 執行失敗：{e}"
 
 tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool, research_tool]
 
