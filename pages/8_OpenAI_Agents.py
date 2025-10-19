@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import time
 from langchain.schema import HumanMessage, AIMessage
+import asyncio
+
 
 def to_ui_dict(msg):
     if isinstance(msg, dict):
@@ -771,10 +773,14 @@ if user_prompt:
     with st.chat_message("assistant"):
         status = st.status(status_label)
 
-        # 非串流版本（簡化整合）
         try:
-            result = Runner.run(main_agent, input=input_text)
-            # 一般 Agent 沒有 output_type 時，轉成字串即可
+            # 這裡要用 asyncio.run 跑協程
+            try:
+                result = asyncio.run(Runner.run(main_agent, input=input_text))
+            except RuntimeError:
+                # Streamlit 可能 event loop 已存在
+                loop = asyncio.get_event_loop()
+                result = loop.run_until_complete(Runner.run(main_agent, input=input_text))
             assistant_text = str(result)
         except Exception as e:
             assistant_text = f"[錯誤] 執行 Agent 失敗：{e}\n\n{traceback.format_exc()}"
