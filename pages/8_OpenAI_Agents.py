@@ -26,6 +26,16 @@ import inspect
 from typing import Any, Dict, List, Optional
 import asyncio
 import time
+from langchain.schema import HumanMessage, AIMessage
+
+def to_ui_dict(msg):
+    if isinstance(msg, dict):
+        return msg
+    if isinstance(msg, HumanMessage):
+        return {"role": "user", "content": msg.content}
+    if isinstance(msg, AIMessage):
+        return {"role": "assistant", "content": msg.content}
+    return {"role": "assistant", "content": str(msg)}
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
@@ -656,6 +666,8 @@ main_agent = OAAgent(
 
 # ==== 美美地顯示歷史 ====
 for msg in st.session_state.messages:
+    if not isinstance(msg, dict):
+        msg = to_ui_dict(msg)
     role = msg.get("role")
     content = msg.get("content")
     if role == "assistant":
