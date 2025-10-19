@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import time
 from langchain.schema import HumanMessage, AIMessage
+import os
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 import asyncio
 
 
