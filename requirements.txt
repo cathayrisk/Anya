@@ -8,6 +8,7 @@ langchain-experimental
 langchain-core
 langgraph-supervisor
 openai
+openai-agents
 
 # Document processing
 faiss-cpu
