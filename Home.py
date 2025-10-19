@@ -24,6 +24,7 @@ from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
 from agents import function_tool, Agent, ModelSettings, WebSearchTool
 from openai.types.shared.reasoning import Reasoning
+import asyncio
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
@@ -382,24 +383,29 @@ def programming_tool(content: str) -> str:
     """
     return programming_reasoning_tool(content)
 
-@function_tool(
-    name_override="research_tool",
-    description_override="根據用戶問題自動規劃、搜尋、整合並產生研究報告"
-)
+@tool("research_tool")
 async def research_tool(user_query: str) -> str:
-    """
-    專業的研究工具，根據用戶問題自動規劃、搜尋、整合並產生研究報告，並用Markdown格式美美地顯示！
-    適合需要多步驟查詢與自動產生報告的情境。
-    """
+    """專業的研究工具，根據用戶問題自動規劃、搜尋、整合並產生研究報告，並用Markdown格式美美地顯示！"""
     plan_result = await Runner.run(planner_agent, user_query)
     search_plan = plan_result.final_output.searches
 
-    search_tasks = [Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}") for item in search_plan]
-    search_results = [str((await t).final_output) for t in asyncio.as_completed(search_tasks)]
+    tasks = [
+        Runner.run(
+            search_agent,
+            f"Search term: {item.query}\nReason: {item.reason}"
+        )
+        for item in search_plan
+    ]
+    search_results = []
+    for fut in asyncio.as_completed(tasks):
+        r = await fut
+        search_results.append(str(r.final_output))
 
-    writer_input = f"Original query: {user_query}\nSummarized search results: {search_results}"
+    writer_input = (
+        f"Original query: {user_query}\n"
+        f"Summarized search results: {search_results}"
+    )
     report = await Runner.run(writer_agent, writer_input)
-
     return str(report.final_output.markdown_report)
 
 tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool, research_tool]
