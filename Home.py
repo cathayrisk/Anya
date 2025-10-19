@@ -68,8 +68,8 @@ class WebSearchPlan(BaseModel):
 planner_agent = Agent(
     name="PlannerAgent",
     instructions=planner_agent_PROMPT,
-    model="gpt-5",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
+    model="gpt-4.1",
+    #model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
 )
 # ---search_agent
@@ -117,8 +117,8 @@ class ReportData(BaseModel):
 writer_agent = Agent(
     name="WriterAgent",
     instructions=writer_agent_PROMPT,
-    model="gpt-5-mini",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
+    model="gpt-4.1-mini",
+    #model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=ReportData,
 )
 # ==== 前處理工具：統一圖片格式 & base64 ====
