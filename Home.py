@@ -387,43 +387,40 @@ def programming_tool(content: str) -> str:
     return programming_reasoning_tool(content)
 
 @tool("research_tool")
-def research_tool(user_query: str, status=None) -> str:
+async def research_tool(user_query: str) -> str:
     """
     專業的研究工具，根據用戶問題自動規劃、搜尋、整合並產生研究報告，並用Markdown格式美美地顯示！
     """
     try:
-        if status:
-            status.update(label="規劃搜尋關鍵字中...", state="running")
-        async def inner():
-            plan_result = await Runner.run(planner_agent, user_query)
-            if status:
-                status.update(label="進行多組網路搜尋...", state="running")
-            search_plan = plan_result.final_output.searches
-            tasks = [
-                Runner.run(
-                    search_agent,
-                    f"Search term: {item.query}\nReason: {item.reason}"
-                )
-                for item in search_plan
-            ]
-            search_results = []
-            for fut in asyncio.as_completed(tasks):
-                r = await fut
-                search_results.append(str(r.final_output))
-            if status:
-                status.update(label="彙整報告中...", state="running")
-            writer_input = (
-                f"Original query: {user_query}\n"
-                f"Summarized search results: {search_results}"
+        print("[research_tool] 開始規劃")
+        plan_result = await Runner.run(planner_agent, user_query)
+        print("[research_tool] 規劃完成", plan_result)
+        search_plan = plan_result.final_output.searches
+
+        print("[research_tool] 開始搜尋")
+        tasks = [
+            Runner.run(
+                search_agent,
+                f"Search term: {item.query}\nReason: {item.reason}"
             )
-            report = await Runner.run(writer_agent, writer_input)
-            if status:
-                status.update(label="完成！", state="complete")
-            return str(report.final_output.markdown_report)
-        return asyncio.run(inner())
+            for item in search_plan
+        ]
+        search_results = []
+        for fut in asyncio.as_completed(tasks):
+            r = await fut
+            print("[research_tool] 搜尋完成", r)
+            search_results.append(str(r.final_output))
+
+        print("[research_tool] 開始寫報告")
+        writer_input = (
+            f"Original query: {user_query}\n"
+            f"Summarized search results: {search_results}"
+        )
+        report = await Runner.run(writer_agent, writer_input)
+        print("[research_tool] 報告完成", report)
+        return str(report.final_output.markdown_report)
     except Exception as e:
-        if status:
-            status.update(label=f"出錯了：{e}", state="error")
+        print("[research_tool] 發生錯誤：", e)
         return f"[錯誤] research_tool 執行失敗：{e}"
 
 tools = [ddgs_search, deep_thought_tool, datetime_tool, get_webpage_answer, wiki_tool, programming_tool, research_tool]
