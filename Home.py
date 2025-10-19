@@ -388,7 +388,9 @@ def programming_tool(content: str) -> str:
 
 @tool("research_tool")
 def research_tool(user_query: str, status=None) -> str:
-    import asyncio
+    """
+    專業的研究工具，根據用戶問題自動規劃、搜尋、整合並產生研究報告，並用Markdown格式美美地顯示！
+    """
     try:
         if status:
             status.update(label="規劃搜尋關鍵字中...", state="running")
