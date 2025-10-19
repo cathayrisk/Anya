@@ -22,10 +22,8 @@ from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
-from agents import function_tool
-from Anya.agents.planner_agent import WebSearchItem, WebSearchPlan, planner_agent
-from Anya.agents.search_agent import search_agent
-from Anya.agents.writer_agent import ReportData, writer_agent
+from agents import function_tool, Agent, ModelSettings, WebSearchTool
+from openai.types.shared.reasoning import Reasoning
 
 # ==== Streamlit 基本設定、state ====
 st.set_page_config(page_title="Anya", layout="wide", page_icon="🥜", initial_sidebar_state="collapsed")
@@ -42,6 +40,83 @@ if "llm" not in st.session_state:
 # ==== OpenAI 物件 ====
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
+# ==== 前處理工具：reasearch Agents====
+# ---planner_agent
+planner_agent_PROMPT = (
+    "You are a helpful research assistant. Given a query, come up with a set of web searches "
+    "to perform to best answer the query. Output between 5 and 20 terms to query for."
+)
+
+
+class WebSearchItem(BaseModel):
+    reason: str
+    "Your reasoning for why this search is important to the query."
+
+    query: str
+    "The search term to use for the web search."
+
+
+class WebSearchPlan(BaseModel):
+    searches: list[WebSearchItem]
+    """A list of web searches to perform to best answer the query."""
+
+
+planner_agent = Agent(
+    name="PlannerAgent",
+    instructions=planner_agent_PROMPT,
+    model="gpt-5",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
+    output_type=WebSearchPlan,
+)
+# ---search_agent
+INSTRUCTIONS = (
+    "You are a research assistant. Given a search term, you search the web for that term and "
+    "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 "
+    "words. Capture the main points. Write succinctly, no need to have complete sentences or good "
+    "grammar. This will be consumed by someone synthesizing a report, so its vital you capture the "
+    "essence and ignore any fluff. Do not include any additional commentary other than the summary "
+    "itself."
+)
+
+search_agent = Agent(
+    name="Search agent",
+    model="gpt-4.1",
+    instructions=INSTRUCTIONS,
+    tools=[WebSearchTool()],
+    # Note that gpt-5 model does not support tool_choice="required",
+    # so if you want to migrate to gpt-5, you'll need to use "auto" instead
+    model_settings=ModelSettings(tool_choice="required"),
+)
+# ---writer_agent
+writer_agent_PROMPT = (
+    "You are a senior researcher tasked with writing a cohesive report for a research query. "
+    "You will be provided with the original query, and some initial research done by a research "
+    "assistant.\n"
+    "You should first come up with an outline for the report that describes the structure and "
+    "flow of the report. Then, generate the report and return that as your final output.\n"
+    "The final output should be in markdown format, and it should be lengthy and detailed. Aim "
+    "for 5-10 pages of content, at least 1000 words."
+)
+
+
+class ReportData(BaseModel):
+    short_summary: str
+    """A short 2-3 sentence summary of the findings."""
+
+    markdown_report: str
+    """The final report"""
+
+    follow_up_questions: list[str]
+    """Suggested topics to research further"""
+
+
+writer_agent = Agent(
+    name="WriterAgent",
+    instructions=writer_agent_PROMPT,
+    model="gpt-5-mini",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
+    output_type=ReportData,
+)
 # ==== 前處理工具：統一圖片格式 & base64 ====
 def process_upload_file(file):
     file.seek(0)
@@ -312,7 +387,10 @@ def programming_tool(content: str) -> str:
     description_override="根據用戶問題自動規劃、搜尋、整合並產生研究報告"
 )
 async def research_tool(user_query: str) -> str:
-    # 這裡就是你原本的 research_workflow
+    """
+    專業的研究工具，根據用戶問題自動規劃、搜尋、整合並產生研究報告，並用Markdown格式美美地顯示！
+    適合需要多步驟查詢與自動產生報告的情境。
+    """
     plan_result = await Runner.run(planner_agent, user_query)
     search_plan = plan_result.final_output.searches
 
