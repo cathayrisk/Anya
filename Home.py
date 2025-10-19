@@ -22,7 +22,7 @@ from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from ddgs import DDGS
-from agents import function_tool, Agent, ModelSettings, WebSearchTool
+from agents import function_tool, Agent, ModelSettings, WebSearchTool, Runner
 from openai.types.shared.reasoning import Reasoning
 import asyncio
 
