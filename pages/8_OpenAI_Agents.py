@@ -783,7 +783,14 @@ if user_prompt:
                 # Streamlit 可能 event loop 已存在
                 loop = asyncio.get_event_loop()
                 result = loop.run_until_complete(Runner.run(main_agent, input=input_text))
-            assistant_text = str(result)
+            assistant_text = getattr(result, "final_output", None)
+            if assistant_text is None:
+                # 如果沒有 final_output 屬性，就用正則抓
+                match = re.search(r"Final output \(str\):\s*(.+)", str(result), re.DOTALL)
+                if match:
+                    assistant_text = match.group(1).strip()
+                else:
+                    assistant_text = str(result)
         except Exception as e:
             assistant_text = f"[錯誤] 執行 Agent 失敗：{e}\n\n{traceback.format_exc()}"
 
