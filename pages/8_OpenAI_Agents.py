@@ -774,7 +774,7 @@ if user_prompt:
     # 簡化做法：把這一輪的 user 文字當 input（圖片目前不直接餵給 Agent，若要 OCR 可明確指示使用 image_ocr_tool）
     input_text = user_text if user_text else "請根據上傳的圖片協助處理。"
 
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=custom_image):
         status = st.status(status_label)
 
         try:
