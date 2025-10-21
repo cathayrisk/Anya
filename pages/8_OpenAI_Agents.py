@@ -31,7 +31,7 @@ import os
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 import asyncio
 
-logo_path = "Anya.jpg"
+logo_path = "Anya2.jpg"
 custom_image = Image.open(logo_path)
 
 def to_ui_dict(msg):
