@@ -31,6 +31,8 @@ import os
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 import asyncio
 
+logo_path = "Anya.jpg"
+custom_image = Image.open(logo_path)
 
 def to_ui_dict(msg):
     if isinstance(msg, dict):
@@ -675,7 +677,7 @@ for msg in st.session_state.messages:
     role = msg.get("role")
     content = msg.get("content")
     if role == "assistant":
-        st.chat_message("assistant").write(content)
+        st.chat_message("assistant", avatar=custom_image).write(content)
     elif role == "user":
         if isinstance(content, str):
             st.chat_message("user").write(content)
