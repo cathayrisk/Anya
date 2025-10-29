@@ -14,7 +14,7 @@ def get_openai_client():
     return OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
 @st.cache_resource
-def get_vector_store(client):
+def get_vector_store(_client):
     vector_store = client.vector_stores.create(name=VECTOR_STORE_NAME)
     return vector_store.id
 
