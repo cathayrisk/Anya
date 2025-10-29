@@ -69,9 +69,14 @@ def multimodal_query(client, vector_store_id, user_text=None, image_file=None):
 
 # ====== Citation 格式化 ======
 def format_response(response):
-    output = response.output[1].content[0]
-    text = output.text
-    citations = output.annotations if hasattr(output, "annotations") else []
+    # 先檢查 output 是否存在且長度足夠
+    if not hasattr(response, "output") or not response.output or len(response.output) < 2:
+        return ":red[⚠️ Assistant 沒有回應，請檢查輸入格式或API狀態！]"
+    output = response.output[1]
+    if not hasattr(output, "content") or not output.content or len(output.content) == 0:
+        return ":red[⚠️ Assistant 沒有產生內容，請檢查輸入格式或API狀態！]"
+    text = output.content[0].text
+    citations = output.content[0].annotations if hasattr(output.content[0], "annotations") else []
     for i, cite in enumerate(citations):
         if hasattr(cite, "filename"):
             text += f"\n[來源{i+1}: {cite.filename}]"
