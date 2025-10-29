@@ -6,6 +6,8 @@ import os
 from agents import Agent, ModelSettings, WebSearchTool, Runner, handoff
 from openai.types.responses import ResponseTextDeltaEvent
 import time
+import nest_asyncio
+nest_asyncio.apply()
 
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 
@@ -163,7 +165,8 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("AI 正在努力思考中..."):
             # 只呼叫 RouterAgent，讓 LLM 自己決定要不要 handoff
-            router_result = asyncio.run(Runner.run(router_agent, user_input))
+            loop = asyncio.get_event_loop()
+            router_result = loop.run_until_complete(Runner.run(router_agent, user_input))
 
             # 如果 LLM handoff 給 planner_agent，則進行研究流程
             if isinstance(router_result.final_output, WebSearchPlan):
