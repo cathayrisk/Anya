@@ -3,7 +3,7 @@ import os
 import mimetypes
 from openai import OpenAI
 import base64
-
+import openai
 
 
 def file_to_data_url(file):
