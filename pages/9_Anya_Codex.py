@@ -64,8 +64,15 @@ def multimodal_query(client, vector_store_id, user_text=None, image_file=None):
             "vector_store_ids": [vector_store_id]
         }]
     }
-    response = client.responses.create(**params)
-    return response
+    try:
+        response = client.responses.create(**params)
+        return response
+    except openai.BadRequestError as e:
+        st.error(f"API BadRequestError: {e}")
+        return None
+    except Exception as e:
+        st.error(f"API Error: {e}")
+        return None
 
 # ====== Citation 格式化 ======
 def format_response(response):
