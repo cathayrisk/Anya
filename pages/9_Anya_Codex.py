@@ -163,7 +163,7 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("AI 正在努力思考中..."):
             # 只呼叫 RouterAgent，讓 LLM 自己決定要不要 handoff
-            router_result = run_async(Runner.run(router_agent, user_input))
+            router_result = asyncio.run(Runner.run(router_agent, user_input))
 
             # 如果 LLM handoff 給 planner_agent，則進行研究流程
             if isinstance(router_result.final_output, WebSearchPlan):
