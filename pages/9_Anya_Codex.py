@@ -4,6 +4,8 @@ import mimetypes
 from openai import OpenAI
 import base64
 
+
+
 def file_to_data_url(file):
     # 讀取圖片內容
     file_bytes = file.read()
@@ -15,7 +17,7 @@ def file_to_data_url(file):
     return f"data:{mime};base64,{b64}"
     
 # ====== 參數設定 ======
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = st.secrets["OPENAI_KEY"])
 VECTOR_STORE_NAME = "my_knowledge_base"
 ALLOWED_FILE_TYPES = ["txt", "pdf", "jpg", "jpeg", "png", "docx", "pptx", "md"]
 
