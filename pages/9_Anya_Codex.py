@@ -2,7 +2,18 @@ import streamlit as st
 import os
 import mimetypes
 from openai import OpenAI
+import base64
 
+def file_to_data_url(file):
+    # 讀取圖片內容
+    file_bytes = file.read()
+    # 判斷副檔名
+    ext = file.name.split(".")[-1].lower()
+    mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
+    # 轉 base64
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+    
 # ====== 參數設定 ======
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 VECTOR_STORE_NAME = "my_knowledge_base"
@@ -42,15 +53,11 @@ def multimodal_query(client, vector_store_id, user_text=None, image_file=None):
     if user_text:
         input_content.append({"type": "input_text", "text": user_text})
     if image_file:
-        # Streamlit 的 UploadedFile 直接存成本地檔案
-        temp_img_path = f"temp_{image_file.name}"
-        with open(temp_img_path, "wb") as f:
-            f.write(image_file.read())
-        # 這裡直接用本地路徑給 OpenAI（如需 base64 請再調整）
-        input_content.append({"type": "input_image", "image_url": temp_img_path})
+        data_url = file_to_data_url(image_file)
+        input_content.append({"type": "input_image", "image_url": data_url})
 
     params = {
-        "model": "gpt-4.1",
+        "model": "gpt-4o",
         "input": [{"role": "user", "content": input_content}],
         "tools": [{
             "type": "file_search",
@@ -58,9 +65,6 @@ def multimodal_query(client, vector_store_id, user_text=None, image_file=None):
         }]
     }
     response = client.responses.create(**params)
-    # 清理暫存圖片
-    if image_file:
-        os.remove(temp_img_path)
     return response
 
 # ====== Citation 格式化 ======
