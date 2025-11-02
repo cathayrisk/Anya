@@ -1,56 +1,56 @@
 import streamlit as st
 import asyncio
-from openai.types.shared.reasoning import Reasoning
 from pydantic import BaseModel
 import os
-from agents import Agent, ModelSettings, WebSearchTool, Runner, handoff
-from openai.types.responses import ResponseTextDeltaEvent
-import time
 import nest_asyncio
 nest_asyncio.apply()
 
+from openai.types.shared.reasoning import Reasoning
+from agents import Agent, ModelSettings, WebSearchTool, Runner, handoff
+
+# 追加入多模態需要的工具
+import base64
+from io import BytesIO
+from PIL import Image
+from openai import OpenAI
+import time
+
+# =========================
+# 基本環境設定
+# =========================
+st.set_page_config(page_title="AI 研究助理 Chat（多模態＋段落淡入）", layout="wide", page_icon="🤖")
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 
-def stream_text_gen(result_streaming):
-    async def gen():
-        async for event in result_streaming.stream_events():
-            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
-                yield event.data.delta or ""
-    return gen()
+def run_async(coro):
+    # 在 Streamlit 中安全地跑 asyncio 協程
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro)
 
+# =========================
+# 打字動畫（無停止功能、只有 emoji，節奏稍慢）
+# =========================
 def emoji_token_stream(
     full_text: str,
     emoji: str = "🌸",
-    # 速度設定（每秒字數的上下限，會隨長度自動插值）
-    min_cps: int = 28,
-    max_cps: int = 140,
+    # 稍微放慢一點點（原本 28~140）
+    min_cps: int = 20,
+    max_cps: int = 110,
     short_len: int = 300,
     long_len: int = 1200,
-    # 標點停頓（以每字延遲為基準的倍數）
-    punctuation_pause: float = 0.45,
-    # 預覽emoji佔整體延遲的比例（越小越含蓄）
-    preview_ratio: float = 0.35,
-    # 程式碼區塊內是否略過emoji預覽並加速
+    punctuation_pause: float = 0.50,  # 標點停頓略增
+    preview_ratio: float = 0.40,      # emoji 預覽比重略增
     code_speedup: float = 1.8,
-    # 可中止旗標（配合按鈕）
-    cancel_key: str | None = None,
-    # 顯示進度百分比
-    show_progress: bool = False,
-    # 外部顯示容器（可傳 st.empty() 進來，方便跳過後用同一格改成全文）
     ph=None
 ):
     """
-    回傳 (text_shown, cancelled)
-    - text_shown: 實際顯示文字（若中止可能是部分）
-    - cancelled : True 表示中途被停止
+    只用 emoji 做短暫預覽、無游標、無停止功能。
     """
     import time
-    import streamlit as st
 
     if not full_text:
-        return "", False
+        return ""
 
-    # 優先用 regex 的 \X 做「字素叢集」切分，避免切壞 emoji/合字
+    # 使用字素叢集切分，避免切壞 emoji/合字
     try:
         import regex as re
         tokens = re.findall(r"\X", full_text)
@@ -72,23 +72,21 @@ def emoji_token_stream(
     per_char_delay = 1.0 / max(1.0, base_cps)
 
     placeholder = ph or st.empty()
-    prog_ph = st.empty() if show_progress else None
 
     out = []
     i = 0
-    cancelled = False
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
 
-    # 讓前段比較精緻、後段一次吐多一點字（更順）
+    # 前段精緻、後段加速（稍慢版）
     def chunk_size(idx):
         if inside_code:
             return 8
-        if idx < 60:
+        if idx < 80:
             return 1
-        if idx < 200:
+        if idx < 240:
             return 2
-        if idx < 800:
+        if idx < 900:
             return 3
         return 4
 
@@ -96,103 +94,79 @@ def emoji_token_stream(
         placeholder.markdown(txt)
 
     while i < n:
-        if cancel_key and st.session_state.get(cancel_key, False):
-            cancelled = True
-            break
-
         k = min(chunk_size(i), n - i)
         chunk_tokens = tokens[i:i + k]
         chunk_text = "".join(chunk_tokens)
         i += k
 
-        # 粗略偵測程式碼區塊（以 ``` 切換）
+        # 偵測 ``` 程式碼區塊
         if "```" in chunk_text:
             flips = chunk_text.count("```")
             if flips % 2 == 1:
                 inside_code = not inside_code
 
-        # 計算這個區塊應該花的時間
         intended = per_char_delay * k
         if inside_code:
             intended = max(intended / code_speedup, 0.002)
 
-        # 標點微停頓（只看區塊最後一個字）
         last_char = chunk_tokens[-1]
         if last_char in punct and not inside_code:
             intended += per_char_delay * punctuation_pause
 
         start_t = time.monotonic()
 
-        # 預覽：只加 emoji，不加游標（你說不要游標～）
+        # 預覽：只有 emoji（不顯示游標）
         current_text = "".join(out)
         if not inside_code:
             render(current_text + emoji)
-            # 預覽時間佔比，最多給一點點就好，避免閃太多
-            preview_sleep = min(intended * preview_ratio, 0.06)
-            time.sleep(preview_sleep)
-        else:
-            preview_sleep = 0.0
+            time.sleep(min(intended * preview_ratio, 0.07))
 
         # 正式寫入
         out.append(chunk_text)
         render("".join(out))
 
-        # 把剩下的時間睡完，讓節奏穩定（扣掉前面預覽用掉的時間）
+        # 填滿剩餘時間，讓節奏穩定
         elapsed = time.monotonic() - start_t
         remain = max(0.0, intended - elapsed)
         time.sleep(remain)
 
-        if show_progress and (i % 60 == 0 or i == n):
-            pct = int(i * 100 / n)
-            prog_ph.caption(f"輸出中… {pct}%")
-
-    # 收尾（保證最後不帶emoji）
+    # 收尾，不帶 emoji
     render("".join(out))
-    if show_progress:
-        prog_ph.empty()
+    return "".join(out)
 
-    return "".join(out), cancelled
+# =========================
+# 段落淡入 + 逐字（方案2）
+# =========================
+def split_md_paragraphs(md: str):
+    parts, buf, in_code = [], [], False
+    for line in md.splitlines(keepends=True):
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            buf.append(line)
+            continue
+        if not in_code and line.strip() == "":
+            if buf:
+                parts.append("".join(buf).strip("\n")); buf=[]
+        else:
+            buf.append(line)
+    if buf:
+        parts.append("".join(buf).strip("\n"))
+    return [p for p in parts if p.strip()]
 
-# 工具列與停止鈕（可選）
-def _stop_stream():
-    st.session_state["cancel_stream"] = True
-if "cancel_stream" not in st.session_state:
-    st.session_state["cancel_stream"] = False
+def paragraph_type_with_fade(md_text: str, emoji: str = "🌸", fade_ms: int = 160):
+    paragraphs = split_md_paragraphs(md_text)
+    for para in paragraphs:
+        ph = st.empty()
+        # 1) 段落淡入（灰色幽靈）
+        ph.markdown(f":grey[{para}]")
+        time.sleep(fade_ms / 1000.0)
+        # 2) 同一個 placeholder 逐字播放（會覆蓋灰色）
+        emoji_token_stream(para, emoji=emoji, ph=ph)
+        st.markdown("")  # 段落間距
 
-toolbar_ph = st.empty()
-display_ph = st.empty()
-
-with toolbar_ph.container():
-    c1, csp, c2 = st.columns([8, 1, 3])
-    with c1:
-        st.caption(":blue-badge[輸出中] 正在輸出～")
-    with c2:
-        if st.button("⏭️ 跳過動畫", type="primary", use_container_width=True, help="直接展開全文"):
-            st.session_state["cancel_stream"] = True
-            st.session_state["reveal_full_after_cancel"] = True
-
-# 只用 emoji、沒有游標
-shown_text, cancelled = emoji_token_stream(
-    ai_text,
-    emoji="🌸",
-    cancel_key="cancel_stream",
-    show_progress=True,
-    ph=display_ph
-)
-
-toolbar_ph.empty()
-st.session_state["cancel_stream"] = False
-
-# 若被使用者中止，就直接展開全文（漂亮又乾淨）
-if cancelled and st.session_state.get("reveal_full_after_cancel", False):
-    display_ph.markdown(ai_text)
-st.session_state["reveal_full_after_cancel"] = False
-
-# 寫入歷史（你可選擇存 shown_text 或 ai_text）
-text_to_store = ai_text
-st.session_state.chat_history.append({"role": "assistant", "text": text_to_store, "images": []})
-
-#---Planner
+# =========================
+# 規劃 Agent（Planner）
+# =========================
 planner_agent_PROMPT = (
     "You are a helpful research assistant. Given a query, come up with a set of web searches "
     "to perform to best answer the query. Output between 5 and 20 terms to query for."
@@ -201,7 +175,6 @@ planner_agent_PROMPT = (
 class WebSearchItem(BaseModel):
     reason: str
     "Your reasoning for why this search is important to the query."
-
     query: str
     "The search term to use for the web search."
 
@@ -217,7 +190,9 @@ planner_agent = Agent(
     output_type=WebSearchPlan,
 )
 
-#----search_agent
+# =========================
+# 搜尋 Agent（Search）
+# =========================
 INSTRUCTIONS = (
     "You are a research assistant. Given a search term, you search the web for that term and "
     "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 "
@@ -235,7 +210,9 @@ search_agent = Agent(
     model_settings=ModelSettings(tool_choice="required"),
 )
 
-#---writer_agent
+# =========================
+# 寫作 Agent（Writer）
+# =========================
 writer_agent_PROMPT = (
     "You are a senior researcher tasked with writing a cohesive report for a research query. "
     "You will be provided with the original query, and some initial research done by a research "
@@ -250,10 +227,8 @@ writer_agent_PROMPT = (
 class ReportData(BaseModel):
     short_summary: str
     """A short 2-3 sentence summary of the findings."""
-
     markdown_report: str
     """The final report"""
-
     follow_up_questions: list[str]
     """Suggested topics to research further"""
 
@@ -265,7 +240,9 @@ writer_agent = Agent(
     output_type=ReportData,
 )
 
-#---RouterAgent（LLM自動判斷是否handoff）
+# =========================
+# Router Agent（自動 handoff）
+# =========================
 ROUTER_PROMPT = """
 你是一個智慧助理，會根據用戶的需求自動決定要怎麼處理問題。
 - 如果用戶的問題是「需要研究、查資料、分析、寫報告、文獻探討」等，請使用 transfer_to_planner_agent 工具，把問題交給研究規劃助理。
@@ -279,22 +256,85 @@ router_agent = Agent(
     model="gpt-5",
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
-        reasoning=Reasoning(effort="low"),  # "minimal", "low", "medium", "high"
-        verbosity="medium",  # "low", "medium", "high"
+        reasoning=Reasoning(effort="low"),
+        verbosity="medium",
     ),
-    handoffs=[
-        handoff(planner_agent)
-    ]
+    handoffs=[handoff(planner_agent)]
 )
 
-def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+# =========================
+# Multimodal：圖片理解模式（新）
+# =========================
+client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
-st.set_page_config(page_title="AI 研究助理 Chat", layout="wide", page_icon="🤖")
+VISION_SYSTEM_PROMPT = """
+你是一位多模態助理。收到圖片與（可選）文字指示時：
+- 先描述圖片關鍵內容（物件、文字、關係、場景、版面）。
+- 若有多張圖片，請比較差異或建立步驟推論。
+- 適度結合OCR與推理；若與使用者提問相關，提供條列式結論與可行建議。
+請以正體中文作答。
+"""
 
-st.title("AI 研究助理 Chat 版")
-st.write("用對話方式問研究問題，AI 會像聊天一樣幫你查資料、寫報告！")
+st.title("AI 研究助理 Chat 版（多模態升級）")
+st.write("用對話方式問研究問題，AI 會像聊天一樣幫你查資料、寫報告！另外也能上傳圖片，請 AI 幫你看圖說故事～")
 
+with st.expander("🖼️ 圖片理解模式（多模態）", expanded=False):
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        vision_text = st.text_area("（可選）輸入你想讓 AI 針對圖片回答的問題或任務", placeholder="例如：幫我比對這兩張簡報圖的差異，整理成3點重點。")
+    with col2:
+        files = st.file_uploader("上傳 1～6 張圖片", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
+    if st.button("分析圖片", type="primary", use_container_width=True, disabled=not files):
+        # 準備內容區塊
+        content_blocks = []
+        if vision_text and vision_text.strip():
+            content_blocks.append({"type": "input_text", "text": vision_text.strip()})
+        imgs_preview = []
+        for f in files[:6]:
+            imgbytes = f.getvalue()
+            mime = f"type" if hasattr(f, "type") and f.type else "image/png"
+            b64 = base64.b64encode(imgbytes).decode()
+            content_blocks.append({"type": "input_image", "image_url": f"data:{mime};base64,{b64}"})
+            imgs_preview.append(imgbytes)
+
+        with st.spinner("安妮亞看圖中…wakuwaku！🤩"):
+            try:
+                resp = client.responses.create(
+                    model="gpt-5",
+                    input=[{"role": "user", "content": content_blocks}],
+                    instructions=VISION_SYSTEM_PROMPT,
+                    parallel_tool_calls=True,
+                    reasoning={"effort": "medium"},
+                    text={"verbosity": "medium"},
+                    store=False,
+                    truncation="auto",
+                )
+                out_text = ""
+                if hasattr(resp, "output") and resp.output:
+                    for item in resp.output:
+                        if hasattr(item, "content") and item.content:
+                            for c in item.content:
+                                if getattr(c, "type", None) == "output_text":
+                                    out_text += c.text
+
+                if not out_text.strip():
+                    out_text = "安妮亞看過了，但沒有辨識到可以回答的重點，能不能補充一下你的期待呢？"
+
+                # 顯示上傳圖片預覽
+                st.markdown("#### 圖片預覽")
+                st.image([Image.open(BytesIO(x)) for x in imgs_preview], width=260)
+
+                st.markdown("#### 解析結果")
+                paragraph_type_with_fade(out_text, emoji="🌸", fade_ms=140)
+
+            except Exception as e:
+                st.error(f"圖片分析失敗：{e}")
+
+st.markdown("---")
+
+# =========================
+# 主要聊天介面（研究/一般對話）
+# =========================
 # 初始化對話歷史
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -319,15 +359,13 @@ if user_input:
     # AI 處理（顯示 spinner）
     with st.chat_message("assistant"):
         with st.spinner("AI 正在努力思考中..."):
-            # 只呼叫 RouterAgent，讓 LLM 自己決定要不要 handoff
-            loop = asyncio.get_event_loop()
-            router_result = loop.run_until_complete(Runner.run(router_agent, user_input))
+            # 讓 Router 決定是否要 handoff
+            router_result = run_async(Runner.run(router_agent, user_input))
 
-            # 如果 LLM handoff 給 planner_agent，則進行研究流程
+            # 若 handoff 到規劃助理（需要研究工作）
             if isinstance(router_result.final_output, WebSearchPlan):
                 # Step 1: 規劃
-                plan_result = router_result  # 就是 planner_agent 的結果
-                search_plan = plan_result.final_output.searches
+                search_plan = router_result.final_output.searches
 
                 plan_md = "### 🔎 搜尋規劃\n"
                 for idx, item in enumerate(search_plan):
@@ -359,14 +397,16 @@ if user_input:
                 report = run_async(Runner.run(writer_agent, writer_input))
 
                 st.markdown("### 📋 Executive Summary")
-                emoji_token_stream(report.final_output.short_summary, emoji="🌟")  # 用星星
+                # 短摘要保留純逐字
+                emoji_token_stream(report.final_output.short_summary, emoji="🌟")
 
                 st.markdown("### 📖 完整報告")
-                emoji_token_stream(report.final_output.markdown_report, emoji="🌸")  # 用花朵
+                # 長文改用「段落淡入 + 逐字」
+                paragraph_type_with_fade(report.final_output.markdown_report, emoji="🌸", fade_ms=160)
 
                 st.markdown("### ❓ 後續建議問題")
                 for q in report.final_output.follow_up_questions:
-                    emoji_token_stream(q, emoji="🥜")  # 用花生
+                    emoji_token_stream(q, emoji="🥜")
 
                 # 把 AI 回覆存進歷史
                 ai_reply = (
@@ -380,13 +420,12 @@ if user_input:
                     "role": "assistant",
                     "content": ai_reply,
                 })
+
             else:
-                # 一般對話，直接顯示 RouterAgent 的回覆
-                router_result = run_async(Runner.run(router_agent, user_input))
+                # 一般對話：直接使用第一次的 router 結果，不要重跑
                 full_text = str(router_result.final_output)
-                emoji_token_stream(full_text)
-                    
+                emoji_token_stream(full_text, emoji="🌸")  # 速度已調慢
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": full_text,  # st.write_stream 回傳完整文字
+                    "content": full_text,
                 })
