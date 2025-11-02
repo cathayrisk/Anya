@@ -153,6 +153,45 @@ def emoji_token_stream(
 
     return "".join(out), cancelled
 
+# 工具列與停止鈕（可選）
+def _stop_stream():
+    st.session_state["cancel_stream"] = True
+if "cancel_stream" not in st.session_state:
+    st.session_state["cancel_stream"] = False
+
+toolbar_ph = st.empty()
+display_ph = st.empty()
+
+with toolbar_ph.container():
+    c1, csp, c2 = st.columns([8, 1, 3])
+    with c1:
+        st.caption(":blue-badge[輸出中] 正在輸出～")
+    with c2:
+        if st.button("⏭️ 跳過動畫", type="primary", use_container_width=True, help="直接展開全文"):
+            st.session_state["cancel_stream"] = True
+            st.session_state["reveal_full_after_cancel"] = True
+
+# 只用 emoji、沒有游標
+shown_text, cancelled = emoji_token_stream(
+    ai_text,
+    emoji="🌸",
+    cancel_key="cancel_stream",
+    show_progress=True,
+    ph=display_ph
+)
+
+toolbar_ph.empty()
+st.session_state["cancel_stream"] = False
+
+# 若被使用者中止，就直接展開全文（漂亮又乾淨）
+if cancelled and st.session_state.get("reveal_full_after_cancel", False):
+    display_ph.markdown(ai_text)
+st.session_state["reveal_full_after_cancel"] = False
+
+# 寫入歷史（你可選擇存 shown_text 或 ai_text）
+text_to_store = ai_text
+st.session_state.chat_history.append({"role": "assistant", "text": text_to_store, "images": []})
+
 #---Planner
 planner_agent_PROMPT = (
     "You are a helpful research assistant. Given a query, come up with a set of web searches "
