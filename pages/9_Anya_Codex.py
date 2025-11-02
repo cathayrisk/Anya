@@ -18,7 +18,7 @@ import time
 # =========================
 # 基本環境設定
 # =========================
-st.set_page_config(page_title="AI 研究助理 Chat（附件＋30輪上下文＋淡入）", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="Anya研究助理(測試中)", layout="wide", page_icon="🤖")
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
@@ -28,20 +28,27 @@ def run_async(coro):
     return loop.run_until_complete(coro)
 
 # =========================
-# 逐字動畫（無閃爍）
+# 逐字動畫
 # =========================
 def emoji_token_stream(
     full_text: str,
-    min_cps: int = 20,     # 穩定、稍慢
+    prefix_emoji: str | None = "🌸",  # 固定前綴 emoji；None 表示不要 emoji
+    min_cps: int = 20,
     max_cps: int = 110,
     short_len: int = 300,
     long_len: int = 1200,
-    punctuation_pause: float = 0.50,  # 句末小停頓
+    punctuation_pause: float = 0.50,
     code_speedup: float = 1.8,
     ph=None
 ):
+    """
+    穩定逐字輸出：不做任何預覽與閃爍。
+    - prefix_emoji：只在非程式碼段落顯示於最前方一次，不會動來動去。
+    """
+    import time, streamlit as st
     if not full_text:
         return ""
+
     try:
         import regex as re
         tokens = re.findall(r"\X", full_text)  # 以字素叢集拆分，避免切壞 emoji/合字
@@ -49,19 +56,20 @@ def emoji_token_stream(
         tokens = list(full_text)
 
     n = len(tokens)
-    def lerp(a, b, t): return a + (b - a) * t
-    if n <= short_len:
-        base_cps = min_cps
-    elif n >= long_len:
-        base_cps = max_cps
+    def lerp(a,b,t): return a + (b - a) * t
+    if n <= short_len: base_cps = min_cps
+    elif n >= long_len: base_cps = max_cps
     else:
         t = (n - short_len) / max(1, (long_len - short_len))
         base_cps = lerp(min_cps, max_cps, t)
     per_char_delay = 1.0 / max(1.0, base_cps)
 
     placeholder = ph or st.empty()
-    out, i, inside_code = [], 0, False
+    out, i = [], 0
+    inside_code = False
     punct = set(".!?;:，。！？：、…\n")
+    # 是否顯示 emoji 前綴（只在整段最前面一次）
+    emoji_prefix_rendered = False
 
     def chunk_size(idx):
         if inside_code: return 10
@@ -70,7 +78,12 @@ def emoji_token_stream(
         if idx < 1000:  return 3
         return 4
 
-    def render(txt): placeholder.markdown(txt)
+    def render():
+        prefix = ""
+        if (not inside_code) and (prefix_emoji is not None):
+            # 只在非 code 段落的最前面加一次 emoji
+            prefix = (prefix_emoji + " ") if (not emoji_prefix_rendered) else ""
+        placeholder.markdown(prefix + "".join(out))
 
     while i < n:
         k = min(chunk_size(i), n - i)
@@ -78,6 +91,7 @@ def emoji_token_stream(
         chunk_text = "".join(chunk_tokens)
         i += k
 
+        # code 區塊判定
         if "```" in chunk_text and chunk_text.count("```") % 2 == 1:
             inside_code = not inside_code
 
@@ -86,29 +100,32 @@ def emoji_token_stream(
             intended = max(intended / code_speedup, 0.002)
 
         last_char = chunk_tokens[-1]
-        if last_char in punct and not inside_code:
+        if (last_char in punct) and (not inside_code):
             intended += per_char_delay * punctuation_pause
 
         start_t = time.monotonic()
         out.append(chunk_text)
-        render("".join(out))
+
+        # 第一次 render 時若可加 emoji，先加一次就固定住
+        if (not inside_code) and (prefix_emoji is not None) and (not emoji_prefix_rendered):
+            emoji_prefix_rendered = True
+
+        render()
         elapsed = time.monotonic() - start_t
         remain = max(0.0, intended - elapsed)
         time.sleep(remain)
 
-    render("".join(out))
+    render()
     return "".join(out)
 
-# =========================
-# 段落淡入 + 逐字（灰色幽靈 → 打字）
-# =========================
+
 def split_md_paragraphs(md: str):
     parts, buf, in_code = [], [], False
     for line in md.splitlines(keepends=True):
         if line.strip().startswith("```"):
             in_code = not in_code
             buf.append(line); continue
-        if not in_code and line.strip() == "":
+        if (not in_code) and (line.strip() == ""):
             if buf:
                 parts.append("".join(buf).strip("\n")); buf=[]
         else:
@@ -116,14 +133,35 @@ def split_md_paragraphs(md: str):
     if buf: parts.append("".join(buf).strip("\n"))
     return [p for p in parts if p.strip()]
 
-def paragraph_type_with_fade(md_text: str, fade_ms: int = 160):
+
+def paragraph_type_with_fade(
+    md_text: str,
+    prefix_emoji: str = "🌸",   # 每段開頭的固定 emoji，不會閃爍
+    fade_ms: int = 420,         # 淡入時間加長，存在感更明顯
+    two_step_ghost: bool = True # 兩段式：斜體灰 → 普通灰 → 正常逐字
+):
+    """
+    兩段式淡入（更明顯）→ 同一 placeholder 逐字顯示。
+    code 區塊自動停用 emoji 前綴，避免破版。
+    """
+
     paragraphs = split_md_paragraphs(md_text)
     for para in paragraphs:
         ph = st.empty()
-        ph.markdown(f":grey[{para}]")       # 灰色幽靈
-        time.sleep(fade_ms / 1000.0)
-        emoji_token_stream(para, ph=ph)     # 再逐字（無預覽、無閃爍）
-        st.markdown("")                     # 段落間距
+        is_code = para.strip().startswith("```")
+        # Step A: 斜體灰（第一階段幽靈）
+        if two_step_ghost:
+            # emoji 也放在幽靈階段（更明顯），code 段落不放
+            ghost_prefix = ("" if is_code else (prefix_emoji + " "))
+            ph.markdown(f":grey[*{ghost_prefix}{para}*]")
+            time.sleep(fade_ms * 0.55 / 1000.0)
+        # Step B: 普通灰（第二階段）
+        ghost_prefix = ("" if is_code else (prefix_emoji + " "))
+        ph.markdown(f":grey[{ghost_prefix}{para}]")
+        time.sleep(fade_ms * (0.45 if two_step_ghost else 1.0) / 1000.0)
+        # Step C: 正式逐字（同一位置覆蓋，不閃爍）
+        emoji_token_stream(para, prefix_emoji=None if is_code else prefix_emoji, ph=ph)
+        st.markdown("")  # 段落間距
 
 # =========================
 # 最近 30 輪上下文
