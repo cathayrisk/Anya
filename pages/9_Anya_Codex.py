@@ -8,7 +8,7 @@ nest_asyncio.apply()
 from openai.types.shared.reasoning import Reasoning
 from agents import Agent, ModelSettings, WebSearchTool, Runner, handoff
 
-# 多模態需要的工具
+# 多模態
 import base64
 from io import BytesIO
 from PIL import Image
@@ -18,25 +18,25 @@ import time
 # =========================
 # 基本環境設定
 # =========================
-st.set_page_config(page_title="AI 研究助理 Chat（st.chat_input 附件版）", layout="wide", page_icon="🤖")
+st.set_page_config(page_title="AI 研究助理 Chat（附件＋30輪上下文＋淡入）", layout="wide", page_icon="🤖")
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
+
+client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
 def run_async(coro):
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(coro)
 
 # =========================
-# 打字動畫（無停止功能、只有 emoji，節奏稍慢）
+# 逐字動畫（無閃爍）
 # =========================
 def emoji_token_stream(
     full_text: str,
-    emoji: str = "🌸",
-    min_cps: int = 20,
+    min_cps: int = 20,     # 穩定、稍慢
     max_cps: int = 110,
     short_len: int = 300,
     long_len: int = 1200,
-    punctuation_pause: float = 0.50,
-    preview_ratio: float = 0.40,
+    punctuation_pause: float = 0.50,  # 句末小停頓
     code_speedup: float = 1.8,
     ph=None
 ):
@@ -44,7 +44,7 @@ def emoji_token_stream(
         return ""
     try:
         import regex as re
-        tokens = re.findall(r"\X", full_text)
+        tokens = re.findall(r"\X", full_text)  # 以字素叢集拆分，避免切壞 emoji/合字
     except Exception:
         tokens = list(full_text)
 
@@ -64,10 +64,10 @@ def emoji_token_stream(
     punct = set(".!?;:，。！？：、…\n")
 
     def chunk_size(idx):
-        if inside_code: return 8
-        if idx < 80:    return 1
-        if idx < 240:   return 2
-        if idx < 900:   return 3
+        if inside_code: return 10
+        if idx < 100:   return 1
+        if idx < 300:   return 2
+        if idx < 1000:  return 3
         return 4
 
     def render(txt): placeholder.markdown(txt)
@@ -78,9 +78,8 @@ def emoji_token_stream(
         chunk_text = "".join(chunk_tokens)
         i += k
 
-        if "```" in chunk_text:
-            if chunk_text.count("```") % 2 == 1:
-                inside_code = not inside_code
+        if "```" in chunk_text and chunk_text.count("```") % 2 == 1:
+            inside_code = not inside_code
 
         intended = per_char_delay * k
         if inside_code:
@@ -91,17 +90,8 @@ def emoji_token_stream(
             intended += per_char_delay * punctuation_pause
 
         start_t = time.monotonic()
-
-        # 預覽：只有 emoji
-        current_text = "".join(out)
-        if not inside_code:
-            render(current_text + emoji)
-            time.sleep(min(intended * preview_ratio, 0.07))
-
-        # 正式寫入
         out.append(chunk_text)
         render("".join(out))
-
         elapsed = time.monotonic() - start_t
         remain = max(0.0, intended - elapsed)
         time.sleep(remain)
@@ -110,7 +100,7 @@ def emoji_token_stream(
     return "".join(out)
 
 # =========================
-# 段落淡入 + 逐字（方案2）
+# 段落淡入 + 逐字（灰色幽靈 → 打字）
 # =========================
 def split_md_paragraphs(md: str):
     parts, buf, in_code = [], [], False
@@ -126,26 +116,39 @@ def split_md_paragraphs(md: str):
     if buf: parts.append("".join(buf).strip("\n"))
     return [p for p in parts if p.strip()]
 
-def paragraph_type_with_fade(md_text: str, emoji: str = "🌸", fade_ms: int = 160):
+def paragraph_type_with_fade(md_text: str, fade_ms: int = 160):
     paragraphs = split_md_paragraphs(md_text)
     for para in paragraphs:
         ph = st.empty()
-        ph.markdown(f":grey[{para}]")
+        ph.markdown(f":grey[{para}]")       # 灰色幽靈
         time.sleep(fade_ms / 1000.0)
-        emoji_token_stream(para, emoji=emoji, ph=ph)
-        st.markdown("")
+        emoji_token_stream(para, ph=ph)     # 再逐字（無預覽、無閃爍）
+        st.markdown("")                     # 段落間距
 
 # =========================
-# 多模態系統提示
+# 最近 30 輪上下文
 # =========================
-client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
-VISION_SYSTEM_PROMPT = """
-你是一位多模態助理。收到圖片與（可選）文字指示時：
-- 先描述圖片關鍵內容（物件、文字、關係、場景、版面）。
-- 若有多張圖片，請比較差異或建立步驟推論。
-- 適度結合OCR與推理；若與使用者提問相關，提供條列式結論與可行建議。
-請以正體中文作答。
-"""
+MAX_TURNS_CTX = 30        # 只用最近 30 則（user/assistant 合計）
+MAX_CTX_CHARS = 8000      # 預防超長；你可依需求調整
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []   # [{"role": "user"/"assistant", "content": str, "images": [(name, bytes), ...]}]
+
+def build_context_snippet(messages, max_turns=MAX_TURNS_CTX, max_chars=MAX_CTX_CHARS):
+    recent = messages[-max_turns:]
+    lines = []
+    for msg in recent:
+        role = "使用者" if msg["role"] == "user" else "助理"
+        text = msg.get("content", "").strip()
+        if not text:
+            continue
+        # 壓掉多餘空白
+        text = " ".join(text.split())
+        lines.append(f"{role}: {text}")
+    ctx = "\n".join(lines)
+    if len(ctx) > max_chars:
+        ctx = ctx[-max_chars:]
+    return ctx
 
 # =========================
 # 規劃/搜尋/寫作/路由 Agents
@@ -164,7 +167,7 @@ class WebSearchPlan(BaseModel):
 
 planner_agent = Agent(
     name="PlannerAgent",
-    instructions=planner_agent_PROMPT if (planner_agent_PROMPT:=planner_agent_PROMPT) else "",
+    instructions=planner_agent_PROMPT,
     model="gpt-5",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
@@ -231,45 +234,44 @@ router_agent = Agent(
 )
 
 # =========================
-# 介面與主要流程（精簡聊天區＋附件）
+# 多模態系統提示
 # =========================
-st.title("AI 研究助理 Chat 版（精簡聊天＋附件上傳）")
-st.write("直接在輸入框貼文字，或一起上傳圖片，AI 會自動切換到多模態模式喔～")
+VISION_SYSTEM_PROMPT = """
+你是一位多模態助理。收到圖片與（可選）文字指示時：
+- 先描述圖片關鍵內容（物件、文字、關係、場景、版面）。
+- 若有多張圖片，請比較差異或建立步驟推論。
+- 適度結合OCR與推理；若與使用者提問相關，提供條列式結論與可行建議。
+請以正體中文作答。
+"""
 
-# 初始化對話歷史（加入 images 欄位）
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# =========================
+# UI 與流程（精簡聊天＋附件）
+# =========================
+st.title("AI 研究助理 Chat 版（附件＋30輪上下文＋淡入）")
+st.write("直接在輸入框打字，或同時上傳圖片（多張可），AI 會自動切換多模態；使用最近 30 輪上下文。")
 
-# 顯示歷史訊息（精簡：只在使用者訊息中顯示縮圖）
+# 顯示歷史（精簡：使用者訊息可顯示縮圖）
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar=msg.get("avatar")):
-        # 文字
         if msg.get("content"):
             st.markdown(msg["content"])
-        # 圖片（只有 user 端可能有）
         if msg.get("images"):
-            thumbs = []
-            for name, imgbytes in msg["images"]:
-                try:
-                    thumbs.append(Image.open(BytesIO(imgbytes)))
-                except Exception:
-                    pass
-            if thumbs:
-                st.image(thumbs, width=220)
+            try:
+                st.image([Image.open(BytesIO(b)) for _, b in msg["images"]], width=220)
+            except Exception:
+                pass
 
 # 使用者輸入（支援多張圖片）
 prompt = st.chat_input(
-    "輸入問題，或一起上傳圖片讓我幫你看圖說故事～",
+    "輸入問題，或上傳圖片讓我幫你看圖說故事～",
     accept_file="multiple",
     file_type=["png", "jpg", "jpeg", "webp"]
 )
 
 if prompt:
-    # 兼容：有些版本回傳字串；有些回傳帶 text/files 的物件
     user_text = prompt.text.strip() if hasattr(prompt, "text") and prompt.text else (prompt.strip() if isinstance(prompt, str) else "")
     files = prompt.files if hasattr(prompt, "files") and prompt.files else []
 
-    # 將圖片轉 base64，不在這裡顯示expander，保持聊天區簡潔
     content_blocks = []
     images_for_history = []
 
@@ -280,13 +282,10 @@ if prompt:
         imgbytes = f.getbuffer()
         mime = getattr(f, "type", None) or "image/png"
         b64 = base64.b64encode(imgbytes).decode()
-        content_blocks.append({
-            "type": "input_image",
-            "image_url": f"data:{mime};base64,{b64}"
-        })
+        content_blocks.append({"type": "input_image", "image_url": f"data:{mime};base64,{b64}"})
         images_for_history.append((getattr(f, "name", "image"), imgbytes))
 
-    # 把使用者訊息（含縮圖）寫入歷史並顯示
+    # 寫入使用者訊息
     st.session_state.messages.append({
         "role": "user",
         "content": user_text,
@@ -301,15 +300,20 @@ if prompt:
     # 助理回覆
     with st.chat_message("assistant"):
         with st.spinner("安妮亞努力思考中…"):
-            # 如果有圖片，走多模態；否則走研究/一般聊天路線
-            if any(block["type"] == "input_image" for block in content_blocks):
+            ctx_snippet = build_context_snippet(st.session_state.messages)
+
+            # 有圖片 → 多模態
+            if any(b["type"] == "input_image" for b in content_blocks):
+                # 把最近 30 輪上下文丟在最前面
+                if ctx_snippet:
+                    content_blocks.insert(0, {"type": "input_text", "text": f"最近對話（最多30輪）：\n{ctx_snippet}"})
                 try:
                     resp = client.responses.create(
                         model="gpt-5",
                         input=[{"role": "user", "content": content_blocks}],
                         instructions=VISION_SYSTEM_PROMPT,
-                        reasoning={"effort": "medium"},
-                        text={"verbosity": "medium"},
+                        reasoning={"effort":"medium"},
+                        text={"verbosity":"medium"},
                         store=False,
                         truncation="auto",
                     )
@@ -323,10 +327,8 @@ if prompt:
                     if not out_text.strip():
                         out_text = "安妮亞看過了，但還沒抓到你想問的重點～可以再具體一點嗎？"
 
-                    # 顯示：段落淡入＋逐字
-                    paragraph_type_with_fade(out_text, emoji="🌸", fade_ms=140)
+                    paragraph_type_with_fade(out_text, fade_ms=140)
 
-                    # 寫入歷史
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": out_text,
@@ -343,17 +345,21 @@ if prompt:
                     })
 
             else:
-                # 純文字：讓 Router 決定是否 handoff 做研究
-                router_result = run_async(Runner.run(router_agent, user_text))
+                # 純文字 → 帶入最近30輪上下文給 Router
+                router_input = (
+                    (f"[最近對話]\n{ctx_snippet}\n\n" if ctx_snippet else "") +
+                    f"[當前使用者問題]\n{user_text}"
+                )
+                router_result = run_async(Runner.run(router_agent, router_input))
 
                 if isinstance(router_result.final_output, WebSearchPlan):
-                    # Step 1 規劃
+                    # 規劃
                     search_plan = router_result.final_output.searches
                     plan_md = "### 🔎 搜尋規劃\n"
                     for idx, item in enumerate(search_plan):
                         plan_md += f"**{idx+1}. {item.query}**\n> {item.reason}\n"
 
-                    # Step 2 並行搜尋
+                    # 並行搜尋
                     tasks = [
                         Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}")
                         for item in search_plan
@@ -373,19 +379,22 @@ if prompt:
                         for idx, summary in enumerate(summaries):
                             st.markdown(f"**{search_plan[idx].query}**\n{summary}\n")
 
-                    # Step 3 寫作
-                    writer_input = f"Original query: {user_text}\nSummarized search results: {summaries}"
+                    # 寫作
+                    writer_input = (
+                        (f"[最近對話]\n{ctx_snippet}\n\n" if ctx_snippet else "") +
+                        f"[原始問題]\n{user_text}\n\n[搜尋摘要]\n{summaries}"
+                    )
                     report = run_async(Runner.run(writer_agent, writer_input))
 
                     st.markdown("### 📋 Executive Summary")
-                    emoji_token_stream(report.final_output.short_summary, emoji="🌟")
+                    paragraph_type_with_fade(report.final_output.short_summary, fade_ms=120)
 
                     st.markdown("### 📖 完整報告")
-                    paragraph_type_with_fade(report.final_output.markdown_report, emoji="🌸", fade_ms=160)
+                    paragraph_type_with_fade(report.final_output.markdown_report, fade_ms=160)
 
                     st.markdown("### ❓ 後續建議問題")
                     for q in report.final_output.follow_up_questions:
-                        emoji_token_stream(q, emoji="🥜")
+                        paragraph_type_with_fade(q, fade_ms=100)
 
                     ai_reply = (
                         plan_md + "\n" +
@@ -403,7 +412,7 @@ if prompt:
                 else:
                     # 一般對話
                     full_text = str(router_result.final_output)
-                    emoji_token_stream(full_text, emoji="🌸")
+                    paragraph_type_with_fade(full_text, fade_ms=120)
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": full_text,
