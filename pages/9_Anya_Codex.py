@@ -164,7 +164,7 @@ class WebSearchPlan(BaseModel):
 
 planner_agent = Agent(
     name="PlannerAgent",
-    instructions=planner_agentPROMPT if (planner_agent_PROMPT:=planner_agent_PROMPT) else "",
+    instructions=planner_agent_PROMPT if (planner_agent_PROMPT:=planner_agent_PROMPT) else "",
     model="gpt-5",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
