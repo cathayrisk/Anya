@@ -64,7 +64,7 @@ def emoji_token_stream(
     out, i = [], 0
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
-    emoji_prefix_rendered = False
+    emoji_prefix_shown = False  # ← 修正：第一次 render 才會變 True
 
     def chunk_size(idx):
         if inside_code: return 10
@@ -74,9 +74,11 @@ def emoji_token_stream(
         return 4
 
     def render():
+        nonlocal emoji_prefix_shown
         prefix = ""
-        if (not inside_code) and (prefix_emoji is not None):
-            prefix = (prefix_emoji + " ") if (not emoji_prefix_rendered) else ""
+        if (not inside_code) and (prefix_emoji is not None) and (not emoji_prefix_shown):
+            prefix = prefix_emoji + " "
+            emoji_prefix_shown = True     # ← 在真正渲染時才標記已顯示
         placeholder.markdown(prefix + "".join(out))
 
     while i < n:
@@ -98,10 +100,6 @@ def emoji_token_stream(
 
         start_t = time.monotonic()
         out.append(chunk_text)
-
-        if (not inside_code) and (prefix_emoji is not None) and (not emoji_prefix_rendered):
-            emoji_prefix_rendered = True
-
         render()
         elapsed = time.monotonic() - start_t
         remain = max(0.0, intended - elapsed)
@@ -109,60 +107,6 @@ def emoji_token_stream(
 
     render()
     return "".join(out)
-
-
-def split_md_paragraphs(md: str):
-    parts, buf, in_code = [], [], False
-    for line in md.splitlines(keepends=True):
-        if line.strip().startswith("```"):
-            in_code = not in_code
-            buf.append(line); continue
-        if (not in_code) and (line.strip() == ""):
-            if buf:
-                parts.append("".join(buf).strip("\n")); buf=[]
-        else:
-            buf.append(line)
-    if buf: parts.append("".join(buf).strip("\n"))
-    return [p for p in parts if p.strip()]
-
-
-def paragraph_type_with_fade(
-    md_text: str,
-    prefix_emoji: str = "🌸",
-    fade_ms: int = 360,         # 調長，淡入更明顯
-    two_step_ghost: bool = True # 兩段式：斜體引用 → 普通引用 → 正常逐字
-):
-    """
-    用純 Markdown 的引用（>）當作「灰色幽靈」：
-    - Step A: 斜體引用（更淡）
-    - Step B: 普通引用（較濃）
-    - Step C: 逐字輸出（帶固定前綴 emoji）
-    注意：code 區塊自動關閉 emoji 前綴並跳過幽靈步驟，避免破版。
-    """
-    import time, streamlit as st
-
-    paragraphs = split_md_paragraphs(md_text)
-    for para in paragraphs:
-        ph = st.empty()
-        is_code = para.strip().startswith("```")
-        prefix = "" if is_code else (prefix_emoji + " ")
-
-        if two_step_ghost and not is_code:
-            # Step A：斜體引用（更淡）
-            ph.markdown(f"> _{prefix}{para}_")
-            time.sleep(fade_ms * 0.55 / 1000.0)
-
-        # Step B：普通引用（更清楚）
-        if not is_code:
-            ph.markdown(f"> {prefix}{para}")
-            time.sleep(fade_ms * (0.45 if two_step_ghost else 1.0) / 1000.0)
-        else:
-            # code 直接略過幽靈，什麼都不做，往下進逐字
-            pass
-
-        # Step C：正式逐字（同一個 placeholder 覆蓋，避免閃爍）
-        emoji_token_stream(para, prefix_emoji=None if is_code else prefix_emoji, ph=ph)
-        st.markdown("")  # 段落間距
 
 # =========================
 # 最近 30 輪上下文
@@ -425,14 +369,14 @@ if prompt:
                     report = run_async(Runner.run(writer_agent, writer_input))
 
                     st.markdown("### 📋 Executive Summary")
-                    paragraph_type_with_fade(report.final_output.short_summary, fade_ms=120)
+                    emoji_token_stream(report.final_output.short_summary, prefix_emoji="🌟")
 
                     st.markdown("### 📖 完整報告")
-                    paragraph_type_with_fade(report.final_output.markdown_report, fade_ms=160)
+                    emoji_token_stream(report.final_output.markdown_report, prefix_emoji="🌸")
 
                     st.markdown("### ❓ 後續建議問題")
                     for q in report.final_output.follow_up_questions:
-                        paragraph_type_with_fade(q, fade_ms=100)
+                        emoji_token_stream(q, prefix_emoji="🥜")
 
                     ai_reply = (
                         plan_md + "\n" +
@@ -450,7 +394,7 @@ if prompt:
                 else:
                     # 一般對話
                     full_text = str(router_result.final_output)
-                    paragraph_type_with_fade(full_text, prefix_emoji="🌸", fade_ms=360)
+                    emoji_token_stream(full_text, prefix_emoji="🌸")
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": full_text,
