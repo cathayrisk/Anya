@@ -286,8 +286,7 @@ VISION_SYSTEM_PROMPT = """
 # =========================
 # UI 與流程（精簡聊天＋附件）
 # =========================
-st.title("AI 研究助理 Chat 版（附件＋30輪上下文＋淡入）")
-st.write("直接在輸入框打字，或同時上傳圖片（多張可），AI 會自動切換多模態；使用最近 30 輪上下文。")
+st.title("Anya研究助理(測試中)")
 
 # 顯示歷史（精簡：使用者訊息可顯示縮圖）
 for msg in st.session_state.messages:
@@ -338,7 +337,7 @@ if prompt:
 
     # 助理回覆
     with st.chat_message("assistant"):
-        with st.spinner("安妮亞努力思考中…"):
+        with st.spinner("安妮亞努力思考中…", show_time=False):
             ctx_snippet = build_context_snippet(st.session_state.messages)
 
             # 有圖片 → 多模態
