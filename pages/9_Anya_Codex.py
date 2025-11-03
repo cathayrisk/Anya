@@ -312,7 +312,7 @@ if prompt:
                     if not out_text.strip():
                         out_text = "安妮亞看過了，但還沒抓到你想問的重點～可以再具體一點嗎？"
 
-                    paragraph_type_with_fade(out_text, fade_ms=140)
+                    emoji_token_stream(out_text, prefix_emoji="🌸")
 
                     st.session_state.messages.append({
                         "role": "assistant",
