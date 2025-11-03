@@ -422,8 +422,8 @@ if prompt:
                     # 一般對話
                     full_text = str(router_result.final_output)
                     emit_assistant(out_text, "🌸")
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": full_text,
-                        "images": []
-                    })
+                    #st.session_state.messages.append({
+                    #    "role": "assistant",
+                    #    "content": full_text,
+                    #    "images": []
+                    #})
