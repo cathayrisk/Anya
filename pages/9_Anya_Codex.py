@@ -32,7 +32,7 @@ def run_async(coro):
 # =========================
 def emoji_token_stream(
     full_text: str,
-    prefix_emoji: str | None = "🌸",  # 固定在最前面顯示一次，不會閃
+    prefix_emoji: str | None = "🌸",  # 固定最前面出現一次；None 表示不要 emoji
     min_cps: int = 20,
     max_cps: int = 110,
     short_len: int = 300,
@@ -45,9 +45,10 @@ def emoji_token_stream(
     if not full_text:
         return ""
 
+    # 用字素叢集切分，避免切壞 emoji/合字
     try:
         import regex as re
-        tokens = re.findall(r"\X", full_text)  # 以字素叢集拆分，避免切壞 emoji/合字
+        tokens = re.findall(r"\X", full_text)
     except Exception:
         tokens = list(full_text)
 
@@ -64,7 +65,7 @@ def emoji_token_stream(
     out, i = [], 0
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
-    emoji_prefix_shown = False  # ← 修正：第一次 render 才會變 True
+    emoji_prefix_shown = False  # 在 render 裡第一次顯示後才設 True
 
     def chunk_size(idx):
         if inside_code: return 10
@@ -76,9 +77,10 @@ def emoji_token_stream(
     def render():
         nonlocal emoji_prefix_shown
         prefix = ""
+        # 只有非程式碼段且尚未顯示過時，才在最前面加一次 emoji
         if (not inside_code) and (prefix_emoji is not None) and (not emoji_prefix_shown):
             prefix = prefix_emoji + " "
-            emoji_prefix_shown = True     # ← 在真正渲染時才標記已顯示
+            emoji_prefix_shown = True
         placeholder.markdown(prefix + "".join(out))
 
     while i < n:
@@ -87,6 +89,7 @@ def emoji_token_stream(
         chunk_text = "".join(chunk_tokens)
         i += k
 
+        # 簡易偵測程式碼區塊（含 ``` 交替）
         if "```" in chunk_text and (chunk_text.count("```") % 2 == 1):
             inside_code = not inside_code
 
