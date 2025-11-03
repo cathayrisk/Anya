@@ -8,6 +8,10 @@ from openai import OpenAI
 import os
 import json
 
+# === 0. Trimming 參數（可調） ===
+# 只保留「最近 N 個使用者回合」做為上下文
+TRIM_LAST_N_USER_TURNS = 3
+
 # === 1. 設定 Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
 
@@ -30,6 +34,79 @@ def emoji_token_stream(full_text, emoji="🌸", cursor_symbol=" "):
     # 最後顯示完整內容（不顯示游標）
     placeholder.markdown(''.join(tokens))
 
+# === 1.1 影像 MIME 偵測（用於回放舊回合圖片） ===
+def _detect_mime_from_bytes(img_bytes: bytes) -> str:
+    try:
+        im = Image.open(BytesIO(img_bytes))
+        fmt = (im.format or "").upper()
+        if fmt == "PNG":
+            return "image/png"
+        if fmt in ("JPG", "JPEG"):
+            return "image/jpeg"
+        if fmt == "WEBP":
+            return "image/webp"
+        if fmt == "GIF":
+            return "image/gif"
+    except Exception:
+        pass
+    return "application/octet-stream"
+
+# === 1.2 將 chat_history 修剪成「最近 N 個使用者回合」並轉成 Responses API input ===
+def build_trimmed_input_messages(pending_user_content_blocks):
+    """
+    將 st.session_state.chat_history 修剪，只保留最近 N 個「使用者回合」，
+    並把目前待送出的使用者訊息（pending_user_content_blocks）接在最後。
+    回傳可直接丟進 client.responses.create(input=...) 的 messages 陣列。
+    """
+    hist = st.session_state.chat_history
+    if not hist:
+        # 首次對話：只送現在這一輪
+        return [{"role": "user", "content": pending_user_content_blocks}]
+
+    # 1) 找到「最近 N 個使用者回合」的起點索引
+    user_count = 0
+    start_idx = 0
+    for i in range(len(hist) - 1, -1, -1):
+        if hist[i].get("role") == "user":
+            user_count += 1
+            if user_count == TRIM_LAST_N_USER_TURNS:
+                start_idx = i
+                break
+    # 如果少於 N 個 user 回合，就從最開頭開始
+
+    selected = hist[start_idx:]
+
+    # 2) 轉成 Responses API 的 messages 形狀
+    messages = []
+    for msg in selected:
+        role = msg.get("role")
+        if role == "user":
+            blocks = []
+            if msg.get("text"):
+                blocks.append({"type": "input_text", "text": msg["text"]})
+            # 將舊回合圖片一併帶入（如果你想更省 token，可以拿掉這段）
+            if msg.get("images"):
+                for fn, imgbytes in msg["images"]:
+                    mime = _detect_mime_from_bytes(imgbytes)
+                    b64 = base64.b64encode(imgbytes).decode()
+                    blocks.append({
+                        "type": "input_image",
+                        "image_url": f"data:{mime};base64,{b64}"
+                    })
+            if blocks:
+                messages.append({"role": "user", "content": blocks})
+        elif role == "assistant":
+            if msg.get("text"):
+                # 以 assistant 的 output_text 形式放回上下文
+                messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": msg["text"]}]
+                })
+
+    # 3) 加上「這一輪」使用者輸入（含圖片）
+    messages.append({"role": "user", "content": pending_user_content_blocks})
+    return messages
+
 # === 2. Session State ===
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = [{
@@ -41,6 +118,10 @@ if "pending_ai" not in st.session_state:
     st.session_state.pending_ai = False
 if "pending_content" not in st.session_state:
     st.session_state.pending_content = None
+
+# 不再使用 previous_response_id（改用 Trimming 手動餵上下文）
+# if "previous_response_id" not in st.session_state:
+#     st.session_state.previous_response_id = None
 
 # === 3. OpenAI client ===
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
@@ -217,67 +298,64 @@ for msg in st.session_state.chat_history:
             if msg.get("text"):
                 st.markdown(msg["text"])
 
-# 1. 記錄上一輪 response_id
-if "previous_response_id" not in st.session_state:
-    st.session_state.previous_response_id = None
-
-# 2. 處理 AI 回覆
+# === 6. 處理 AI 回覆（使用 Trimming；移除 spinner，只保留 status） ===
 if st.session_state.pending_ai and st.session_state.pending_content:
     with st.chat_message("assistant"):
         status = st.status("安妮亞馬上回覆你！", expanded=False)
-        with st.spinner("Wait for it...", show_time=True):
-            try:
-                response = client.responses.create(
-                    model="gpt-5",
-                    input=[
-                        {
-                            "role": "user",
-                            "content": st.session_state.pending_content
-                        }
-                    ],
-                    tools=[{"type": "web_search"}],
-                    tool_choice="auto",
-                    parallel_tool_calls=True,
-                    reasoning={ "effort": "medium" },
-                    text={ "verbosity": "medium" },
-                    instructions=ANYA_SYSTEM_PROMPT,
-                    include=[
-                        "web_search_call.action.sources",
-                        "message.input_image.image_url"
-                    ],
-                    store=True,
-                    truncation="auto",
-                    previous_response_id=st.session_state.previous_response_id
-                )
-                ai_text = ""
-                if hasattr(response, "output") and response.output:
-                    for item in response.output:
-                        if hasattr(item, "content") and item.content:
-                            for c in item.content:
-                                if getattr(c, "type", None) == "output_text":
-                                    ai_text += c.text
-                if not ai_text:
-                    ai_text = "安妮亞找不到答案～（抱歉啦！）"
-                    
-                # 關掉 spinner 之後，先「播放打字動畫」
-                status.update(label="安妮亞正在輸出中…", state="running")
-                emoji_token_stream(ai_text, emoji="🌸")  # ← 用你現成的動畫函式
-                st.session_state.previous_response_id = response.id
-            except Exception as e:
-                ai_text = f"API 發生錯誤：{e}"
+        try:
+            # 依 Trimming 規則組裝上下文 + 這一輪使用者訊息
+            trimmed_messages = build_trimmed_input_messages(st.session_state.pending_content)
 
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "text": ai_text,
-                "images": []
-            })
-            st.session_state.pending_ai = False
-            st.session_state.pending_content = None
-            status.update(label="安妮亞回答完畢！🥜", state="complete")
-            st.rerun()
+            response = client.responses.create(
+                model="gpt-5",
+                input=trimmed_messages,  # ← 不再用 previous_response_id，而是送修剪後的 messages
+                tools=[{"type": "web_search"}],
+                tool_choice="auto",
+                parallel_tool_calls=True,
+                reasoning={"effort": "medium"},
+                text={"verbosity": "medium"},
+                instructions=ANYA_SYSTEM_PROMPT,
+                include=[
+                    "web_search_call.action.sources",
+                    "message.input_image.image_url"
+                ],
+                truncation="auto",
+            )
 
-# 3. 使用者輸入
-prompt = st.chat_input("wakuwaku！安妮亞可以幫你看圖說故事嚕！", accept_file="multiple", file_type=["jpg", "jpeg", "png"])
+            ai_text = ""
+            if hasattr(response, "output") and response.output:
+                for item in response.output:
+                    if hasattr(item, "content") and item.content:
+                        for c in item.content:
+                            if getattr(c, "type", None) == "output_text":
+                                ai_text += c.text
+            if not ai_text:
+                ai_text = "安妮亞找不到答案～（抱歉啦！）"
+
+            # 狀態更新：正在輸出
+            status.update(label="安妮亞正在輸出中…", state="running")
+            emoji_token_stream(ai_text, emoji="🌸", cursor_symbol=" ")
+
+        except Exception as e:
+            ai_text = f"API 發生錯誤：{e}"
+
+        # 寫回歷史 & 收尾
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "text": ai_text,
+            "images": []
+        })
+        st.session_state.pending_ai = False
+        st.session_state.pending_content = None
+        status.update(label="安妮亞回答完畢！🥜", state="complete")
+        st.rerun()
+
+# === 7. 使用者輸入 ===
+prompt = st.chat_input(
+    "wakuwaku！安妮亞可以幫你看圖說故事嚕！",
+    accept_file="multiple",
+    file_type=["jpg", "jpeg", "png"]
+)
 if prompt:
     user_text = prompt.text.strip() if prompt.text else ""
     images_for_history = []
@@ -294,7 +372,7 @@ if prompt:
             "image_url": f"data:{mime};base64,{b64}"
         })
         images_for_history.append((f.name, imgbytes))
-    
+
     st.session_state.chat_history.append({
         "role": "user",
         "text": user_text,
