@@ -32,23 +32,23 @@ def run_async(coro):
 # =========================
 def emoji_token_stream(
     full_text: str,
-    prefix_emoji: str | None = "🌸",  # 固定最前面出現一次；None 表示不要 emoji
+    prefix_emoji: str | None = "🌸",   # 固定在最前面出現一次；None 表示不要 emoji
     min_cps: int = 20,
     max_cps: int = 110,
     short_len: int = 300,
     long_len: int = 1200,
     punctuation_pause: float = 0.50,
     code_speedup: float = 1.8,
+    prefix_on_code: bool = True,       # 即使段落是 ```code``` 也保留前綴 emoji
     ph=None
 ):
     import time, streamlit as st
     if not full_text:
         return ""
 
-    # 用字素叢集切分，避免切壞 emoji/合字
     try:
         import regex as re
-        tokens = re.findall(r"\X", full_text)
+        tokens = re.findall(r"\X", full_text)  # 以字素叢集切分，避免切壞 emoji/合字
     except Exception:
         tokens = list(full_text)
 
@@ -65,7 +65,10 @@ def emoji_token_stream(
     out, i = [], 0
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
-    emoji_prefix_shown = False  # 在 render 裡第一次顯示後才設 True
+
+    # 關鍵：永久前綴（鎖定後每次 render 都會帶上）
+    emoji_prefix_locked = False
+    emoji_prefix_str = ""
 
     def chunk_size(idx):
         if inside_code: return 10
@@ -75,13 +78,12 @@ def emoji_token_stream(
         return 4
 
     def render():
-        nonlocal emoji_prefix_shown
-        prefix = ""
-        # 只有非程式碼段且尚未顯示過時，才在最前面加一次 emoji
-        if (not inside_code) and (prefix_emoji is not None) and (not emoji_prefix_shown):
-            prefix = prefix_emoji + " "
-            emoji_prefix_shown = True
-        placeholder.markdown(prefix + "".join(out))
+        nonlocal emoji_prefix_locked, emoji_prefix_str
+        # 第一次 render 時決定是否啟用前綴（鎖定後每幀保留）
+        if (prefix_emoji is not None) and (not emoji_prefix_locked) and (prefix_on_code or not inside_code):
+            emoji_prefix_str = prefix_emoji + " "
+            emoji_prefix_locked = True
+        placeholder.markdown(emoji_prefix_str + "".join(out))
 
     while i < n:
         k = min(chunk_size(i), n - i)
@@ -89,7 +91,6 @@ def emoji_token_stream(
         chunk_text = "".join(chunk_tokens)
         i += k
 
-        # 簡易偵測程式碼區塊（含 ``` 交替）
         if "```" in chunk_text and (chunk_text.count("```") % 2 == 1):
             inside_code = not inside_code
 
@@ -110,6 +111,29 @@ def emoji_token_stream(
 
     render()
     return "".join(out)
+
+def emit_assistant(text: str, emoji: str | None = "🌸", ph=None):
+    # 當下逐字顯示（會看到 emoji 固定在最前面）
+    emoji_token_stream(text, prefix_emoji=emoji, ph=ph)
+    # 存歷史：文字和「前綴emoji」分欄存，重繪時再組起來
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": text,
+        "images": [],
+        "prefix_emoji": emoji
+    })
+
+# 顯示歷史（精簡：使用者訊息可顯示縮圖）
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"], avatar=msg.get("avatar")):
+        if msg.get("content"):
+            prefix = (msg.get("prefix_emoji") + " ") if msg.get("prefix_emoji") else ""
+            st.markdown(prefix + msg["content"])
+        if msg.get("images"):
+            try:
+                st.image([Image.open(BytesIO(b)) for _, b in msg["images"]], width=220)
+            except Exception:
+                pass
 
 # =========================
 # 最近 30 輪上下文
@@ -312,7 +336,7 @@ if prompt:
                     if not out_text.strip():
                         out_text = "安妮亞看過了，但還沒抓到你想問的重點～可以再具體一點嗎？"
 
-                    emoji_token_stream(out_text, prefix_emoji="🌸")
+                    emit_assistant(out_text, "🌸")
 
                     st.session_state.messages.append({
                         "role": "assistant",
@@ -372,14 +396,14 @@ if prompt:
                     report = run_async(Runner.run(writer_agent, writer_input))
 
                     st.markdown("### 📋 Executive Summary")
-                    emoji_token_stream(report.final_output.short_summary, prefix_emoji="🌟")
+                    emit_assistant(report.final_output.short_summary, "🌟")
 
                     st.markdown("### 📖 完整報告")
-                    emoji_token_stream(report.final_output.markdown_report, prefix_emoji="🌸")
+                    emit_assistant(report.final_output.markdown_report, "🌸")
 
                     st.markdown("### ❓ 後續建議問題")
                     for q in report.final_output.follow_up_questions:
-                        emoji_token_stream(q, prefix_emoji="🥜")
+                        emit_assistant(q, "🥜")
 
                     ai_reply = (
                         plan_md + "\n" +
@@ -397,7 +421,7 @@ if prompt:
                 else:
                     # 一般對話
                     full_text = str(router_result.final_output)
-                    emoji_token_stream(full_text, prefix_emoji="🌸")
+                    emit_assistant(out_text, "🌸")
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": full_text,
