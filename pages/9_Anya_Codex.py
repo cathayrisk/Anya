@@ -39,7 +39,7 @@ def emoji_token_stream(
     long_len: int = 1200,
     punctuation_pause: float = 0.50,
     code_speedup: float = 1.8,
-    prefix_on_code: bool = True,       # 即使段落是 ```code``` 也保留前綴 emoji
+    prefix_on_code: bool = True,       # 就算第一段是 code 也保留前綴 emoji
     ph=None
 ):
     import time, streamlit as st
@@ -48,7 +48,7 @@ def emoji_token_stream(
 
     try:
         import regex as re
-        tokens = re.findall(r"\X", full_text)  # 以字素叢集切分，避免切壞 emoji/合字
+        tokens = re.findall(r"\X", full_text)
     except Exception:
         tokens = list(full_text)
 
@@ -66,7 +66,7 @@ def emoji_token_stream(
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
 
-    # 關鍵：永久前綴（鎖定後每次 render 都會帶上）
+    # 關鍵：永久前綴，每一幀都會帶著它
     emoji_prefix_locked = False
     emoji_prefix_str = ""
 
@@ -79,7 +79,6 @@ def emoji_token_stream(
 
     def render():
         nonlocal emoji_prefix_locked, emoji_prefix_str
-        # 第一次 render 時決定是否啟用前綴（鎖定後每幀保留）
         if (prefix_emoji is not None) and (not emoji_prefix_locked) and (prefix_on_code or not inside_code):
             emoji_prefix_str = prefix_emoji + " "
             emoji_prefix_locked = True
@@ -113,9 +112,9 @@ def emoji_token_stream(
     return "".join(out)
 
 def emit_assistant(text: str, emoji: str | None = "🌸", ph=None):
-    # 當下逐字顯示（會看到 emoji 固定在最前面）
+    # 1) 當下逐字顯示（含固定前綴emoji、不閃爍）
     emoji_token_stream(text, prefix_emoji=emoji, ph=ph)
-    # 存歷史：文字和「前綴emoji」分欄存，重繪時再組起來
+    # 2) 也把「要顯示哪個emoji」存到歷史，重繪時才看得到
     st.session_state.messages.append({
         "role": "assistant",
         "content": text,
@@ -140,6 +139,9 @@ for msg in st.session_state.messages:
 # =========================
 MAX_TURNS_CTX = 30        # 只用最近 30 則（user/assistant 合計）
 MAX_CTX_CHARS = 8000      # 預防超長；你可依需求調整
+
+# ---- Session State 安全初始化（一定要在任何 messages 讀寫前）----
+st.session_state.setdefault("messages", [])   # 用預設空陣列避免 AttributeError
 
 if "messages" not in st.session_state:
     st.session_state.messages = []   # [{"role": "user"/"assistant", "content": str, "images": [(name, bytes), ...]}]
@@ -260,10 +262,11 @@ VISION_SYSTEM_PROMPT = """
 st.title("Anya研究助理(測試中)")
 
 # 顯示歷史（精簡：使用者訊息可顯示縮圖）
-for msg in st.session_state.messages:
+for msg in st.session_state.get("messages", []):
     with st.chat_message(msg["role"], avatar=msg.get("avatar")):
         if msg.get("content"):
-            st.markdown(msg["content"])
+            prefix = (msg.get("prefix_emoji") + " ") if msg.get("prefix_emoji") else ""
+            st.markdown(prefix + msg["content"])  # ← 重繪時把emoji前綴一起畫出來
         if msg.get("images"):
             try:
                 st.image([Image.open(BytesIO(b)) for _, b in msg["images"]], width=220)
