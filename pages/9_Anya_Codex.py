@@ -1,54 +1,56 @@
 import streamlit as st
 import asyncio
+from openai.types.shared.reasoning import Reasoning
 from pydantic import BaseModel
 import os
+from agents import Agent, ModelSettings, WebSearchTool, Runner, handoff
+from openai.types.responses import ResponseTextDeltaEvent
+import time
 import nest_asyncio
 nest_asyncio.apply()
 
-from openai.types.shared.reasoning import Reasoning
-from agents import Agent, ModelSettings, WebSearchTool, Runner, handoff
-
-# 多模態
-import base64
-from io import BytesIO
-from PIL import Image
-from openai import OpenAI
-import time
-
-# =========================
-# 基本環境設定
-# =========================
-st.set_page_config(page_title="Anya研究助理(測試中)", layout="wide", page_icon="🤖")
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 
-client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
+def stream_text_gen(result_streaming):
+    async def gen():
+        async for event in result_streaming.stream_events():
+            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                yield event.data.delta or ""
+    return gen()
 
-# ★ 一定要先初始化，再去用 messages！
-if "messages" not in st.session_state:
-    st.session_state.messages = []   # [{"role": "...", "content": "...", "images": [...], "prefix_emoji": "..."}]
-
-def run_async(coro):
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(coro)
-
-# =========================
-# 逐字動畫
-# =========================
 def emoji_token_stream(
     full_text: str,
-    prefix_emoji: str | None = "🌸",
-    min_cps: int = 20,
-    max_cps: int = 110,
+    emoji: str = "🌸",
+    # 速度設定（每秒字數的上下限，會隨長度自動插值）
+    min_cps: int = 28,
+    max_cps: int = 140,
     short_len: int = 300,
     long_len: int = 1200,
-    punctuation_pause: float = 0.50,
+    # 標點停頓（以每字延遲為基準的倍數）
+    punctuation_pause: float = 0.45,
+    # 預覽emoji佔整體延遲的比例（越小越含蓄）
+    preview_ratio: float = 0.35,
+    # 程式碼區塊內是否略過emoji預覽並加速
     code_speedup: float = 1.8,
-    prefix_on_code: bool = True,
+    # 可中止旗標（配合按鈕）
+    cancel_key: str | None = None,
+    # 顯示進度百分比
+    show_progress: bool = False,
+    # 外部顯示容器（可傳 st.empty() 進來，方便跳過後用同一格改成全文）
     ph=None
 ):
-    import time, streamlit as st
+    """
+    回傳 (text_shown, cancelled)
+    - text_shown: 實際顯示文字（若中止可能是部分）
+    - cancelled : True 表示中途被停止
+    """
+    import time
+    import streamlit as st
+
     if not full_text:
-        return ""
+        return "", False
+
+    # 優先用 regex 的 \X 做「字素叢集」切分，避免切壞 emoji/合字
     try:
         import regex as re
         tokens = re.findall(r"\X", full_text)
@@ -56,100 +58,102 @@ def emoji_token_stream(
         tokens = list(full_text)
 
     n = len(tokens)
-    def lerp(a,b,t): return a + (b - a) * t
-    if n <= short_len: base_cps = min_cps
-    elif n >= long_len: base_cps = max_cps
+
+    # 依長度插值速度
+    def lerp(a, b, t): return a + (b - a) * t
+    if n <= short_len:
+        base_cps = min_cps
+    elif n >= long_len:
+        base_cps = max_cps
     else:
         t = (n - short_len) / max(1, (long_len - short_len))
         base_cps = lerp(min_cps, max_cps, t)
+
     per_char_delay = 1.0 / max(1.0, base_cps)
 
     placeholder = ph or st.empty()
-    out, i = [], 0
+    prog_ph = st.empty() if show_progress else None
+
+    out = []
+    i = 0
+    cancelled = False
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
 
-    emoji_prefix_locked = False
-    emoji_prefix_str = ""
-
+    # 讓前段比較精緻、後段一次吐多一點字（更順）
     def chunk_size(idx):
-        if inside_code: return 10
-        if idx < 100:   return 1
-        if idx < 300:   return 2
-        if idx < 1000:  return 3
+        if inside_code:
+            return 8
+        if idx < 60:
+            return 1
+        if idx < 200:
+            return 2
+        if idx < 800:
+            return 3
         return 4
 
-    def render():
-        nonlocal emoji_prefix_locked, emoji_prefix_str
-        if (prefix_emoji is not None) and (not emoji_prefix_locked) and (prefix_on_code or not inside_code):
-            emoji_prefix_str = prefix_emoji + " "
-            emoji_prefix_locked = True
-        placeholder.markdown(emoji_prefix_str + "".join(out))
+    def render(txt):
+        placeholder.markdown(txt)
 
     while i < n:
+        if cancel_key and st.session_state.get(cancel_key, False):
+            cancelled = True
+            break
+
         k = min(chunk_size(i), n - i)
-        chunk_tokens = tokens[i:i+k]
+        chunk_tokens = tokens[i:i + k]
         chunk_text = "".join(chunk_tokens)
         i += k
 
-        if "```" in chunk_text and (chunk_text.count("```") % 2 == 1):
-            inside_code = not inside_code
+        # 粗略偵測程式碼區塊（以 ``` 切換）
+        if "```" in chunk_text:
+            flips = chunk_text.count("```")
+            if flips % 2 == 1:
+                inside_code = not inside_code
 
+        # 計算這個區塊應該花的時間
         intended = per_char_delay * k
         if inside_code:
             intended = max(intended / code_speedup, 0.002)
 
+        # 標點微停頓（只看區塊最後一個字）
         last_char = chunk_tokens[-1]
-        if (last_char in punct) and (not inside_code):
+        if last_char in punct and not inside_code:
             intended += per_char_delay * punctuation_pause
 
         start_t = time.monotonic()
+
+        # 預覽：只加 emoji，不加游標（你說不要游標～）
+        current_text = "".join(out)
+        if not inside_code:
+            render(current_text + emoji)
+            # 預覽時間佔比，最多給一點點就好，避免閃太多
+            preview_sleep = min(intended * preview_ratio, 0.06)
+            time.sleep(preview_sleep)
+        else:
+            preview_sleep = 0.0
+
+        # 正式寫入
         out.append(chunk_text)
-        render()
+        render("".join(out))
+
+        # 把剩下的時間睡完，讓節奏穩定（扣掉前面預覽用掉的時間）
         elapsed = time.monotonic() - start_t
         remain = max(0.0, intended - elapsed)
         time.sleep(remain)
 
-    render()
-    return "".join(out)
+        if show_progress and (i % 60 == 0 or i == n):
+            pct = int(i * 100 / n)
+            prog_ph.caption(f"輸出中… {pct}%")
 
-def emit_assistant(text: str, emoji: str | None = "🌸", ph=None):
-    emoji_token_stream(text, prefix_emoji=emoji, ph=ph)  # 當下逐字（會有emoji）
-    st.session_state.messages.append({                   # 歷史也記住要畫哪個emoji
-        "role": "assistant",
-        "content": text,
-        "images": [],
-        "prefix_emoji": emoji
-    })
+    # 收尾（保證最後不帶emoji）
+    render("".join(out))
+    if show_progress:
+        prog_ph.empty()
 
-# =========================
-# 最近 30 輪上下文
-# =========================
-MAX_TURNS_CTX = 30        # 只用最近 30 則（user/assistant 合計）
-MAX_CTX_CHARS = 8000      # 預防超長；你可依需求調整
+    return "".join(out), cancelled
 
-# ---- Session State 安全初始化（一定要在任何 messages 讀寫前）----
-st.session_state.setdefault("messages", [])   # 用預設空陣列避免 AttributeError
-
-def build_context_snippet(messages, max_turns=MAX_TURNS_CTX, max_chars=MAX_CTX_CHARS):
-    recent = messages[-max_turns:]
-    lines = []
-    for msg in recent:
-        role = "使用者" if msg["role"] == "user" else "助理"
-        text = msg.get("content", "").strip()
-        if not text:
-            continue
-        # 壓掉多餘空白
-        text = " ".join(text.split())
-        lines.append(f"{role}: {text}")
-    ctx = "\n".join(lines)
-    if len(ctx) > max_chars:
-        ctx = ctx[-max_chars:]
-    return ctx
-
-# =========================
-# 規劃/搜尋/寫作/路由 Agents
-# =========================
+#---Planner
 planner_agent_PROMPT = (
     "You are a helpful research assistant. Given a query, come up with a set of web searches "
     "to perform to best answer the query. Output between 5 and 20 terms to query for."
@@ -157,10 +161,14 @@ planner_agent_PROMPT = (
 
 class WebSearchItem(BaseModel):
     reason: str
+    "Your reasoning for why this search is important to the query."
+
     query: str
+    "The search term to use for the web search."
 
 class WebSearchPlan(BaseModel):
     searches: list[WebSearchItem]
+    """A list of web searches to perform to best answer the query."""
 
 planner_agent = Agent(
     name="PlannerAgent",
@@ -170,6 +178,7 @@ planner_agent = Agent(
     output_type=WebSearchPlan,
 )
 
+#----search_agent
 INSTRUCTIONS = (
     "You are a research assistant. Given a search term, you search the web for that term and "
     "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 "
@@ -187,6 +196,7 @@ search_agent = Agent(
     model_settings=ModelSettings(tool_choice="required"),
 )
 
+#---writer_agent
 writer_agent_PROMPT = (
     "You are a senior researcher tasked with writing a cohesive report for a research query. "
     "You will be provided with the original query, and some initial research done by a research "
@@ -200,8 +210,13 @@ writer_agent_PROMPT = (
 
 class ReportData(BaseModel):
     short_summary: str
+    """A short 2-3 sentence summary of the findings."""
+
     markdown_report: str
+    """The final report"""
+
     follow_up_questions: list[str]
+    """Suggested topics to research further"""
 
 writer_agent = Agent(
     name="WriterAgent",
@@ -211,6 +226,7 @@ writer_agent = Agent(
     output_type=ReportData,
 )
 
+#---RouterAgent（LLM自動判斷是否handoff）
 ROUTER_PROMPT = """
 你是一個智慧助理，會根據用戶的需求自動決定要怎麼處理問題。
 - 如果用戶的問題是「需要研究、查資料、分析、寫報告、文獻探討」等，請使用 transfer_to_planner_agent 工具，把問題交給研究規劃助理。
@@ -224,194 +240,114 @@ router_agent = Agent(
     model="gpt-5",
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
-        reasoning=Reasoning(effort="low"),
-        verbosity="medium",
+        reasoning=Reasoning(effort="low"),  # "minimal", "low", "medium", "high"
+        verbosity="medium",  # "low", "medium", "high"
     ),
-    handoffs=[handoff(planner_agent)]
+    handoffs=[
+        handoff(planner_agent)
+    ]
 )
 
-# =========================
-# 多模態系統提示
-# =========================
-VISION_SYSTEM_PROMPT = """
-你是一位多模態助理。收到圖片與（可選）文字指示時：
-- 先描述圖片關鍵內容（物件、文字、關係、場景、版面）。
-- 若有多張圖片，請比較差異或建立步驟推論。
-- 適度結合OCR與推理；若與使用者提問相關，提供條列式結論與可行建議。
-請以正體中文作答。
-"""
+def run_async(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
 
-# =========================
-# UI 與流程（精簡聊天＋附件）
-# =========================
-st.title("Anya研究助理(測試中)")
+st.set_page_config(page_title="AI 研究助理 Chat", layout="wide", page_icon="🤖")
 
-# 顯示歷史（精簡：使用者訊息可顯示縮圖）
-for msg in st.session_state.messages:  # ← 已經先初始化過，就不用 get(...)
+st.title("AI 研究助理 Chat 版")
+st.write("用對話方式問研究問題，AI 會像聊天一樣幫你查資料、寫報告！")
+
+# 初始化對話歷史
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# 顯示歷史訊息
+for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar=msg.get("avatar")):
-        if msg.get("content"):
-            prefix = (msg.get("prefix_emoji") + " ") if msg.get("prefix_emoji") else ""
-            st.markdown(prefix + msg["content"])  # ← 重繪時把emoji一起畫出來
-        if msg.get("images"):
-            try:
-                st.image([Image.open(BytesIO(b)) for _, b in msg["images"]], width=220)
-            except Exception:
-                pass
+        st.markdown(msg["content"])
 
-# 使用者輸入（支援多張圖片）
-prompt = st.chat_input(
-    "輸入問題，或上傳圖片讓我幫你看圖說故事～",
-    accept_file="multiple",
-    file_type=["png", "jpg", "jpeg", "webp"]
-)
+# 聊天輸入
+user_input = st.chat_input("請輸入你想研究的問題或繼續追問...")
 
-if prompt:
-    user_text = prompt.text.strip() if hasattr(prompt, "text") and prompt.text else (prompt.strip() if isinstance(prompt, str) else "")
-    files = prompt.files if hasattr(prompt, "files") and prompt.files else []
-
-    content_blocks = []
-    images_for_history = []
-
-    if user_text:
-        content_blocks.append({"type": "input_text", "text": user_text})
-
-    for f in files:
-        imgbytes = f.getbuffer()
-        mime = getattr(f, "type", None) or "image/png"
-        b64 = base64.b64encode(imgbytes).decode()
-        content_blocks.append({"type": "input_image", "image_url": f"data:{mime};base64,{b64}"})
-        images_for_history.append((getattr(f, "name", "image"), imgbytes))
-
-    # 寫入使用者訊息
+if user_input:
+    # 顯示使用者訊息
     st.session_state.messages.append({
         "role": "user",
-        "content": user_text,
-        "images": images_for_history
+        "content": user_input,
     })
     with st.chat_message("user"):
-        if user_text:
-            st.markdown(user_text)
-        if images_for_history:
-            st.image([Image.open(BytesIO(b)) for _, b in images_for_history], width=220)
+        st.markdown(user_input)
 
-    # 助理回覆
+    # AI 處理（顯示 spinner）
     with st.chat_message("assistant"):
-        with st.spinner("安妮亞努力思考中…", show_time=False):
-            ctx_snippet = build_context_snippet(st.session_state.messages)
+        with st.spinner("AI 正在努力思考中..."):
+            # 只呼叫 RouterAgent，讓 LLM 自己決定要不要 handoff
+            loop = asyncio.get_event_loop()
+            router_result = loop.run_until_complete(Runner.run(router_agent, user_input))
 
-            # 有圖片 → 多模態
-            if any(b["type"] == "input_image" for b in content_blocks):
-                # 把最近 30 輪上下文丟在最前面
-                if ctx_snippet:
-                    content_blocks.insert(0, {"type": "input_text", "text": f"最近對話（最多30輪）：\n{ctx_snippet}"})
-                try:
-                    resp = client.responses.create(
-                        model="gpt-5",
-                        input=[{"role": "user", "content": content_blocks}],
-                        instructions=VISION_SYSTEM_PROMPT,
-                        reasoning={"effort":"medium"},
-                        text={"verbosity":"medium"},
-                        store=False,
-                        truncation="auto",
-                    )
-                    out_text = ""
-                    if hasattr(resp, "output") and resp.output:
-                        for item in resp.output:
-                            if hasattr(item, "content") and item.content:
-                                for c in item.content:
-                                    if getattr(c, "type", None) == "output_text":
-                                        out_text += c.text
-                    if not out_text.strip():
-                        out_text = "安妮亞看過了，但還沒抓到你想問的重點～可以再具體一點嗎？"
+            # 如果 LLM handoff 給 planner_agent，則進行研究流程
+            if isinstance(router_result.final_output, WebSearchPlan):
+                # Step 1: 規劃
+                plan_result = router_result  # 就是 planner_agent 的結果
+                search_plan = plan_result.final_output.searches
 
-                    emit_assistant(out_text, "🌸")
+                plan_md = "### 🔎 搜尋規劃\n"
+                for idx, item in enumerate(search_plan):
+                    plan_md += f"**{idx+1}. {item.query}**\n> {item.reason}\n"
 
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": out_text,
-                        "images": []
-                    })
+                # Step 2: 並行搜尋
+                search_tasks = [
+                    Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}")
+                    for item in search_plan
+                ]
+                search_results = run_async(asyncio.gather(*search_tasks))
+                summaries = [str(r.final_output) for r in search_results]
 
-                except Exception as e:
-                    err = f"圖片分析失敗：{e}"
-                    st.error(err)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": err,
-                        "images": []
-                    })
+                summary_md = "### 📝 各項搜尋摘要\n"
+                for idx, summary in enumerate(summaries):
+                    summary_md += f"**{search_plan[idx].query}**\n{summary}\n\n"
 
-            else:
-                # 純文字 → 帶入最近30輪上下文給 Router
-                router_input = (
-                    (f"[最近對話]\n{ctx_snippet}\n\n" if ctx_snippet else "") +
-                    f"[當前使用者問題]\n{user_text}"
-                )
-                router_result = run_async(Runner.run(router_agent, router_input))
-
-                if isinstance(router_result.final_output, WebSearchPlan):
-                    # 規劃
-                    search_plan = router_result.final_output.searches
-                    plan_md = "### 🔎 搜尋規劃\n"
+                with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
+                    st.markdown("### 搜尋規劃")
                     for idx, item in enumerate(search_plan):
-                        plan_md += f"**{idx+1}. {item.query}**\n> {item.reason}\n"
+                        st.markdown(f"**{idx+1}. {item.query}**\n> {item.reason}")
 
-                    # 並行搜尋
-                    tasks = [
-                        Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}")
-                        for item in search_plan
-                    ]
-                    results = run_async(asyncio.gather(*tasks))
-                    summaries = [str(r.final_output) for r in results]
-
-                    summary_md = "### 📝 各項搜尋摘要\n"
+                    st.markdown("### 各項搜尋摘要")
                     for idx, summary in enumerate(summaries):
-                        summary_md += f"**{search_plan[idx].query}**\n{summary}\n\n"
+                        st.markdown(f"**{search_plan[idx].query}**\n{summary}\n")
 
-                    with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=False):
-                        st.markdown("### 搜尋規劃")
-                        for idx, item in enumerate(search_plan):
-                            st.markdown(f"**{idx+1}. {item.query}**\n> {item.reason}")
-                        st.markdown("### 各項搜尋摘要")
-                        for idx, summary in enumerate(summaries):
-                            st.markdown(f"**{search_plan[idx].query}**\n{summary}\n")
+                # Step 3: 整合寫作
+                writer_input = f"Original query: {user_input}\nSummarized search results: {summaries}"
+                report = run_async(Runner.run(writer_agent, writer_input))
 
-                    # 寫作
-                    writer_input = (
-                        (f"[最近對話]\n{ctx_snippet}\n\n" if ctx_snippet else "") +
-                        f"[原始問題]\n{user_text}\n\n[搜尋摘要]\n{summaries}"
-                    )
-                    report = run_async(Runner.run(writer_agent, writer_input))
+                st.markdown("### 📋 Executive Summary")
+                emoji_token_stream(report.final_output.short_summary, emoji="🌟")  # 用星星
 
-                    st.markdown("### 📋 Executive Summary")
-                    emit_assistant(report.final_output.short_summary, "🌟")
+                st.markdown("### 📖 完整報告")
+                emoji_token_stream(report.final_output.markdown_report, emoji="🌸")  # 用花朵
 
-                    st.markdown("### 📖 完整報告")
-                    emit_assistant(report.final_output.markdown_report, "🌸")
+                st.markdown("### ❓ 後續建議問題")
+                for q in report.final_output.follow_up_questions:
+                    emoji_token_stream(q, emoji="🥜")  # 用花生
 
-                    st.markdown("### ❓ 後續建議問題")
-                    for q in report.final_output.follow_up_questions:
-                        emit_assistant(q, "🥜")
-
-                    ai_reply = (
-                        plan_md + "\n" +
-                        summary_md + "\n" +
-                        "#### Executive Summary\n" + report.final_output.short_summary + "\n" +
-                        "#### 完整報告\n" + report.final_output.markdown_report + "\n" +
-                        "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in report.final_output.follow_up_questions])
-                    )
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": ai_reply,
-                        "images": []
-                    })
-
-                else:
-                    # 一般對話
-                    full_text = str(router_result.final_output)
-                    emit_assistant(full_text, "🌸")
-                    #st.session_state.messages.append({
-                    #    "role": "assistant",
-                    #    "content": full_text,
-                    #    "images": []
-                    #})
+                # 把 AI 回覆存進歷史
+                ai_reply = (
+                    plan_md + "\n" +
+                    summary_md + "\n" +
+                    "#### Executive Summary\n" + report.final_output.short_summary + "\n" +
+                    "#### 完整報告\n" + report.final_output.markdown_report + "\n" +
+                    "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in report.final_output.follow_up_questions])
+                )
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": ai_reply,
+                })
+            else:
+                # 一般對話，直接顯示 RouterAgent 的回覆
+                router_result = run_async(Runner.run(router_agent, user_input))
+                full_text = str(router_result.final_output)
+                emoji_token_stream(full_text)
+                    
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": full_text,  # st.write_stream 回傳完整文字
+                })
