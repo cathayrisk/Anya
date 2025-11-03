@@ -23,6 +23,10 @@ os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
 
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 
+# ★ 一定要先初始化，再去用 messages！
+if "messages" not in st.session_state:
+    st.session_state.messages = []   # [{"role": "...", "content": "...", "images": [...], "prefix_emoji": "..."}]
+
 def run_async(coro):
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(coro)
@@ -32,20 +36,19 @@ def run_async(coro):
 # =========================
 def emoji_token_stream(
     full_text: str,
-    prefix_emoji: str | None = "🌸",   # 固定在最前面出現一次；None 表示不要 emoji
+    prefix_emoji: str | None = "🌸",
     min_cps: int = 20,
     max_cps: int = 110,
     short_len: int = 300,
     long_len: int = 1200,
     punctuation_pause: float = 0.50,
     code_speedup: float = 1.8,
-    prefix_on_code: bool = True,       # 就算第一段是 code 也保留前綴 emoji
+    prefix_on_code: bool = True,
     ph=None
 ):
     import time, streamlit as st
     if not full_text:
         return ""
-
     try:
         import regex as re
         tokens = re.findall(r"\X", full_text)
@@ -66,7 +69,6 @@ def emoji_token_stream(
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
 
-    # 關鍵：永久前綴，每一幀都會帶著它
     emoji_prefix_locked = False
     emoji_prefix_str = ""
 
@@ -112,27 +114,13 @@ def emoji_token_stream(
     return "".join(out)
 
 def emit_assistant(text: str, emoji: str | None = "🌸", ph=None):
-    # 1) 當下逐字顯示（含固定前綴emoji、不閃爍）
-    emoji_token_stream(text, prefix_emoji=emoji, ph=ph)
-    # 2) 也把「要顯示哪個emoji」存到歷史，重繪時才看得到
-    st.session_state.messages.append({
+    emoji_token_stream(text, prefix_emoji=emoji, ph=ph)  # 當下逐字（會有emoji）
+    st.session_state.messages.append({                   # 歷史也記住要畫哪個emoji
         "role": "assistant",
         "content": text,
         "images": [],
         "prefix_emoji": emoji
     })
-
-# 顯示歷史（精簡：使用者訊息可顯示縮圖）
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"], avatar=msg.get("avatar")):
-        if msg.get("content"):
-            prefix = (msg.get("prefix_emoji") + " ") if msg.get("prefix_emoji") else ""
-            st.markdown(prefix + msg["content"])
-        if msg.get("images"):
-            try:
-                st.image([Image.open(BytesIO(b)) for _, b in msg["images"]], width=220)
-            except Exception:
-                pass
 
 # =========================
 # 最近 30 輪上下文
@@ -142,9 +130,6 @@ MAX_CTX_CHARS = 8000      # 預防超長；你可依需求調整
 
 # ---- Session State 安全初始化（一定要在任何 messages 讀寫前）----
 st.session_state.setdefault("messages", [])   # 用預設空陣列避免 AttributeError
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []   # [{"role": "user"/"assistant", "content": str, "images": [(name, bytes), ...]}]
 
 def build_context_snippet(messages, max_turns=MAX_TURNS_CTX, max_chars=MAX_CTX_CHARS):
     recent = messages[-max_turns:]
@@ -262,11 +247,11 @@ VISION_SYSTEM_PROMPT = """
 st.title("Anya研究助理(測試中)")
 
 # 顯示歷史（精簡：使用者訊息可顯示縮圖）
-for msg in st.session_state.get("messages", []):
+for msg in st.session_state.messages:  # ← 已經先初始化過，就不用 get(...)
     with st.chat_message(msg["role"], avatar=msg.get("avatar")):
         if msg.get("content"):
             prefix = (msg.get("prefix_emoji") + " ") if msg.get("prefix_emoji") else ""
-            st.markdown(prefix + msg["content"])  # ← 重繪時把emoji前綴一起畫出來
+            st.markdown(prefix + msg["content"])  # ← 重繪時把emoji一起畫出來
         if msg.get("images"):
             try:
                 st.image([Image.open(BytesIO(b)) for _, b in msg["images"]], width=220)
@@ -424,7 +409,7 @@ if prompt:
                 else:
                     # 一般對話
                     full_text = str(router_result.final_output)
-                    emit_assistant(out_text, "🌸")
+                    emit_assistant(full_text, "🌸")
                     #st.session_state.messages.append({
                     #    "role": "assistant",
                     #    "content": full_text,
