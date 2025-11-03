@@ -32,7 +32,7 @@ def run_async(coro):
 # =========================
 def emoji_token_stream(
     full_text: str,
-    prefix_emoji: str | None = "🌸",  # 固定前綴 emoji；None 表示不要 emoji
+    prefix_emoji: str | None = "🌸",  # 固定在最前面顯示一次，不會閃
     min_cps: int = 20,
     max_cps: int = 110,
     short_len: int = 300,
@@ -41,10 +41,6 @@ def emoji_token_stream(
     code_speedup: float = 1.8,
     ph=None
 ):
-    """
-    穩定逐字輸出：不做任何預覽與閃爍。
-    - prefix_emoji：只在非程式碼段落顯示於最前方一次，不會動來動去。
-    """
     import time, streamlit as st
     if not full_text:
         return ""
@@ -68,7 +64,6 @@ def emoji_token_stream(
     out, i = [], 0
     inside_code = False
     punct = set(".!?;:，。！？：、…\n")
-    # 是否顯示 emoji 前綴（只在整段最前面一次）
     emoji_prefix_rendered = False
 
     def chunk_size(idx):
@@ -81,7 +76,6 @@ def emoji_token_stream(
     def render():
         prefix = ""
         if (not inside_code) and (prefix_emoji is not None):
-            # 只在非 code 段落的最前面加一次 emoji
             prefix = (prefix_emoji + " ") if (not emoji_prefix_rendered) else ""
         placeholder.markdown(prefix + "".join(out))
 
@@ -91,8 +85,7 @@ def emoji_token_stream(
         chunk_text = "".join(chunk_tokens)
         i += k
 
-        # code 區塊判定
-        if "```" in chunk_text and chunk_text.count("```") % 2 == 1:
+        if "```" in chunk_text and (chunk_text.count("```") % 2 == 1):
             inside_code = not inside_code
 
         intended = per_char_delay * k
@@ -106,7 +99,6 @@ def emoji_token_stream(
         start_t = time.monotonic()
         out.append(chunk_text)
 
-        # 第一次 render 時若可加 emoji，先加一次就固定住
         if (not inside_code) and (prefix_emoji is not None) and (not emoji_prefix_rendered):
             emoji_prefix_rendered = True
 
@@ -136,30 +128,39 @@ def split_md_paragraphs(md: str):
 
 def paragraph_type_with_fade(
     md_text: str,
-    prefix_emoji: str = "🌸",   # 每段開頭的固定 emoji，不會閃爍
-    fade_ms: int = 420,         # 淡入時間加長，存在感更明顯
-    two_step_ghost: bool = True # 兩段式：斜體灰 → 普通灰 → 正常逐字
+    prefix_emoji: str = "🌸",
+    fade_ms: int = 360,         # 調長，淡入更明顯
+    two_step_ghost: bool = True # 兩段式：斜體引用 → 普通引用 → 正常逐字
 ):
     """
-    兩段式淡入（更明顯）→ 同一 placeholder 逐字顯示。
-    code 區塊自動停用 emoji 前綴，避免破版。
+    用純 Markdown 的引用（>）當作「灰色幽靈」：
+    - Step A: 斜體引用（更淡）
+    - Step B: 普通引用（較濃）
+    - Step C: 逐字輸出（帶固定前綴 emoji）
+    注意：code 區塊自動關閉 emoji 前綴並跳過幽靈步驟，避免破版。
     """
+    import time, streamlit as st
 
     paragraphs = split_md_paragraphs(md_text)
     for para in paragraphs:
         ph = st.empty()
         is_code = para.strip().startswith("```")
-        # Step A: 斜體灰（第一階段幽靈）
-        if two_step_ghost:
-            # emoji 也放在幽靈階段（更明顯），code 段落不放
-            ghost_prefix = ("" if is_code else (prefix_emoji + " "))
-            ph.markdown(f":grey[*{ghost_prefix}{para}*]")
+        prefix = "" if is_code else (prefix_emoji + " ")
+
+        if two_step_ghost and not is_code:
+            # Step A：斜體引用（更淡）
+            ph.markdown(f"> _{prefix}{para}_")
             time.sleep(fade_ms * 0.55 / 1000.0)
-        # Step B: 普通灰（第二階段）
-        ghost_prefix = ("" if is_code else (prefix_emoji + " "))
-        ph.markdown(f":grey[{ghost_prefix}{para}]")
-        time.sleep(fade_ms * (0.45 if two_step_ghost else 1.0) / 1000.0)
-        # Step C: 正式逐字（同一位置覆蓋，不閃爍）
+
+        # Step B：普通引用（更清楚）
+        if not is_code:
+            ph.markdown(f"> {prefix}{para}")
+            time.sleep(fade_ms * (0.45 if two_step_ghost else 1.0) / 1000.0)
+        else:
+            # code 直接略過幽靈，什麼都不做，往下進逐字
+            pass
+
+        # Step C：正式逐字（同一個 placeholder 覆蓋，避免閃爍）
         emoji_token_stream(para, prefix_emoji=None if is_code else prefix_emoji, ph=ph)
         st.markdown("")  # 段落間距
 
@@ -450,7 +451,7 @@ if prompt:
                 else:
                     # 一般對話
                     full_text = str(router_result.final_output)
-                    paragraph_type_with_fade(full_text, fade_ms=120)
+                    paragraph_type_with_fade(full_text, prefix_emoji="🌸", fade_ms=360)
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": full_text,
