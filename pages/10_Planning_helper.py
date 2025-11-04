@@ -216,7 +216,7 @@ def run_workflow_sync(text: str, store_flag: bool) -> Dict[str, Any]:
 
 # ====== 顯示歷史訊息 ======
 for m in st.session_state.messages:
-    with st.chat_message(m["role"], if m["role"] == "user" else "🧠"):
+    with st.chat_message(m["role"], avatar="🤩" if m["role"] == "user" else "🧠"):
         st.markdown(m["content"])
 
 # ====== Chat Input ======
@@ -230,13 +230,13 @@ prompt = st.chat_input(
 if prompt:
     # 使用者訊息
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar="🤩"):
         st.markdown(prompt)
 
     # 整段 transcript 餵給 workflow
     full_text = transcript_from_messages(st.session_state.messages)
 
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar="🧠"):
         with st.spinner("安妮亞努力規劃中…(滴答滴答)"):
             out = run_workflow_sync(full_text, store_opt)
 
