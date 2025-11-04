@@ -9,11 +9,11 @@ if str(ROOT) not in sys.path:
 
 # 先試小寫的 workflows.py
 try:
-    from agents.workflows import run_workflow, WorkflowInput
+    from Agents.workflows import run_workflow, WorkflowInput
 except ModuleNotFoundError:
     # 若你的檔名其實是 Workflow.py（大寫W）
     try:
-        from agents.Workflow import run_workflow, WorkflowInput
+        from Agents.Workflow import run_workflow, WorkflowInput
     except ModuleNotFoundError as e:
         # 顯示提示，方便你在UI看到
         import streamlit as st, pkgutil
