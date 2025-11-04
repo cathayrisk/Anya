@@ -10,7 +10,7 @@ import json
 
 # === 0. Trimming 參數（可調） ===
 # 只保留「最近 N 個使用者回合」做為上下文
-TRIM_LAST_N_USER_TURNS = 3
+TRIM_LAST_N_USER_TURNS = 30
 
 # === 1. 設定 Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
@@ -284,6 +284,68 @@ https://example.com/2
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
 
+# 3. murmur（Responses API 版）& agent運作（無 BaseCallbackHandler）
+# 3.1 匯總聊天文字（延用你原先的做法）
+all_text = []
+for msg in st.session_state.messages:
+    if hasattr(msg, "content"):
+        if isinstance(msg.content, str):
+            all_text.append(msg.content)
+        elif isinstance(msg.content, list):
+            for part in msg.content:
+                if part.get("type") in ("text", "input_text"):
+                    all_text.append(part["text"])
+all_text = "\n".join(all_text)
+
+# 3.2 以 Responses API 產生 murmur（15字以內 + 可愛emoji）
+status_prompt = f"""
+# Role and Objective
+你是安妮亞（Anya Forger），一個天真可愛、開朗樂觀的小女孩，會根據聊天紀錄，產生一句最適合顯示在 status 上的可愛 murmur，並在最後加上一個可愛 emoji。
+
+# Instructions
+- 只回傳一句可愛的 murmur，**15字以內**，最後加上一個可愛 emoji。
+- 必須用正體中文。
+- murmur 要像小聲自言自語、貼心、自然。
+- 內容要可愛、正向、活潑，能反映目前聊天的氣氛。
+- emoji 要和 murmur 氣氛搭配，可以是花生、愛心、星星、花朵等。
+- 不要重複用過的句子，請多樣化。
+- 不要加任何多餘說明、標點或格式。
+- 不要回覆「以下是...」、「這是...」等開頭。
+- 不要加引號或標題。
+- 不要回覆「15字以內」這句話本身。
+
+# Context
+聊天紀錄：
+{all_text}
+
+# Output
+只回傳一句可愛的 murmur，15字以內，最後加上一個可愛 emoji。
+""".strip()
+
+try:
+    murmur_resp = client.responses.create(
+        model="gpt-4.1-nano",   # 也可用 gpt-4.1-mini
+        input=[{"role": "user", "content": status_prompt}],
+        timeout=12
+    )
+    status_label = (getattr(murmur_resp, "output_text", "") or "").strip()
+    if not status_label:
+        # 後備解析（避免不同 SDK 版型）
+        if getattr(murmur_resp, "output", None):
+            for item in murmur_resp.output:
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") in ("output_text", "text"):
+                        status_label = (getattr(c, "text", "") or "").strip()
+                        if status_label:
+                            break
+                if status_label:
+                    break
+    status_label = status_label.replace("\n", "").replace("\r", "").strip("「」\"' ")
+    if len(status_label) > 15:
+        status_label = status_label[:15]
+except Exception:
+    status_label = "今天氣氛好可愛✨"  # 兜底 murmur
+
 # === 5. 聊天歷史呈現 ===
 for msg in st.session_state.chat_history:
     if msg["role"] == "user":
@@ -301,9 +363,10 @@ for msg in st.session_state.chat_history:
 # === 6. 處理 AI 回覆（使用 Trimming；移除 spinner，只保留 status） ===
 if st.session_state.pending_ai and st.session_state.pending_content:
     with st.chat_message("assistant"):
-        status = st.status("安妮亞馬上回覆你！", expanded=False)
+        status = st.status(status_label, expanded=False)
         try:
             # 依 Trimming 規則組裝上下文 + 這一輪使用者訊息
+            status.update(label=f"{status_label}｜安妮亞開始思考中…🧠", state="running")
             trimmed_messages = build_trimmed_input_messages(st.session_state.pending_content)
 
             response = client.responses.create(
@@ -333,11 +396,12 @@ if st.session_state.pending_ai and st.session_state.pending_content:
                 ai_text = "安妮亞找不到答案～（抱歉啦！）"
 
             # 狀態更新：正在輸出
-            status.update(label="安妮亞正在輸出中…", state="running")
             emoji_token_stream(ai_text, emoji="🌸", cursor_symbol=" ")
+            status.update(label=f"{status_label}｜安妮亞回答完畢！🎉", state="complete")
 
         except Exception as e:
             ai_text = f"API 發生錯誤：{e}"
+            status.update(label=f"{status_label}｜出現小狀況了…請再試一次🛠️", state="error")
 
         # 寫回歷史 & 收尾
         st.session_state.chat_history.append({
