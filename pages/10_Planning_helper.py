@@ -1,3 +1,27 @@
+# pages/10_Planning_helper.py
+from pathlib import Path
+import sys
+
+# 讓 Python 可以從專案根目錄匯入（…/anya）
+ROOT = Path(__file__).resolve().parents[1]  # parents[1] = /mount/src/anya
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# 先試小寫的 workflows.py
+try:
+    from agents.workflows import run_workflow, WorkflowInput
+except ModuleNotFoundError:
+    # 若你的檔名其實是 Workflow.py（大寫W）
+    try:
+        from agents.Workflow import run_workflow, WorkflowInput
+    except ModuleNotFoundError as e:
+        # 顯示提示，方便你在UI看到
+        import streamlit as st, pkgutil
+        st.error(":red[無法載入 agents.workflows / agents.Workflow]")
+        st.caption(f"sys.path 前3項：{sys.path[:3]}")
+        st.caption(f"agents 可見性：{bool(pkgutil.find_loader('agents'))}")
+        raise e
+
 # app.py
 import asyncio
 import streamlit as st
