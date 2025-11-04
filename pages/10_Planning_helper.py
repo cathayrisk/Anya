@@ -28,7 +28,7 @@ except Exception:
         def __init__(self, *args, **kwargs): ...
 
 # ===== 頁面設定 =====
-st.set_page_config(page_title="Initiative Planner", page_icon=":material_rocket:")
+st.set_page_config(page_title="Initiative Planner")
 st.title(":material_rocket: Initiative Planner")
 st.caption("用聊天方式規劃專案目標、時程、資源。這版沒有 sidebar，介面更清爽。")
 
