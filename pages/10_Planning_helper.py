@@ -88,7 +88,7 @@ If one or more are missing, return:
 
     triage_settings = ModelSettings(store=store_flag)
     if HAS_REASONING:
-        triage_settings.reasoning = Reasoning(effort="minimal", summary="auto")
+        triage_settings.reasoning = Reasoning(effort="minimal")
 
     triage = Agent(
         name="Triage",
@@ -128,7 +128,7 @@ Ask concise, direct questions to obtain whatever is missing.""",
         model="gpt-5",
         model_settings=ModelSettings(
             store=store_flag,
-            reasoning=Reasoning(effort="minimal", summary="auto") if HAS_REASONING else None
+            reasoning=Reasoning(effort="minimal") if HAS_REASONING else None
         )
     )
 
