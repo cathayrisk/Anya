@@ -15,24 +15,19 @@ TRIM_LAST_N_USER_TURNS = 30
 # === 1. 設定 Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
 
-def emoji_token_stream(full_text, emoji="🌸", cursor_symbol=" "):
+def emoji_token_stream(full_text, emoji="🌸", cursor_symbol=" ", chunk=8):
     placeholder = st.empty()
-    tokens = []
-    cursor_visible = True
-
-    for idx, token in enumerate(full_text):
-        tokens.append(token)
-        cursor_visible = not cursor_visible
-        cursor = cursor_symbol if cursor_visible else " "
-        safe_text = ''.join(tokens[:-1])
-        # 1. 先用 emoji 顯示新字
-        placeholder.markdown(safe_text + emoji + cursor)
-        time.sleep(0.03)
-        # 2. 再換成正常字
-        placeholder.markdown(''.join(tokens) + cursor)
-        time.sleep(0.01)
-    # 最後顯示完整內容（不顯示游標）
-    placeholder.markdown(''.join(tokens))
+    n = len(full_text)
+    # 長文直接一次輸出，避免大量重繪
+    if n > 600:
+        placeholder.markdown(full_text)
+        return
+    # 短文才做分塊動畫
+    for i in range(0, n, chunk):
+        shown = full_text[:i+chunk]
+        placeholder.markdown(shown + cursor_symbol + emoji)
+        time.sleep(0.02)
+    placeholder.markdown(full_text)
 
 # === 1.1 影像 MIME 偵測（用於回放舊回合圖片） ===
 def _detect_mime_from_bytes(img_bytes: bytes) -> str:
