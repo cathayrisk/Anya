@@ -119,6 +119,10 @@ if "pending_ai" not in st.session_state:
 if "pending_content" not in st.session_state:
     st.session_state.pending_content = None
 
+# 初始化（放在 === 2. Session State === 下面）
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # 但這樣還要在送出時同步 append，工作量較大
+
 # 不再使用 previous_response_id（改用 Trimming 手動餵上下文）
 # if "previous_response_id" not in st.session_state:
 #     st.session_state.previous_response_id = None
@@ -285,17 +289,12 @@ https://example.com/2
 """
 
 # 3. murmur（Responses API 版）& agent運作（無 BaseCallbackHandler）
-# 3.1 匯總聊天文字（延用你原先的做法）
+# 3.1 匯總聊天文字（改用 chat_history，避免 messages 未初始化）
 all_text = []
-for msg in st.session_state.messages:
-    if hasattr(msg, "content"):
-        if isinstance(msg.content, str):
-            all_text.append(msg.content)
-        elif isinstance(msg.content, list):
-            for part in msg.content:
-                if part.get("type") in ("text", "input_text"):
-                    all_text.append(part["text"])
-all_text = "\n".join(all_text)
+for msg in st.session_state.get("chat_history", []):
+    if msg.get("text"):
+        all_text.append(msg["text"])
+all_text = "\n".join(all_text[-50:])  # 視需要保留最近幾則，避免太長
 
 # 3.2 以 Responses API 產生 murmur（15字以內 + 可愛emoji）
 status_prompt = f"""
@@ -428,8 +427,8 @@ if prompt:
     if user_text:
         content_blocks.append({"type": "input_text", "text": user_text})
     for f in prompt.files:
-        imgbytes = f.getbuffer()
-        mime = f.type
+        imgbytes = f.getvalue()  # ← 直接 bytes
+        mime = f.type or "image/png"
         b64 = base64.b64encode(imgbytes).decode()
         content_blocks.append({
             "type": "input_image",
