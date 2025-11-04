@@ -13,7 +13,7 @@ try:
 except ModuleNotFoundError:
     # 若你的檔名其實是 Workflow.py（大寫W）
     try:
-        from Agents.Workflow import run_workflow, WorkflowInput
+        from Agents.Workflows import run_workflow, WorkflowInput
     except ModuleNotFoundError as e:
         # 顯示提示，方便你在UI看到
         import streamlit as st, pkgutil
