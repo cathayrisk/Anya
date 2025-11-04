@@ -30,7 +30,7 @@ except Exception:
 # ===== 頁面設定 =====
 st.set_page_config(page_title="Initiative Planner")
 st.title(":material_rocket: Initiative Planner")
-st.caption("用聊天方式規劃專案目標、時程、資源。這版沒有 sidebar，介面更清爽。")
+st.caption("用聊天方式規劃專案目標、時程、資源。")
 
 # ===== Chat 狀態 =====
 if "messages" not in st.session_state:
@@ -216,7 +216,7 @@ def run_workflow_sync(text: str, store_flag: bool) -> Dict[str, Any]:
 
 # ====== 顯示歷史訊息 ======
 for m in st.session_state.messages:
-    with st.chat_message(m["role"], avatar="🧑‍💻" if m["role"] == "user" else "🧠"):
+    with st.chat_message(m["role"], if m["role"] == "user" else "🧠"):
         st.markdown(m["content"])
 
 # ====== Chat Input ======
@@ -230,13 +230,13 @@ prompt = st.chat_input(
 if prompt:
     # 使用者訊息
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user", avatar="🧑‍💻"):
+    with st.chat_message("user"):
         st.markdown(prompt)
 
     # 整段 transcript 餵給 workflow
     full_text = transcript_from_messages(st.session_state.messages)
 
-    with st.chat_message("assistant", avatar="🧠"):
+    with st.chat_message("assistant"):
         with st.spinner("安妮亞努力規劃中…(滴答滴答)"):
             out = run_workflow_sync(full_text, store_opt)
 
