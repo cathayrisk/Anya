@@ -3,12 +3,12 @@ import asyncio
 import streamlit as st
 
 # 你前面貼的程式：請確保 run_workflow 與 WorkflowInput 可被匯入
-# from your_package.workflows import run_workflow, WorkflowInput
+from agents.workflows import run_workflow, WorkflowInput
 from typing import List, Dict, Any
 
 # ===== 若 run_workflow 是 async，包成 sync 呼叫 =====
 def run_workflow_sync(text: str) -> Dict[str, Any]:
-    from your_package.workflows import run_workflow, WorkflowInput  # TODO: 修改成你的實際路徑
+    from Agents.workflows import run_workflow, WorkflowInput  # TODO: 修改成你的實際路徑
     return asyncio.run(run_workflow(WorkflowInput(input_as_text=text)))
 
 # ===== 小工具：把歷史訊息變成單一字串給 triage 看 =====
@@ -20,6 +20,8 @@ def transcript_from_messages(msgs: List[Dict[str, str]]) -> str:
     return "\n".join(lines)
 
 # ===== 初始化狀態 =====
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
+
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "assistant", "content": "嗨嗨～請描述你的專案目標、時間範圍與目前資源，安妮亞來幫你規劃！🥜"}
