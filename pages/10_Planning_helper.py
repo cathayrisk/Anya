@@ -15,7 +15,7 @@ try:
         TResponseInputItem, Runner, RunConfig, trace
     )
 except Exception as e:
-    st.set_page_config(page_title="Initiative Planner", page_icon=":material_rocket:")
+    st.set_page_config(page_title="Initiative Planner")
     st.error(":red[無法載入基礎 agents 套件]，請確認環境有提供 Agent/Runner/WebSearchTool。")
     st.stop()
 
