@@ -365,7 +365,7 @@ if st.session_state.pending_ai and st.session_state.pending_content:
         status = st.status(status_label, expanded=False)
         try:
             # 依 Trimming 規則組裝上下文 + 這一輪使用者訊息
-            status.update(label=f"{status_label}｜安妮亞開始思考中…🧠", state="running")
+            status.update(label=f"{status_label}", state="running")
             trimmed_messages = build_trimmed_input_messages(st.session_state.pending_content)
 
             response = client.responses.create(
