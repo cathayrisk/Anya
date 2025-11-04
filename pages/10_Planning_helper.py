@@ -3,7 +3,7 @@ import asyncio
 import streamlit as st
 
 # 你前面貼的程式：請確保 run_workflow 與 WorkflowInput 可被匯入
-from agents.workflows import run_workflow, WorkflowInput
+from Agents.workflows import run_workflow, WorkflowInput
 from typing import List, Dict, Any
 
 # ===== 若 run_workflow 是 async，包成 sync 呼叫 =====
