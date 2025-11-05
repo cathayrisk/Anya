@@ -19,14 +19,14 @@ def emoji_token_stream(full_text, emoji="🌸", cursor_symbol=" ", chunk=8):
     placeholder = st.empty()
     n = len(full_text)
     # 長文直接一次輸出，避免大量重繪
-    if n > 600:
+    if n > 1000:
         placeholder.markdown(full_text)
         return
     # 短文才做分塊動畫
     for i in range(0, n, chunk):
         shown = full_text[:i+chunk]
         placeholder.markdown(shown + cursor_symbol + emoji)
-        time.sleep(0.02)
+        time.sleep(0.03)
     placeholder.markdown(full_text)
 
 # === 1.1 影像 MIME 偵測（用於回放舊回合圖片） ===
