@@ -515,8 +515,8 @@ if prompt:
             ai_text, url_cits, file_cits = f"API 發生錯誤：{e}", [], []
 
         # 假串流：把一次拿回的 ai_text，逐段顯示（打字機效果）
-        def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.01):
-            buf = ""
+        def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03):
+            buf = "🌸"
             for i in range(0, len(text), step_chars):
                 buf = text[: i + step_chars]
                 placeholder.markdown(buf)
