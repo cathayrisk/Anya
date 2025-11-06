@@ -4,6 +4,7 @@ import re
 import time
 import json
 import asyncio
+import threading
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
@@ -42,8 +43,23 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty
         placeholder.markdown(empty_msg)
     return text
 
+# 穩定版：確保 coroutine 一定被 await
 def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        result_container = {}
+        def _runner():
+            result_container["value"] = asyncio.run(coro)
+        t = threading.Thread(target=_runner)
+        t.start()
+        t.join()
+        return result_container["value"]
+    else:
+        return asyncio.run(coro)
 
 # === 1.1 圖片工具：縮圖 & data URL ===
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -377,7 +393,6 @@ if "chat_history" not in st.session_state:
 
 # === 3. OpenAI client（.streamlit/secrets.toml: OPENAI_KEY） ===
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
-
 # === 4. 系統提示（一般分支使用 Responses API） ===
 ANYA_SYSTEM_PROMPT = """
 Developer: # Agentic Reminders
@@ -695,7 +710,7 @@ if prompt:
                     plan_md += f"**{idx+1}. {item.query}**\n> {item.reason}\n"
                 st.markdown(plan_md)
 
-                # 並行搜尋摘要
+                # 並行搜尋摘要（這裡用同步迭代，穩定顯示；也可自行改為並發）
                 summaries = run_search_summaries(client, search_plan)
 
                 summary_md = "### 📝 各項搜尋摘要\n"
