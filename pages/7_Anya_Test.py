@@ -315,7 +315,7 @@ ROUTER_PROMPT = with_handoff_prefix("""
 router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
-    model="gpt-5",
+    model="gpt-5-mini",
     tools=[],  # 重要：Router 不掛搜尋工具，避免與交棒競爭
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
@@ -393,6 +393,7 @@ if "chat_history" not in st.session_state:
 
 # === 3. OpenAI client（.streamlit/secrets.toml: OPENAI_KEY） ===
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
+
 # === 4. 系統提示（一般分支使用 Responses API） ===
 ANYA_SYSTEM_PROMPT = """
 Developer: # Agentic Reminders
@@ -613,9 +614,9 @@ for msg in st.session_state.chat_history:
 
 # === 7. 使用者輸入（支援圖片 + PDF/文件） ===
 prompt = st.chat_input(
-    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～（可在訊息中寫『只讀第1-3頁』）",
+    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
     accept_file="multiple",
-    file_type=["jpg","jpeg","png","webp","gif","pdf","txt","md","json","csv","docx","pptx"]
+    file_type=["jpg","jpeg","png","webp","gif","pdf"]
 )
 
 # === 8. 主流程：Router 分流 + 兩條路徑 ===
@@ -681,7 +682,18 @@ if prompt:
             "text": f"請僅根據提供的頁面內容作答（頁碼：{keep_pages}）。若需要其他頁資訊，請先提出需要的頁碼建議。"
         })
 
-    # 寫入歷史（顯示用）
+    # 立刻顯示「使用者泡泡」（修正：避免等到 AI 完整回覆才出現）
+    with st.chat_message("user"):
+        if user_text:
+            st.markdown(user_text)
+        if images_for_history:
+            for fn, thumb, _ in images_for_history:
+                st.image(thumb, caption=fn, width=220)
+        if docs_for_history:
+            for fn in docs_for_history:
+                st.caption(f"📎 {fn}")
+
+    # 寫入歷史（顯示用，供 rerun 後重現）
     st.session_state.chat_history.append({
         "role": "user",
         "text": user_text,
@@ -704,23 +716,19 @@ if prompt:
 
                 search_plan = router_result.final_output.searches
 
-                # 顯示搜尋規劃
-                plan_md = "### 🔎 搜尋規劃\n"
+                # 準備計畫與摘要（不在外層輸出，統一放進 expander）
+                plan_md_lines = []
                 for idx, item in enumerate(search_plan):
-                    plan_md += f"**{idx+1}. {item.query}**\n> {item.reason}\n"
-                st.markdown(plan_md)
+                    plan_md_lines.append(f"**{idx+1}. {item.query}**\n> {item.reason}")
 
-                # 並行搜尋摘要（這裡用同步迭代，穩定顯示；也可自行改為並發）
+                # 並行或序列搜尋摘要（這裡用序列，穩定）
                 summaries = run_search_summaries(client, search_plan)
 
-                summary_md = "### 📝 各項搜尋摘要\n"
-                for it in summaries:
-                    summary_md += f"**{it['query']}**\n{it['summary']}\n\n"
-
+                # 全程包在單一 expander（修正點2）
                 with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
                     st.markdown("### 搜尋規劃")
-                    for idx, item in enumerate(search_plan):
-                        st.markdown(f"**{idx+1}. {item.query}**\n> {item.reason}")
+                    for line in plan_md_lines:
+                        st.markdown(line)
                     st.markdown("### 各項搜尋摘要")
                     for it in summaries:
                         st.markdown(f"**{it['query']}**\n{it['summary']}")
@@ -767,9 +775,12 @@ if prompt:
                             st.markdown(f"- {fn}")
 
                 # 存入歷史（完整回覆）
+                plan_md_saved = "### 🔎 搜尋規劃\n" + "\n".join(plan_md_lines)
+                summary_md_saved = "### 📝 各項搜尋摘要\n" + "\n\n".join([f"**{it['query']}**\n{it['summary']}" for it in summaries])
+
                 ai_reply = (
-                    plan_md + "\n" +
-                    summary_md + "\n" +
+                    plan_md_saved + "\n\n" +
+                    summary_md_saved + "\n\n" +
                     "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
                     "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
                     "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
