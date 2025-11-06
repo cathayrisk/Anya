@@ -2,6 +2,7 @@ import streamlit as st
 import base64
 import re
 import time
+import json
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
@@ -14,6 +15,17 @@ MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024     # 單次請求總量預警（48MB）
 
 # === 1. 設定 Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent (web + fake-stream + sources)", page_icon="🥜", layout="wide")
+
+# === 共用：假串流打字效果（集中定義，避免重複） ===
+def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
+    buf = "🌸"
+    for i in range(0, len(text), step_chars):
+        buf = text[: i + step_chars]
+        placeholder.markdown(buf)
+        time.sleep(delay)
+    if not text:
+        placeholder.markdown(empty_msg)
+    return text
 
 # === 1.1 圖片工具：縮圖 & data URL ===
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -153,7 +165,7 @@ def parse_response_text_and_citations(resp):
     if text_attr:
         text_parts.append(text_attr)
 
-    # 再掃描 output 結構取 annotations
+    # 再掃描 output 結構取 annotations / tool calls
     try:
         for item in getattr(resp, "output", []) or []:
             if getattr(item, "type", "") == "message":
@@ -181,6 +193,110 @@ def parse_response_text_and_citations(resp):
     file_cits = dedup_by(file_cits, "filename") if any(c.get("filename") for c in file_cits) else dedup_by(file_cits, "file_id")
     return text or "安妮亞找不到答案～（抱歉啦！）", url_cits, file_cits
 
+# === 1.5 研究/寫報告流程：Planner / Search / Writer（供工具使用） ===
+PLANNER_PROMPT = (
+    "You are a helpful research planner. Given a user query, output a JSON object only, with the key "
+    "'searches' as a list of objects each containing 'reason' and 'query'. Generate 5–15 items. "
+    "No extra text, only JSON."
+)
+SEARCH_SUMMARY_PROMPT = (
+    "You are a research assistant. Use web search for the given term and produce a concise 2–3 paragraph "
+    "summary (<300 words). Capture key facts, names, dates, numbers. Ignore fluff. "
+    "Only the summary text."
+)
+WRITER_PROMPT = (
+    "你是一位資深研究員，請針對原始問題與初步搜尋摘要，撰寫完整中文報告。"
+    "輸出 JSON（僅限 JSON）：short_summary（2-3句）、markdown_report（至少1000字，Markdown格式）、"
+    "follow_up_questions（3-8條）。請用台灣用語。"
+)
+
+def try_load_json(text: str, fallback=None):
+    if fallback is None:
+        fallback = {}
+    try:
+        s = text.find("{"); e = text.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            return json.loads(text[s:e+1])
+        return json.loads(text)
+    except Exception:
+        return fallback
+
+def run_planner(client: OpenAI, query: str):
+    resp = client.responses.create(
+        model="gpt-5",
+        input=[{"role": "user", "content": [{"type": "input_text", "text": f"Query: {query}"}]}],
+        instructions=PLANNER_PROMPT,
+    )
+    text, _, _ = parse_response_text_and_citations(resp)
+    data = try_load_json(text, {"searches": []})
+    searches = []
+    for it in data.get("searches", []):
+        q = (it.get("query") or "").strip()
+        r = (it.get("reason") or "").strip() or "補足關鍵面向"
+        if q:
+            searches.append({"query": q, "reason": r})
+    return searches[:15]
+
+def run_search_summaries(client: OpenAI, searches: list[dict]):
+    out = []
+    for it in searches:
+        resp = client.responses.create(
+            model="gpt-4.1",
+            input=[{"role": "user", "content": [
+                {"type": "input_text", "text": f"{SEARCH_SUMMARY_PROMPT}\n\nSearch term: {it['query']}\nReason: {it['reason']}"}
+            ]}],
+            tools=[{"type": "web_search"}],
+            tool_choice="auto",
+        )
+        text, url_cits, _ = parse_response_text_and_citations(resp)
+        out.append({"query": it["query"], "reason": it["reason"], "summary": text, "citations": url_cits or []})
+    return out
+
+def run_writer(client: OpenAI, trimmed_messages: list, original_query: str, search_results: list[dict]):
+    combined = "\n\n".join([f"- {r['query']}\n{r['summary']}" for r in search_results])
+    # 把使用者上傳的圖片/PDF等（已包含在 trimmed_messages）一併送入
+    writer_input = trimmed_messages + [{
+        "role": "user",
+        "content": [{"type": "input_text", "text": f"[Writer]\n{WRITER_PROMPT}\n\nOriginal query:\n{original_query}\n\nSummarized search results:\n{combined}"}]
+    }]
+    resp = client.responses.create(model="gpt-5-mini", input=writer_input)
+    text, url_cits, file_cits = parse_response_text_and_citations(resp)
+    data = try_load_json(text, {"short_summary": "", "markdown_report": "", "follow_up_questions": []})
+    return data, url_cits, file_cits
+
+# === 1.6 功能工具：研究報告工具定義 + 本地執行器 ===
+RESEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "generate_research_report",
+        "description": "針對研究/文獻回顧/寫報告需求，規劃搜尋→彙整→產出完整報告（中文）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "使用者的研究/報告主題"},
+                "max_searches": {"type": "integer", "minimum": 3, "maximum": 20, "default": 10}
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+def tool_generate_research_report(args: dict, client: OpenAI, trimmed_messages: list):
+    query = (args.get("query") or "").strip()
+    max_n = int(args.get("max_searches", 10))
+    plan = run_planner(client, query)[:max_n]
+    summaries = run_search_summaries(client, plan)
+    writer_data, writer_url_cits, writer_file_cits = run_writer(client, trimmed_messages, query, summaries)
+    return {
+        "plan": plan,
+        "summaries": summaries,
+        "short_summary": writer_data.get("short_summary", ""),
+        "markdown_report": writer_data.get("markdown_report", ""),
+        "follow_up_questions": writer_data.get("follow_up_questions", []),
+        "url_citations": writer_url_cits or [],
+        "file_citations": writer_file_cits or [],
+    }
+
 # === 2. Session State ===
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = [{
@@ -192,6 +308,7 @@ if "chat_history" not in st.session_state:
 
 # === 3. OpenAI client（.streamlit/secrets.toml: OPENAI_KEY） ===
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
+
 # === 4. 系統提示 ===
 ANYA_SYSTEM_PROMPT = """
 Developer: # Agentic Reminders
@@ -218,12 +335,10 @@ After each tool call or code edit, validate result in 1-2 lines and proceed or s
 - 若回答不完全正確，請主動道歉並表達會再努力。
 
 ## 工具使用規則
-
-你可以根據下列情境，決定是否要調用工具：
+- 遇到屬於「研究、查資料、分析、寫報告、文獻回顧/探討」等任務，請優先呼叫'RESEARCH_TOOL'工具以產生研究報告；一般對話或純看圖/讀PDF摘要則直接回答。
 - `web_search`：當用戶的提問判斷需要搜尋網路資料時，請使用這個工具搜尋網路資訊。
-- Use only tools listed in allowed_tools; for routine read-only tasks call automatically; for destructive ops require confirmation。
-
-Before any significant tool call, state in one line: purpose + minimal inputs。
+- 僅能使用允許的工具；破壞性操作需先確認。
+- 重大工具呼叫前請先以一行說明目的與最小化輸入。
 
 ---
 ## 搜尋工具使用進階指引
@@ -490,15 +605,14 @@ if prompt:
         "docs": docs_for_history
     })
 
-    # === 8. 非串流呼叫 Responses API（預設「啟用網路搜尋」），但用「假串流」顯示；並呈現來源與檔案 ===
+    # === 8. 非串流呼叫 Responses API（啟用網路搜尋 + 研究報告工具），用假串流顯示；呈現來源與檔案 ===
     with st.chat_message("assistant"):
         placeholder = st.empty()
         sources_container = st.container()
         try:
             trimmed_messages = build_trimmed_input_messages(content_blocks)
 
-            # 預設啟用網路搜尋
-            tools = [{"type": "web_search"}]
+            tools = [{"type": "web_search"}, RESEARCH_TOOL]
             tool_choice = "auto"
 
             resp = client.responses.create(
@@ -509,50 +623,104 @@ if prompt:
                 tool_choice=tool_choice,
             )
 
+            # 工具回圈：若模型呼叫 generate_research_report → 執行 → 回填
+            last_report_payload = None
+            while True:
+                tool_calls = []
+                for item in getattr(resp, "output", []) or []:
+                    if getattr(item, "type", "") == "tool_call":
+                        name = getattr(item, "name", "")
+                        args_text = getattr(item, "arguments", "{}") or "{}"
+                        try:
+                            args = json.loads(args_text)
+                        except Exception:
+                            args = {}
+                        if name == "generate_research_report":
+                            last_report_payload = tool_generate_research_report(args, client, trimmed_messages)
+                            tool_calls.append({
+                                "tool_call_id": getattr(item, "id", None),
+                                "output": json.dumps(last_report_payload, ensure_ascii=False)
+                            })
+                if not tool_calls:
+                    break
+                resp = client.responses.submit_tool_outputs(
+                    response_id=resp.id,
+                    tool_outputs=tool_calls
+                )
+
+            # 取得最終文字與 citations
             ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
 
+            # 假串流顯示最終文字
+            final_text = fake_stream_markdown(ai_text, placeholder)
+
+            # 顯示來源與引用檔案（若有）
+            with sources_container:
+                showed_any = False
+                if url_cits:
+                    showed_any = True
+                    st.markdown("**來源**")
+                    for c in url_cits:
+                        title = c.get("title") or c.get("url")
+                        url = c.get("url")
+                        st.markdown(f"- [{title}]({url})")
+                if file_cits:
+                    showed_any = True
+                    st.markdown("**引用檔案**")
+                    for c in file_cits:
+                        fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                        st.markdown(f"- {fname}")
+
+                # 若是研究工具有回傳 payload，補充顯示「規劃 + 各項摘要」與 citations（避免模型未標註時看不到）
+                if last_report_payload:
+                    plan = last_report_payload.get("plan", [])
+                    sums = last_report_payload.get("summaries", [])
+                    extra_urls = last_report_payload.get("url_citations", [])
+                    extra_files = last_report_payload.get("file_citations", [])
+
+                    with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=False):
+                        st.markdown("### 搜尋規劃")
+                        for i, it in enumerate(plan):
+                            st.markdown(f"**{i+1}. {it['query']}**\n> {it['reason']}")
+                        st.markdown("### 各項搜尋摘要")
+                        for it in sums:
+                            st.markdown(f"**{it['query']}**\n{it['summary']}")
+
+                    if extra_urls and not url_cits:
+                        st.markdown("**來源（工具彙整）**")
+                        seen = set()
+                        for c in extra_urls:
+                            url = c.get("url")
+                            if url and url not in seen:
+                                seen.add(url)
+                                title = c.get("title") or url
+                                st.markdown(f"- [{title}]({url})")
+                    if extra_files and not file_cits:
+                        st.markdown("**引用檔案（工具彙整）**")
+                        for c in extra_files:
+                            fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                            st.markdown(f"- {fname}")
+
+                # 沒任何 citations 時，也列出本回合上傳的檔案
+                if not (url_cits or file_cits or (last_report_payload and (last_report_payload.get('url_citations') or last_report_payload.get('file_citations')))) and docs_for_history:
+                    st.markdown("**本回合上傳檔案**")
+                    for fn in docs_for_history:
+                        st.markdown(f"- {fn}")
+
+            # 寫回歷史
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "text": final_text,
+                "images": [],
+                "docs": []
+            })
+
         except Exception as e:
-            ai_text, url_cits, file_cits = f"API 發生錯誤：{e}", [], []
-
-        # 假串流：把一次拿回的 ai_text，逐段顯示（打字機效果）
-        def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03):
-            buf = "🌸"
-            for i in range(0, len(text), step_chars):
-                buf = text[: i + step_chars]
-                placeholder.markdown(buf)
-                time.sleep(delay)
-            if not text:
-                placeholder.markdown("安妮亞找不到答案～（抱歉啦！）")
-            return text
-
-        final_text = fake_stream_markdown(ai_text, placeholder)
-
-        # 顯示來源與引用檔案（若有）
-        with sources_container:
-            if url_cits:
-                st.markdown("**來源**")
-                for c in url_cits:
-                    title = c.get("title") or c.get("url")
-                    url = c.get("url")
-                    st.markdown(f"- [{title}]({url})")
-            if file_cits:
-                st.markdown("**引用檔案**")
-                for c in file_cits:
-                    fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
-                    st.markdown(f"- {fname}")
-
-            # 無 file_citation 時，也把本回合上傳的檔案列出參考
-            if not file_cits and docs_for_history:
-                st.markdown("**本回合上傳檔案**")
-                for fn in docs_for_history:
-                    st.markdown(f"- {fn}")
-
-        # 寫回歷史
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "text": final_text,
-            "images": [],
-            "docs": []
-        })
+            placeholder.markdown(f"API 發生錯誤：{e}")
+            with sources_container:
+                if docs_for_history:
+                    st.markdown("**本回合上傳檔案**")
+                    for fn in docs_for_history:
+                        st.markdown(f"- {fn}")
 
     st.rerun()
