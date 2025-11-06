@@ -1,17 +1,21 @@
 import streamlit as st
 import base64
+import re
+import time
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
+import os
+from pypdf import PdfReader, PdfWriter
 
-# === 0. Trimming 參數（可調） ===
-TRIM_LAST_N_USER_TURNS = 15        # 建議先收斂一點，更省 token
-MAX_STREAM_TIMEOUT_SEC = 60
+# === 0. Trimming / 大小限制（可調） ===
+TRIM_LAST_N_USER_TURNS = 8                 # 降低歷史回合，省 token
+MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024     # 單次請求總量預警（48MB）
 
 # === 1. 設定 Streamlit 頁面 ===
-st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
+st.set_page_config(page_title="Anya Multimodal Agent (web + fake-stream + sources)", page_icon="🥜", layout="wide")
 
-# === 1.1 快取：縮圖 & data URL ===
+# === 1.1 圖片工具：縮圖 & data URL ===
 @st.cache_data(show_spinner=False, max_entries=256)
 def make_thumb(imgbytes: bytes, max_w=220) -> bytes:
     im = Image.open(BytesIO(imgbytes))
@@ -40,21 +44,154 @@ def bytes_to_data_url(imgbytes: bytes) -> str:
     b64 = base64.b64encode(imgbytes).decode()
     return f"data:{mime};base64,{b64}"
 
+# === 1.2 檔案工具：data URI（PDF/TXT/MD/JSON/CSV/DOCX/PPTX） ===
+DOC_MIME_MAP = {
+    ".pdf":  "application/pdf",
+    ".txt":  "text/plain",
+    ".md":   "text/markdown",
+    ".json": "application/json",
+    ".csv":  "text/csv",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+def guess_mime_by_ext(filename: str) -> str:
+    ext = os.path.splitext(filename.lower())[1]
+    return DOC_MIME_MAP.get(ext, "application/octet-stream")
+
+def file_bytes_to_data_url(filename: str, data: bytes) -> str:
+    mime = guess_mime_by_ext(filename)
+    b64 = base64.b64encode(data).decode()
+    return f"data:{mime};base64,{b64}"
+
+# === 1.3 PDF 工具：頁碼解析 / 實際切頁 ===
+def parse_page_ranges_from_text(text: str) -> list[int]:
+    """
+    從使用者訊息中解析頁碼範圍。
+    支援：
+    - 只讀第1-3頁 / 第2頁 / 第5,7,9頁
+    - pages 2-5 / page 3 / p2-4,6
+    - 2-4,6,10-12（需同句含 頁/page/p 關鍵字）
+    """
+    if not text:
+        return []
+    pages = set()
+
+    # 範圍
+    range_patterns = [
+        r'第\s*(\d+)\s*[-~至到]\s*(\d+)\s*頁',
+        r'(\d+)\s*[-–—]\s*(\d+)\s*頁',
+        r'p(?:age)?s?\s*(\d+)\s*[-–—]\s*(\d+)',
+        r'(?<!\w)(\d+)\s*[-–—]\s*(\d+)(?!\w)',
+    ]
+    for pat in range_patterns:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > 0 and b >= a:
+                for p in range(a, b + 1):
+                    pages.add(p)
+
+    # 單頁
+    single_patterns = [
+        r'第\s*(\d+)\s*頁',
+        r'p(?:age)?\s*(\d+)',
+    ]
+    for pat in single_patterns:
+        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            p = int(m.group(1))
+            if p > 0:
+                pages.add(p)
+
+    # 逗號分隔數字（需同行含頁/page/p）
+    if re.search(r'(頁|page|pages|p[^\w])', text, flags=re.IGNORECASE):
+        for m in re.finditer(r'(?<!\d)(\d+)(?:\s*,\s*(\d+))+', text):
+            nums = [int(x) for x in m.group(0).split(",") if x.strip().isdigit()]
+            for n in nums:
+                if n > 0:
+                    pages.add(n)
+
+    return sorted(pages)
+
+def slice_pdf_bytes(pdf_bytes: bytes, keep_pages_1based: list[int]) -> bytes:
+    """依 1-based 頁碼取出頁面，回傳新的 PDF bytes；若 keep_pages 為空則原封不動"""
+    if not keep_pages_1based:
+        return pdf_bytes
+    reader = PdfReader(BytesIO(pdf_bytes))
+    n = len(reader.pages)
+    writer = PdfWriter()
+    for p in keep_pages_1based:
+        if 1 <= p <= n:
+            writer.add_page(reader.pages[p - 1])
+    out = BytesIO()
+    writer.write(out)
+    out.seek(0)
+    return out.getvalue()
+
+# === 1.4 回覆解析：擷取文字 + 來源註解 ===
+def dedup_by(items, key):
+    seen = set()
+    out = []
+    for it in items:
+        k = it.get(key)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
+def parse_response_text_and_citations(resp):
+    """
+    回傳 (text, url_citations, file_citations)
+    url_citations: [{title, url}]
+    file_citations: [{filename, file_id}]
+    """
+    text_parts = []
+    url_cits = []
+    file_cits = []
+
+    # 先試 output_text
+    text_attr = getattr(resp, "output_text", None)
+    if text_attr:
+        text_parts.append(text_attr)
+
+    # 再掃描 output 結構取 annotations
+    try:
+        for item in getattr(resp, "output", []) or []:
+            if getattr(item, "type", "") == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") == "output_text":
+                        t = getattr(c, "text", "")
+                        if t and not text_attr:
+                            text_parts.append(t)
+                        for ann in getattr(c, "annotations", []) or []:
+                            at = getattr(ann, "type", "")
+                            if at == "url_citation":
+                                url = getattr(ann, "url", None)
+                                title = getattr(ann, "title", None)
+                                if url:
+                                    url_cits.append({"url": url, "title": title})
+                            elif at == "file_citation":
+                                filename = getattr(ann, "filename", None)
+                                fid = getattr(ann, "file_id", None)
+                                file_cits.append({"filename": filename, "file_id": fid})
+    except Exception:
+        pass
+
+    text = "".join(text_parts) if text_parts else ""
+    url_cits = dedup_by(url_cits, "url")
+    file_cits = dedup_by(file_cits, "filename") if any(c.get("filename") for c in file_cits) else dedup_by(file_cits, "file_id")
+    return text or "安妮亞找不到答案～（抱歉啦！）", url_cits, file_cits
+
 # === 2. Session State ===
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = [{
         "role": "assistant",
-        "text": "嗨嗨～安妮亞大升級了！👋 有什麼想問安妮亞的嗎？",
-        "images": []  # [(name, thumb_bytes, orig_bytes)]
+        "text": "嗨嗨～安妮亞來了！👋 上傳圖片或PDF，直接問你想知道的內容吧！\n小提醒：訊息裡可寫「只讀第1-3頁」或「pages 2,5,10-12」限制PDF頁面～",
+        "images": [],
+        "docs": []
     }]
-if "pending_ai" not in st.session_state:
-    st.session_state.pending_ai = False
-if "pending_content" not in st.session_state:
-    st.session_state.pending_content = None
 
-# === 3. OpenAI client ===
+# === 3. OpenAI client（.streamlit/secrets.toml: OPENAI_KEY） ===
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
-
 # === 4. 系統提示 ===
 ANYA_SYSTEM_PROMPT = """
 Developer: # Agentic Reminders
@@ -227,7 +364,7 @@ def build_trimmed_input_messages(pending_user_content_blocks):
     if not hist:
         return [{"role": "user", "content": pending_user_content_blocks}]
 
-    # 1) 找到最近 N 個「使用者回合」起點
+    # 找到最近 N 個「使用者回合」起點
     user_count = 0
     start_idx = 0
     for i in range(len(hist) - 1, -1, -1):
@@ -238,7 +375,7 @@ def build_trimmed_input_messages(pending_user_content_blocks):
                 break
     selected = hist[start_idx:]
 
-    # 2) 轉 Responses messages：僅保留文字歷史，且只讓「最後一輪使用者回合」帶圖片
+    # 僅保留文字歷史，且只讓「最後一輪使用者回合」帶圖片
     messages = []
     last_user_idx = max([i for i, m in enumerate(selected) if m.get("role") == "user"], default=-1)
     for i, msg in enumerate(selected):
@@ -247,7 +384,6 @@ def build_trimmed_input_messages(pending_user_content_blocks):
             blocks = []
             if msg.get("text"):
                 blocks.append({"type": "input_text", "text": msg["text"]})
-            # 僅最後一輪使用者回合帶圖，降低 payload
             if i == last_user_idx and msg.get("images"):
                 for _fn, _thumb, orig in msg["images"]:
                     data_url = bytes_to_data_url(orig)
@@ -261,43 +397,11 @@ def build_trimmed_input_messages(pending_user_content_blocks):
                     "content": [{"type": "output_text", "text": msg["text"]}]
                 })
 
-    # 3) 加上「這一輪」使用者輸入
+    # 加上「這一輪」使用者輸入（含文字/圖片/文件）
     messages.append({"role": "user", "content": pending_user_content_blocks})
     return messages
 
-# === 6. Responses 串流 → 純文字產生器（給 st.write_stream） ===
-def responses_text_stream(client, *, model, messages, tools=None, tool_choice="none",
-                          instructions=None, timeout=MAX_STREAM_TIMEOUT_SEC):
-    # 使用官方 stream context，逐事件拿 delta
-    with client.responses.stream(
-        model=model,
-        input=messages,
-        tools=tools or [],
-        tool_choice=tool_choice,
-        instructions=instructions,
-        truncation="auto",
-        parallel_tool_calls=True,
-        reasoning={"effort": "medium"},
-        text={"verbosity": "medium"},
-        timeout=timeout,
-    ) as stream:
-        for event in stream:
-            et = getattr(event, "type", "")
-            if et == "response.output_text.delta":
-                delta = getattr(event, "delta", "")
-                if delta:
-                    yield delta
-            elif et == "response.error":
-                err = getattr(event, "error", "")
-                yield f"\n[發生錯誤] {err}\n"
-
-# === 7. 側邊控制（可選） ===
-st.sidebar.markdown("### 偏好設定")
-allow_web = st.sidebar.toggle("允許網路搜尋（可能稍慢）", value=False)
-tool_choice = "auto" if allow_web else "none"
-tools = [{"type": "web_search"}] if allow_web else []
-
-# === 8. 顯示歷史（縮圖顯示，省記憶體） ===
+# === 6. 顯示歷史（圖片縮圖 + 文件檔名） ===
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         if msg.get("text"):
@@ -305,78 +409,150 @@ for msg in st.session_state.chat_history:
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
+        if msg.get("docs"):
+            for fn in msg["docs"]:
+                st.caption(f"📎 {fn}")
 
-# === 9. 回覆階段（真正串流輸出） ===
-if st.session_state.pending_ai and st.session_state.pending_content:
-    with st.chat_message("assistant"):
-        status = st.status("思考中…✨", expanded=False)
-        try:
-            status.update(label="思考中…✨", state="running")
-            trimmed_messages = build_trimmed_input_messages(st.session_state.pending_content)
-
-            # 串流到畫面；write_stream 會回傳完整文字
-            ai_text = st.write_stream(
-                responses_text_stream(
-                    client,
-                    model="gpt-5",
-                    messages=trimmed_messages,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    instructions=ANYA_SYSTEM_PROMPT,
-                    timeout=MAX_STREAM_TIMEOUT_SEC,
-                )
-            )
-            if not ai_text:
-                ai_text = "安妮亞找不到答案～（抱歉啦！）"
-            status.update(label="完成！🎉", state="complete")
-        except Exception as e:
-            ai_text = f"API 發生錯誤：{e}"
-            status.update(label="出現小狀況了…請再試一次🛠️", state="error")
-
-        # 寫回歷史 & 收尾
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "text": ai_text,
-            "images": []
-        })
-        st.session_state.pending_ai = False
-        st.session_state.pending_content = None
-        st.rerun()
-
-# === 10. 使用者輸入 ===
+# === 7. 使用者輸入（支援圖片 + PDF/文件） ===
 prompt = st.chat_input(
-    "wakuwaku！安妮亞可以幫你看圖說故事嚕！",
+    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～（可在訊息中寫『只讀第1-3頁』）",
     accept_file="multiple",
-    file_type=["jpg", "jpeg", "png"]
+    file_type=["jpg","jpeg","png","webp","gif","pdf","txt","md","json","csv","docx","pptx"]
 )
 
 if prompt:
     user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
     images_for_history = []
+    docs_for_history = []
     content_blocks = []
+
+    # 解析「只讀指定頁」：從使用者文字自動抓頁碼（PDF 才會用到）
+    keep_pages = parse_page_ranges_from_text(user_text)
 
     if user_text:
         content_blocks.append({"type": "input_text", "text": user_text})
 
     files = getattr(prompt, "files", []) or []
+    total_payload_bytes = 0
     for f in files:
-        imgbytes = f.getvalue()
-        thumb = make_thumb(imgbytes)
-        images_for_history.append((f.name, thumb, imgbytes))
-        # 當回合送模型才需要 data_url，這裡先不轉；由 build_trimmed_input_messages 處理
+        name = f.name
+        data = f.getvalue()
+        total_payload_bytes += len(data)
+
+        if len(data) > MAX_REQ_TOTAL_BYTES:
+            st.warning(f"檔案過大（{name} > 48MB），先不送出喔～請拆小再試 🙏")
+            continue
+
+        # 圖片
+        if name.lower().endswith((".jpg",".jpeg",".png",".webp",".gif")):
+            thumb = make_thumb(data)
+            images_for_history.append((name, thumb, data))
+            data_url = bytes_to_data_url(data)
+            content_blocks.append({"type": "input_image", "image_url": data_url})
+            continue
+
+        # 文件（含 PDF）
+        is_pdf = name.lower().endswith(".pdf")
+        original_pdf = data
+
+        # 只讀指定頁：若使用者有指定頁碼→實際切頁（僅 PDF）
+        if is_pdf and keep_pages:
+            try:
+                data = slice_pdf_bytes(data, keep_pages)
+                st.info(f"已切出指定頁：{keep_pages}（檔案：{name}）")
+            except Exception as e:
+                st.warning(f"切頁失敗，改送整本：{name}（{e}）")
+                data = original_pdf
+
+        # 顯示於歷史
+        docs_for_history.append(name)
+
+        # 送文件給模型（以 data URI 附件）
+        file_data_uri = file_bytes_to_data_url(name, data)
+        content_blocks.append({
+            "type": "input_file",
+            "filename": name,
+            "file_data": file_data_uri
+        })
+
+    # 若有指定頁碼，附上提醒（實際檔案已被切頁）
+    if keep_pages:
+        content_blocks.append({
+            "type": "input_text",
+            "text": f"請僅根據提供的頁面內容作答（頁碼：{keep_pages}）。若需要其他頁資訊，請先提出需要的頁碼建議。"
+        })
 
     # 寫入歷史（顯示用）
     st.session_state.chat_history.append({
         "role": "user",
         "text": user_text,
-        "images": images_for_history
+        "images": images_for_history,
+        "docs": docs_for_history
     })
 
-    # 設定這一輪要送給模型的內容（含圖片）
-    for _fn, _thumb, orig in images_for_history:
-        data_url = bytes_to_data_url(orig)
-        content_blocks.append({"type": "input_image", "image_url": data_url})
+    # === 8. 非串流呼叫 Responses API（預設「啟用網路搜尋」），但用「假串流」顯示；並呈現來源與檔案 ===
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        sources_container = st.container()
+        try:
+            trimmed_messages = build_trimmed_input_messages(content_blocks)
 
-    st.session_state.pending_ai = True
-    st.session_state.pending_content = content_blocks
+            # 預設啟用網路搜尋
+            tools = [{"type": "web_search"}]
+            tool_choice = "auto"
+
+            resp = client.responses.create(
+                model="gpt-5",
+                input=trimmed_messages,
+                instructions=ANYA_SYSTEM_PROMPT,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
+            ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
+
+        except Exception as e:
+            ai_text, url_cits, file_cits = f"API 發生錯誤：{e}", [], []
+
+        # 假串流：把一次拿回的 ai_text，逐段顯示（打字機效果）
+        def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.01):
+            buf = ""
+            for i in range(0, len(text), step_chars):
+                buf = text[: i + step_chars]
+                placeholder.markdown(buf)
+                time.sleep(delay)
+            if not text:
+                placeholder.markdown("安妮亞找不到答案～（抱歉啦！）")
+            return text
+
+        final_text = fake_stream_markdown(ai_text, placeholder)
+
+        # 顯示來源與引用檔案（若有）
+        with sources_container:
+            if url_cits:
+                st.markdown("**來源**")
+                for c in url_cits:
+                    title = c.get("title") or c.get("url")
+                    url = c.get("url")
+                    st.markdown(f"- [{title}]({url})")
+            if file_cits:
+                st.markdown("**引用檔案**")
+                for c in file_cits:
+                    fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                    st.markdown(f"- {fname}")
+
+            # 無 file_citation 時，也把本回合上傳的檔案列出參考
+            if not file_cits and docs_for_history:
+                st.markdown("**本回合上傳檔案**")
+                for fn in docs_for_history:
+                    st.markdown(f"- {fn}")
+
+        # 寫回歷史
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "text": final_text,
+            "images": [],
+            "docs": []
+        })
+
     st.rerun()
