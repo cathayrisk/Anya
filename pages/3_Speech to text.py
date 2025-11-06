@@ -15,10 +15,10 @@ from langchain_text_splitters import CharacterTextSplitter
 from langgraph.constants import Send
 from langgraph.graph import END, START, StateGraph
 from langchain_core.documents import Document
-from langchain.chains.combine_documents.reduce import (
-    acollapse_docs,
-    split_list_of_docs,
-)
+#from langchain.chains.combine_documents.reduce import (
+#    acollapse_docs,
+#    split_list_of_docs,
+#)
 import operator
 import asyncio
 import uuid
@@ -964,9 +964,9 @@ if f is not None:
         return summarize_transcription
 
     with tab2:
-        with st.spinner('Generating summary...'):
-            summarize_transcription = asyncio.run(calculate_summary())
-            st.markdown(summarize_transcription)
+        #with st.spinner('Generating summary...'):
+            #summarize_transcription = asyncio.run(calculate_summary())
+            #st.markdown(summarize_transcription)
 
     # 保存轉錄結果到 session_state
         if 'formatted_transcription' not in st.session_state:
@@ -976,111 +976,111 @@ if f is not None:
 
     with tab3:
         with st.container():
-            try:
-                formatted_transcription = st.session_state.get('formatted_transcription', "")
-                transcript = [
-                    (
-                        "Speaker",
-                        full_transcription,
-                    ),
-                ]
+            #try:
+            #    formatted_transcription = st.session_state.get('formatted_transcription', "")
+            #    transcript = [
+            #        (
+            #            "Speaker",
+            #            full_transcription,
+            #        ),
+            #    ]
 
-                formatted = "\n".join(f"{x[0]}: {x[1]}" for x in transcript)
+            #    formatted = "\n".join(f"{x[0]}: {x[1]}" for x in transcript)
 
-                tools = [TranscriptSummary]
-                bound_llm = bind_validator_with_retries(
-                    llm,
-                    tools=tools,
-                )
-                prompt = ChatPromptTemplate.from_messages(
-                    [
-                        ("system", "Respond directly using the TranscriptSummary function."),
-                        ("placeholder", "{messages}"),
-                    ]
-                )
+            #    tools = [TranscriptSummary]
+            #    bound_llm = bind_validator_with_retries(
+            #        llm,
+            #        tools=tools,
+            #    )
+            #    prompt = ChatPromptTemplate.from_messages(
+            #        [
+            #            ("system", "Respond directly using the TranscriptSummary function."),
+            #            ("placeholder", "{messages}"),
+            #        ]
+            #    )
 
-                bound_chain = prompt | bound_llm              
-                try:
-                    results = bound_chain.invoke(
-                        {
-                            "messages": [
-                                (
-                                    "user",
-                                    f"Extract the summary from the following conversation:\n\n<convo>\n{formatted}\n</convo>"
-                                    "\n\nRemember to respond using the TranscriptSummary function.",
-                                )
-                            ]
-                        },
-                    )
-                except ValueError as e:
-                    print(repr(e))
-                data = results.additional_kwargs
+            #    bound_chain = prompt | bound_llm              
+            #    try:
+            #        results = bound_chain.invoke(
+            #            {
+            #                "messages": [
+            #                    (
+            #                        "user",
+            #                        f"Extract the summary from the following conversation:\n\n<convo>\n{formatted}\n</convo>"
+            #                        "\n\nRemember to respond using the TranscriptSummary function.",
+            #                    )
+            #                ]
+            #            },
+            #        )
+            #    except ValueError as e:
+            #        print(repr(e))
+            #    data = results.additional_kwargs
 
                 # 提取 tool_calls
-                tool_calls = data['tool_calls']
+            #    tool_calls = data['tool_calls']
 
                 # 遍歷每個 tool_call
-                for tool_call in tool_calls:
+            #    for tool_call in tool_calls:
                     # 提取 Arguments
-                    arguments = tool_call['function']['arguments']
+            #        arguments = tool_call['function']['arguments']
 
                     # 解析 Arguments 中的 JSON 字符串
-                    arguments_data = json.loads(arguments)
+            #        arguments_data = json.loads(arguments)
 
                     # 提取 Metadata
-                    metadata = arguments_data['metadata']
-                    st.markdown("### Metadata")
-                    st.markdown(f"- **標題**: {metadata['title']}")
-                    st.markdown(f"- **地點**: {metadata['location']['content']}")
-                    st.markdown(f"- **持續時間**: {metadata['duration']}")
+            #        metadata = arguments_data['metadata']
+            #        st.markdown("### Metadata")
+            #        st.markdown(f"- **標題**: {metadata['title']}")
+            #        st.markdown(f"- **地點**: {metadata['location']['content']}")
+            #        st.markdown(f"- **持續時間**: {metadata['duration']}")
 
                     # 提取 Key Moments
-                    key_moments = arguments_data['key_moments']
-                    st.markdown("\n### Key Moments")
-                    for moment in key_moments:
-                        st.markdown(f"- **主題**: {moment['topic']}")
-                        st.markdown(f"  - **時刻總結**: {moment['moments_summary']}")
-                        for info in moment['background_info']:
-                            st.markdown(f"    - **事實**: {info['factoid']['content']}")
-                            st.markdown(f"      - **為什麼重要**: {info['why']}")
+            #        key_moments = arguments_data['key_moments']
+            #        st.markdown("\n### Key Moments")
+            #        for moment in key_moments:
+            #            st.markdown(f"- **主題**: {moment['topic']}")
+            #            st.markdown(f"  - **時刻總結**: {moment['moments_summary']}")
+            #            for info in moment['background_info']:
+            #                st.markdown(f"    - **事實**: {info['factoid']['content']}")
+            #                st.markdown(f"      - **為什麼重要**: {info['why']}")
 
                     # 提取 Insightful Quotes
-                    insightful_quotes = arguments_data['insightful_quotes']
-                    st.markdown("\n### Insightful Quotes")
-                    for quote in insightful_quotes:
-                        st.markdown(f"- **引用**: {quote['quote']['content']}")
-                        st.markdown(f"  - **講者**: {quote['speaker']}")
-                        st.markdown(f"  - **分析**: {quote['analysis']}")
+            #        insightful_quotes = arguments_data['insightful_quotes']
+            #        st.markdown("\n### Insightful Quotes")
+            #        for quote in insightful_quotes:
+            #            st.markdown(f"- **引用**: {quote['quote']['content']}")
+            #            st.markdown(f"  - **講者**: {quote['speaker']}")
+            #            st.markdown(f"  - **分析**: {quote['analysis']}")
 
                     # 提取 Overall Summary
-                    overall_summary = arguments_data['overall_summary']
-                    st.markdown("### Overall Summary:")
-                    st.markdown(f"{overall_summary}")
+            #        overall_summary = arguments_data['overall_summary']
+            #        st.markdown("### Overall Summary:")
+            #        st.markdown(f"{overall_summary}")
 
                     # 提取 Next Steps
-                    next_steps = arguments_data['next_steps']
-                    st.markdown("\n### Next Steps")
+            #        next_steps = arguments_data['next_steps']
+            #        st.markdown("\n### Next Steps")
                     
-                    for step in next_steps:
-                        st.markdown(f"- {step}")
+            #        for step in next_steps:
+            #            st.markdown(f"- {step}")
 
                     # 提取 Other Stuff
-                    other_stuff = arguments_data['other_stuff']
-                    st.markdown("\n### Other Stuff")
-                    for item in other_stuff:
-                        st.markdown(f"- **內容**: {item['content']}")
+            #        other_stuff = arguments_data['other_stuff']
+            #        st.markdown("\n### Other Stuff")
+            #        for item in other_stuff:
+            #            st.markdown(f"- **內容**: {item['content']}")
 
                     # 提取特定內容
-                    title = arguments_data['metadata']['title']
-                    location = arguments_data['metadata']['location']['content']
-                    duration = arguments_data['metadata']['duration']
-                    key_moments = arguments_data['key_moments']
-                    insightful_quotes = arguments_data['insightful_quotes']
-                    overall_summary = arguments_data['overall_summary']
-                    next_steps = arguments_data['next_steps']
+            #        title = arguments_data['metadata']['title']
+            #        location = arguments_data['metadata']['location']['content']
+            #        duration = arguments_data['metadata']['duration']
+            #        key_moments = arguments_data['key_moments']
+            #        insightful_quotes = arguments_data['insightful_quotes']
+            #        overall_summary = arguments_data['overall_summary']
+            #        next_steps = arguments_data['next_steps']
             
-            except Exception as e:
-                st.markdown(f"發生錯誤: {repr(e)}")
+           # except Exception as e:
+           #     st.markdown(f"發生錯誤: {repr(e)}")
 
     with tab4:
         with st.container():
