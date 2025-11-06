@@ -798,4 +798,4 @@ if prompt:
                 import traceback
                 st.code(traceback.format_exc())
 
-    st.rerun()
+    #st.rerun()
