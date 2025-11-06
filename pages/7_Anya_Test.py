@@ -90,6 +90,22 @@ def bytes_to_data_url(imgbytes: bytes) -> str:
     b64 = base64.b64encode(imgbytes).decode()
     return f"data:{mime};base64,{b64}"
 
+# --- async 包裝器：確保 coroutine 的建立與 await 在同一個事件迴圈 ---
+
+async def arouter_decide(router_agent, text: str):
+    # 單一 Router 判斷
+    return await Runner.run(router_agent, text)
+
+async def aparallel_search(search_agent, search_plan):
+    # 這裡建立與等待 coroutines 都在同一 loop 內完成
+    async def one(item):
+        return await Runner.run(
+            search_agent,
+            f"Search term: {item.query}\nReason: {item.reason}"
+        )
+    tasks = [one(item) for item in search_plan]
+    return await asyncio.gather(*tasks)
+
 # === 1.2 檔案工具：data URI（PDF/TXT/MD/JSON/CSV/DOCX/PPTX） ===
 DOC_MIME_MAP = {
     ".pdf":  "application/pdf",
@@ -664,18 +680,14 @@ if prompt:
             trimmed_messages = build_trimmed_input_messages(content_blocks)
 
             # Router 判斷是否交棒
-            router_result = run_async(Runner.run(router_agent, user_text))
+            router_result = run_async(arouter_decide(router_agent, user_text))
 
             if isinstance(router_result.final_output, WebSearchPlan):
                 # ===== 研究路徑：Planner → 並行搜尋（Agents）→ Writer（Responses + 附件） =====
                 search_plan = router_result.final_output.searches
 
                 # Step 2: 並行搜尋（回到你原本的高效率寫法）
-                search_tasks = [
-                    Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}")
-                    for item in search_plan
-                ]
-                search_results = run_async(asyncio.gather(*search_tasks))
+                search_results = run_async(aparallel_search(search_agent, search_plan))
                 summary_texts = [str(r.final_output) for r in search_results]
 
                 # 只在這一輪執行期間顯示 expander（不存歷史）——修正點1
