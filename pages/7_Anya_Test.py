@@ -11,8 +11,8 @@ from openai import OpenAI
 import os
 from pypdf import PdfReader, PdfWriter
 
-# ====== Agents SDK（Router / Planner）======
-from agents import Agent, ModelSettings, Runner, handoff, HandoffInputData, RunContextWrapper
+# ====== Agents SDK（Router / Planner / Search）======
+from agents import Agent, ModelSettings, Runner, handoff, HandoffInputData, RunContextWrapper, WebSearchTool
 from agents.extensions import handoff_filters
 try:
     from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -112,18 +112,9 @@ def file_bytes_to_data_url(filename: str, data: bytes) -> str:
 
 # === 1.3 PDF 工具：頁碼解析 / 實際切頁 ===
 def parse_page_ranges_from_text(text: str) -> list[int]:
-    """
-    從使用者訊息中解析頁碼範圍。
-    支援：
-    - 只讀第1-3頁 / 第2頁 / 第5,7,9頁
-    - pages 2-5 / page 3 / p2-4,6
-    - 2-4,6,10-12（需同句含 頁/page/p 關鍵字）
-    """
     if not text:
         return []
     pages = set()
-
-    # 範圍
     range_patterns = [
         r'第\s*(\d+)\s*[-~至到]\s*(\d+)\s*頁',
         r'(\d+)\s*[-–—]\s*(\d+)\s*頁',
@@ -136,8 +127,6 @@ def parse_page_ranges_from_text(text: str) -> list[int]:
             if a > 0 and b >= a:
                 for p in range(a, b + 1):
                     pages.add(p)
-
-    # 單頁
     single_patterns = [
         r'第\s*(\d+)\s*頁',
         r'p(?:age)?\s*(\d+)',
@@ -147,19 +136,15 @@ def parse_page_ranges_from_text(text: str) -> list[int]:
             p = int(m.group(1))
             if p > 0:
                 pages.add(p)
-
-    # 逗號分隔數字（需同行含頁/page/p）
     if re.search(r'(頁|page|pages|p[^\w])', text, flags=re.IGNORECASE):
         for m in re.finditer(r'(?<!\d)(\d+)(?:\s*,\s*(\d+))+', text):
             nums = [int(x) for x in m.group(0).split(",") if x.strip().isdigit()]
             for n in nums:
                 if n > 0:
                     pages.add(n)
-
     return sorted(pages)
 
 def slice_pdf_bytes(pdf_bytes: bytes, keep_pages_1based: list[int]) -> bytes:
-    """依 1-based 頁碼取出頁面，回傳新的 PDF bytes；若 keep_pages 為空則原封不動"""
     if not keep_pages_1based:
         return pdf_bytes
     reader = PdfReader(BytesIO(pdf_bytes))
@@ -185,19 +170,12 @@ def dedup_by(items, key):
     return out
 
 def parse_response_text_and_citations(resp):
-    """
-    回傳 (text, url_citations, file_citations)
-    url_citations: [{title, url}]
-    file_citations: [{filename, file_id}]
-    """
     text_parts = []
     url_cits = []
     file_cits = []
-
     text_attr = getattr(resp, "output_text", None)
     if text_attr:
         text_parts.append(text_attr)
-
     try:
         for item in getattr(resp, "output", []) or []:
             if getattr(item, "type", "") == "message":
@@ -219,7 +197,6 @@ def parse_response_text_and_citations(resp):
                                 file_cits.append({"filename": filename, "file_id": fid})
     except Exception:
         pass
-
     text = "".join(text_parts) if text_parts else ""
     url_cits = dedup_by(url_cits, "url")
     file_cits = dedup_by(file_cits, "filename") if any(c.get("filename") for c in file_cits) else dedup_by(file_cits, "file_id")
@@ -230,7 +207,7 @@ def with_handoff_prefix(text: str) -> str:
     pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
     return f"{pref}\n{text}" if pref else text
 
-# === 1.5 Planner / Router（Agents） ===
+# === 1.5 Planner / Router / Search（Agents） ===
 class WebSearchItem(BaseModel):
     reason: str
     query: str
@@ -250,13 +227,11 @@ class PlannerHandoffInput(BaseModel):
 # 交棒時歷史過濾：清工具呼叫、保留最後 K 則，保住最後一輪附件
 def research_handoff_message_filter(handoff_message_data: HandoffInputData) -> HandoffInputData:
     if is_gpt_5_default():
-        # gpt-5 預設不大改歷史，保持穩定
         return HandoffInputData(
             input_history=handoff_message_data.input_history,
             pre_handoff_items=tuple(handoff_message_data.pre_handoff_items),
             new_items=tuple(handoff_message_data.new_items),
         )
-
     filtered = handoff_filters.remove_all_tools(handoff_message_data)
     history = filtered.input_history
     if isinstance(history, tuple):
@@ -268,7 +243,7 @@ def research_handoff_message_filter(handoff_message_data: HandoffInputData) -> H
         new_items=tuple(filtered.new_items),
     )
 
-# on_handoff：記錄交棒事件（可視需求擴充）
+# on_handoff：記錄交棒事件
 async def on_research_handoff(ctx: RunContextWrapper[None], input_data: PlannerHandoffInput):
     print(f"[handoff] research query: {input_data.query} | len_pref={input_data.target_length} | need_sources={input_data.need_sources}")
 
@@ -285,6 +260,22 @@ planner_agent = Agent(
     model="gpt-5",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
+)
+
+# Search Agent（用于並行搜尋）
+search_INSTRUCTIONS = with_handoff_prefix(
+    "You are a research assistant. Given a search term, you search the web for that term and "
+    "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 words. "
+    "Capture the main points. Write succinctly, ignore fluff. Only the summary text.\n"
+    "請務必以正體中文回應，並遵循台灣用語習慣。"
+)
+
+search_agent = Agent(
+    name="SearchAgent",
+    model="gpt-4.1",
+    instructions=search_INSTRUCTIONS,
+    tools=[WebSearchTool()],
+    model_settings=ModelSettings(tool_choice="required"),
 )
 
 # Router Agent（只做分流）
@@ -315,8 +306,8 @@ ROUTER_PROMPT = with_handoff_prefix("""
 router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
-    model="gpt-5-mini",
-    tools=[],  # 重要：Router 不掛搜尋工具，避免與交棒競爭
+    model="gpt-5",
+    tools=[],  # 重要：Router 不掛搜尋工具
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
         verbosity="medium",
@@ -333,12 +324,7 @@ router_agent = Agent(
     ]
 )
 
-# === 1.6 研究路徑：Responses Search/Writer（保留附件能力） ===
-PLANNER_INPUT_FOR_SEARCH = (
-    "You are a research assistant. Use web search for the given term and produce a concise 2–3 paragraph summary "
-    "(<300 words). Capture key facts, names, dates, numbers. Ignore fluff. Only return the summary text."
-)
-
+# === 1.6 Writer（Responses，保留附件能力） ===
 WRITER_PROMPT = (
     "你是一位資深研究員，請針對原始問題與初步搜尋摘要，撰寫完整中文報告。"
     "輸出 JSON（僅限 JSON）：short_summary（2-3句）、markdown_report（至少1000字、Markdown格式）、"
@@ -355,21 +341,6 @@ def try_load_json(text: str, fallback=None):
         return json.loads(text)
     except Exception:
         return fallback
-
-def run_search_summaries(client: OpenAI, searches: list[WebSearchItem]):
-    out = []
-    for it in searches:
-        resp = client.responses.create(
-            model="gpt-4.1",
-            input=[{"role": "user", "content": [
-                {"type": "input_text", "text": f"{PLANNER_INPUT_FOR_SEARCH}\n\nSearch term: {it.query}\nReason: {it.reason}"}
-            ]}],
-            tools=[{"type": "web_search"}],
-            tool_choice="auto",
-        )
-        text, url_cits, _ = parse_response_text_and_citations(resp)
-        out.append({"query": it.query, "reason": it.reason, "summary": text, "citations": url_cits or []})
-    return out
 
 def run_writer(client: OpenAI, trimmed_messages: list, original_query: str, search_results: list[dict]):
     combined = "\n\n".join([f"- {r['query']}\n{r['summary']}" for r in search_results])
@@ -562,8 +533,6 @@ def build_trimmed_input_messages(pending_user_content_blocks):
     hist = st.session_state.chat_history
     if not hist:
         return [{"role": "user", "content": pending_user_content_blocks}]
-
-    # 找到最近 N 個「使用者回合」起點
     user_count = 0
     start_idx = 0
     for i in range(len(hist) - 1, -1, -1):
@@ -573,8 +542,6 @@ def build_trimmed_input_messages(pending_user_content_blocks):
                 start_idx = i
                 break
     selected = hist[start_idx:]
-
-    # 僅保留文字歷史，且只讓「最後一輪使用者回合」帶圖片
     messages = []
     last_user_idx = max([i for i, m in enumerate(selected) if m.get("role") == "user"], default=-1)
     for i, msg in enumerate(selected):
@@ -595,8 +562,6 @@ def build_trimmed_input_messages(pending_user_content_blocks):
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": msg["text"]}]
                 })
-
-    # 加上「這一輪」使用者輸入（含文字/圖片/文件）
     messages.append({"role": "user", "content": pending_user_content_blocks})
     return messages
 
@@ -614,9 +579,9 @@ for msg in st.session_state.chat_history:
 
 # === 7. 使用者輸入（支援圖片 + PDF/文件） ===
 prompt = st.chat_input(
-    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
+    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～（可在訊息中寫『只讀第1-3頁』）",
     accept_file="multiple",
-    file_type=["jpg","jpeg","png","webp","gif","pdf"]
+    file_type=["jpg","jpeg","png","webp","gif","pdf","txt","md","json","csv","docx","pptx"]
 )
 
 # === 8. 主流程：Router 分流 + 兩條路徑 ===
@@ -626,7 +591,6 @@ if prompt:
     docs_for_history = []
     content_blocks = []
 
-    # 解析「只讀指定頁」：從使用者文字自動抓頁碼（PDF 才會用到）
     keep_pages = parse_page_ranges_from_text(user_text)
 
     if user_text:
@@ -643,7 +607,6 @@ if prompt:
             st.warning(f"檔案過大（{name} > 48MB），先不送出喔～請拆小再試 🙏")
             continue
 
-        # 圖片
         if name.lower().endswith((".jpg",".jpeg",".png",".webp",".gif")):
             thumb = make_thumb(data)
             images_for_history.append((name, thumb, data))
@@ -651,11 +614,8 @@ if prompt:
             content_blocks.append({"type": "input_image", "image_url": data_url})
             continue
 
-        # 文件（含 PDF）
         is_pdf = name.lower().endswith(".pdf")
         original_pdf = data
-
-        # 只讀指定頁：若使用者有指定頁碼→實際切頁（僅 PDF）
         if is_pdf and keep_pages:
             try:
                 data = slice_pdf_bytes(data, keep_pages)
@@ -664,10 +624,7 @@ if prompt:
                 st.warning(f"切頁失敗，改送整本：{name}（{e}）")
                 data = original_pdf
 
-        # 顯示於歷史
         docs_for_history.append(name)
-
-        # 送文件給模型（以 data URI 附件）
         file_data_uri = file_bytes_to_data_url(name, data)
         content_blocks.append({
             "type": "input_file",
@@ -675,14 +632,13 @@ if prompt:
             "file_data": file_data_uri
         })
 
-    # 若有指定頁碼，附上提醒（實際檔案已被切頁）
     if keep_pages:
         content_blocks.append({
             "type": "input_text",
             "text": f"請僅根據提供的頁面內容作答（頁碼：{keep_pages}）。若需要其他頁資訊，請先提出需要的頁碼建議。"
         })
 
-    # 立刻顯示「使用者泡泡」（修正：避免等到 AI 完整回覆才出現）
+    # 立即顯示使用者泡泡
     with st.chat_message("user"):
         if user_text:
             st.markdown(user_text)
@@ -693,7 +649,7 @@ if prompt:
             for fn in docs_for_history:
                 st.caption(f"📎 {fn}")
 
-    # 寫入歷史（顯示用，供 rerun 後重現）
+    # 寫入歷史（供之後 rerun 顯示）
     st.session_state.chat_history.append({
         "role": "user",
         "text": user_text,
@@ -705,37 +661,40 @@ if prompt:
         placeholder = st.empty()
         sources_container = st.container()
         try:
-            # 8.1 構建帶附件的歷史（供一般分支與 Writer）
             trimmed_messages = build_trimmed_input_messages(content_blocks)
 
-            # 8.2 Router 只用文字判斷是否交棒（不掛搜尋工具）
+            # Router 判斷是否交棒
             router_result = run_async(Runner.run(router_agent, user_text))
 
             if isinstance(router_result.final_output, WebSearchPlan):
-                # ===== 研究路徑：Planner → 搜尋摘要（Responses）→ Writer（Responses + 附件） =====
-
+                # ===== 研究路徑：Planner → 並行搜尋（Agents）→ Writer（Responses + 附件） =====
                 search_plan = router_result.final_output.searches
 
-                # 準備計畫與摘要（不在外層輸出，統一放進 expander）
-                plan_md_lines = []
-                for idx, item in enumerate(search_plan):
-                    plan_md_lines.append(f"**{idx+1}. {item.query}**\n> {item.reason}")
+                # Step 2: 並行搜尋（回到你原本的高效率寫法）
+                search_tasks = [
+                    Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}")
+                    for item in search_plan
+                ]
+                search_results = run_async(asyncio.gather(*search_tasks))
+                summary_texts = [str(r.final_output) for r in search_results]
 
-                # 並行或序列搜尋摘要（這裡用序列，穩定）
-                summaries = run_search_summaries(client, search_plan)
-
-                # 全程包在單一 expander（修正點2）
-                with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
+                # 只在這一輪執行期間顯示 expander（不存歷史）——修正點1
+                with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=False):
                     st.markdown("### 搜尋規劃")
-                    for line in plan_md_lines:
-                        st.markdown(line)
+                    for idx, item in enumerate(search_plan):
+                        st.markdown(f"**{idx+1}. {item.query}**\n> {item.reason}")
                     st.markdown("### 各項搜尋摘要")
-                    for it in summaries:
-                        st.markdown(f"**{it['query']}**\n{it['summary']}")
+                    for idx, summary in enumerate(summary_texts):
+                        st.markdown(f"**{search_plan[idx].query}**\n{summary}")
 
-                # Writer（帶上本回合附件上下文）
+                # 整理給 Writer 的輸入
+                search_for_writer = [
+                    {"query": search_plan[i].query, "summary": summary_texts[i]}
+                    for i in range(len(search_plan))
+                ]
+
                 writer_data, writer_url_cits, writer_file_cits = run_writer(
-                    client, trimmed_messages, user_text, summaries
+                    client, trimmed_messages, user_text, search_for_writer
                 )
 
                 st.markdown("### 📋 Executive Summary")
@@ -748,17 +707,12 @@ if prompt:
                 for q in writer_data.get("follow_up_questions", []) or []:
                     st.markdown(f"- {q}")
 
-                # 彙整來源
-                all_url_cits = []
-                for it in summaries:
-                    all_url_cits.extend(it.get("citations", []) or [])
-                all_url_cits.extend(writer_url_cits or [])
-
+                # 顯示來源（Writer 階段）
                 with sources_container:
-                    if all_url_cits:
+                    if writer_url_cits:
                         st.markdown("**來源**")
                         seen = set()
-                        for c in all_url_cits:
+                        for c in writer_url_cits:
                             url = c.get("url")
                             if url and url not in seen:
                                 seen.add(url)
@@ -774,13 +728,8 @@ if prompt:
                         for fn in docs_for_history:
                             st.markdown(f"- {fn}")
 
-                # 存入歷史（完整回覆）
-                plan_md_saved = "### 🔎 搜尋規劃\n" + "\n".join(plan_md_lines)
-                summary_md_saved = "### 📝 各項搜尋摘要\n" + "\n\n".join([f"**{it['query']}**\n{it['summary']}" for it in summaries])
-
+                # 存入歷史：只保存「報告內容」，不包含規劃與摘要——修正點1
                 ai_reply = (
-                    plan_md_saved + "\n\n" +
-                    summary_md_saved + "\n\n" +
                     "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
                     "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
                     "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
