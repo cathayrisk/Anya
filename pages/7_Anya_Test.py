@@ -116,35 +116,59 @@ async def aparallel_search(search_agent, search_plan):
     return await asyncio.gather(*tasks)
 
 # 新增：並行搜尋＋即時顯示（完成序「類串流」）
-async def aparallel_search_stream(search_agent, search_plan, body_placeholders, per_task_timeout=90):
+async def aparallel_search_stream(
+    search_agent,
+    search_plan,
+    body_placeholders,
+    per_task_timeout=90,
+    max_concurrency=4,
+    retries=1,
+    retry_delay=1.0,
+):
     """
-    並行執行每條搜尋，哪條先完成就先更新對應區塊。
-    - 不再用 task 物件做對照，直接讓任務回傳 (idx, result)。
-    - 加入 per_task_timeout（秒）避免個別任務卡死。
-    - 失敗時在對應區塊顯示錯誤訊息，不影響其他任務。
+    並行搜尋（完成即顯示）穩定版：
+    - 併發上限：max_concurrency，避免一次開太多請求
+    - 單條超時：per_task_timeout（秒）
+    - 重試：retries 次數 + 指數退避 retry_delay
+    - 每條完成後即更新對應 placeholder；失敗只影響該條
     """
-    async def one(idx, item):
-        try:
-            # 執行搜尋（必要時可在這裡先寫一行說明「即將呼叫搜尋」再交由 agent）
-            coro = Runner.run(
-                search_agent,
-                f"Search term: {item.query}\nReason: {item.reason}"
-            )
-            res = await asyncio.wait_for(coro, timeout=per_task_timeout)
-            return idx, res, None
-        except Exception as e:
-            return idx, None, e
+    import asyncio
 
-    # 建立所有任務（每個任務會回傳 (idx, res, err)）
-    tasks = [asyncio.create_task(one(idx, item)) for idx, item in enumerate(search_plan)]
-    results = [None] * len(search_plan)
-
-    # 防呆：placeholder 長度不夠就補齊
+    # 防呆：placeholder 長度不夠就補齊（不新建 UI，只避免 IndexError）
     if len(body_placeholders) < len(search_plan):
-        # 不在這裡新建 UI；這個防呆只是避免 IndexError
         body_placeholders = body_placeholders + [None] * (len(search_plan) - len(body_placeholders))
 
-    # 逐個完成就更新對應 placeholder
+    # 先放上「搜尋中…」提示，避免空白
+    for ph in body_placeholders:
+        if ph is not None:
+            try:
+                ph.markdown(":blue[搜尋中…]")
+            except Exception:
+                pass
+
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def run_one(idx, item):
+        attempt = 0
+        while True:
+            try:
+                async with sem:
+                    coro = Runner.run(
+                        search_agent,
+                        f"Search term: {item.query}\nReason: {item.reason}"
+                    )
+                    res = await asyncio.wait_for(coro, timeout=per_task_timeout)
+                return idx, res, None
+            except Exception as e:
+                attempt += 1
+                if attempt <= retries:
+                    await asyncio.sleep(retry_delay * (2 ** (attempt - 1)))
+                    continue
+                return idx, None, e
+
+    tasks = [asyncio.create_task(run_one(i, it)) for i, it in enumerate(search_plan)]
+    results = [None] * len(search_plan)
+
     for fut in asyncio.as_completed(tasks):
         idx, res, err = await fut
         results[idx] = res if err is None else err
@@ -154,10 +178,9 @@ async def aparallel_search_stream(search_agent, search_plan, body_placeholders, 
                 if err is not None:
                     ph.markdown(f":red[搜尋失敗]：{err}")
                 else:
-                    txt = str(getattr(res, "final_output", "") or res or "")
-                    ph.markdown(txt if txt else "（沒有產出摘要）")
+                    text = str(getattr(res, "final_output", "") or res or "")
+                    ph.markdown(text if text else "（沒有產出摘要）")
             except Exception:
-                # UI 更新失敗時，忽略避免中斷其他任務
                 pass
 
     return results
