@@ -301,15 +301,19 @@ FRONT_ROUTER_PROMPT = (
     "決策必須在第一步完成；若呼叫工具，嚴禁輸出其他內容。回覆語言使用繁體中文。"
 )
 
-def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_text: str, max_tokens=1200):
+def run_front_router_stream(client, content_blocks, placeholder, user_text: str, max_tokens=12000):
     """
     gpt-4.1 串流作為前置 Router：
     - 若適合快速回答：直接串流文本，回傳 {"kind":"fast","text":...}
     - 若需升級：第一步改呼叫工具，回傳 {"kind":"general","args":{...}} 或 {"kind":"research","args":{...}}
     - 若不確定：預設升級到 general，帶上原 query
     """
+    import json
+
     buffer = ""
     first_decision = None  # "text" or "tool"
+    saw_tool = False
+    final = None
 
     input_items = [{"role": "user", "content": content_blocks}]
 
@@ -325,33 +329,53 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
         max_output_tokens=max_tokens,
         service_tier="priority",
     ) as stream:
-        for event in stream:
-            et = getattr(event, "type", "")
-            # 文字流（第一個文字 delta → fast）
-            if et == "response.output_text.delta":
-                if first_decision is None:
-                    first_decision = "text"
-                delta = getattr(event, "delta", "")
-                if delta:
-                    buffer += delta
-                    placeholder.markdown(buffer)
-            # 工具呼叫
-            elif et.startswith("response.tool_call") or et.startswith("response.function_call"):
-                if first_decision is None:
-                    first_decision = "tool"
-                break
+        try:
+            for event in stream:
+                et = getattr(event, "type", "")
 
-        final = stream.get_final_response()
+                # 文字流（第一個文字 delta 出現才判定為 fast）
+                if et == "response.output_text.delta":
+                    # 若尚未決策且尚未看到工具，就視為文字路徑
+                    if first_decision is None and not saw_tool:
+                        first_decision = "text"
+                    if first_decision == "text":
+                        delta = getattr(event, "delta", "")
+                        if delta:
+                            buffer += delta
+                            placeholder.markdown(buffer)
+
+                # 工具呼叫（不要 break，繼續把事件讀到結束）
+                elif et.startswith("response.tool_call") or et.startswith("response.function_call"):
+                    saw_tool = True
+                    if first_decision is None:
+                        first_decision = "tool"
+                    # 不輸出任何文字，持續 drain 直到 completed
+
+                # 其他事件一律忽略，但保持 drain 到 completed
+                else:
+                    pass
+
+            # 事件讀到結束後再拿最終回應
+            final = stream.get_final_response()
+
+        except RuntimeError as e:
+            # 若因為尚未收到 completed 而出錯，補一次 until_done 再拿 final
+            try:
+                stream.until_done()
+                final = stream.get_final_response()
+            except Exception:
+                # 還是失敗就拋回去，讓上層顯示錯誤
+                raise e
 
     if first_decision == "text":
         return {"kind": "fast", "text": buffer}
 
-    # 解析工具呼叫
+    # 解析工具名稱與參數（從最終回應）
     tool_name, tool_args = None, {}
     try:
         for item in getattr(final, "output", []) or []:
             itype = getattr(item, "type", "")
-            if itype in ("tool_call", "function_call") or itype.endswith("_call"):
+            if itype in ("tool_call", "function_call") or itype.startswith("response.") or itype.endswith("_call"):
                 tool_name = getattr(item, "name", None) or getattr(item, "tool_name", None)
                 raw_args = getattr(item, "arguments", None) or getattr(item, "args", None)
                 if isinstance(raw_args, str):
@@ -371,6 +395,7 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
     if tool_name == "escalate_to_research":
         return {"kind": "research", "args": tool_args or {}}
 
+    # 不確定就保守升級到 general
     return {"kind": "general", "args": {"reason": "uncertain", "query": user_text, "need_web": True}}
 
 # === 1.5 Planner / Router / Search（Agents） ===
