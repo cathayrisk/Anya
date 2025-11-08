@@ -97,7 +97,7 @@ async def arouter_decide(router_agent, text: str):
     return await Runner.run(router_agent, text)
 
 async def aparallel_search(search_agent, search_plan):
-    # 這裡建立與等待 coroutines 都在同一 loop 內完成
+    # 建立與等待 coroutines 都在同一 loop 內完成
     async def one(item):
         return await Runner.run(
             search_agent,
@@ -323,7 +323,7 @@ router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
     model="gpt-5",
-    tools=[],  # 重要：Router 不掛搜尋工具
+    tools=[],  # Router 不掛搜尋工具
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
         verbosity="medium",
@@ -377,6 +377,24 @@ if "chat_history" not in st.session_state:
         "images": [],
         "docs": []
     }]
+
+# 研究面板持久化（避免 rerun 消失；下次送出訊息才關閉）
+if "research_panel" not in st.session_state:
+    st.session_state.research_panel = None
+if "show_research_panel" not in st.session_state:
+    st.session_state.show_research_panel = False
+
+def render_research_panel():
+    rp = st.session_state.get("research_panel")
+    if not (st.session_state.get("show_research_panel") and rp):
+        return
+    with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
+        st.markdown("### 搜尋規劃")
+        for i, item in enumerate(rp.get("plan", [])):
+            st.markdown(f"**{i+1}. {item['query']}**\n> {item['reason']}")
+        st.markdown("### 各項搜尋摘要")
+        for it in rp.get("summaries", []):
+            st.markdown(f"**{it['query']}**\n{it['summary']}")
 
 # === 3. OpenAI client（.streamlit/secrets.toml: OPENAI_KEY） ===
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
@@ -590,8 +608,11 @@ for msg in st.session_state.chat_history:
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
         if msg.get("docs"):
-            for fn in msg["docs"]:
+            for fn in msg.get("docs", []):
                 st.caption(f"📎 {fn}")
+
+# 歷史訊息顯示完，若有暫存的研究面板就顯示（跨 rerun 仍存在）
+render_research_panel()
 
 # === 7. 使用者輸入（支援圖片 + PDF/文件） ===
 prompt = st.chat_input(
@@ -602,6 +623,10 @@ prompt = st.chat_input(
 
 # === 8. 主流程：Router 分流 + 兩條路徑 ===
 if prompt:
+    # 新一輪使用者訊息送出 → 關閉上一輪的搜尋規劃面板（下次送出才消失）
+    if st.session_state.get("show_research_panel"):
+        st.session_state.show_research_panel = False
+
     user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
     images_for_history = []
     docs_for_history = []
@@ -686,18 +711,20 @@ if prompt:
                 # ===== 研究路徑：Planner → 並行搜尋（Agents）→ Writer（Responses + 附件） =====
                 search_plan = router_result.final_output.searches
 
-                # Step 2: 並行搜尋（回到你原本的高效率寫法）
+                # 並行搜尋
                 search_results = run_async(aparallel_search(search_agent, search_plan))
                 summary_texts = [str(r.final_output) for r in search_results]
 
-                # 只在這一輪執行期間顯示 expander（不存歷史）——修正點1
-                with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=False):
-                    st.markdown("### 搜尋規劃")
-                    for idx, item in enumerate(search_plan):
-                        st.markdown(f"**{idx+1}. {item.query}**\n> {item.reason}")
-                    st.markdown("### 各項搜尋摘要")
-                    for idx, summary in enumerate(summary_texts):
-                        st.markdown(f"**{search_plan[idx].query}**\n{summary}")
+                # 存成持久面板，並立刻渲染（直到下一次送出訊息才關閉）
+                st.session_state.research_panel = {
+                    "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
+                    "summaries": [
+                        {"query": search_plan[i].query, "summary": summary_texts[i]}
+                        for i in range(len(search_plan))
+                    ]
+                }
+                st.session_state.show_research_panel = True
+                render_research_panel()
 
                 # 整理給 Writer 的輸入
                 search_for_writer = [
@@ -740,7 +767,7 @@ if prompt:
                         for fn in docs_for_history:
                             st.markdown(f"- {fn}")
 
-                # 存入歷史：只保存「報告內容」，不包含規劃與摘要——修正點1
+                # 存入歷史：只保存「報告內容」，不包含規劃與摘要（規劃/摘要用面板呈現）
                 ai_reply = (
                     "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
                     "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
@@ -798,4 +825,6 @@ if prompt:
                 import traceback
                 st.code(traceback.format_exc())
 
-    #st.rerun()
+# 重要：移除強制 st.rerun()，避免回覆/面板顯示後立刻消失
+# （Streamlit 本身會在 chat_input 送出時自動 rerun）
+# st.rerun()
