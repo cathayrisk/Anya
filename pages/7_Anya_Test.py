@@ -546,7 +546,7 @@ https://example.com/2
 我們仍然維持「買進」評等。
 """
 
-def run_front_router_stream(client: OpenAI, input_messages: list, placeholder, user_text: str, max_tokens=1200):
+def run_front_router_stream(client: OpenAI, input_messages: list, placeholder, user_text: str):
     """
     gpt-4.1 串流作為前置 Router（吃 trimmed_messages）：
     - 若適合快速回答：直接串流文本，回傳 {"kind":"fast","text":...}
@@ -568,7 +568,6 @@ def run_front_router_stream(client: OpenAI, input_messages: list, placeholder, u
         parallel_tool_calls=False,
         max_tool_calls=1,
         temperature=0.2,
-        max_output_tokens=max_tokens,
         service_tier="priority",
     ) as stream:
         try:
@@ -995,7 +994,7 @@ if prompt:
 
         try:
             with status_area:
-                with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=True) as status:
+                with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=False) as status:
                     placeholder = output_area.empty()
 
                     # 使用共用短期記憶的 Router 串流
@@ -1015,7 +1014,7 @@ if prompt:
                         st.stop()
 
                     if fr_result["kind"] == "general":
-                        status.update(label="↗️ 切換到深度回答（gpt‑5）", state="running", expanded=True)
+                        status.update(label="↗️ 切換到深度回答（gpt‑5）", state="running", expanded=False)
                         need_web = bool(fr_result.get("args", {}).get("need_web"))
                         resp = client.responses.create(
                             model="gpt-5",
