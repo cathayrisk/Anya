@@ -27,6 +27,17 @@ from typing import Literal, Optional, List
 TRIM_LAST_N_USER_TURNS = 8                 # 降低歷史回合，省 token
 MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024     # 單次請求總量預警（48MB）
 
+# === 0.1 統一取得 OpenAI API Key 並同步到環境變數（給 Agents SDK 用） ===
+OPENAI_API_KEY = (
+    st.secrets.get("OPENAI_API_KEY")
+    or st.secrets.get("OPENAI_KEY")
+    or os.getenv("OPENAI_API_KEY")
+)
+if not OPENAI_API_KEY:
+    st.error("找不到 OpenAI API Key，請在 .streamlit/secrets.toml 設定 OPENAI_API_KEY 或 OPENAI_KEY。")
+    st.stop()
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # 讓 Agents SDK 可以讀到
+
 # === 1. 設定 Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent (Router + multimodal)", page_icon="🥜", layout="wide")
 st.title("Anya Multimodal Agent（Router 分流 + 看圖讀PDF）")
@@ -396,8 +407,9 @@ def render_research_panel():
         for it in rp.get("summaries", []):
             st.markdown(f"**{it['query']}**\n{it['summary']}")
 
-# === 3. OpenAI client（.streamlit/secrets.toml: OPENAI_KEY） ===
-client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
+# === 3. OpenAI client（使用統一的 OPENAI_API_KEY） ===
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # === 4. 系統提示（一般分支使用 Responses API） ===
 ANYA_SYSTEM_PROMPT = """
@@ -818,13 +830,7 @@ if prompt:
                 })
 
         except Exception as e:
+            # 安全錯誤處理：避免存取 e.response
             placeholder.markdown(f"API 發生錯誤：{e}")
-            try:
-                st.code(e.response.json(), language="json")
-            except Exception:
-                import traceback
-                st.code(traceback.format_exc())
-
-# 重要：移除強制 st.rerun()，避免回覆/面板顯示後立刻消失
-# （Streamlit 本身會在 chat_input 送出時自動 rerun）
-# st.rerun()
+            import traceback
+            st.code(traceback.format_exc())
