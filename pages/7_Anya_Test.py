@@ -45,7 +45,7 @@ st.caption("研究/寫報告/文獻回顧 → Router 交棒規劃；一般對話
 
 # === 共用：假串流打字效果（集中定義，避免重複） ===
 def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
-    buf = "🌸"
+    buf = ""
     for i in range(0, len(text), step_chars):
         buf = text[: i + step_chars]
         placeholder.markdown(buf)
@@ -102,13 +102,10 @@ def bytes_to_data_url(imgbytes: bytes) -> str:
     return f"data:{mime};base64,{b64}"
 
 # --- async 包裝器：確保 coroutine 的建立與 await 在同一個事件迴圈 ---
-
 async def arouter_decide(router_agent, text: str):
-    # 單一 Router 判斷
     return await Runner.run(router_agent, text)
 
 async def aparallel_search(search_agent, search_plan):
-    # 建立與等待 coroutines 都在同一 loop 內完成
     async def one(item):
         return await Runner.run(
             search_agent,
@@ -290,7 +287,6 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
 
     input_items = [{"role": "user", "content": content_blocks}]
 
-    # 使用 .stream(...)：不要再傳 stream=True
     with client.responses.stream(
         model="gpt-4.1",
         input=input_items,
@@ -305,8 +301,7 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
     ) as stream:
         for event in stream:
             et = getattr(event, "type", "")
-
-            # 文字流（第一個文字 delta 出現就判定為 fast）
+            # 文字流
             if et == "response.output_text.delta":
                 if first_decision is None:
                     first_decision = "text"
@@ -314,26 +309,22 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
                 if delta:
                     buffer += delta
                     placeholder.markdown(buffer)
-
-            # 工具呼叫（寬鬆比對不同 SDK 事件名稱）
+            # 工具呼叫
             elif et.startswith("response.tool_call") or et.startswith("response.function_call"):
                 if first_decision is None:
                     first_decision = "tool"
-                # 第一時間偵測到工具就中斷事件迴圈，改用最終回應解析工具
                 break
 
-        # 取得最終回應物件（含工具呼叫與完整結構）
         final = stream.get_final_response()
 
     if first_decision == "text":
         return {"kind": "fast", "text": buffer}
 
-    # 解析工具名稱與參數（從最終回應）
+    # 解析工具呼叫
     tool_name, tool_args = None, {}
     try:
         for item in getattr(final, "output", []) or []:
             itype = getattr(item, "type", "")
-            # 兼容多種型別命名
             if itype in ("tool_call", "function_call") or itype.endswith("_call"):
                 tool_name = getattr(item, "name", None) or getattr(item, "tool_name", None)
                 raw_args = getattr(item, "arguments", None) or getattr(item, "args", None)
@@ -365,7 +356,6 @@ class WebSearchItem(BaseModel):
 class WebSearchPlan(BaseModel):
     searches: list[WebSearchItem]
 
-# 交棒輸入（結構化）
 class PlannerHandoffInput(BaseModel):
     query: str
     need_sources: bool = True
@@ -374,7 +364,6 @@ class PlannerHandoffInput(BaseModel):
     domains: List[str] = []
     languages: List[str] = ["zh-TW"]
 
-# 交棒時歷史過濾：清工具呼叫、保留最後 K 則，保住最後一輪附件
 def research_handoff_message_filter(handoff_message_data: HandoffInputData) -> HandoffInputData:
     if is_gpt_5_default():
         return HandoffInputData(
@@ -393,11 +382,9 @@ def research_handoff_message_filter(handoff_message_data: HandoffInputData) -> H
         new_items=tuple(filtered.new_items),
     )
 
-# on_handoff：記錄交棒事件
 async def on_research_handoff(ctx: RunContextWrapper[None], input_data: PlannerHandoffInput):
     print(f"[handoff] research query: {input_data.query} | len_pref={input_data.target_length} | need_sources={input_data.need_sources}")
 
-# Planner Agent
 planner_agent_PROMPT = with_handoff_prefix(
     "You are a helpful research planner. Given a query, come up with a set of web searches "
     "to perform to best answer the query. Output between 5 and 20 terms to query for.\n"
@@ -412,7 +399,6 @@ planner_agent = Agent(
     output_type=WebSearchPlan,
 )
 
-# Search Agent（用于並行搜尋）
 search_INSTRUCTIONS = with_handoff_prefix(
     "You are a research assistant. Given a search term, you search the web for that term and "
     "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 words. "
@@ -428,7 +414,6 @@ search_agent = Agent(
     model_settings=ModelSettings(tool_choice="required"),
 )
 
-# Router Agent（只做分流） - 備援用
 ROUTER_PROMPT = with_handoff_prefix("""
 你是一個判斷助理，負責決定是否把問題交給「研究規劃助理」。
 
@@ -443,7 +428,7 @@ router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
     model="gpt-5",
-    tools=[],  # Router 不掛搜尋工具
+    tools=[],
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
         verbosity="medium",
@@ -498,7 +483,6 @@ if "chat_history" not in st.session_state:
         "docs": []
     }]
 
-# 研究面板持久化（避免 rerun 消失；下次送出訊息才關閉）
 if "research_panel" not in st.session_state:
     st.session_state.research_panel = None
 if "show_research_panel" not in st.session_state:
@@ -818,250 +802,262 @@ if prompt:
         "docs": docs_for_history
     })
 
+    # 助理區塊（固定順序：Status 先 → 串流輸出 → 來源）
     with st.chat_message("assistant"):
-        placeholder = st.empty()
+        # 先建立三個容器：狀態在上、輸出在中、來源在下
+        status_area = st.container()
+        output_area = st.container()
         sources_container = st.container()
+
         try:
-            # 4.1 前置 Router（UI 不加按鈕，用 st.status 呈現狀態）
-            with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=False) as status:
-                fr_result = run_front_router_stream(client, content_blocks, placeholder, user_text)
+            # 先渲染狀態（確保永遠出現在最上方）
+            with status_area:
+                with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=True) as status:
+                    # 串流輸出在 status 之後建立，視覺順序固定
+                    placeholder = output_area.empty()
 
-                if fr_result["kind"] == "fast":
-                    # 快路徑完成
-                    status.update(label="⚡ 已以快速回應完成", state="complete")
-                    final_text = fr_result["text"]
-                    # 顯示本回合上傳檔案（若有）
-                    with sources_container:
-                        if docs_for_history:
-                            st.markdown("**本回合上傳檔案**")
-                            for fn in docs_for_history:
-                                st.markdown(f"- {fn}")
-                    st.session_state.chat_history.append({"role": "assistant","text": final_text,"images": [],"docs": []})
-                    st.stop()
+                    # 4.1 前置 Router
+                    fr_result = run_front_router_stream(client, content_blocks, placeholder, user_text)
 
-                # 準備歷史（一般/研究路徑會用到）
-                trimmed_messages = build_trimmed_input_messages(content_blocks)
+                    if fr_result["kind"] == "fast":
+                        status.update(label="⚡ 已以快速回應完成", state="complete", expanded=False)
+                        final_text = fr_result["text"]
+                        with sources_container:
+                            if docs_for_history:
+                                st.markdown("**本回合上傳檔案**")
+                                for fn in docs_for_history:
+                                    st.markdown(f"- {fn}")
+                        st.session_state.chat_history.append({"role": "assistant","text": final_text,"images": [],"docs": []})
+                        st.stop()
 
-                if fr_result["kind"] == "general":
-                    status.update(label="↗️ 切換到深度回答（gpt‑5）", state="running", expanded=True)
-                    need_web = bool(fr_result.get("args", {}).get("need_web"))
-                    resp = client.responses.create(
-                        model="gpt-5",
-                        input=trimmed_messages,
-                        instructions=ANYA_SYSTEM_PROMPT,
-                        tools=[{"type": "web_search"}] if need_web else [],
-                        tool_choice="auto",
-                    )
-                    ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
-                    final_text = fake_stream_markdown(ai_text, placeholder)
-                    status.update(label="✅ 深度回答完成", state="complete", expanded=False)
+                    # 準備歷史（一般/研究路徑會用到）
+                    trimmed_messages = build_trimmed_input_messages(content_blocks)
 
-                    with sources_container:
-                        if url_cits:
-                            st.markdown("**來源**")
-                            for c in url_cits:
-                                title = c.get("title") or c.get("url")
-                                url = c.get("url")
-                                st.markdown(f"- [{title}]({url})")
-                        if file_cits:
-                            st.markdown("**引用檔案**")
-                            for c in file_cits:
-                                fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
-                                st.markdown(f"- {fname}")
-                        if not file_cits and docs_for_history:
-                            st.markdown("**本回合上傳檔案**")
-                            for fn in docs_for_history:
-                                st.markdown(f"- {fn}")
+                    if fr_result["kind"] == "general":
+                        status.update(label="↗️ 切換到深度回答（gpt‑5）", state="running", expanded=True)
+                        need_web = bool(fr_result.get("args", {}).get("need_web"))
+                        resp = client.responses.create(
+                            model="gpt-5",
+                            input=trimmed_messages,
+                            instructions=ANYA_SYSTEM_PROMPT,
+                            tools=[{"type": "web_search"}] if need_web else [],
+                            tool_choice="auto",
+                        )
+                        ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
+                        final_text = fake_stream_markdown(ai_text, placeholder)
+                        status.update(label="✅ 深度回答完成", state="complete", expanded=False)
 
-                    st.session_state.chat_history.append({
-                        "role": "assistant",
-                        "text": final_text,
-                        "images": [],
-                        "docs": []
-                    })
-                    st.stop()
-
-                if fr_result["kind"] == "research":
-                    status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
-
-                    # 1) Planner（用 query 字串呼叫，最穩定相容）
-                    plan_query = fr_result["args"].get("query") or user_text
-                    plan_res = run_async(Runner.run(planner_agent, plan_query))
-                    search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
-
-                    # 2) 並行搜尋
-                    search_results = run_async(aparallel_search(search_agent, search_plan))
-                    summary_texts = [str(r.final_output) for r in search_results]
-
-                    # 研究面板
-                    st.session_state.research_panel = {
-                        "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
-                        "summaries": [{"query": search_plan[i].query, "summary": summary_texts[i]} for i in range(len(search_plan))]
-                    }
-                    st.session_state.show_research_panel = True
-                    render_research_panel()
-
-                    # 3) Writer
-                    search_for_writer = [
-                        {"query": search_plan[i].query, "summary": summary_texts[i]}
-                        for i in range(len(search_plan))
-                    ]
-                    writer_data, writer_url_cits, writer_file_cits = run_writer(
-                        client, trimmed_messages, plan_query, search_for_writer
-                    )
-
-                    st.markdown("### 📋 Executive Summary")
-                    fake_stream_markdown(writer_data.get("short_summary", ""), st.empty())
-
-                    st.markdown("### 📖 完整報告")
-                    fake_stream_markdown(writer_data.get("markdown_report", ""), st.empty())
-
-                    st.markdown("### ❓ 後續建議問題")
-                    for q in writer_data.get("follow_up_questions", []) or []:
-                        st.markdown(f"- {q}")
-
-                    with sources_container:
-                        if writer_url_cits:
-                            st.markdown("**來源**")
-                            seen = set()
-                            for c in writer_url_cits:
-                                url = c.get("url")
-                                if url and url not in seen:
-                                    seen.add(url)
-                                    title = c.get("title") or url
+                        with sources_container:
+                            if url_cits:
+                                st.markdown("**來源**")
+                                for c in url_cits:
+                                    title = c.get("title") or c.get("url")
+                                    url = c.get("url")
                                     st.markdown(f"- [{title}]({url})")
-                        if writer_file_cits:
-                            st.markdown("**引用檔案**")
-                            for c in writer_file_cits:
-                                fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
-                                st.markdown(f"- {fname}")
-                        if not writer_file_cits and docs_for_history:
-                            st.markdown("**本回合上傳檔案**")
-                            for fn in docs_for_history:
-                                st.markdown(f"- {fn}")
+                            if file_cits:
+                                st.markdown("**引用檔案**")
+                                for c in file_cits:
+                                    fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                                    st.markdown(f"- {fname}")
+                            if not file_cits and docs_for_history:
+                                st.markdown("**本回合上傳檔案**")
+                                for fn in docs_for_history:
+                                    st.markdown(f"- {fn}")
 
-                    # 存入歷史（只保存報告內容）
-                    ai_reply = (
-                        "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
-                        "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
-                        "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
-                    )
-                    st.session_state.chat_history.append({
-                        "role": "assistant",
-                        "text": ai_reply,
-                        "images": [],
-                        "docs": []
-                    })
-                    status.update(label="✅ 研究流程完成", state="complete", expanded=False)
-                    st.stop()
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "text": final_text,
+                            "images": [],
+                            "docs": []
+                        })
+                        st.stop()
 
-            # 若前置 Router 未返回任何可處理結果（極少見），退回舊 Router（備援）
-            trimmed_messages = build_trimmed_input_messages(content_blocks)
-            router_result = run_async(arouter_decide(router_agent, user_text))
+                    if fr_result["kind"] == "research":
+                        status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
 
-            if isinstance(router_result.final_output, WebSearchPlan):
-                search_plan = router_result.final_output.searches
-                search_results = run_async(aparallel_search(search_agent, search_plan))
-                summary_texts = [str(r.final_output) for r in search_results]
+                        # 1) Planner（直接以字串 query 呼叫）
+                        plan_query = fr_result["args"].get("query") or user_text
+                        plan_res = run_async(Runner.run(planner_agent, plan_query))
+                        search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
 
-                st.session_state.research_panel = {
-                    "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
-                    "summaries": [
-                        {"query": search_plan[i].query, "summary": summary_texts[i]}
-                        for i in range(len(search_plan))
-                    ]
-                }
-                st.session_state.show_research_panel = True
-                render_research_panel()
+                        # 2) 並行搜尋
+                        search_results = run_async(aparallel_search(search_agent, search_plan))
+                        summary_texts = [str(r.final_output) for r in search_results]
 
-                search_for_writer = [
-                    {"query": search_plan[i].query, "summary": summary_texts[i]}
-                    for i in range(len(search_plan))
-                ]
+                        # 研究面板（沿用你的現有 UI）
+                        st.session_state.research_panel = {
+                            "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
+                            "summaries": [{"query": search_plan[i].query, "summary": summary_texts[i]} for i in range(len(search_plan))]
+                        }
+                        st.session_state.show_research_panel = True
+                        render_research_panel()
 
-                writer_data, writer_url_cits, writer_file_cits = run_writer(
-                    client, trimmed_messages, user_text, search_for_writer
-                )
+                        # 3) Writer
+                        search_for_writer = [
+                            {"query": search_plan[i].query, "summary": summary_texts[i]}
+                            for i in range(len(search_plan))
+                        ]
+                        writer_data, writer_url_cits, writer_file_cits = run_writer(
+                            client, trimmed_messages, plan_query, search_for_writer
+                        )
 
-                st.markdown("### 📋 Executive Summary")
-                fake_stream_markdown(writer_data.get("short_summary", ""), st.empty())
+                        st.markdown("### 📋 Executive Summary")
+                        fake_stream_markdown(writer_data.get("short_summary", ""), output_area.empty())
 
-                st.markdown("### 📖 完整報告")
-                fake_stream_markdown(writer_data.get("markdown_report", ""), st.empty())
+                        st.markdown("### 📖 完整報告")
+                        fake_stream_markdown(writer_data.get("markdown_report", ""), output_area.empty())
 
-                st.markdown("### ❓ 後續建議問題")
-                for q in writer_data.get("follow_up_questions", []) or []:
-                    st.markdown(f"- {q}")
+                        st.markdown("### ❓ 後續建議問題")
+                        for q in writer_data.get("follow_up_questions", []) or []:
+                            st.markdown(f"- {q}")
 
-                with sources_container:
-                    if writer_url_cits:
-                        st.markdown("**來源**")
-                        seen = set()
-                        for c in writer_url_cits:
-                            url = c.get("url")
-                            if url and url not in seen:
-                                seen.add(url)
-                                title = c.get("title") or url
-                                st.markdown(f"- [{title}]({url})")
-                    if writer_file_cits:
-                        st.markdown("**引用檔案**")
-                        for c in writer_file_cits:
-                            fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
-                            st.markdown(f"- {fname}")
-                    if not writer_file_cits and docs_for_history:
-                        st.markdown("**本回合上傳檔案**")
-                        for fn in docs_for_history:
-                            st.markdown(f"- {fn}")
+                        with sources_container:
+                            if writer_url_cits:
+                                st.markdown("**來源**")
+                                seen = set()
+                                for c in writer_url_cits:
+                                    url = c.get("url")
+                                    if url and url not in seen:
+                                        seen.add(url)
+                                        title = c.get("title") or url
+                                        st.markdown(f"- [{title}]({url})")
+                            if writer_file_cits:
+                                st.markdown("**引用檔案**")
+                                for c in writer_file_cits:
+                                    fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                                    st.markdown(f"- {fname}")
+                            if not writer_file_cits and docs_for_history:
+                                st.markdown("**本回合上傳檔案**")
+                                for fn in docs_for_history:
+                                    st.markdown(f"- {fn}")
 
-                ai_reply = (
-                    "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
-                    "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
-                    "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
-                )
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "text": ai_reply,
-                    "images": [],
-                    "docs": []
-                })
+                        # 存入歷史
+                        ai_reply = (
+                            "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
+                            "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
+                            "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
+                        )
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "text": ai_reply,
+                            "images": [],
+                            "docs": []
+                        })
+                        status.update(label="✅ 研究流程完成", state="complete", expanded=False)
+                        st.stop()
 
-            else:
-                resp = client.responses.create(
-                    model="gpt-5",
-                    input=trimmed_messages,
-                    instructions=ANYA_SYSTEM_PROMPT,
-                    tools=[{"type": "web_search"}],
-                    tool_choice="auto",
-                )
+                    # 若前置 Router 無結果（極少見），回退舊 Router（仍在同一個 status 區塊內）
+                    status.update(label="↩️ 回退至舊 Router 決策中…", state="running", expanded=True)
+                    trimmed_messages = build_trimmed_input_messages(content_blocks)
+                    router_result = run_async(arouter_decide(router_agent, user_text))
 
-                ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
-                final_text = fake_stream_markdown(ai_text, placeholder)
+                    if isinstance(router_result.final_output, WebSearchPlan):
+                        search_plan = router_result.final_output.searches
+                        search_results = run_async(aparallel_search(search_agent, search_plan))
+                        summary_texts = [str(r.final_output) for r in search_results]
 
-                with sources_container:
-                    if url_cits:
-                        st.markdown("**來源**")
-                        for c in url_cits:
-                            title = c.get("title") or c.get("url")
-                            url = c.get("url")
-                            st.markdown(f"- [{title}]({url})")
-                    if file_cits:
-                        st.markdown("**引用檔案**")
-                        for c in file_cits:
-                            fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
-                            st.markdown(f"- {fname}")
-                    if not file_cits and docs_for_history:
-                        st.markdown("**本回合上傳檔案**")
-                        for fn in docs_for_history:
-                            st.markdown(f"- {fn}")
+                        st.session_state.research_panel = {
+                            "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
+                            "summaries": [
+                                {"query": search_plan[i].query, "summary": summary_texts[i]}
+                                for i in range(len(search_plan))
+                            ]
+                        }
+                        st.session_state.show_research_panel = True
+                        render_research_panel()
 
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "text": final_text,
-                    "images": [],
-                    "docs": []
-                })
+                        search_for_writer = [
+                            {"query": search_plan[i].query, "summary": summary_texts[i]}
+                            for i in range(len(search_plan))
+                        ]
+
+                        writer_data, writer_url_cits, writer_file_cits = run_writer(
+                            client, trimmed_messages, user_text, search_for_writer
+                        )
+
+                        st.markdown("### 📋 Executive Summary")
+                        fake_stream_markdown(writer_data.get("short_summary", ""), output_area.empty())
+
+                        st.markdown("### 📖 完整報告")
+                        fake_stream_markdown(writer_data.get("markdown_report", ""), output_area.empty())
+
+                        st.markdown("### ❓ 後續建議問題")
+                        for q in writer_data.get("follow_up_questions", []) or []:
+                            st.markdown(f"- {q}")
+
+                        with sources_container:
+                            if writer_url_cits:
+                                st.markdown("**來源**")
+                                seen = set()
+                                for c in writer_url_cits:
+                                    url = c.get("url")
+                                    if url and url not in seen:
+                                        seen.add(url)
+                                        title = c.get("title") or url
+                                        st.markdown(f"- [{title}]({url})")
+                            if writer_file_cits:
+                                st.markdown("**引用檔案**")
+                                for c in writer_file_cits:
+                                    fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                                    st.markdown(f"- {fname}")
+                            if not writer_file_cits and docs_for_history:
+                                st.markdown("**本回合上傳檔案**")
+                                for fn in docs_for_history:
+                                    st.markdown(f"- {fn}")
+
+                        ai_reply = (
+                            "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
+                            "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
+                            "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
+                        )
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "text": ai_reply,
+                            "images": [],
+                            "docs": []
+                        })
+                        status.update(label="✅ 回退流程完成", state="complete", expanded=False)
+
+                    else:
+                        resp = client.responses.create(
+                            model="gpt-5",
+                            input=trimmed_messages,
+                            instructions=ANYA_SYSTEM_PROMPT,
+                            tools=[{"type": "web_search"}],
+                            tool_choice="auto",
+                        )
+
+                        ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
+                        final_text = fake_stream_markdown(ai_text, output_area.empty())
+
+                        with sources_container:
+                            if url_cits:
+                                st.markdown("**來源**")
+                                for c in url_cits:
+                                    title = c.get("title") or c.get("url")
+                                    url = c.get("url")
+                                    st.markdown(f"- [{title}]({url})")
+                            if file_cits:
+                                st.markdown("**引用檔案**")
+                                for c in file_cits:
+                                    fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                                    st.markdown(f"- {fname}")
+                            if not file_cits and docs_for_history:
+                                st.markdown("**本回合上傳檔案**")
+                                for fn in docs_for_history:
+                                    st.markdown(f"- {fn}")
+
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "text": final_text,
+                            "images": [],
+                            "docs": []
+                        })
+                        status.update(label="✅ 回退流程完成", state="complete", expanded=False)
 
         except Exception as e:
-            placeholder.markdown(f"API 發生錯誤：{e}")
+            # 若發生例外，status 顯示 error，且在下方印 traceback
+            with status_area:
+                st.status(f"❌ 發生錯誤：{e}", state="error", expanded=True)
             import traceback
             st.code(traceback.format_exc())
