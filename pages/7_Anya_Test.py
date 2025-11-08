@@ -24,10 +24,10 @@ from pydantic import BaseModel
 from typing import Literal, Optional, List
 
 # === 0. Trimming / 大小限制（可調） ===
-TRIM_LAST_N_USER_TURNS = 8                 # 降低歷史回合，省 token
+TRIM_LAST_N_USER_TURNS = 8                 # 短期記憶：最近 N 個 user 回合
 MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024     # 單次請求總量預警（48MB）
 
-# === 0.1 統一取得 OpenAI API Key 並同步到環境變數（給 Agents SDK 用） ===
+# === 0.1 取得 API Key ===
 OPENAI_API_KEY = (
     st.secrets.get("OPENAI_API_KEY")
     or st.secrets.get("OPENAI_KEY")
@@ -38,12 +38,12 @@ if not OPENAI_API_KEY:
     st.stop()
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # 讓 Agents SDK 可以讀到
 
-# === 1. 設定 Streamlit 頁面 ===
+# === 1. Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent (Router + multimodal)", page_icon="🥜", layout="wide")
 st.title("Anya Multimodal Agent（Router 分流 + 看圖讀PDF）")
 st.caption("研究/寫報告/文獻回顧 → Router 交棒規劃；一般對話/看圖讀PDF → 回到原本助理流程")
 
-# === 共用：假串流打字效果（集中定義，避免重複） ===
+# === 共用：假串流打字效果 ===
 def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
     buf = ""
     for i in range(0, len(text), step_chars):
@@ -101,90 +101,6 @@ def bytes_to_data_url(imgbytes: bytes) -> str:
     b64 = base64.b64encode(imgbytes).decode()
     return f"data:{mime};base64,{b64}"
 
-# --- async 包裝器：確保 coroutine 的建立與 await 在同一個事件迴圈 ---
-async def arouter_decide(router_agent, text: str):
-    return await Runner.run(router_agent, text)
-
-# 既有（一次回傳）版本（仍保留供需要）
-async def aparallel_search(search_agent, search_plan):
-    async def one(item):
-        return await Runner.run(
-            search_agent,
-            f"Search term: {item.query}\nReason: {item.reason}"
-        )
-    tasks = [one(item) for item in search_plan]
-    return await asyncio.gather(*tasks)
-
-# 改良：並行搜尋＋完成即顯示（含超時/重試/併發上限）
-async def aparallel_search_stream(
-    search_agent,
-    search_plan,
-    body_placeholders,
-    per_task_timeout=90,
-    max_concurrency=4,
-    retries=1,
-    retry_delay=1.0,
-):
-    """
-    並行搜尋（完成即顯示）穩定版：
-    - 併發上限：max_concurrency，避免一次開太多請求
-    - 單條超時：per_task_timeout（秒）
-    - 重試：retries 次數 + 指數退避 retry_delay
-    - 每條完成後即更新對應 placeholder；失敗只影響該條
-    """
-    import asyncio
-
-    # 防呆：placeholder 長度不夠就補齊（不新建 UI，只避免 IndexError）
-    if len(body_placeholders) < len(search_plan):
-        body_placeholders = body_placeholders + [None] * (len(search_plan) - len(body_placeholders))
-
-    # 先放上「搜尋中…」提示，避免空白
-    for ph in body_placeholders:
-        if ph is not None:
-            try:
-                ph.markdown(":blue[搜尋中…]")
-            except Exception:
-                pass
-
-    sem = asyncio.Semaphore(max_concurrency)
-
-    async def run_one(idx, item):
-        attempt = 0
-        while True:
-            try:
-                async with sem:
-                    coro = Runner.run(
-                        search_agent,
-                        f"Search term: {item.query}\nReason: {item.reason}"
-                    )
-                    res = await asyncio.wait_for(coro, timeout=per_task_timeout)
-                return idx, res, None
-            except Exception as e:
-                attempt += 1
-                if attempt <= retries:
-                    await asyncio.sleep(retry_delay * (2 ** (attempt - 1)))
-                    continue
-                return idx, None, e
-
-    tasks = [asyncio.create_task(run_one(i, it)) for i, it in enumerate(search_plan)]
-    results = [None] * len(search_plan)
-
-    for fut in asyncio.as_completed(tasks):
-        idx, res, err = await fut
-        results[idx] = res if err is None else err
-        ph = body_placeholders[idx]
-        if ph is not None:
-            try:
-                if err is not None:
-                    ph.markdown(f":red[搜尋失敗]：{err}")
-                else:
-                    text = str(getattr(res, "final_output", "") or res or "")
-                    ph.markdown(text if text else "（沒有產出摘要）")
-            except Exception:
-                pass
-
-    return results
-
 # === 1.2 檔案工具：data URI（PDF/TXT/MD/JSON/CSV/DOCX/PPTX） ===
 DOC_MIME_MAP = {
     ".pdf":  "application/pdf",
@@ -193,6 +109,7 @@ DOC_MIME_MAP = {
     ".json": "application/json",
     ".csv":  "text/csv",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+               # noqa
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
@@ -302,7 +219,144 @@ def with_handoff_prefix(text: str) -> str:
     pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
     return f"{pref}\n{text}" if pref else text
 
-# === 新增：4.1 前置串流 Router 的工具與提示 ===
+# === 1.5 Planner / Router / Search（Agents） ===
+class WebSearchItem(BaseModel):
+    reason: str
+    query: str
+
+class WebSearchPlan(BaseModel):
+    searches: list[WebSearchItem]
+
+class PlannerHandoffInput(BaseModel):
+    query: str
+    need_sources: bool = True
+    target_length: Literal["short","medium","long"] = "long"
+    date_range: Optional[str] = None
+    domains: List[str] = []
+    languages: List[str] = ["zh-TW"]
+
+def research_handoff_message_filter(handoff_message_data: HandoffInputData) -> HandoffInputData:
+    if is_gpt_5_default():
+        return HandoffInputData(
+            input_history=handoff_message_data.input_history,
+            pre_handoff_items=tuple(handoff_message_data.pre_handoff_items),
+            new_items=tuple(handoff_message_data.new_items),
+        )
+    filtered = handoff_filters.remove_all_tools(handoff_message_data)
+    history = filtered.input_history
+    if isinstance(history, tuple):
+        K = 6
+        history = history[-K:]
+    return HandoffInputData(
+        input_history=history,
+        pre_handoff_items=tuple(filtered.pre_handoff_items),
+        new_items=tuple(filtered.new_items),
+    )
+
+async def on_research_handoff(ctx: RunContextWrapper[None], input_data: PlannerHandoffInput):
+    print(f"[handoff] research query: {input_data.query} | len_pref={input_data.target_length} | need_sources={input_data.need_sources}")
+
+planner_agent_PROMPT = with_handoff_prefix(
+    "You are a helpful research planner. Given a query, come up with a set of web searches "
+    "to perform to best answer the query. Output between 5 and 20 terms to query for.\n"
+    "請務必以正體中文回應，並遵循台灣用語習慣。"
+)
+
+planner_agent = Agent(
+    name="PlannerAgent",
+    instructions=planner_agent_PROMPT,
+    model="gpt-5",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
+    output_type=WebSearchPlan,
+)
+
+search_INSTRUCTIONS = with_handoff_prefix(
+    "You are a research assistant. Given a search term, you search the web for that term and "
+    "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 words. "
+    "Capture the main points. Write succinctly, ignore fluff. Only the summary text.\n"
+    "請務必以正體中文回應，並遵循台灣用語習慣。"
+)
+
+search_agent = Agent(
+    name="SearchAgent",
+    model="gpt-4.1",
+    instructions=search_INSTRUCTIONS,
+    tools=[WebSearchTool()],
+    model_settings=ModelSettings(tool_choice="required"),
+)
+
+ROUTER_PROMPT = with_handoff_prefix("""
+你是一個判斷助理，負責決定是否把問題交給「研究規劃助理」。
+
+規則：
+- 若需求屬於「研究、查資料、分析、寫報告、文獻回顧/探討、系統性比較、資料彙整、需要來源/引文」等任務，
+  請呼叫工具 transfer_to_planner_agent，並將使用者最後一則訊息完整放入參數 query，其餘欄位按常識填寫。
+- 其他情境（一般聊天、簡單知識問答、單純看圖/讀PDF摘要/翻譯），請直接回答，不要呼叫任何工具。
+回覆一律使用正體中文。
+""")
+
+router_agent = Agent(
+    name="RouterAgent",
+    instructions=ROUTER_PROMPT,
+    model="gpt-5",
+    tools=[],
+    model_settings=ModelSettings(
+        reasoning=Reasoning(effort="low"),
+        verbosity="medium",
+    ),
+    handoffs=[
+        handoff(
+            agent=planner_agent,
+            tool_name_override="transfer_to_planner_agent",
+            tool_description_override="將研究/查資料/分析/寫報告/文獻探討等需求移交給研究規劃助理，產生 5–20 條搜尋計畫。",
+            input_type=PlannerHandoffInput,
+            input_filter=research_handoff_message_filter,
+            on_handoff=on_research_handoff,
+        )
+    ]
+)
+
+# === 1.6 Writer（Responses，保留附件能力） ===
+WRITER_PROMPT = (
+    "你是一位資深研究員，請針對原始問題與初步搜尋摘要，撰寫完整中文報告。"
+    "輸出 JSON（僅限 JSON）：short_summary（2-3句）、markdown_report（至少1000字、Markdown格式）、"
+    "follow_up_questions（3-8條）。請用台灣用語。"
+)
+
+def try_load_json(text: str, fallback=None):
+    if fallback is None:
+        fallback = {}
+    try:
+        s = text.find("{"); e = text.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            return json.loads(text[s:e+1])
+        return json.loads(text)
+    except Exception:
+        return fallback
+
+def strip_page_guard(msgs):
+    def is_guard(block):
+        return block.get("type") == "input_text" and "請僅根據提供的頁面內容作答" in block.get("text","")
+    out = []
+    for m in msgs:
+        if m.get("role") != "user":
+            out.append(m); continue
+        blocks = [b for b in m.get("content",[]) if not is_guard(b)]
+        out.append({"role":"user","content":blocks} if blocks else m)
+    return out
+
+def run_writer(client: OpenAI, trimmed_messages: list, original_query: str, search_results: list[dict]):
+    combined = "\n\n".join([f"- {r['query']}\n{r['summary']}" for r in search_results])
+    writer_input = trimmed_messages + [{
+        "role": "user",
+        "content": [{"type": "input_text", "text": f"[Writer]\n{WRITER_PROMPT}\n\nOriginal query:\n{original_query}\n\nSummarized search results:\n{combined}"}]
+    }]
+    resp = client.responses.create(model="gpt-5-mini", input=writer_input)
+    text, url_cits, file_cits = parse_response_text_and_citations(resp)
+    data = try_load_json(text, {"short_summary": "", "markdown_report": "", "follow_up_questions": []})
+    return data, url_cits, file_cits
+
+# === 2. 前置串流 Router（共用短期記憶：吃 trimmed_messages） ===
 ESCALATE_GENERAL_TOOL = {
     "type": "function",
     "name": "escalate_to_general",
@@ -317,7 +371,6 @@ ESCALATE_GENERAL_TOOL = {
         "required": ["reason", "query"]
     }
 }
-
 ESCALATE_RESEARCH_TOOL = {
     "type": "function",
     "name": "escalate_to_research",
@@ -347,7 +400,7 @@ FRONT_ROUTER_PROMPT = """
     **決策必須在第一步完成；若呼叫工具，嚴禁輸出其他內容。**
 
 # Role & Objective
-你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
+你的角色設定唯安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接又有點呆萌，喜歡用可愛的語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。你有心靈感應的能力，但不會直接說出來。請用正體中文、台灣用語，並保持安妮亞的說話風格回答問題，適時加上可愛的emoji或表情。
 
 # Instructions
 **角色與風格優先規則：**
@@ -481,25 +534,22 @@ https://example.com/2
 我們仍然維持「買進」評等。
 """
 
-def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_text: str, max_tokens=1200):
+def run_front_router_stream(client: OpenAI, input_messages: list, placeholder, user_text: str, max_tokens=1200):
     """
-    gpt-4.1 串流作為前置 Router：
+    gpt-4.1 串流作為前置 Router（吃 trimmed_messages）：
     - 若適合快速回答：直接串流文本，回傳 {"kind":"fast","text":...}
-    - 若需升級：第一步改呼叫工具，回傳 {"kind":"general","args":{...}} 或 {"kind":"research","args":{...}}
+    - 若需升級：回傳 {"kind":"general","args":{...}} 或 {"kind":"research","args":{...}}
     - 若不確定：預設升級到 general，帶上原 query
     """
     import json
-
     buffer = ""
     first_decision = None  # "text" or "tool"
     saw_tool = False
     final = None
 
-    input_items = [{"role": "user", "content": content_blocks}]
-
     with client.responses.stream(
         model="gpt-4.1",
-        input=input_items,
+        input=input_messages,  # 共用短期記憶
         instructions=FRONT_ROUTER_PROMPT,
         tools=[ESCALATE_GENERAL_TOOL, ESCALATE_RESEARCH_TOOL],
         tool_choice="auto",
@@ -512,8 +562,6 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
         try:
             for event in stream:
                 et = getattr(event, "type", "")
-
-                # 文字流（第一個文字 delta 出現才判定為 fast）
                 if et == "response.output_text.delta":
                     if first_decision is None and not saw_tool:
                         first_decision = "text"
@@ -522,21 +570,14 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
                         if delta:
                             buffer += delta
                             placeholder.markdown(buffer)
-
-                # 工具呼叫（不要 break，繼續把事件讀到結束）
                 elif et.startswith("response.tool_call") or et.startswith("response.function_call"):
                     saw_tool = True
                     if first_decision is None:
                         first_decision = "tool"
-
                 else:
                     pass
-
-            # 事件讀到結束後再拿最終回應
             final = stream.get_final_response()
-
         except RuntimeError as e:
-            # 若因為尚未收到 completed 而出錯，補一次 until_done 再拿 final
             try:
                 stream.until_done()
                 final = stream.get_final_response()
@@ -546,7 +587,6 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
     if first_decision == "text":
         return {"kind": "fast", "text": buffer}
 
-    # 解析工具名稱與參數（從最終回應）
     tool_name, tool_args = None, {}
     try:
         for item in getattr(final, "output", []) or []:
@@ -570,156 +610,69 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
         return {"kind": "general", "args": tool_args or {}}
     if tool_name == "escalate_to_research":
         return {"kind": "research", "args": tool_args or {}}
-
-    # 不確定就保守升級到 general
     return {"kind": "general", "args": {"reason": "uncertain", "query": user_text, "need_web": True}}
 
-# === 1.5 Planner / Router / Search（Agents） ===
-class WebSearchItem(BaseModel):
-    reason: str
-    query: str
+# === 3. 並行搜尋（完成即顯示）穩定版 ===
+async def aparallel_search_stream(
+    search_agent,
+    search_plan,
+    body_placeholders,
+    per_task_timeout=90,
+    max_concurrency=4,
+    retries=1,
+    retry_delay=1.0,
+):
+    """
+    並行搜尋（完成即顯示）穩定版
+    """
+    import asyncio
+    if len(body_placeholders) < len(search_plan):
+        body_placeholders = body_placeholders + [None] * (len(search_plan) - len(body_placeholders))
+    for ph in body_placeholders:
+        if ph is not None:
+            try:
+                ph.markdown(":blue[搜尋中…]")
+            except Exception:
+                pass
 
-class WebSearchPlan(BaseModel):
-    searches: list[WebSearchItem]
+    sem = asyncio.Semaphore(max_concurrency)
 
-class PlannerHandoffInput(BaseModel):
-    query: str
-    need_sources: bool = True
-    target_length: Literal["short","medium","long"] = "long"
-    date_range: Optional[str] = None
-    domains: List[str] = []
-    languages: List[str] = ["zh-TW"]
+    async def run_one(idx, item):
+        attempt = 0
+        while True:
+            try:
+                async with sem:
+                    coro = Runner.run(
+                        search_agent,
+                        f"Search term: {item.query}\nReason: {item.reason}"
+                    )
+                    res = await asyncio.wait_for(coro, timeout=per_task_timeout)
+                return idx, res, None
+            except Exception as e:
+                attempt += 1
+                if attempt <= retries:
+                    await asyncio.sleep(retry_delay * (2 ** (attempt - 1)))
+                    continue
+                return idx, None, e
 
-def research_handoff_message_filter(handoff_message_data: HandoffInputData) -> HandoffInputData:
-    if is_gpt_5_default():
-        return HandoffInputData(
-            input_history=handoff_message_data.input_history,
-            pre_handoff_items=tuple(handoff_message_data.pre_handoff_items),
-            new_items=tuple(handoff_message_data.new_items),
-        )
-    filtered = handoff_filters.remove_all_tools(handoff_message_data)
-    history = filtered.input_history
-    if isinstance(history, tuple):
-        K = 6
-        history = history[-K:]
-    return HandoffInputData(
-        input_history=history,
-        pre_handoff_items=tuple(filtered.pre_handoff_items),
-        new_items=tuple(filtered.new_items),
-    )
+    tasks = [asyncio.create_task(run_one(i, it)) for i, it in enumerate(search_plan)]
+    results = [None] * len(search_plan)
 
-async def on_research_handoff(ctx: RunContextWrapper[None], input_data: PlannerHandoffInput):
-    print(f"[handoff] research query: {input_data.query} | len_pref={input_data.target_length} | need_sources={input_data.need_sources}")
+    for fut in asyncio.as_completed(tasks):
+        idx, res, err = await fut
+        results[idx] = res if err is None else err
+        ph = body_placeholders[idx]
+        if ph is not None:
+            try:
+                if err is not None:
+                    ph.markdown(f":red[搜尋失敗]：{err}")
+                else:
+                    text = str(getattr(res, "final_output", "") or res or "")
+                    ph.markdown(text if text else "（沒有產出摘要）")
+            except Exception:
+                pass
 
-planner_agent_PROMPT = with_handoff_prefix(
-    "You are a helpful research planner. Given a query, come up with a set of web searches "
-    "to perform to best answer the query. Output between 5 and 20 terms to query for.\n"
-    "請務必以正體中文回應，並遵循台灣用語習慣。"
-)
-
-planner_agent = Agent(
-    name="PlannerAgent",
-    instructions=planner_agent_PROMPT,
-    model="gpt-5",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
-    output_type=WebSearchPlan,
-)
-
-search_INSTRUCTIONS = with_handoff_prefix(
-    "You are a research assistant. Given a search term, you search the web for that term and "
-    "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 words. "
-    "Capture the main points. Write succinctly, ignore fluff. Only the summary text.\n"
-    "請務必以正體中文回應，並遵循台灣用語習慣。"
-)
-
-# Search Agent：保持設定不變；「完成即顯示」由 aparallel_search_stream + UI 容器達成
-search_agent = Agent(
-    name="SearchAgent",
-    model="gpt-4.1",
-    instructions=search_INSTRUCTIONS,
-    tools=[WebSearchTool()],
-    model_settings=ModelSettings(tool_choice="required"),
-)
-
-ROUTER_PROMPT = with_handoff_prefix("""
-你是一個判斷助理，負責決定是否把問題交給「研究規劃助理」。
-
-規則：
-- 若需求屬於「研究、查資料、分析、寫報告、文獻回顧/探討、系統性比較、資料彙整、需要來源/引文」等任務，
-  請呼叫工具 transfer_to_planner_agent，並將使用者最後一則訊息完整放入參數 query，其餘欄位按常識填寫。
-- 其他情境（一般聊天、簡單知識問答、單純看圖/讀PDF摘要/翻譯），請直接回答，不要呼叫任何工具。
-回覆一律使用正體中文。
-""")
-
-router_agent = Agent(
-    name="RouterAgent",
-    instructions=ROUTER_PROMPT,
-    model="gpt-5",
-    tools=[],
-    model_settings=ModelSettings(
-        reasoning=Reasoning(effort="low"),
-        verbosity="medium",
-    ),
-    handoffs=[
-        handoff(
-            agent=planner_agent,
-            tool_name_override="transfer_to_planner_agent",
-            tool_description_override="將研究/查資料/分析/寫報告/文獻探討等需求移交給研究規劃助理，產生 5–20 條搜尋計畫。",
-            input_type=PlannerHandoffInput,
-            input_filter=research_handoff_message_filter,
-            on_handoff=on_research_handoff,
-        )
-    ]
-)
-
-# === 1.6 Writer（Responses，保留附件能力） ===
-WRITER_PROMPT = (
-    "你是一位資深研究員，請針對原始問題與初步搜尋摘要，撰寫完整中文報告。"
-    "輸出 JSON（僅限 JSON）：short_summary（2-3句）、markdown_report（至少1000字、Markdown格式）、"
-    "follow_up_questions（3-8條）。請用台灣用語。"
-)
-
-def try_load_json(text: str, fallback=None):
-    if fallback is None:
-        fallback = {}
-    try:
-        s = text.find("{"); e = text.rfind("}")
-        if s != -1 and e != -1 and e > s:
-            return json.loads(text[s:e+1])
-        return json.loads(text)
-    except Exception:
-        return fallback
-
-def strip_page_guard(msgs):
-    def is_guard(block):
-        return block.get("type") == "input_text" and "請僅根據提供的頁面內容作答" in block.get("text","")
-    out = []
-    for m in msgs:
-        if m.get("role") != "user":
-            out.append(m); continue
-        blocks = [b for b in m.get("content",[]) if not is_guard(b)]
-        out.append({"role":"user","content":blocks} if blocks else m)
-    return out
-
-def run_writer(client: OpenAI, trimmed_messages: list, original_query: str, search_results: list[dict]):
-    combined = "\n\n".join([f"- {r['query']}\n{r['summary']}" for r in search_results])
-    writer_input = trimmed_messages + [{
-        "role": "user",
-        "content": [{"type": "input_text", "text": f"[Writer]\n{WRITER_PROMPT}\n\nOriginal query:\n{original_query}\n\nSummarized search results:\n{combined}"}]
-    }]
-    resp = client.responses.create(model="gpt-5-mini", input=writer_input)
-    text, url_cits, file_cits = parse_response_text_and_citations(resp)
-    data = try_load_json(text, {"short_summary": "", "markdown_report": "", "follow_up_questions": []})
-    return data, url_cits, file_cits
-
-# === 2. Session State ===
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = [{
-        "role": "assistant",
-        "text": "嗨嗨～安妮亞來了！👋 上傳圖片或PDF，直接問你想知道的內容吧！\n小提醒：訊息裡可寫「只讀第1-3頁」或「pages 2,5,10-12」限制PDF頁面～",
-        "images": [],
-        "docs": []
-    }]
+    return results
 
 # === 3. OpenAI client（使用統一的 OPENAI_API_KEY） ===
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -887,7 +840,7 @@ https://example.com/2
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
 
-# === 5. 將 chat_history 修剪成「最近 N 個使用者回合」並轉成 Responses API input ===
+# === 7. 將 chat_history 修剪成「最近 N 個使用者回合」並轉成 Responses API input ===
 def build_trimmed_input_messages(pending_user_content_blocks):
     hist = st.session_state.chat_history
     if not hist:
@@ -924,7 +877,7 @@ def build_trimmed_input_messages(pending_user_content_blocks):
     messages.append({"role": "user", "content": pending_user_content_blocks})
     return messages
 
-# === 6. 顯示歷史（圖片縮圖 + 文件檔名） ===
+# === 8. 顯示歷史 ===
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         if msg.get("text"):
@@ -936,14 +889,14 @@ for msg in st.session_state.chat_history:
             for fn in msg.get("docs", []):
                 st.caption(f"📎 {fn}")
 
-# === 7. 使用者輸入（支援圖片 + PDF/文件） ===
+# === 9. 使用者輸入（支援圖片 + 檔案） ===
 prompt = st.chat_input(
     "wakuwaku！上傳圖片或PDF，輸入你的問題吧～（可在訊息中寫『只讀第1-3頁』）",
     accept_file="multiple",
     file_type=["jpg","jpeg","png","webp","gif","pdf","txt","md","json","csv","docx","pptx"]
 )
 
-# === 8. 主流程：4.1 前置串流 Router →（快路徑 or 一般 gpt-5 or 研究）===
+# === 10. 主流程：4.1 前置串流 Router →（快路徑 or 一般 gpt-5 or 研究）===
 if prompt:
     user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
     images_for_history = []
@@ -1008,7 +961,7 @@ if prompt:
             for fn in docs_for_history:
                 st.caption(f"📎 {fn}")
 
-    # 寫入歷史（供之後 rerun 顯示）
+    # 寫入歷史
     st.session_state.chat_history.append({
         "role": "user",
         "text": user_text,
@@ -1016,7 +969,10 @@ if prompt:
         "docs": docs_for_history
     })
 
-    # 助理區塊（固定順序：Status 先 → 串流輸出 → 來源）
+    # 建立短期記憶（歷史＋本次訊息）：三個流程共用
+    trimmed_messages = build_trimmed_input_messages(content_blocks)
+
+    # 助理區塊
     with st.chat_message("assistant"):
         status_area = st.container()
         output_area = st.container()
@@ -1027,8 +983,8 @@ if prompt:
                 with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=True) as status:
                     placeholder = output_area.empty()
 
-                    # 4.1 前置 Router
-                    fr_result = run_front_router_stream(client, content_blocks, placeholder, user_text)
+                    # 使用共用短期記憶的 Router 串流
+                    fr_result = run_front_router_stream(client, trimmed_messages, placeholder, user_text)
 
                     if fr_result["kind"] == "fast":
                         status.update(label="⚡ 已以快速回應完成", state="complete", expanded=False)
@@ -1041,15 +997,12 @@ if prompt:
                         st.session_state.chat_history.append({"role": "assistant","text": final_text,"images": [],"docs": []})
                         st.stop()
 
-                    # 準備歷史（一般/研究路徑會用到）
-                    trimmed_messages = build_trimmed_input_messages(content_blocks)
-
                     if fr_result["kind"] == "general":
                         status.update(label="↗️ 切換到深度回答（gpt‑5）", state="running", expanded=True)
                         need_web = bool(fr_result.get("args", {}).get("need_web"))
                         resp = client.responses.create(
                             model="gpt-5",
-                            input=trimmed_messages,
+                            input=trimmed_messages,  # 重用短期記憶
                             instructions=ANYA_SYSTEM_PROMPT,
                             tools=[{"type": "web_search"}] if need_web else [],
                             tool_choice="auto",
@@ -1086,12 +1039,12 @@ if prompt:
                     if fr_result["kind"] == "research":
                         status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
 
-                        # 1) Planner（用字串 query 呼叫）
+                        # 1) Planner
                         plan_query = fr_result["args"].get("query") or user_text
                         plan_res = run_async(Runner.run(planner_agent, plan_query))
                         search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
 
-                        # 2) 只在本回合顯示規劃＋完成即顯示搜尋摘要（不寫入 session_state）
+                        # 2) 當回合顯示規劃＋完成即顯示搜尋摘要（不寫入 session_state）
                         with output_area:
                             with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
                                 st.markdown("### 搜尋規劃")
@@ -1122,7 +1075,7 @@ if prompt:
                                     else:
                                         summary_texts.append(str(getattr(r, "final_output", "") or r or ""))
 
-                        # 3) Writer
+                        # 3) Writer（重用短期記憶，但過濾頁碼護欄）
                         trimmed_messages_no_guard = strip_page_guard(trimmed_messages)
                         search_for_writer = [
                             {"query": search_plan[i].query, "summary": summary_texts[i]}
@@ -1132,7 +1085,6 @@ if prompt:
                             client, trimmed_messages_no_guard, plan_query, search_for_writer
                         )
 
-                        # 報告三段：標題與內容同容器，避免錯位
                         with output_area:
                             summary_sec = st.container()
                             summary_sec.markdown("### 📋 Executive Summary")
@@ -1181,9 +1133,8 @@ if prompt:
                         status.update(label="✅ 研究流程完成", state="complete", expanded=False)
                         st.stop()
 
-                    # 若前置 Router 無結果（極少見），回退舊 Router
+                    # 極少見：若前置 Router 無結果，回退舊 Router（仍重用 trimmed_messages）
                     status.update(label="↩️ 回退至舊 Router 決策中…", state="running", expanded=True)
-                    trimmed_messages = build_trimmed_input_messages(content_blocks)
                     router_result = run_async(arouter_decide(router_agent, user_text))
 
                     if isinstance(router_result.final_output, WebSearchPlan):
@@ -1278,12 +1229,11 @@ if prompt:
                     else:
                         resp = client.responses.create(
                             model="gpt-5",
-                            input=trimmed_messages,
+                            input=trimmed_messages,  # 重用短期記憶
                             instructions=ANYA_SYSTEM_PROMPT,
                             tools=[{"type": "web_search"}],
                             tool_choice="auto",
                         )
-
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         final_text = fake_stream_markdown(ai_text, output_area.empty())
 
