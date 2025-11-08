@@ -229,6 +229,11 @@ def parse_response_text_and_citations(resp):
     file_cits = dedup_by(file_cits, "filename") if any(c.get("filename") for c in file_cits) else dedup_by(file_cits, "file_id")
     return text or "安妮亞找不到答案～（抱歉啦！）", url_cits, file_cits
 
+# === 小工具：注入 handoff 官方前綴 ===
+def with_handoff_prefix(text: str) -> str:
+    pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
+    return f"{pref}\n{text}" if pref else text
+
 # === 新增：4.1 前置串流 Router 的工具與提示 ===
 ESCALATE_GENERAL_TOOL = {
     "type": "function",
@@ -285,6 +290,7 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
 
     input_items = [{"role": "user", "content": content_blocks}]
 
+    # 使用 .stream(...)：不要再傳 stream=True
     with client.responses.stream(
         model="gpt-4.1",
         input=input_items,
@@ -293,14 +299,14 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
         tool_choice="auto",
         parallel_tool_calls=False,
         max_tool_calls=1,
-        stream=True,
         temperature=0.2,
         max_output_tokens=max_tokens,
         service_tier="priority",
     ) as stream:
         for event in stream:
             et = getattr(event, "type", "")
-            # 文字流
+
+            # 文字流（第一個文字 delta 出現就判定為 fast）
             if et == "response.output_text.delta":
                 if first_decision is None:
                     first_decision = "text"
@@ -308,22 +314,26 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
                 if delta:
                     buffer += delta
                     placeholder.markdown(buffer)
-            # 工具呼叫（寬鬆比對事件名）
-            elif "tool_call" in et or "function_call" in et:
+
+            # 工具呼叫（寬鬆比對不同 SDK 事件名稱）
+            elif et.startswith("response.tool_call") or et.startswith("response.function_call"):
                 if first_decision is None:
                     first_decision = "tool"
+                # 第一時間偵測到工具就中斷事件迴圈，改用最終回應解析工具
                 break
 
+        # 取得最終回應物件（含工具呼叫與完整結構）
         final = stream.get_final_response()
 
     if first_decision == "text":
         return {"kind": "fast", "text": buffer}
 
-    # 解析工具名稱與參數
+    # 解析工具名稱與參數（從最終回應）
     tool_name, tool_args = None, {}
     try:
         for item in getattr(final, "output", []) or []:
             itype = getattr(item, "type", "")
+            # 兼容多種型別命名
             if itype in ("tool_call", "function_call") or itype.endswith("_call"):
                 tool_name = getattr(item, "name", None) or getattr(item, "tool_name", None)
                 raw_args = getattr(item, "arguments", None) or getattr(item, "args", None)
@@ -334,7 +344,8 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
                         tool_args = {}
                 elif isinstance(raw_args, dict):
                     tool_args = raw_args
-                break
+                if tool_name:
+                    break
     except Exception:
         pass
 
@@ -345,11 +356,6 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
 
     # 不確定就保守升級到 general
     return {"kind": "general", "args": {"reason": "uncertain", "query": user_text, "need_web": True}}
-
-# === 小工具：注入 handoff 官方前綴 ===
-def with_handoff_prefix(text: str) -> str:
-    pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
-    return f"{pref}\n{text}" if pref else text
 
 # === 1.5 Planner / Router / Search（Agents） ===
 class WebSearchItem(BaseModel):
@@ -422,7 +428,7 @@ search_agent = Agent(
     model_settings=ModelSettings(tool_choice="required"),
 )
 
-# Router Agent（只做分流） - 仍保留（可作為備援），但預設不觸發，因為前置 Router 已先決策
+# Router Agent（只做分流） - 備援用
 ROUTER_PROMPT = with_handoff_prefix("""
 你是一個判斷助理，負責決定是否把問題交給「研究規劃助理」。
 
@@ -512,7 +518,6 @@ def render_research_panel():
 
 # === 3. OpenAI client（使用統一的 OPENAI_API_KEY） ===
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 
 # === 4. 系統提示（一般分支使用 Responses API） ===
 ANYA_SYSTEM_PROMPT = """
@@ -879,23 +884,16 @@ if prompt:
                 if fr_result["kind"] == "research":
                     status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
 
-                    # 1) Planner（依前置 Router 參數或回退到使用者原文）
-                    plan_input = PlannerHandoffInput(
-                        query=fr_result["args"].get("query") or user_text,
-                        need_sources=fr_result["args"].get("need_sources", True),
-                        target_length=fr_result["args"].get("target_length", "long"),
-                        date_range=fr_result["args"].get("date_range"),
-                        domains=fr_result["args"].get("domains") or [],
-                        languages=fr_result["args"].get("languages") or ["zh-TW"],
-                    )
-                    plan_res = run_async(Runner.run(planner_agent, plan_input))
+                    # 1) Planner（用 query 字串呼叫，最穩定相容）
+                    plan_query = fr_result["args"].get("query") or user_text
+                    plan_res = run_async(Runner.run(planner_agent, plan_query))
                     search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
 
                     # 2) 並行搜尋
                     search_results = run_async(aparallel_search(search_agent, search_plan))
                     summary_texts = [str(r.final_output) for r in search_results]
 
-                    # 研究面板（沿用你的現有UI）
+                    # 研究面板
                     st.session_state.research_panel = {
                         "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
                         "summaries": [{"query": search_plan[i].query, "summary": summary_texts[i]} for i in range(len(search_plan))]
@@ -903,13 +901,13 @@ if prompt:
                     st.session_state.show_research_panel = True
                     render_research_panel()
 
-                    # 3) Writer（沿用你的函式）
+                    # 3) Writer
                     search_for_writer = [
                         {"query": search_plan[i].query, "summary": summary_texts[i]}
                         for i in range(len(search_plan))
                     ]
                     writer_data, writer_url_cits, writer_file_cits = run_writer(
-                        client, trimmed_messages, plan_input.query, search_for_writer
+                        client, trimmed_messages, plan_query, search_for_writer
                     )
 
                     st.markdown("### 📋 Executive Summary")
