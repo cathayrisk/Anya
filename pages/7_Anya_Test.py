@@ -105,7 +105,7 @@ def bytes_to_data_url(imgbytes: bytes) -> str:
 async def arouter_decide(router_agent, text: str):
     return await Runner.run(router_agent, text)
 
-# 既有（一次回傳）版本
+# 既有（一次回傳）版本（仍保留供需要）
 async def aparallel_search(search_agent, search_plan):
     async def one(item):
         return await Runner.run(
@@ -115,7 +115,7 @@ async def aparallel_search(search_agent, search_plan):
     tasks = [one(item) for item in search_plan]
     return await asyncio.gather(*tasks)
 
-# 新增：並行搜尋＋即時顯示（完成序「類串流」）
+# 改良：並行搜尋＋完成即顯示（含超時/重試/併發上限）
 async def aparallel_search_stream(
     search_agent,
     search_plan,
@@ -481,7 +481,7 @@ https://example.com/2
 我們仍然維持「買進」評等。
 """
 
-def run_front_router_stream(client, content_blocks, placeholder, user_text: str, max_tokens=12000):
+def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_text: str, max_tokens=1200):
     """
     gpt-4.1 串流作為前置 Router：
     - 若適合快速回答：直接串流文本，回傳 {"kind":"fast","text":...}
@@ -515,7 +515,6 @@ def run_front_router_stream(client, content_blocks, placeholder, user_text: str,
 
                 # 文字流（第一個文字 delta 出現才判定為 fast）
                 if et == "response.output_text.delta":
-                    # 若尚未決策且尚未看到工具，就視為文字路徑
                     if first_decision is None and not saw_tool:
                         first_decision = "text"
                     if first_decision == "text":
@@ -529,9 +528,7 @@ def run_front_router_stream(client, content_blocks, placeholder, user_text: str,
                     saw_tool = True
                     if first_decision is None:
                         first_decision = "tool"
-                    # 不輸出任何文字，持續 drain 直到 completed
 
-                # 其他事件一律忽略，但保持 drain 到 completed
                 else:
                     pass
 
@@ -544,7 +541,6 @@ def run_front_router_stream(client, content_blocks, placeholder, user_text: str,
                 stream.until_done()
                 final = stream.get_final_response()
             except Exception:
-                # 還是失敗就拋回去，讓上層顯示錯誤
                 raise e
 
     if first_decision == "text":
@@ -636,7 +632,7 @@ search_INSTRUCTIONS = with_handoff_prefix(
     "請務必以正體中文回應，並遵循台灣用語習慣。"
 )
 
-# 保持 Agent 設定不變；「串流顯示」由我們的 aparallel_search_stream + UI 容器來達成
+# Search Agent：保持設定不變；「完成即顯示」由 aparallel_search_stream + UI 容器達成
 search_agent = Agent(
     name="SearchAgent",
     model="gpt-4.1",
@@ -694,6 +690,17 @@ def try_load_json(text: str, fallback=None):
     except Exception:
         return fallback
 
+def strip_page_guard(msgs):
+    def is_guard(block):
+        return block.get("type") == "input_text" and "請僅根據提供的頁面內容作答" in block.get("text","")
+    out = []
+    for m in msgs:
+        if m.get("role") != "user":
+            out.append(m); continue
+        blocks = [b for b in m.get("content",[]) if not is_guard(b)]
+        out.append({"role":"user","content":blocks} if blocks else m)
+    return out
+
 def run_writer(client: OpenAI, trimmed_messages: list, original_query: str, search_results: list[dict]):
     combined = "\n\n".join([f"- {r['query']}\n{r['summary']}" for r in search_results])
     writer_input = trimmed_messages + [{
@@ -713,24 +720,6 @@ if "chat_history" not in st.session_state:
         "images": [],
         "docs": []
     }]
-
-# 研究面板持久化（避免 rerun 消失；下次送出訊息才關閉）
-if "research_panel" not in st.session_state:
-    st.session_state.research_panel = None
-if "show_research_panel" not in st.session_state:
-    st.session_state.show_research_panel = False
-
-def render_research_panel():
-    rp = st.session_state.get("research_panel")
-    if not (st.session_state.get("show_research_panel") and rp):
-        return
-    with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
-        st.markdown("### 搜尋規劃")
-        for i, item in enumerate(rp.get("plan", [])):
-            st.markdown(f"**{i+1}. {item['query']}**\n> {item['reason']}")
-        st.markdown("### 各項搜尋摘要")
-        for it in rp.get("summaries", []):
-            st.markdown(f"**{it['query']}**\n{it['summary']}")
 
 # === 3. OpenAI client（使用統一的 OPENAI_API_KEY） ===
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -947,9 +936,6 @@ for msg in st.session_state.chat_history:
             for fn in msg.get("docs", []):
                 st.caption(f"📎 {fn}")
 
-# 歷史訊息顯示完，若有暫存的研究面板就顯示（跨 rerun 仍存在）
-render_research_panel()
-
 # === 7. 使用者輸入（支援圖片 + PDF/文件） ===
 prompt = st.chat_input(
     "wakuwaku！上傳圖片或PDF，輸入你的問題吧～（可在訊息中寫『只讀第1-3頁』）",
@@ -959,10 +945,6 @@ prompt = st.chat_input(
 
 # === 8. 主流程：4.1 前置串流 Router →（快路徑 or 一般 gpt-5 or 研究）===
 if prompt:
-    # 新一輪使用者訊息送出 → 關閉上一輪的搜尋規劃面板（下次送出才消失）
-    if st.session_state.get("show_research_panel"):
-        st.session_state.show_research_panel = False
-
     user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
     images_for_history = []
     docs_for_history = []
@@ -1036,16 +1018,13 @@ if prompt:
 
     # 助理區塊（固定順序：Status 先 → 串流輸出 → 來源）
     with st.chat_message("assistant"):
-        # 三層容器：狀態在上、輸出在中、來源在下
         status_area = st.container()
         output_area = st.container()
         sources_container = st.container()
 
         try:
-            # 先渲染狀態（確保永遠在最上方）
             with status_area:
-                with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=False) as status:
-                    # 串流/輸出區塊在 status 之後建立，順序固定
+                with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=True) as status:
                     placeholder = output_area.empty()
 
                     # 4.1 前置 Router
@@ -1066,7 +1045,7 @@ if prompt:
                     trimmed_messages = build_trimmed_input_messages(content_blocks)
 
                     if fr_result["kind"] == "general":
-                        status.update(label="↗️ 切換到深度回答（gpt‑5）", state="running", expanded=False)
+                        status.update(label="↗️ 切換到深度回答（gpt‑5）", state="running", expanded=True)
                         need_web = bool(fr_result.get("args", {}).get("need_web"))
                         resp = client.responses.create(
                             model="gpt-5",
@@ -1112,40 +1091,45 @@ if prompt:
                         plan_res = run_async(Runner.run(planner_agent, plan_query))
                         search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
 
-                        # 2) 顯示規劃與「類串流」搜尋輸出（完成即更新）
+                        # 2) 只在本回合顯示規劃＋完成即顯示搜尋摘要（不寫入 session_state）
                         with output_area:
                             with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
-                                # 規劃列表
                                 st.markdown("### 搜尋規劃")
                                 for i, it in enumerate(search_plan):
                                     st.markdown(f"**{i+1}. {it.query}**\n> {it.reason}")
                                 st.markdown("### 各項搜尋摘要")
 
-                                # 為每條搜尋建立一個段落容器與 body placeholder
                                 body_placeholders = []
                                 for i, it in enumerate(search_plan):
                                     sec = st.container()
                                     sec.markdown(f"**{it.query}**")
                                     body_placeholders.append(sec.empty())
 
-                                # 並行執行，完成就更新對應 placeholder
-                                search_results = run_async(aparallel_search_stream(search_agent, search_plan, body_placeholders))
-                                summary_texts = [str(r.final_output) for r in search_results]
+                                search_results = run_async(aparallel_search_stream(
+                                    search_agent,
+                                    search_plan,
+                                    body_placeholders,
+                                    per_task_timeout=90,
+                                    max_concurrency=4,
+                                    retries=1,
+                                    retry_delay=1.0,
+                                ))
 
-                        # 持久化面板（下次送訊息才關閉）
-                        st.session_state.research_panel = {
-                            "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
-                            "summaries": [{"query": search_plan[i].query, "summary": summary_texts[i]} for i in range(len(search_plan))]
-                        }
-                        st.session_state.show_research_panel = True
+                                summary_texts = []
+                                for r in search_results:
+                                    if isinstance(r, Exception):
+                                        summary_texts.append(f"（該條搜尋失敗：{r}）")
+                                    else:
+                                        summary_texts.append(str(getattr(r, "final_output", "") or r or ""))
 
                         # 3) Writer
+                        trimmed_messages_no_guard = strip_page_guard(trimmed_messages)
                         search_for_writer = [
                             {"query": search_plan[i].query, "summary": summary_texts[i]}
                             for i in range(len(search_plan))
                         ]
                         writer_data, writer_url_cits, writer_file_cits = run_writer(
-                            client, trimmed_messages, plan_query, search_for_writer
+                            client, trimmed_messages_no_guard, plan_query, search_for_writer
                         )
 
                         # 報告三段：標題與內容同容器，避免錯位
@@ -1183,7 +1167,6 @@ if prompt:
                                 for fn in docs_for_history:
                                     st.markdown(f"- {fn}")
 
-                        # 存入歷史（只保存報告內容）
                         ai_reply = (
                             "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
                             "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
@@ -1198,7 +1181,7 @@ if prompt:
                         status.update(label="✅ 研究流程完成", state="complete", expanded=False)
                         st.stop()
 
-                    # 若前置 Router 無結果（極少見），回退舊 Router（仍在同一個 status 區塊內）
+                    # 若前置 Router 無結果（極少見），回退舊 Router
                     status.update(label="↩️ 回退至舊 Router 決策中…", state="running", expanded=True)
                     trimmed_messages = build_trimmed_input_messages(content_blocks)
                     router_result = run_async(arouter_decide(router_agent, user_text))
@@ -1206,7 +1189,6 @@ if prompt:
                     if isinstance(router_result.final_output, WebSearchPlan):
                         search_plan = router_result.final_output.searches
 
-                        # 顯示規劃＋「類串流」搜尋輸出
                         with output_area:
                             with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
                                 st.markdown("### 搜尋規劃")
@@ -1220,26 +1202,30 @@ if prompt:
                                     sec.markdown(f"**{it.query}**")
                                     body_placeholders.append(sec.empty())
 
-                                search_results = run_async(aparallel_search_stream(search_agent, search_plan, body_placeholders))
-                                summary_texts = [str(r.final_output) for r in search_results]
-
-                        # 持久化面板
-                        st.session_state.research_panel = {
-                            "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
-                            "summaries": [
-                                {"query": search_plan[i].query, "summary": summary_texts[i]}
-                                for i in range(len(search_plan))
-                            ]
-                        }
-                        st.session_state.show_research_panel = True
+                                search_results = run_async(aparallel_search_stream(
+                                    search_agent,
+                                    search_plan,
+                                    body_placeholders,
+                                    per_task_timeout=90,
+                                    max_concurrency=4,
+                                    retries=1,
+                                    retry_delay=1.0,
+                                ))
+                                summary_texts = []
+                                for r in search_results:
+                                    if isinstance(r, Exception):
+                                        summary_texts.append(f"（該條搜尋失敗：{r}）")
+                                    else:
+                                        summary_texts.append(str(getattr(r, "final_output", "") or r or ""))
 
                         search_for_writer = [
                             {"query": search_plan[i].query, "summary": summary_texts[i]}
                             for i in range(len(search_plan))
                         ]
 
+                        trimmed_messages_no_guard = strip_page_guard(trimmed_messages)
                         writer_data, writer_url_cits, writer_file_cits = run_writer(
-                            client, trimmed_messages, user_text, search_for_writer
+                            client, trimmed_messages_no_guard, user_text, search_for_writer
                         )
 
                         with output_area:
@@ -1327,7 +1313,6 @@ if prompt:
                         status.update(label="✅ 回退流程完成", state="complete", expanded=False)
 
         except Exception as e:
-            # 若發生例外，status 顯示 error，且在下方印 traceback
             with status_area:
                 st.status(f"❌ 發生錯誤：{e}", state="error", expanded=True)
             import traceback
