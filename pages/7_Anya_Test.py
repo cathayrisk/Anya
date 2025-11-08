@@ -43,6 +43,19 @@ st.set_page_config(page_title="Anya Multimodal Agent (Router + multimodal)", pag
 st.title("Anya Multimodal Agent（Router 分流 + 看圖讀PDF）")
 st.caption("研究/寫報告/文獻回顧 → Router 交棒規劃；一般對話/看圖讀PDF → 回到原本助理流程")
 
+# === 1.a Session 預設值保險（務必在任何使用 chat_history 前） ===
+# UPDATED: 新增初始化＋保險，避免 AttributeError
+def ensure_session_defaults():
+    if "chat_history" not in st.session_state or not isinstance(st.session_state.chat_history, list):
+        st.session_state.chat_history = [{
+            "role": "assistant",
+            "text": "嗨嗨～安妮亞來了！👋 上傳圖片或PDF，直接問你想知道的內容吧！\n小提醒：訊息裡可寫「只讀第1-3頁」或「pages 2,5,10-12」限制PDF頁面～",
+            "images": [],
+            "docs": []
+        }]
+
+ensure_session_defaults()  # UPDATED: 提早初始化，保證後續可用
+
 # === 共用：假串流打字效果 ===
 def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
     buf = ""
@@ -109,7 +122,6 @@ DOC_MIME_MAP = {
     ".json": "application/json",
     ".csv":  "text/csv",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-               # noqa
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
@@ -674,9 +686,6 @@ async def aparallel_search_stream(
 
     return results
 
-# === 3. OpenAI client（使用統一的 OPENAI_API_KEY） ===
-client = OpenAI(api_key=OPENAI_API_KEY)
-
 # === 4. 系統提示（一般分支使用 Responses API） ===
 ANYA_SYSTEM_PROMPT = """
 Developer: # Agentic Reminders
@@ -840,9 +849,13 @@ https://example.com/2
 請依照上述規則與範例，若用戶要求「翻譯」、「請翻譯」或「幫我翻譯」時，請完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。其餘內容思考後以安妮亞的風格、條列式、可愛語氣、正體中文、正確Markdown格式回答問題。請先思考再作答，確保每一題都用最合適的格式呈現。
 """
 
-# === 7. 將 chat_history 修剪成「最近 N 個使用者回合」並轉成 Responses API input ===
+# === 5. OpenAI client ===
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# === 6. 將 chat_history 修剪成「最近 N 個使用者回合」並轉成 Responses API input ===
 def build_trimmed_input_messages(pending_user_content_blocks):
-    hist = st.session_state.chat_history
+    # UPDATED: 使用 get 安全讀取，避免不存在時噴錯
+    hist = st.session_state.get("chat_history", [])
     if not hist:
         return [{"role": "user", "content": pending_user_content_blocks}]
     user_count = 0
@@ -877,26 +890,27 @@ def build_trimmed_input_messages(pending_user_content_blocks):
     messages.append({"role": "user", "content": pending_user_content_blocks})
     return messages
 
-# === 8. 顯示歷史 ===
-for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
+# === 7. 顯示歷史（安全讀取版） ===
+# UPDATED: 用 get 讀取，避免屬性不存在
+for msg in st.session_state.get("chat_history", []):
+    with st.chat_message(msg.get("role", "assistant")):
         if msg.get("text"):
             st.markdown(msg["text"])
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
         if msg.get("docs"):
-            for fn in msg.get("docs", []):
+            for fn in msg["docs"]:
                 st.caption(f"📎 {fn}")
 
-# === 9. 使用者輸入（支援圖片 + 檔案） ===
+# === 8. 使用者輸入（支援圖片 + 檔案） ===
 prompt = st.chat_input(
     "wakuwaku！上傳圖片或PDF，輸入你的問題吧～（可在訊息中寫『只讀第1-3頁』）",
     accept_file="multiple",
     file_type=["jpg","jpeg","png","webp","gif","pdf","txt","md","json","csv","docx","pptx"]
 )
 
-# === 10. 主流程：4.1 前置串流 Router →（快路徑 or 一般 gpt-5 or 研究）===
+# === 9. 主流程：4.1 前置串流 Router →（快路徑 or 一般 gpt-5 or 研究）===
 if prompt:
     user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
     images_for_history = []
@@ -961,7 +975,8 @@ if prompt:
             for fn in docs_for_history:
                 st.caption(f"📎 {fn}")
 
-    # 寫入歷史
+    # 寫入歷史（先保險初始化一次）
+    ensure_session_defaults()  # UPDATED: 追加保險
     st.session_state.chat_history.append({
         "role": "user",
         "text": user_text,
@@ -994,6 +1009,8 @@ if prompt:
                                 st.markdown("**本回合上傳檔案**")
                                 for fn in docs_for_history:
                                     st.markdown(f"- {fn}")
+                        # 寫入歷史（保險初始化）
+                        ensure_session_defaults()  # UPDATED
                         st.session_state.chat_history.append({"role": "assistant","text": final_text,"images": [],"docs": []})
                         st.stop()
 
@@ -1028,6 +1045,7 @@ if prompt:
                                 for fn in docs_for_history:
                                     st.markdown(f"- {fn}")
 
+                        ensure_session_defaults()  # UPDATED
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "text": final_text,
@@ -1124,6 +1142,7 @@ if prompt:
                             "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
                             "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
                         )
+                        ensure_session_defaults()  # UPDATED
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "text": ai_reply,
@@ -1135,6 +1154,8 @@ if prompt:
 
                     # 極少見：若前置 Router 無結果，回退舊 Router（仍重用 trimmed_messages）
                     status.update(label="↩️ 回退至舊 Router 決策中…", state="running", expanded=True)
+                    async def arouter_decide(router_agent, text: str):
+                        return await Runner.run(router_agent, text)
                     router_result = run_async(arouter_decide(router_agent, user_text))
 
                     if isinstance(router_result.final_output, WebSearchPlan):
@@ -1218,6 +1239,7 @@ if prompt:
                             "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
                             "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
                         )
+                        ensure_session_defaults()  # UPDATED
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "text": ai_reply,
@@ -1254,6 +1276,7 @@ if prompt:
                                 for fn in docs_for_history:
                                     st.markdown(f"- {fn}")
 
+                        ensure_session_defaults()  # UPDATED
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "text": final_text,
