@@ -68,7 +68,7 @@ def run_async(coro):
         t = threading.Thread(target=_runner)
         t.start()
         t.join()
-        return result_container["value"]
+        return result_container.get("value")
     else:
         return asyncio.run(coro)
 
@@ -105,6 +105,7 @@ def bytes_to_data_url(imgbytes: bytes) -> str:
 async def arouter_decide(router_agent, text: str):
     return await Runner.run(router_agent, text)
 
+# 既有（一次回傳）版本
 async def aparallel_search(search_agent, search_plan):
     async def one(item):
         return await Runner.run(
@@ -113,6 +114,31 @@ async def aparallel_search(search_agent, search_plan):
         )
     tasks = [one(item) for item in search_plan]
     return await asyncio.gather(*tasks)
+
+# 新增：並行搜尋＋即時顯示（完成序「類串流」）
+async def aparallel_search_stream(search_agent, search_plan, body_placeholders):
+    # 建任務
+    tasks = []
+    task_idx = {}
+    for idx, item in enumerate(search_plan):
+        coro = Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}")
+        t = asyncio.create_task(coro)
+        tasks.append(t)
+        task_idx[t] = idx
+
+    results = [None] * len(search_plan)
+    # 逐個完成就更新 UI
+    for t in asyncio.as_completed(tasks):
+        res = await t
+        idx = task_idx[t]
+        results[idx] = res
+        text = str(getattr(res, "final_output", "") or res)
+        ph = body_placeholders[idx]
+        try:
+            ph.markdown(text if text else "（沒有產出摘要）")
+        except Exception:
+            pass
+    return results
 
 # === 1.2 檔案工具：data URI（PDF/TXT/MD/JSON/CSV/DOCX/PPTX） ===
 DOC_MIME_MAP = {
@@ -301,7 +327,7 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
     ) as stream:
         for event in stream:
             et = getattr(event, "type", "")
-            # 文字流
+            # 文字流（第一個文字 delta → fast）
             if et == "response.output_text.delta":
                 if first_decision is None:
                     first_decision = "text"
@@ -345,7 +371,6 @@ def run_front_router_stream(client: OpenAI, content_blocks, placeholder, user_te
     if tool_name == "escalate_to_research":
         return {"kind": "research", "args": tool_args or {}}
 
-    # 不確定就保守升級到 general
     return {"kind": "general", "args": {"reason": "uncertain", "query": user_text, "need_web": True}}
 
 # === 1.5 Planner / Router / Search（Agents） ===
@@ -406,6 +431,7 @@ search_INSTRUCTIONS = with_handoff_prefix(
     "請務必以正體中文回應，並遵循台灣用語習慣。"
 )
 
+# 保持 Agent 設定不變；「串流顯示」由我們的 aparallel_search_stream + UI 容器來達成
 search_agent = Agent(
     name="SearchAgent",
     model="gpt-4.1",
@@ -483,6 +509,7 @@ if "chat_history" not in st.session_state:
         "docs": []
     }]
 
+# 研究面板持久化（避免 rerun 消失；下次送出訊息才關閉）
 if "research_panel" not in st.session_state:
     st.session_state.research_panel = None
 if "show_research_panel" not in st.session_state:
@@ -804,16 +831,16 @@ if prompt:
 
     # 助理區塊（固定順序：Status 先 → 串流輸出 → 來源）
     with st.chat_message("assistant"):
-        # 先建立三個容器：狀態在上、輸出在中、來源在下
+        # 三層容器：狀態在上、輸出在中、來源在下
         status_area = st.container()
         output_area = st.container()
         sources_container = st.container()
 
         try:
-            # 先渲染狀態（確保永遠出現在最上方）
+            # 先渲染狀態（確保永遠在最上方）
             with status_area:
                 with st.status("⚡ 快速路由中（gpt‑4.1 串流）", expanded=True) as status:
-                    # 串流輸出在 status 之後建立，視覺順序固定
+                    # 串流/輸出區塊在 status 之後建立，順序固定
                     placeholder = output_area.empty()
 
                     # 4.1 前置 Router
@@ -875,22 +902,37 @@ if prompt:
                     if fr_result["kind"] == "research":
                         status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
 
-                        # 1) Planner（直接以字串 query 呼叫）
+                        # 1) Planner（用字串 query 呼叫）
                         plan_query = fr_result["args"].get("query") or user_text
                         plan_res = run_async(Runner.run(planner_agent, plan_query))
                         search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
 
-                        # 2) 並行搜尋
-                        search_results = run_async(aparallel_search(search_agent, search_plan))
-                        summary_texts = [str(r.final_output) for r in search_results]
+                        # 2) 顯示規劃與「類串流」搜尋輸出（完成即更新）
+                        with output_area:
+                            with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
+                                # 規劃列表
+                                st.markdown("### 搜尋規劃")
+                                for i, it in enumerate(search_plan):
+                                    st.markdown(f"**{i+1}. {it.query}**\n> {it.reason}")
+                                st.markdown("### 各項搜尋摘要")
 
-                        # 研究面板（沿用你的現有 UI）
+                                # 為每條搜尋建立一個段落容器與 body placeholder
+                                body_placeholders = []
+                                for i, it in enumerate(search_plan):
+                                    sec = st.container()
+                                    sec.markdown(f"**{it.query}**")
+                                    body_placeholders.append(sec.empty())
+
+                                # 並行執行，完成就更新對應 placeholder
+                                search_results = run_async(aparallel_search_stream(search_agent, search_plan, body_placeholders))
+                                summary_texts = [str(r.final_output) for r in search_results]
+
+                        # 持久化面板（下次送訊息才關閉）
                         st.session_state.research_panel = {
                             "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
                             "summaries": [{"query": search_plan[i].query, "summary": summary_texts[i]} for i in range(len(search_plan))]
                         }
                         st.session_state.show_research_panel = True
-                        render_research_panel()
 
                         # 3) Writer
                         search_for_writer = [
@@ -901,15 +943,20 @@ if prompt:
                             client, trimmed_messages, plan_query, search_for_writer
                         )
 
-                        st.markdown("### 📋 Executive Summary")
-                        fake_stream_markdown(writer_data.get("short_summary", ""), output_area.empty())
+                        # 報告三段：標題與內容同容器，避免錯位
+                        with output_area:
+                            summary_sec = st.container()
+                            summary_sec.markdown("### 📋 Executive Summary")
+                            fake_stream_markdown(writer_data.get("short_summary", ""), summary_sec.empty())
 
-                        st.markdown("### 📖 完整報告")
-                        fake_stream_markdown(writer_data.get("markdown_report", ""), output_area.empty())
+                            report_sec = st.container()
+                            report_sec.markdown("### 📖 完整報告")
+                            fake_stream_markdown(writer_data.get("markdown_report", ""), report_sec.empty())
 
-                        st.markdown("### ❓ 後續建議問題")
-                        for q in writer_data.get("follow_up_questions", []) or []:
-                            st.markdown(f"- {q}")
+                            q_sec = st.container()
+                            q_sec.markdown("### ❓ 後續建議問題")
+                            for q in writer_data.get("follow_up_questions", []) or []:
+                                q_sec.markdown(f"- {q}")
 
                         with sources_container:
                             if writer_url_cits:
@@ -931,7 +978,7 @@ if prompt:
                                 for fn in docs_for_history:
                                     st.markdown(f"- {fn}")
 
-                        # 存入歷史
+                        # 存入歷史（只保存報告內容）
                         ai_reply = (
                             "#### Executive Summary\n" + (writer_data.get("short_summary", "") or "") + "\n" +
                             "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n" +
@@ -953,9 +1000,25 @@ if prompt:
 
                     if isinstance(router_result.final_output, WebSearchPlan):
                         search_plan = router_result.final_output.searches
-                        search_results = run_async(aparallel_search(search_agent, search_plan))
-                        summary_texts = [str(r.final_output) for r in search_results]
 
+                        # 顯示規劃＋「類串流」搜尋輸出
+                        with output_area:
+                            with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
+                                st.markdown("### 搜尋規劃")
+                                for i, it in enumerate(search_plan):
+                                    st.markdown(f"**{i+1}. {it.query}**\n> {it.reason}")
+                                st.markdown("### 各項搜尋摘要")
+
+                                body_placeholders = []
+                                for i, it in enumerate(search_plan):
+                                    sec = st.container()
+                                    sec.markdown(f"**{it.query}**")
+                                    body_placeholders.append(sec.empty())
+
+                                search_results = run_async(aparallel_search_stream(search_agent, search_plan, body_placeholders))
+                                summary_texts = [str(r.final_output) for r in search_results]
+
+                        # 持久化面板
                         st.session_state.research_panel = {
                             "plan": [{"query": it.query, "reason": it.reason} for it in search_plan],
                             "summaries": [
@@ -964,7 +1027,6 @@ if prompt:
                             ]
                         }
                         st.session_state.show_research_panel = True
-                        render_research_panel()
 
                         search_for_writer = [
                             {"query": search_plan[i].query, "summary": summary_texts[i]}
@@ -975,15 +1037,19 @@ if prompt:
                             client, trimmed_messages, user_text, search_for_writer
                         )
 
-                        st.markdown("### 📋 Executive Summary")
-                        fake_stream_markdown(writer_data.get("short_summary", ""), output_area.empty())
+                        with output_area:
+                            summary_sec = st.container()
+                            summary_sec.markdown("### 📋 Executive Summary")
+                            fake_stream_markdown(writer_data.get("short_summary", ""), summary_sec.empty())
 
-                        st.markdown("### 📖 完整報告")
-                        fake_stream_markdown(writer_data.get("markdown_report", ""), output_area.empty())
+                            report_sec = st.container()
+                            report_sec.markdown("### 📖 完整報告")
+                            fake_stream_markdown(writer_data.get("markdown_report", ""), report_sec.empty())
 
-                        st.markdown("### ❓ 後續建議問題")
-                        for q in writer_data.get("follow_up_questions", []) or []:
-                            st.markdown(f"- {q}")
+                            q_sec = st.container()
+                            q_sec.markdown("### ❓ 後續建議問題")
+                            for q in writer_data.get("follow_up_questions", []) or []:
+                                q_sec.markdown(f"- {q}")
 
                         with sources_container:
                             if writer_url_cits:
