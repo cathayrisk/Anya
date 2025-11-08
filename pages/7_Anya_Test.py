@@ -116,28 +116,50 @@ async def aparallel_search(search_agent, search_plan):
     return await asyncio.gather(*tasks)
 
 # 新增：並行搜尋＋即時顯示（完成序「類串流」）
-async def aparallel_search_stream(search_agent, search_plan, body_placeholders):
-    # 建任務
-    tasks = []
-    task_idx = {}
-    for idx, item in enumerate(search_plan):
-        coro = Runner.run(search_agent, f"Search term: {item.query}\nReason: {item.reason}")
-        t = asyncio.create_task(coro)
-        tasks.append(t)
-        task_idx[t] = idx
-
-    results = [None] * len(search_plan)
-    # 逐個完成就更新 UI
-    for t in asyncio.as_completed(tasks):
-        res = await t
-        idx = task_idx[t]
-        results[idx] = res
-        text = str(getattr(res, "final_output", "") or res)
-        ph = body_placeholders[idx]
+async def aparallel_search_stream(search_agent, search_plan, body_placeholders, per_task_timeout=90):
+    """
+    並行執行每條搜尋，哪條先完成就先更新對應區塊。
+    - 不再用 task 物件做對照，直接讓任務回傳 (idx, result)。
+    - 加入 per_task_timeout（秒）避免個別任務卡死。
+    - 失敗時在對應區塊顯示錯誤訊息，不影響其他任務。
+    """
+    async def one(idx, item):
         try:
-            ph.markdown(text if text else "（沒有產出摘要）")
-        except Exception:
-            pass
+            # 執行搜尋（必要時可在這裡先寫一行說明「即將呼叫搜尋」再交由 agent）
+            coro = Runner.run(
+                search_agent,
+                f"Search term: {item.query}\nReason: {item.reason}"
+            )
+            res = await asyncio.wait_for(coro, timeout=per_task_timeout)
+            return idx, res, None
+        except Exception as e:
+            return idx, None, e
+
+    # 建立所有任務（每個任務會回傳 (idx, res, err)）
+    tasks = [asyncio.create_task(one(idx, item)) for idx, item in enumerate(search_plan)]
+    results = [None] * len(search_plan)
+
+    # 防呆：placeholder 長度不夠就補齊
+    if len(body_placeholders) < len(search_plan):
+        # 不在這裡新建 UI；這個防呆只是避免 IndexError
+        body_placeholders = body_placeholders + [None] * (len(search_plan) - len(body_placeholders))
+
+    # 逐個完成就更新對應 placeholder
+    for fut in asyncio.as_completed(tasks):
+        idx, res, err = await fut
+        results[idx] = res if err is None else err
+        ph = body_placeholders[idx]
+        if ph is not None:
+            try:
+                if err is not None:
+                    ph.markdown(f":red[搜尋失敗]：{err}")
+                else:
+                    txt = str(getattr(res, "final_output", "") or res or "")
+                    ph.markdown(txt if txt else "（沒有產出摘要）")
+            except Exception:
+                # UI 更新失敗時，忽略避免中斷其他任務
+                pass
+
     return results
 
 # === 1.2 檔案工具：data URI（PDF/TXT/MD/JSON/CSV/DOCX/PPTX） ===
