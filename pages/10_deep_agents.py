@@ -24,6 +24,9 @@ if not OPENAI_API_KEY:
     st.stop()
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # 讓 Agents SDK 可以讀到
 
+# === 5. OpenAI client ===
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 # 基礎套件
 try:
     from agents import Agent, Runner
