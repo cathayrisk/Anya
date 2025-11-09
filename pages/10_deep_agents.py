@@ -13,11 +13,16 @@ st.set_page_config(page_title="Anya DeepAgents Orchestrator", page_icon="🧠")
 st.title("🧠 Anya DeepAgents Orchestrator")
 st.caption("A+ 版（小並行＋重試＋驗收）｜以 Streamlit 聊天互動執行 triage → plan → execute → verify → deliver")
 
-# API Key
-try:
-    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
-except Exception:
-    st.warning("找不到 OPENAI_KEY，請於 .streamlit/secrets.toml 設定 OPENAI_KEY。")
+# === 0.1 取得 API Key ===
+OPENAI_API_KEY = (
+    st.secrets.get("OPENAI_API_KEY")
+    or st.secrets.get("OPENAI_KEY")
+    or os.getenv("OPENAI_API_KEY")
+)
+if not OPENAI_API_KEY:
+    st.error("找不到 OpenAI API Key，請在 .streamlit/secrets.toml 設定 OPENAI_API_KEY 或 OPENAI_KEY。")
+    st.stop()
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # 讓 Agents SDK 可以讀到
 
 # 基礎套件
 try:
