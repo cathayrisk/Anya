@@ -1,33 +1,30 @@
 # Anya/pages/main.py
 from __future__ import annotations
 
+# 先處理環境變數與靜音追蹤匯出（一定要在 import agents 之前）
 import os
+os.environ.setdefault("AGENTS_TRACE_EXPORT", "disabled")  # 關掉 trace export 初始化訊息
+
 import json
 import asyncio
 import random
 from typing import Dict, List, Sequence, Tuple
-from openai import OpenAI
+
 import streamlit as st
 
 st.set_page_config(page_title="Anya DeepAgents Orchestrator", page_icon="🧠")
 st.title("🧠 Anya DeepAgents Orchestrator")
 st.caption("A+ 版（小並行＋重試＋驗收）｜以 Streamlit 聊天互動執行 triage → plan → execute → verify → deliver")
 
-# === 0.1 取得 API Key ===
-OPENAI_API_KEY = (
-    st.secrets.get("OPENAI_API_KEY")
-    or st.secrets.get("OPENAI_KEY")
-    or os.getenv("OPENAI_API_KEY")
-)
-if not OPENAI_API_KEY:
+# === 取得 API Key（先環境後 secrets，並在 import agents 前完成設定）===
+_openai_key = os.getenv("OPENAI_API_KEY")
+_openai_key = st.secrets.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_KEY") or _openai_key
+if not _openai_key:
     st.error("找不到 OpenAI API Key，請在 .streamlit/secrets.toml 設定 OPENAI_API_KEY 或 OPENAI_KEY。")
     st.stop()
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # 讓 Agents SDK 可以讀到
+os.environ["OPENAI_API_KEY"] = _openai_key  # 讓 Agents SDK 可在 import 後直接讀到
 
-# === 5. OpenAI client ===
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# 基礎套件
+# 基礎套件（現在再載入，會讀到 OPENAI_API_KEY；且 trace 已被關掉）
 try:
     from agents import Agent, Runner
 except Exception as e:
