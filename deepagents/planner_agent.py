@@ -20,6 +20,6 @@ PLANNER_PROMPT = """
 planner_agent = Agent(
     name="PlannerAgent",
     instructions=PLANNER_PROMPT,
-    model="o3-mini",
+    model="gpt-5",
     output_type=Plan,
 )
