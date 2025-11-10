@@ -294,10 +294,10 @@ if prompt:
     with st.chat_message("assistant", avatar="🧠"):
         # 狀態列（st.status）即時顯示進度
         with st.status("分類中（Triage）", state="running") as tri_stat, \
-             st.status("規劃中（Plan）", state="waiting") as plan_stat, \
-             st.status("執行中（Execute）", state="waiting") as exec_stat, \
-             st.status("撰寫中（Write）", state="waiting") as write_stat, \
-             st.status("驗證中（Final Verify）", state="waiting") as final_stat:
+             st.status("規劃中（Plan）", state="running") as plan_stat, \
+             st.status("執行中（Execute）", state="running") as exec_stat, \
+             st.status("撰寫中（Write）", state="running") as write_stat, \
+             st.status("驗證中（Final Verify）", state="running") as final_stat:
 
             def _progress_cb(event: str, info: Dict):
                 if event == "triage.start":
