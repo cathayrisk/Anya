@@ -100,7 +100,7 @@ class APlusOrchestrator:
         # 5) 最終驗證
         final_criteria = _ensure_dict(plan.metadata.acceptance_criteria_final)
         verify_input = {"output": final_output, "criteria": final_criteria}
-        final_ver = await Runner.run(verifier_agent, verify_input)
+        final_ver = await Runner.run(verifier_agent, json.dumps(verify_input, ensure_ascii=False))
         verification = final_ver.final_output_as(VerificationResult)
 
         return {
@@ -141,7 +141,7 @@ class APlusOrchestrator:
                 # 驗收（把 JSON 字串轉 dict）
                 criteria = _ensure_dict(step.acceptance_criteria)
                 verify_input = {"output": output, "criteria": criteria}
-                ver_res = await Runner.run(verifier_agent, verify_input)
+                ver_res = await Runner.run(verifier_agent, json.dumps(verify_input, ensure_ascii=False))
                 ver = ver_res.final_output_as(VerificationResult)
                 if ver.passed:
                     return step.id, output
