@@ -568,7 +568,7 @@ def run_front_router_stream(client: OpenAI, input_messages: list, placeholder, u
         tool_choice="auto",
         parallel_tool_calls=False,
         max_tool_calls=1,
-        temperature=0.2,
+        temperature=0,
         service_tier="priority",
     ) as stream:
         try:
