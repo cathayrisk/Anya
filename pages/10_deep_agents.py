@@ -8,7 +8,7 @@ os.environ.setdefault("AGENTS_TRACE_EXPORT", "disabled")  # 關掉 trace export 
 import json
 import asyncio
 import random
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import streamlit as st
 
@@ -63,46 +63,93 @@ def _ensure_dict(obj) -> Dict:
             return {}
     return {}
 
+# 預設最佳參數（無側欄）
+DEFAULT_MAX_PARALLEL = 5          # 建議 4–6；取 5
+DEFAULT_BASE_BACKOFF = 0.6        # 退避較靈敏
+DEFAULT_STRICT_VERIFY = False     # 步驟驗收未過→以 [WARN] 放行，不中斷
+
 # Orchestrator
 class APlusOrchestrator:
-    def __init__(self, max_parallel: int = 3, base_backoff: float = 1.0, strict_verify: bool = False):
+    def __init__(
+        self,
+        max_parallel: int = DEFAULT_MAX_PARALLEL,
+        base_backoff: float = DEFAULT_BASE_BACKOFF,
+        strict_verify: bool = DEFAULT_STRICT_VERIFY,
+        progress: Optional[Callable[[str, Dict], None]] = None,
+    ):
         self.max_parallel = max_parallel
         self.base_backoff = base_backoff
         self.strict_verify = strict_verify
+        self._progress = progress or (lambda *args, **kwargs: None)
+
+    def _notify(self, event: str, **payload):
+        try:
+            self._progress(event, payload)
+        except Exception:
+            # 靜默忽略 UI 回報失敗，避免影響主流程
+            pass
 
     async def run(self, goal: str) -> Dict[str, object]:
         # 1) Triage
+        self._notify("triage.start", goal=goal)
         triage_res = await Runner.run(triage_agent, goal)
         triage = triage_res.final_output_as(TriageDecision)
+        self._notify("triage.done", triage=triage)
 
         # 2) Plan
+        self._notify("plan.start")
         planner_input = f"Goal: {goal}\nTriage: {triage.model_dump_json()}"
         plan_res = await Runner.run(planner_agent, planner_input)
         plan = plan_res.final_output_as(Plan)
+        self._notify("plan.done", total_steps=len(plan.steps))
 
         # 3) Execute
+        self._notify("execute.start")
         outputs: Dict[str, str] = {}
 
         # 3a) 並行批次
-        for _, steps in self._group_parallel_steps(plan.steps).items():
+        for group_key, steps in self._group_parallel_steps(plan.steps).items():
+            self._notify("execute.batch_start", batch=group_key, count=len(steps))
             await self._execute_parallel_batch(steps, outputs)
+            self._notify("execute.batch_done", batch=group_key)
 
         # 3b) 序列步驟
         serial_steps = [s for s in plan.steps if not s.is_parallel]
         for step in serial_steps:
+            self._notify("execute.step_start", step_id=step.id, desc=step.description, tool=step.tool_name)
             sid, out = await self._execute_with_retry(step)
             outputs[sid] = out
+            # 根據是否 WARN/ERROR 更新
+            if out and "[ERROR]" in out:
+                self._notify("execute.step_error", step_id=sid, message=out)
+            elif out and "[WARN]" in out:
+                self._notify("execute.step_warn", step_id=sid, message=out)
+            else:
+                self._notify("execute.step_ok", step_id=sid)
+        self._notify("execute.done")
 
         # 4) Writer
+        self._notify("write.start")
         writer_input = f"Goal: {plan.metadata.goal}\nArtifacts: {outputs}"
         final_res = await Runner.run(writer_agent, writer_input)
         final_output = str(final_res.final_output)
+        self._notify("write.done")
 
-        # 5) 最終驗證
-        final_criteria = _ensure_dict(plan.metadata.acceptance_criteria_final)
+        # 5) 最終驗證（提供預設標準，避免缺 criteria）
+        self._notify("final_verify.start")
+        final_criteria = _ensure_dict(getattr(plan.metadata, "acceptance_criteria_final", None))
+        if not final_criteria:
+            final_criteria = {
+                "type": "research",
+                "min_sources": 8,
+                "must_have_sections": ["政策公告彙整", "主流媒體交叉", "學者/產業觀點", "社會影響", "事件時間線"],
+                "per_source_fields": ["title", "url", "published_date"],
+                "date_window_max_months": 18,
+            }
         verify_input = {"output": final_output, "criteria": final_criteria}
         final_ver = await Runner.run(verifier_agent, json.dumps(verify_input, ensure_ascii=False))
         verification = final_ver.final_output_as(VerificationResult)
+        self._notify("final_verify.done", passed=verification.passed)
 
         return {
             "ok": True,
@@ -127,10 +174,18 @@ class APlusOrchestrator:
         async def run_one(step: Step) -> Tuple[str, str]:
             async with sem:
                 try:
+                    self._notify("execute.step_start", step_id=step.id, desc=step.description, tool=step.tool_name)
                     sid, out = await self._execute_with_retry(step)
+                    # 回報狀態
+                    if out and "[ERROR]" in out:
+                        self._notify("execute.step_error", step_id=sid, message=out)
+                    elif out and "[WARN]" in out:
+                        self._notify("execute.step_warn", step_id=sid, message=out)
+                    else:
+                        self._notify("execute.step_ok", step_id=sid)
                     return sid, out
                 except Exception as e:
-                    # 標記錯誤但不中斷整批
+                    self._notify("execute.step_error", step_id=step.id, message=str(e))
                     return step.id, f"[ERROR] {e}"
 
         tasks = [asyncio.create_task(run_one(s)) for s in steps]
@@ -138,12 +193,11 @@ class APlusOrchestrator:
             try:
                 sid, out = await coro
             except Exception as e:
-                # 極端情況保底
                 sid, out = "unknown_step", f"[ERROR] {e}"
             outputs[sid] = out
 
     async def _execute_with_retry(self, step: Step) -> Tuple[str, str]:
-        attempts = step.max_retries + 1
+        attempts = step.max_retries + 1 if getattr(step, "max_retries", None) is not None else 2  # 預設重試 1 次
         for i in range(attempts):
             try:
                 output = await self._execute_step(step, attempt=i, total_attempts=attempts)
@@ -155,11 +209,9 @@ class APlusOrchestrator:
                 if ver.passed:
                     return step.id, output
                 else:
-                    # 若還有重試次數 → 退避後重來
                     if i < attempts - 1:
                         await asyncio.sleep(self._backoff(i))
                         continue
-                    # 最後一次仍未過 → 視 strict_verify 決定是警告放行或直接丟錯
                     if not self.strict_verify:
                         return step.id, f"{output}\n\n[WARN] verify failed: {ver.issues}"
                     raise RuntimeError(f"Step {step.id} failed verification: {ver.issues}")
@@ -167,10 +219,24 @@ class APlusOrchestrator:
                 if i < attempts - 1:
                     await asyncio.sleep(self._backoff(i))
                     continue
-                raise RuntimeError(f"Step {step.id} error after retries: {e}")
+                return step.id, f"[ERROR] Step {step.id} error after retries: {e}"
 
     def _backoff(self, attempt: int) -> float:
         return (2 ** attempt) * self.base_backoff + random.uniform(0, 0.3)
+
+    def _cap_timeout(self, step: Step) -> float:
+        # 依步驟類型給合理上限，避免超長等待
+        typ = _ensure_dict(step.acceptance_criteria).get("type", "")
+        if typ == "research":
+            cap = 90.0
+        elif typ in ("data", "code"):
+            cap = 120.0
+        else:
+            cap = 240.0  # 例如寫作或未標註型別
+        t = getattr(step, "timeout", None)
+        if t is None or t <= 0:
+            return cap
+        return min(float(t), cap)
 
     async def _execute_step(self, step: Step, attempt: int = 0, total_attempts: int = 1) -> str:
         agent = self._route_agent(step)
@@ -182,11 +248,8 @@ class APlusOrchestrator:
             f"Retry: {attempt + 1}/{total_attempts}"
         )
         task = Runner.run(agent, input_payload)
-        timeout = getattr(step, "timeout", None)
-        if timeout:
-            res = await asyncio.wait_for(task, timeout=timeout)
-        else:
-            res = await task
+        timeout = self._cap_timeout(step)
+        res = await asyncio.wait_for(task, timeout=timeout)
         return str(res.final_output)
 
     def _route_agent(self, step: Step) -> Agent:
@@ -203,14 +266,6 @@ if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "assistant", "content": "嗨嗨～請描述你的目標或要解的問題，安妮亞幫你規劃→並行研究→彙整交付！🥜"}
     ]
-
-# 側邊欄
-with st.sidebar:
-    st.header("設定")
-    max_parallel = st.slider("最大並行數", min_value=1, max_value=8, value=3, step=1)
-    base_backoff = st.slider("重試基礎退避秒數", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
-    soft_fail = st.checkbox("步驟驗收未過改為警告（不中斷）", value=True)
-    st.caption("提示：並行數建議 2–4，退避越長越保守喔。")
 
 # transcript
 def transcript_from_messages(msgs: List[Dict[str, str]]) -> str:
@@ -237,29 +292,83 @@ if prompt:
     full_text = transcript_from_messages(st.session_state.messages)
 
     with st.chat_message("assistant", avatar="🧠"):
-        with st.spinner("安妮亞努力規劃與研究中…(滴答滴答)"):
+        # 狀態列（st.status）即時顯示進度
+        with st.status("分類中（Triage）", state="running") as tri_stat, \
+             st.status("規劃中（Plan）", state="waiting") as plan_stat, \
+             st.status("執行中（Execute）", state="waiting") as exec_stat, \
+             st.status("撰寫中（Write）", state="waiting") as write_stat, \
+             st.status("驗證中（Final Verify）", state="waiting") as final_stat:
+
+            def _progress_cb(event: str, info: Dict):
+                if event == "triage.start":
+                    tri_stat.update(label="分類中（Triage）", state="running")
+                elif event == "triage.done":
+                    tri_stat.update(label="分類完成（Triage）", state="complete")
+
+                elif event == "plan.start":
+                    plan_stat.update(label="規劃中（Plan）", state="running")
+                elif event == "plan.done":
+                    plan_stat.update(label=f"規劃完成（{info.get('total_steps', 0)} 步）", state="complete")
+                    exec_stat.update(label="執行中（Execute）", state="running")
+
+                elif event == "execute.start":
+                    exec_stat.update(label="執行中（Execute）", state="running")
+                elif event == "execute.batch_start":
+                    exec_stat.update(label=f"執行中：並行批次「{info.get('batch')}」", state="running")
+                elif event == "execute.batch_done":
+                    exec_stat.update(label=f"執行中：批次「{info.get('batch')}」完成", state="running")
+                elif event == "execute.step_start":
+                    # 可視需要寫更細緻訊息（略）
+                    pass
+                elif event == "execute.step_ok":
+                    pass
+                elif event == "execute.step_warn":
+                    pass
+                elif event == "execute.step_error":
+                    pass
+                elif event == "execute.done":
+                    exec_stat.update(label="執行完成（Execute）", state="complete")
+                    write_stat.update(label="撰寫中（Write）", state="running")
+
+                elif event == "write.start":
+                    write_stat.update(label="撰寫中（Write）", state="running")
+                elif event == "write.done":
+                    write_stat.update(label="撰寫完成（Write）", state="complete")
+                    final_stat.update(label="驗證中（Final Verify）", state="running")
+
+                elif event == "final_verify.start":
+                    final_stat.update(label="驗證中（Final Verify）", state="running")
+                elif event == "final_verify.done":
+                    if info.get("passed"):
+                        final_stat.update(label="驗證完成（✅ 通過）", state="complete")
+                    else:
+                        final_stat.update(label="驗證完成（⚠️ 有問題）", state="complete")
+
             async def _run_once() -> Dict[str, object]:
                 orchestrator = APlusOrchestrator(
-                    max_parallel=max_parallel,
-                    base_backoff=base_backoff,
-                    strict_verify=not soft_fail,
+                    max_parallel=DEFAULT_MAX_PARALLEL,
+                    base_backoff=DEFAULT_BASE_BACKOFF,
+                    strict_verify=DEFAULT_STRICT_VERIFY,
+                    progress=_progress_cb,
                 )
                 return await orchestrator.run(full_text)
 
             try:
                 out = asyncio.run(_run_once())
             except RuntimeError:
-                # Fallback: 在已存在 event loop 的環境（例如某些雲端或嵌套呼叫）
+                # Fallback: 在已存在 event loop 的環境
                 loop = asyncio.new_event_loop()
                 try:
                     asyncio.set_event_loop(loop)
                     out = loop.run_until_complete(_run_once())
                 except Exception as e:
+                    final_stat.update(label=f"流程失敗：{e}", state="error")
                     st.error(f"流程失敗：{e}")
                     st.stop()
                 finally:
                     loop.close()
             except Exception as e:
+                final_stat.update(label=f"流程失敗：{e}", state="error")
                 st.error(f"流程失敗：{e}")
                 st.stop()
 
@@ -275,29 +384,29 @@ if prompt:
                 if tri.notes:
                     st.markdown(f"- notes: {tri.notes}")
 
-        # Plan
+        # Plan（不顯示 S1/S2…，只顯示「步驟編號」與描述）
         plan = out.get("plan")
         if plan:
             with st.expander("Plan 步驟（含並行標註）", expanded=False):
                 for i, s in enumerate(plan.steps, start=1):
                     tag = "並行" if s.is_parallel else "序列"
                     tool = f"{s.tool_name}" if s.tool_name else "-"
-                    st.markdown(f"**Step {i} | {s.id}** · {tag} · tool={tool}")
+                    st.markdown(f"**步驟 {i}** · {tag} · tool={tool}")
                     st.markdown(f"- {s.description}")
                     if s.parallel_group:
                         st.markdown(f"- parallel_group: {s.parallel_group}")
-                    if s.acceptance_criteria is not None:
-                        show = s.acceptance_criteria if isinstance(s.acceptance_criteria, str) else json.dumps(s.acceptance_criteria, ensure_ascii=False)
-                        st.markdown(f"- acceptance_criteria: `{show}`")
-                    if s.max_retries or getattr(s, 'timeout', None):
-                        st.caption(f"retries={s.max_retries}, timeout={getattr(s, 'timeout', None)}s")
+                    # 若需要可顯示驗收條件
+                    # show = s.acceptance_criteria if isinstance(s.acceptance_criteria, str) else json.dumps(s.acceptance_criteria, ensure_ascii=False)
+                    # st.markdown(f"- acceptance_criteria: `{show}`")
+                    if getattr(s, "max_retries", None) is not None or getattr(s, 'timeout', None):
+                        st.caption(f"retries={getattr(s, 'max_retries', 0)}, timeout={getattr(s, 'timeout', None)}s")
 
-        # 步驟輸出
+        # 步驟輸出（摘要）
         step_outputs = out.get("step_outputs") or {}
         if step_outputs:
             with st.expander("步驟輸出（摘要）", expanded=False):
                 for sid, text in step_outputs.items():
-                    st.markdown(f"**{sid}**")
+                    # 不再顯示 S-id；僅顯示內容
                     st.code(text[:2000] + ("..." if len(text) > 2000 else ""), language="markdown")
 
         # 最終輸出
