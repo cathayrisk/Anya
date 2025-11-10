@@ -18,7 +18,7 @@ st.caption("A+ 版（小並行＋重試＋驗收）｜以 Streamlit 聊天互動
 
 # === 取得 API Key（先環境後 secrets，並在 import agents 前完成設定）===
 _openai_key = os.getenv("OPENAI_API_KEY")
-_openai_key = st.secrets.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_KEY") or _openai_key
+_openai_key = st.secrets.get("OPENAI_API_KEY") or st.secrets["OPENAI_KEY"] or _openai_key
 if not _openai_key:
     st.error("找不到 OpenAI API Key，請在 .streamlit/secrets.toml 設定 OPENAI_API_KEY 或 OPENAI_KEY。")
     st.stop()
