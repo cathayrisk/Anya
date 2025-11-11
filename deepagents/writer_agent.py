@@ -1,6 +1,6 @@
 # Anya/deepagents/writer_agent.py
 from __future__ import annotations
-
+from openai.types.shared.reasoning import Reasoning
 from agents import Agent, ModelSettings
 
 WRITER_PROMPT = """
