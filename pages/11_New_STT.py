@@ -387,7 +387,6 @@ def map_summarize_blocks(flat_sentences: List[str], chunk_size=DEFAULT_MAP_CHUNK
                     {"role": "user", "content": [{"type": "input_text", "text": user_msg}]},
                 ],
                 text={"format": {"type": "text"}, "verbosity": "low"},
-                reasoning={"effort": "low"},
                 tools=[],
             )
             content = resp.output_text or ""
@@ -418,8 +417,7 @@ def reduce_finalize_json(map_blocks: List[str]) -> Dict[str, Any]:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}, "verbosity": "low"},
-            reasoning={"effort": "low", "summary": "auto"},
+            text={"format": {"type": "text"}}
             tools=[],
         )
         s = (resp.output_text or "").strip()
@@ -449,8 +447,7 @@ def reduce_finalize_markdown(map_blocks: List[str]) -> str:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}, "verbosity": "medium"},
-            reasoning={"effort": "low", "summary": "auto"},
+            text={"format": {"type": "text"}},
             tools=[],
         )
         return (resp.output_text or "").strip()
@@ -497,15 +494,6 @@ with st.expander("上傳會議錄音檔案", expanded=True):
 # ========== 單一整體收合的進階調整 ==========
 with st.expander("進階調整（全部設定，可選）", expanded=False):
     st.caption("平常維持預設即可；只有音檔特性特殊時再開啟。")
-
-    st.markdown("###### 參數檢視")
-    st.text(f"MIN_SILENCE_LEN_MS = {MIN_SILENCE_LEN_MS}")
-    st.text(f"KEEP_SILENCE_MS = {KEEP_SILENCE_MS}")
-    st.text(f"SILENCE_DB_OFFSET = {SILENCE_DB_OFFSET}")
-    st.text(f"OVERLAP_MS = {OVERLAP_MS}")
-    st.text(f"MAX_CHUNK_MS = {MAX_CHUNK_MS}, MIN_CHUNK_MS = {MIN_CHUNK_MS}")
-    st.text(f"MAP_CHUNK_SIZE = {DEFAULT_MAP_CHUNK_SIZE}")
-
     st.markdown("###### 音訊前處理")
     cols = st.columns(2)
     with cols[0]:
