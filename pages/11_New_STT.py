@@ -32,7 +32,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 頂部卡片標題
-st.markdown('<div class="pink-card header-pill"><span class="emoji">💬</span> 安妮亞聽寫室：錄音變文字</div>', unsafe_allow_html=True)
+st.markdown('<div class="pink-card header-pill"><span class="emoji">💋</span> Speech to text transcription</div>', unsafe_allow_html=True)
 
 # 檢查 FFmpeg
 AudioSegment.converter = which("ffmpeg")
@@ -244,7 +244,7 @@ def refine_zh_tw_via_prompt(lines: List[str]) -> List[str]:
                 {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
                 {"role": "user", "content": [{"type": "input_text", "text": blob}]},
             ],
-            text={"format": {"type": "text"}},
+            text={"format": {"type": "text"}, "verbosity": "low"},
             tools=[],
         )
         out = (resp.output_text or "").rstrip("\n")
@@ -417,7 +417,7 @@ def reduce_finalize_json(map_blocks: List[str]) -> Dict[str, Any]:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}}
+            text={"format": {"type": "text"}, "verbosity": "low"},
             tools=[],
         )
         s = (resp.output_text or "").strip()
@@ -447,7 +447,7 @@ def reduce_finalize_markdown(map_blocks: List[str]) -> str:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}},
+            text={"format": {"type": "text"}, "verbosity": "medium"},
             tools=[],
         )
         return (resp.output_text or "").strip()
@@ -494,6 +494,8 @@ with st.expander("上傳會議錄音檔案", expanded=True):
 # ========== 單一整體收合的進階調整 ==========
 with st.expander("進階調整（全部設定，可選）", expanded=False):
     st.caption("平常維持預設即可；只有音檔特性特殊時再開啟。")
+
+    st.markdown("###### 參數檢視")
     st.markdown("###### 音訊前處理")
     cols = st.columns(2)
     with cols[0]:
