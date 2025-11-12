@@ -50,9 +50,9 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 # ========== 參數 ==========
-MODEL_STT = "gpt-4o-transcribe"
-MODEL_MAP = "gpt-5-mini"
-MODEL_REDUCE = "gpt-5-mini"
+MODEL_STT = "gpt-4o-transcribe"  # STT 忠實轉錄原語言
+MODEL_MAP = "gpt-5"              # 分段摘要
+MODEL_REDUCE = "gpt-5"           # 總整/潤飾
 
 # 切段參數
 MIN_SILENCE_LEN_MS = 700
@@ -213,45 +213,62 @@ def pretty_format_sentences(sentences: List[str]) -> List[str]:
         pretty.append(s2)
     return pretty
 
-# 顯示層：逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）
+# 顯示層：逐行『潤飾＋必要時翻譯』為正體中文（台灣用語），穩定版（批次＋分隔符）
 def refine_zh_tw_via_prompt(lines: List[str]) -> List[str]:
     """
-    顯示層用途：將多行句子逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）。
-    規範：
-    - 保持原意，不捏造資訊；允許修順語序與標點，使更自然流暢。
-    - 若該行為英文或混雜語言，翻譯為正體中文（台灣用語）。
-    - 保留數字、單位、時間、金額、emoji、網址、簡短代碼片段等。
-    - 保持與輸入完全相同的行數與順序；每一輸入行對應輸出一行。
-    - 口吻：簡潔、專業、自然。
+    將多行句子逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）。
+    - 批次處理＋分隔符防走位；單批失敗只回退該批，不影響其他批。
     """
     if not lines:
         return lines
-    blob = "\n".join(lines)
-    dev_msg = (
-        "你將收到多行逐字稿，請逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）。\n"
-        "要求：\n"
-        "1) 僅做語句潤飾與正體翻譯，保留原意，不得捏造資訊。\n"
-        "2) 若該行是英文或混雜語言，請翻譯為正體中文（台灣用語）。\n"
-        "3) 保留數字、單位、時間、金額、emoji、網址、簡短代碼片段等非語意內容。\n"
-        "4) 保持與輸入『完全相同的行數與順序』；每一輸入行對應輸出一行。\n"
-        "5) 標點與用詞採台灣慣用，語氣簡潔專業、自然。\n"
-        "只輸出最終文本，不要任何解釋。"
-    )
-    try:
-        resp = client.responses.create(
-            model=MODEL_REDUCE,
-            input=[
-                {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
-                {"role": "user", "content": [{"type": "input_text", "text": blob}]},
-            ],
-            text={"format": {"type": "text"},},
-            tools=[],
+
+    SEP = "\u241E"  # ␞ 極少見的可視分隔符
+    MAX_BATCH_CHARS = 9000  # 單批最大字數（保守）
+    MAX_BATCH_LINES = 120   # 單批最多行數（保守）
+
+    def _refine_batch(batch: List[str]) -> List[str]:
+        blob = SEP.join(batch)
+        dev_msg = (
+            "你將收到多行逐字稿，請逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）。\n"
+            "要求：\n"
+            "1) 保留原意，只做語句潤飾與正體翻譯，不得捏造資訊。\n"
+            "2) 若該行是英文或混雜語言，翻譯為正體中文（台灣用語）。\n"
+            "3) 嚴禁合併/拆分行；嚴禁插入或刪除空行；輸入幾行就輸出幾行。\n"
+            "4) 保留數字、單位、時間、金額、emoji、網址、簡短代碼片段等非語意內容。\n"
+            "5) 用詞採台灣慣用、口吻簡潔專業自然。\n"
+            "6) 行與行由特殊分隔符 ␞（U+241E）連接；請務必保留相同數量的分隔符，不可新增或移除。\n"
+            "只輸出最終文本，不要任何解釋。"
         )
-        out = (resp.output_text or "").rstrip("\n")
-        out_lines = out.split("\n") if out else []
-        return out_lines if len(out_lines) == len(lines) else lines
-    except Exception:
-        return lines
+        try:
+            resp = client.responses.create(
+                model=MODEL_REDUCE,
+                input=[
+                    {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": blob}]},
+                ],
+                text={"format": {"type": "text"}},
+                tools=[],
+            )
+            out = (resp.output_text or "").rstrip("\n")
+            out_lines = out.split(SEP) if SEP in out else out.split("\n")
+            return out_lines if len(out_lines) == len(batch) else batch
+        except Exception:
+            return batch
+
+    # 分批處理
+    refined_all: List[str] = []
+    batch: List[str] = []
+    size = 0
+    for s in lines:
+        if (len(batch) >= MAX_BATCH_LINES) or (size + len(s) + 1 > MAX_BATCH_CHARS):
+            refined_all.extend(_refine_batch(batch))
+            batch, size = [], 0
+        batch.append(s)
+        size += len(s) + 1
+    if batch:
+        refined_all.extend(_refine_batch(batch))
+
+    return refined_all if refined_all else lines
 
 # Prompt（若端點支援就用、不支援自動回退）
 def build_prompt(prev_text: str, glossary: str, style_seed: str, max_tokens: int = 220) -> str:
@@ -386,7 +403,7 @@ def map_summarize_blocks(flat_sentences: List[str], chunk_size=DEFAULT_MAP_CHUNK
                     {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
                     {"role": "user", "content": [{"type": "input_text", "text": user_msg}]},
                 ],
-                text={"format": {"type": "text"}, },
+                text={"format": {"type": "text"}},
                 tools=[],
             )
             content = resp.output_text or ""
@@ -417,7 +434,7 @@ def reduce_finalize_json(map_blocks: List[str]) -> Dict[str, Any]:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}, },
+            text={"format": {"type": "text"}},
             tools=[],
         )
         s = (resp.output_text or "").strip()
@@ -447,7 +464,7 @@ def reduce_finalize_markdown(map_blocks: List[str]) -> str:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}, },
+            text={"format": {"type": "text"}},
             tools=[],
         )
         return (resp.output_text or "").strip()
@@ -495,7 +512,6 @@ with st.expander("上傳會議錄音檔案", expanded=True):
 with st.expander("進階調整（全部設定，可選）", expanded=False):
     st.caption("平常維持預設即可；只有音檔特性特殊時再開啟。")
 
-    st.markdown("###### 參數檢視")
     st.markdown("###### 音訊前處理")
     cols = st.columns(2)
     with cols[0]:
@@ -591,6 +607,8 @@ with tab1:
         paras = group_into_paragraphs(refined_lines, max_chars=280, max_sents=4)
         final_md = "\n\n".join(paras)
         stream_container.markdown(final_md)
+        if refined_lines == pretty_lines:
+            st.caption("提示：可讀版潤飾/翻譯可能未生效（模型回覆格式不符或服務暫時失敗，已回退原文顯示）。")
         st.success("Transcription complete!")
 
         status.update(label="整併重點（內部計算）...")
