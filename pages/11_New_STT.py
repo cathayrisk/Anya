@@ -244,7 +244,7 @@ def refine_zh_tw_via_prompt(lines: List[str]) -> List[str]:
                 {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
                 {"role": "user", "content": [{"type": "input_text", "text": blob}]},
             ],
-            text={"format": {"type": "text"}, "verbosity": "low"},
+            text={"format": {"type": "text"},},
             tools=[],
         )
         out = (resp.output_text or "").rstrip("\n")
@@ -386,7 +386,7 @@ def map_summarize_blocks(flat_sentences: List[str], chunk_size=DEFAULT_MAP_CHUNK
                     {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
                     {"role": "user", "content": [{"type": "input_text", "text": user_msg}]},
                 ],
-                text={"format": {"type": "text"}, "verbosity": "low"},
+                text={"format": {"type": "text"}, },
                 tools=[],
             )
             content = resp.output_text or ""
@@ -417,7 +417,7 @@ def reduce_finalize_json(map_blocks: List[str]) -> Dict[str, Any]:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}, "verbosity": "low"},
+            text={"format": {"type": "text"}, },
             tools=[],
         )
         s = (resp.output_text or "").strip()
@@ -447,7 +447,7 @@ def reduce_finalize_markdown(map_blocks: List[str]) -> str:
         resp = client.responses.create(
             model=MODEL_REDUCE,
             input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
-            text={"format": {"type": "text"}, "verbosity": "medium"},
+            text={"format": {"type": "text"}, },
             tools=[],
         )
         return (resp.output_text or "").strip()
