@@ -19,7 +19,7 @@ st.set_page_config(page_title="會議錄音 → 直播逐字＋摘要", page_ico
 st.markdown("""
 <style>
 :root { --brand:#9c2b2f; --brand-weak:#9c2b2fcc; --bg:#FFF6F6; --border:#f2d9d9; }
-.main .block-container{padding-top:2.2rem} /* 加大頂部內距，避免標題被切到 */
+.main .block-container{padding-top:2.2rem}
 .pink-card{background:var(--bg);border:1px solid var(--border);padding:16px 22px;border-radius:12px;margin-bottom:12px;overflow:visible;}
 .header-pill{display:flex;align-items:center;gap:12px;font-size:22px;font-weight:700;color:#2f2f2f;line-height:1.35;min-height:48px;}
 .header-pill .emoji{font-size:22px;display:inline-block;transform:translateY(1px);}
@@ -31,8 +31,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 頂部卡片標題（修正不再被切）
-st.markdown('<div class="pink-card header-pill"><span class="emoji">💋</span> Speech to text transcription</div>', unsafe_allow_html=True)
+# 頂部卡片標題
+st.markdown('<div class="pink-card header-pill"><span class="emoji">💬</span> 安妮亞聽寫室：錄音變文字</div>', unsafe_allow_html=True)
 
 # 檢查 FFmpeg
 AudioSegment.converter = which("ffmpeg")
@@ -50,9 +50,9 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 # ========== 參數 ==========
-MODEL_STT = "gpt-4o-mini-transcribe"
+MODEL_STT = "gpt-4o-transcribe"
 MODEL_MAP = "gpt-5"
-MODEL_REDUCE = "gpt-5"
+MODEL_REDUCE = "gpt-4.1"
 
 # 切段參數
 MIN_SILENCE_LEN_MS = 700
@@ -94,12 +94,10 @@ def convert_to_wav(input_path: str, output_path: str, target_sr=16000):
     return output_path
 
 def normalize_loudness(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
-    """將整體音量正規化到 target_dbfs。"""
     gain = target_dbfs - audio.dBFS
     return audio.apply_gain(gain)
 
 def trim_leading_silence(audio: AudioSegment, silence_threshold_db: float = -30.0, chunk_ms: int = 10) -> AudioSegment:
-    """修剪開頭前導靜音。"""
     trim_ms = 0
     while trim_ms < len(audio) and audio[trim_ms:trim_ms+chunk_ms].dBFS < silence_threshold_db:
         trim_ms += chunk_ms
@@ -107,7 +105,6 @@ def trim_leading_silence(audio: AudioSegment, silence_threshold_db: float = -30.
 
 def apply_filters(audio: AudioSegment, use_high_pass: bool = False, hp_hz: int = 100,
                   use_low_pass: bool = False, lp_hz: int = 9500) -> AudioSegment:
-    """可選的高通/低通濾波（輕度降噪）。"""
     out = audio
     if use_high_pass:
         out = out.high_pass_filter(hp_hz)
@@ -116,7 +113,6 @@ def apply_filters(audio: AudioSegment, use_high_pass: bool = False, hp_hz: int =
     return out
 
 def split_audio_on_silence_safe(audio: AudioSegment) -> List[AudioSegment]:
-    """先用靜音切段，再做最長/最短保護；若找不到靜音則回退固定切段。"""
     silence_thresh = audio.dBFS - SILENCE_DB_OFFSET
     raw_chunks = silence.split_on_silence(
         audio,
@@ -125,7 +121,6 @@ def split_audio_on_silence_safe(audio: AudioSegment) -> List[AudioSegment]:
         keep_silence=KEEP_SILENCE_MS
     )
 
-    # 回退：找不到靜音則固定切段
     if not raw_chunks:
         chunks = []
         i = 0
@@ -134,7 +129,6 @@ def split_audio_on_silence_safe(audio: AudioSegment) -> List[AudioSegment]:
             chunks.append(audio[i:end])
             i = end
     else:
-        # 合併太短的、保留重疊
         filtered = []
         for c in raw_chunks:
             if len(c) < 250:
@@ -160,7 +154,6 @@ def split_audio_on_silence_safe(audio: AudioSegment) -> List[AudioSegment]:
                 else:
                     chunks.append(c)
 
-    # 最長/最短保護：切太長的、併太短的
     normalized = []
     for seg in chunks:
         if len(seg) <= MAX_CHUNK_MS:
@@ -172,7 +165,6 @@ def split_audio_on_silence_safe(audio: AudioSegment) -> List[AudioSegment]:
                 normalized.append(seg[start:end])
                 start = end
 
-    # 再把過短的併到前一段
     final_chunks = []
     for seg in normalized:
         if final_chunks and len(seg) < MIN_CHUNK_MS:
@@ -183,7 +175,6 @@ def split_audio_on_silence_safe(audio: AudioSegment) -> List[AudioSegment]:
     return final_chunks
 
 def split_sentences(text: str) -> List[str]:
-    # 中英標點皆盡量支援
     parts = re.split(r'([。！？；;.!?\n])', text)
     result = []
     for i in range(0, len(parts) - 1, 2):
@@ -203,29 +194,18 @@ def dedupe_against_prev(curr: List[str], prev: List[str], threshold=0.80) -> Lis
             out.append(s)
     return out
 
-# 輕量可讀性後處理
 def add_cjk_spacing(text: str) -> str:
-    """
-    在中英文/數字之間自動補空格，讓混排更好讀。
-    例：今天開會AI很忙 → 今天開會 AI 很忙
-    """
     text = re.sub(r'([\u4e00-\u9fff])([A-Za-z0-9$%#@&])', r'\1 \2', text)
     text = re.sub(r'([A-Za-z0-9$%#@&])([\u4e00-\u9fff])', r'\1 \2', text)
     return text
 
 def normalize_symbols(text: str) -> str:
-    """
-    常見符號統一化（不做語意更動）
-    """
     text = text.replace("％", "%").replace("＄", "$")
     text = text.replace("–", "-").replace("—", "-")
     text = text.replace("\u200b", "").replace("\u200c", "")
     return text
 
 def pretty_format_sentences(sentences: List[str]) -> List[str]:
-    """
-    對逐句內容做輕量整理：補空格＋符號統一，不改語意、不合併句子。
-    """
     pretty = []
     for s in sentences:
         s2 = add_cjk_spacing(s)
@@ -233,31 +213,38 @@ def pretty_format_sentences(sentences: List[str]) -> List[str]:
         pretty.append(s2)
     return pretty
 
-# 只在「可讀版顯示」時做：以 GPT-5 將多行逐句轉為正體（台灣用語）
-def force_traditional_via_prompt(lines: List[str]) -> List[str]:
+# 顯示層：逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）
+def refine_zh_tw_via_prompt(lines: List[str]) -> List[str]:
     """
-    顯示層用途：將多行句子逐行轉為正體中文（台灣用語）。
-    - 僅做字形轉換：禁止翻譯、改寫、增刪。
-    - 嚴格保留行數與順序、保留非中文內容與空白/換行。
-    - 失敗時原樣返回。
+    顯示層用途：將多行句子逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）。
+    規範：
+    - 保持原意，不捏造資訊；允許修順語序與標點，使更自然流暢。
+    - 若該行為英文或混雜語言，翻譯為正體中文（台灣用語）。
+    - 保留數字、單位、時間、金額、emoji、網址、簡短代碼片段等。
+    - 保持與輸入完全相同的行數與順序；每一輸入行對應輸出一行。
+    - 口吻：簡潔、專業、自然。
     """
     if not lines:
         return lines
     blob = "\n".join(lines)
     dev_msg = (
-        "將以下多行文字逐行轉為正體中文（繁體，台灣用語）。"
-        "要求：僅做字形轉換；不得翻譯或改寫；保留所有非中文內容（英數、符號、emoji）、空白與換行；"
-        "回傳與輸入完全相同行數與順序；只輸出轉換後文本，不要任何解釋或附加符號。"
+        "你將收到多行逐字稿，請逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）。\n"
+        "要求：\n"
+        "1) 僅做語句潤飾與正體翻譯，保留原意，不得捏造資訊。\n"
+        "2) 若該行是英文或混雜語言，請翻譯為正體中文（台灣用語）。\n"
+        "3) 保留數字、單位、時間、金額、emoji、網址、簡短代碼片段等非語意內容。\n"
+        "4) 保持與輸入『完全相同的行數與順序』；每一輸入行對應輸出一行。\n"
+        "5) 標點與用詞採台灣慣用，語氣簡潔專業、自然。\n"
+        "只輸出最終文本，不要任何解釋。"
     )
     try:
         resp = client.responses.create(
-            model=MODEL_REDUCE,  # 使用 GPT-5
+            model=MODEL_REDUCE,
             input=[
                 {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
                 {"role": "user", "content": [{"type": "input_text", "text": blob}]},
             ],
-            text={"format": {"type": "text"}, "verbosity": "low"},
-            reasoning={"effort": "minimal", "summary": "auto"},
+            text={"format": {"type": "text"}},
             tools=[],
         )
         out = (resp.output_text or "").rstrip("\n")
@@ -268,11 +255,7 @@ def force_traditional_via_prompt(lines: List[str]) -> List[str]:
 
 # Prompt（若端點支援就用、不支援自動回退）
 def build_prompt(prev_text: str, glossary: str, style_seed: str, max_tokens: int = 220) -> str:
-    """
-    組 Prompt（示例文本 + 專有名詞詞表 + 上段尾端前文）。若 STT 端點不支援 prompt，程式會自動回退不使用。
-    """
     parts = []
-    # 強化正體中文傾向
     parts.append("請全程使用正體中文（繁體，台灣用語）。")
     if style_seed and style_seed.strip():
         parts.append(style_seed.strip())
@@ -300,14 +283,11 @@ def stream_transcribe_all(
     glossary: str = "",
     style_seed: str = ""
 ):
-    """
-    串流轉錄：若支援 prompt，則帶入（不支援會自動回退）。
-    """
     import time
     all_text = ""
-    rolling_context = ""  # 下一段的前文
+    rolling_context = ""
     last_flush = 0.0
-    FLUSH_INTERVAL = 0.15  # 150ms 節流
+    FLUSH_INTERVAL = 0.15
 
     for i, chunk in enumerate(chunks):
         chunk_hash = _hash_bytes(chunk.raw_data)
@@ -329,7 +309,6 @@ def stream_transcribe_all(
                 tmp_path = tmp.name
                 chunk.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
             with open(tmp_path, "rb") as audio_file:
-                # 準備 prompt（僅在啟用時）
                 extra_kwargs = {}
                 if use_prompting:
                     prompt_str = build_prompt(rolling_context, glossary, style_seed, max_tokens=220)
@@ -337,7 +316,6 @@ def stream_transcribe_all(
                         extra_kwargs["prompt"] = prompt_str
 
                 try:
-                    # 嘗試帶 prompt 串流
                     stream = client.audio.transcriptions.create(
                         model=MODEL_STT,
                         file=audio_file,
@@ -346,7 +324,6 @@ def stream_transcribe_all(
                         **extra_kwargs
                     )
                 except Exception:
-                    # 若 STT 端點不支援 prompt，回退不帶 prompt 再試一次
                     try:
                         stream = client.audio.transcriptions.create(
                             model=MODEL_STT,
@@ -382,7 +359,6 @@ def stream_transcribe_all(
         cache_set_text(cache_key, full_text.strip())
         all_text += full_text + "\n"
 
-        # 更新滾動前文（只保留尾端避免過長）
         rolling_context = (rolling_context + " " + full_text).strip()
         if len(rolling_context) > 5000:
             rolling_context = rolling_context[-5000:]
@@ -411,7 +387,7 @@ def map_summarize_blocks(flat_sentences: List[str], chunk_size=DEFAULT_MAP_CHUNK
                     {"role": "user", "content": [{"type": "input_text", "text": user_msg}]},
                 ],
                 text={"format": {"type": "text"}, "verbosity": "low"},
-                reasoning={"effort": "low", "summary": "auto"},
+                reasoning={"effort": "low"},
                 tools=[],
             )
             content = resp.output_text or ""
@@ -483,10 +459,6 @@ def reduce_finalize_markdown(map_blocks: List[str]) -> str:
 
 # 顯示模式工具：段落群組（僅保留段落模式用）
 def group_into_paragraphs(sentences: List[str], max_chars: int = 260, max_sents: int = 4) -> List[str]:
-    """
-    把逐句內容自動群組成段落：每段最多 max_sents 句或近似字數超過 max_chars 就換段。
-    不改動語意，只做視覺分段。
-    """
     paras, cur, length = [], [], 0
     for s in sentences:
         s = s.strip()
@@ -567,11 +539,10 @@ if not (f and start_btn):
 raw_bytes = f.read()
 st.audio(raw_bytes)
 
-# Tabs（把狀態列放在「轉錄結果」最上方）
+# Tabs
 tab1, tab2, tab3, tab4 = st.tabs(["轉錄結果", "重點摘要", "內容解析", "原始內容"])
 
 with tab1:
-    # 狀態列固定在前，避免被往下擠看不到
     with st.status("處理中...", expanded=True) as status:
         status.update(label="儲存與轉檔...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{f.name.split('.')[-1]}") as temp_input:
@@ -583,7 +554,6 @@ with tab1:
             wav_path = temp_input_path + ".wav"
             convert_to_wav(temp_input_path, wav_path)
 
-        # 載入與前處理
         status.update(label="載入音檔與前處理...")
         audio = AudioSegment.from_file(wav_path, format="wav")
         if do_trim_leading:
@@ -593,14 +563,12 @@ with tab1:
         if use_high_pass or use_low_pass:
             audio = apply_filters(audio, use_high_pass=use_high_pass, hp_hz=hp_hz, use_low_pass=use_low_pass, lp_hz=lp_hz)
 
-        # 切段
         status.update(label="靜音切段（附最長/最短保護；找不到靜音會回退固定切）...")
         chunks = split_audio_on_silence_safe(audio)
         if not chunks:
             st.error("無法切出有效音訊段，請檢查音檔或調整參數。")
             st.stop()
 
-        # 即時區塊（live），完成後改成段落模式可讀版
         st.markdown("#### 轉錄結果")
         stream_container = st.empty()
         progress_bar = st.progress(0.0)
@@ -614,9 +582,8 @@ with tab1:
             glossary=glossary_input if use_prompting else "",
             style_seed=style_seed if use_prompting else ""
         )
-        raw_stream_text = all_text.strip()  # 存下最原始串流輸出（未分句／未去重）
+        raw_stream_text = all_text.strip()
 
-        # 分句與跨段去重
         status.update(label="分句與跨段去重...")
         grouped_sentences = []
         for i, txt in enumerate(all_text.split("\n")):
@@ -628,26 +595,23 @@ with tab1:
                 grouped_sentences.append(unique)
         flat_sentences = [s for group in grouped_sentences for s in group]
 
-        # 完成後，只保留段落模式（自動群組）顯示
-        stream_container.empty()
+        # 可讀版：輕量整理 → 潤飾/翻譯為正體 → 段落化 → Markdown 呈現（直接覆蓋直播容器，避免空窗）
         pretty_lines = pretty_format_sentences(flat_sentences)
-        # 顯示前逐行轉為「正體中文（台灣用語）」；僅字形轉換、不改寫
-        pretty_lines = force_traditional_via_prompt(pretty_lines)
-        paras = group_into_paragraphs(pretty_lines, max_chars=280, max_sents=4)
-        st.markdown("\n\n".join(paras))
+        refined_lines = refine_zh_tw_via_prompt(pretty_lines)
+        paras = group_into_paragraphs(refined_lines, max_chars=280, max_sents=4)
+        final_md = "\n\n".join(paras)
+        stream_container.markdown(final_md)
         st.success("Transcription complete!")
 
-        # 內部計算：分段摘要（不顯示）
         status.update(label="整併重點（內部計算）...")
         map_blocks_text = map_summarize_blocks(flat_sentences)
 
-        # 生成最終會議摘要（Tab2：敘述版）、內容解析（Tab3：主題重點）
         status.update(label="生成最終會議摘要與內容解析...")
-        final_minutes = reduce_finalize_json(map_blocks_text)   # 給內容解析用
-        final_md = reduce_finalize_markdown(map_blocks_text)    # 給重點摘要用
+        final_minutes = reduce_finalize_json(map_blocks_text)
+        final_md_summary = reduce_finalize_markdown(map_blocks_text)
 
         with tab2:
-            st.markdown(final_md)
+            st.markdown(final_md_summary)
             st.download_button(
                 "下載會議記錄 JSON",
                 data=json.dumps(final_minutes, ensure_ascii=False, indent=2),
@@ -660,7 +624,6 @@ with tab1:
 
         with tab4:
             st.markdown("#### 原始內容（最原始串流輸出，未分句／未去重）")
-            # 原樣呈現，方便與可讀版對照
             st.code(raw_stream_text, language="text")
 
         status.update(label="全部完成！", state="complete", expanded=True)
