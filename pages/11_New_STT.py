@@ -51,8 +51,8 @@ client = OpenAI(api_key=OPENAI_KEY)
 
 # ========== 參數 ==========
 MODEL_STT = "gpt-4o-transcribe"  # STT 忠實轉錄原語言
-MODEL_MAP = "gpt-5"              # 分段摘要
-MODEL_REDUCE = "gpt-5"           # 總整/潤飾
+MODEL_MAP = "gpt-5-mini"              # 分段摘要
+MODEL_REDUCE = "gpt-5-mini"           # 總整/潤飾
 
 # 切段參數
 MIN_SILENCE_LEN_MS = 700
