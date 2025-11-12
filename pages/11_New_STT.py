@@ -51,8 +51,8 @@ client = OpenAI(api_key=OPENAI_KEY)
 
 # ========== 參數 ==========
 MODEL_STT = "gpt-4o-transcribe"
-MODEL_MAP = "gpt-5"
-MODEL_REDUCE = "gpt-4.1"
+MODEL_MAP = "gpt-5-mini"
+MODEL_REDUCE = "gpt-5-mini"
 
 # 切段參數
 MIN_SILENCE_LEN_MS = 700
