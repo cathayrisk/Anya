@@ -32,7 +32,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 頂部卡片標題
-st.markdown('<div class="pink-card header-pill"><span class="emoji">💋</span> Speech to text transcription</div>', unsafe_allow_html=True)
+st.markdown('<div class="pink-card header-pill"><span class="emoji">💬</span> 安妮亞開會不漏接：逐字 × 摘要</div>', unsafe_allow_html=True)
 
 # 檢查 FFmpeg
 AudioSegment.converter = which("ffmpeg")
