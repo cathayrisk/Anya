@@ -50,7 +50,7 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 # ========== 參數 ==========
-MODEL_STT = "gpt-4o-transcribe"  # STT 忠實轉錄原語言
+MODEL_STT = "gpt-4o-mini-transcribe"  # STT 忠實轉錄原語言
 MODEL_MAP = "gpt-5-mini"              # 分段摘要
 MODEL_REDUCE = "gpt-4.1"           # 總整/潤飾
 
@@ -337,6 +337,7 @@ def stream_transcribe_all(
                         model=MODEL_STT,
                         file=audio_file,
                         response_format="text",
+                        prompt="This audio contains a discussion or presentation. Always preserve the original language of each sentence. If a sentence is in English, output it in English; if in Chinese, output it in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate or alter the language. The audio may cover various topics such as updates, feedback, or informative lectures.",
                         stream=True,
                         **extra_kwargs
                     )
@@ -346,6 +347,7 @@ def stream_transcribe_all(
                             model=MODEL_STT,
                             file=audio_file,
                             response_format="text",
+                            prompt="This audio contains a discussion or presentation. Always preserve the original language of each sentence. If a sentence is in English, output it in English; if in Chinese, output it in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate or alter the language. The audio may cover various topics such as updates, feedback, or informative lectures.",
                             stream=True
                         )
                         container.warning("此轉錄端點不支援 prompt，引導已自動停用（本次）。")
