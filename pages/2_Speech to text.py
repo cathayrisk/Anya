@@ -1,1090 +1,873 @@
-import streamlit as st
+# -*- coding: utf-8 -*-
+# 會議錄音 → 直播逐字＋摘要（並行潤飾強化版）
+# 變更重點：
+# - 預設啟用「可讀版潤飾/翻譯」
+# - STT（Producer）與潤飾（Consumer）並行，微批次送出，保持順序回填
+# - 相鄰視窗去重（Jaccard trigram）取代 difflib 大量比對；效能提升
+# - 補上「看到塞車怎麼調」的註解，方便依檔案長度調整
+# - 修正 Unicode 不等號、損壞的 regex
+
 import os
 import re
-import time
-import random
-import tempfile
-from openai import OpenAI
-from pydub import AudioSegment
-from pydub.utils import which
-from concurrent.futures import ThreadPoolExecutor
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_text_splitters import CharacterTextSplitter
-from langgraph.constants import Send
-from langgraph.graph import END, START, StateGraph
-from langchain_core.documents import Document
-#from langchain.chains.combine_documents.reduce import (
-#    acollapse_docs,
-#    split_list_of_docs,
-#)
-import operator
-import asyncio
-import uuid
-from typing import (
-    Annotated,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Type,
-    Union,
-    TypedDict,
-)
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import (
-    AIMessage,
-    AnyMessage,
-    BaseMessage,
-    HumanMessage,
-    ToolCall,
-)
-from langchain_core.prompt_values import PromptValue
-from langchain_core.runnables import (
-    Runnable,
-    RunnableLambda,
-)
-from typing_extensions import TypedDict
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ValidationNode
-from pydantic import BaseModel, Field, field_validator
 import json
-from langchain_core.callbacks.base import BaseCallbackHandler
-from streamlit.delta_generator import DeltaGenerator
 import difflib
+import hashlib
+import tempfile
+import multiprocessing
+from typing import List, Dict, Any
 
+import streamlit as st
+from openai import OpenAI
+from pydub import AudioSegment, silence
+from pydub.utils import which
 
-class StreamHandler(BaseCallbackHandler):
-    def __init__(self, message_container: DeltaGenerator):
-        self.tokens = []
-        self.message_container = message_container
-        self.cursor_visible = True
+from queue import Queue, Empty
+from threading import Thread, Lock
+import time
+import concurrent.futures
 
-    @property
-    def text(self):
-        return ''.join(self.tokens)
+# ========== 基本設定 ==========
+st.set_page_config(page_title="會議錄音 → 直播逐字＋摘要", page_icon="📝", layout="wide")
 
-    def on_llm_new_token(self, token: str, **kwargs) -> None:
-        self.tokens.append(token)
-        self.cursor_visible = not self.cursor_visible
-        cursor = '<span style="color:#4B3832;font-weight:bold;">▌</span>' if self.cursor_visible else '<span style="color:transparent;">▌</span>'
+# 自訂樣式
+st.markdown("""
+<style>
+:root { --brand:#9c2b2f; --brand-weak:#9c2b2fcc; --bg:#FFF6F6; --border:#f2d9d9; }
+.main .block-container{padding-top:2.2rem}
+.pink-card{background:var(--bg);border:1px solid var(--border);padding:16px 22px;border-radius:12px;margin-bottom:12px;overflow:visible;}
+.header-pill{display:flex;align-items:center;gap:12px;font-size:22px;font-weight:700;color:#2f2f2f;line-height:1.35;min-height:48px;}
+.header-pill .emoji{font-size:22px;display:inline-block;transform:translateY(1px);}
+.stTabs [data-baseweb="tab-list"]{gap:24px;border-bottom:1px solid #f0e2e2;margin-bottom:8px}
+.stTabs [data-baseweb="tab"]{padding:10px 2px;color:var(--brand-weak);font-weight:600}
+.stTabs [aria-selected="true"]{color:var(--brand);border-bottom:3px solid var(--brand)}
+.stMarkdown p{line-height:1.8}
+.transcript-readable{font-size:1.02rem;line-height:1.9;letter-spacing:0.02em;}
+</style>
+""", unsafe_allow_html=True)
 
-        pulse_grow_in_style = """
-        <style>
-        @keyframes pulseGrowInA8 {
-          0% {
-            opacity: 0;
-            transform: scale(0.1);
-          }
-          40% {
-            opacity: 1;
-            transform: scale(1.4);
-          }
-          60% {
-            transform: scale(0.8);
-          }
-          80% {
-            transform: scale(1.15);
-          }
-          100% {
-            opacity: 1;
-            transform: scale(1);
-          }
-        }
-        .pulse-grow-ina8 {
-          animation: pulseGrowInA8 1.2s cubic-bezier(.68,-0.55,.27,1.55);
-          display: inline-block;
-        }
-        </style>
-        """
+# 頂部卡片標題
+st.markdown('<div class="pink-card header-pill"><span class="emoji">✍️</span> 安妮亞開會不漏接：逐字 × 摘要</div>', unsafe_allow_html=True)
 
-        safe_text = ''.join(self.tokens[:-1])
-        pulse_grow_token = f'<span class="pulse-grow-ina8">{self.tokens[-1]}</span>'
-
-        self.message_container.markdown(
-            pulse_grow_in_style + safe_text + pulse_grow_token + cursor,
-            unsafe_allow_html=True
-        )
-        time.sleep(0.05)
-
-    def on_llm_end(self, *args, **kwargs):
-        self.message_container.markdown(''.join(self.tokens), unsafe_allow_html=True)
-        
-# 配置 pydub 使用 FFmpeg
+# 檢查 FFmpeg
 AudioSegment.converter = which("ffmpeg")
 AudioSegment.ffprobe = which("ffprobe")
+if not AudioSegment.converter or not AudioSegment.ffprobe:
+    st.error("找不到 ffmpeg/ffprobe，請先於系統安裝後再試。")
+    st.stop()
 
-# 初始化 OpenAI 客戶端
-os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
-client = OpenAI()
+# 讀取 API Key
+OPENAI_KEY = st.secrets.get("OPENAI_KEY", os.getenv("OPENAI_API_KEY"))
+if not OPENAI_KEY:
+    st.error("找不到 API Key，請在 Streamlit Secrets 設定 OPENAI_KEY 或環境變數 OPENAI_API_KEY。")
+    st.stop()
 
-# 初始化 LangChain 的 ChatOpenAI 模型
-llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.0, streaming=True)
+client = OpenAI(api_key=OPENAI_KEY)
 
-judge_llm = ChatOpenAI(model="gpt-4.1-nano", temperature=0.0)
+# ========== 參數 ==========
+MODEL_STT = "gpt-4o-mini-transcribe"  # STT 忠實轉錄原語言
+MODEL_MAP = "gpt-5-mini"              # 分段摘要
+MODEL_REDUCE = "gpt-4.1"              # 總整/潤飾
 
-def split_sentences(text):
-    """
-    將中文文本依據句號、問號、驚嘆號、分號、換行等標點斷句。
-    """
-    # 以標點符號或換行為斷句依據
-    sentences = re.split(r'([。！？；\n])', text)
+# 切段參數
+MIN_SILENCE_LEN_MS = 700
+KEEP_SILENCE_MS = 300
+SILENCE_DB_OFFSET = 16
+OVERLAP_MS = 1200
+
+# 片段長度保護與回退
+MAX_CHUNK_MS = 30_000   # 單段最長 30 秒
+MIN_CHUNK_MS = 2_000    # 單段最短 2 秒
+FALLBACK_WINDOW_MS = 20_000  # 找不到靜音時，固定切 20 秒
+
+DEFAULT_MAP_CHUNK_SIZE = 40
+
+# 工人數：潤飾同時處理批次的最大數（建議 1 起步；塞車時再開到 2）
+MAX_STREAM_WORKERS = min(2, multiprocessing.cpu_count())
+
+CACHE_DIR = ".stt_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# ========== 工具函式 ==========
+def _hash_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
+
+def cache_get_text(key: str) -> str | None:
+    path = os.path.join(CACHE_DIR, key + ".txt")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return None
+
+def cache_set_text(key: str, value: str):
+    path = os.path.join(CACHE_DIR, key + ".txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(value)
+
+def convert_to_wav(input_path: str, output_path: str, target_sr=16000):
+    audio = AudioSegment.from_file(input_path)
+    audio = audio.set_frame_rate(target_sr).set_channels(1)
+    audio.export(output_path, format="wav")
+    return output_path
+
+def normalize_loudness(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
+    gain = target_dbfs - audio.dBFS
+    return audio.apply_gain(gain)
+
+def trim_leading_silence(audio: AudioSegment, silence_threshold_db: float = -30.0, chunk_ms: int = 10) -> AudioSegment:
+    trim_ms = 0
+    while trim_ms < len(audio) and audio[trim_ms:trim_ms+chunk_ms].dBFS < silence_threshold_db:
+        trim_ms += chunk_ms
+    return audio[trim_ms:]
+
+def apply_filters(audio: AudioSegment, use_high_pass: bool = False, hp_hz: int = 100,
+                  use_low_pass: bool = False, lp_hz: int = 9500) -> AudioSegment:
+    out = audio
+    if use_high_pass:
+        out = out.high_pass_filter(hp_hz)
+    if use_low_pass:
+        out = out.low_pass_filter(lp_hz)
+    return out
+
+def split_audio_on_silence_safe(audio: AudioSegment) -> List[AudioSegment]:
+    silence_thresh = audio.dBFS - SILENCE_DB_OFFSET
+    raw_chunks = silence.split_on_silence(
+        audio,
+        min_silence_len=MIN_SILENCE_LEN_MS,
+        silence_thresh=silence_thresh,
+        keep_silence=KEEP_SILENCE_MS
+    )
+
+    if not raw_chunks:
+        chunks = []
+        i = 0
+        while i < len(audio):
+            end = min(i + FALLBACK_WINDOW_MS, len(audio))
+            chunks.append(audio[i:end])
+            i = end
+    else:
+        filtered = []
+        for c in raw_chunks:
+            if len(c) < 250:
+                if filtered:
+                    filtered[-1] = filtered[-1] + c
+                else:
+                    filtered.append(c)
+            else:
+                filtered.append(c)
+        if not filtered:
+            filtered = raw_chunks
+
+        chunks = []
+        for i, c in enumerate(filtered):
+            if i == 0:
+                chunks.append(c)
+            else:
+                prev = filtered[i - 1]
+                safe_overlap = min(OVERLAP_MS, len(prev))
+                if safe_overlap > 0:
+                    overlap = prev[-safe_overlap:]
+                    chunks.append(overlap + c)
+                else:
+                    chunks.append(c)
+
+    normalized = []
+    for seg in chunks:
+        if len(seg) <= MAX_CHUNK_MS:
+            normalized.append(seg)
+        else:
+            start = 0
+            while start < len(seg):
+                end = min(start + MAX_CHUNK_MS, len(seg))
+                normalized.append(seg[start:end])
+                start = end
+
+    final_chunks = []
+    for seg in normalized:
+        if final_chunks and len(seg) < MIN_CHUNK_MS:
+            final_chunks[-1] = final_chunks[-1] + seg
+        else:
+            final_chunks.append(seg)
+
+    return final_chunks
+
+def split_sentences(text: str) -> List[str]:
+    parts = re.split(r'([。！？；;.!?\n])', text)
     result = []
-    for i in range(0, len(sentences)-1, 2):
-        result.append(sentences[i] + sentences[i+1])
-    if len(sentences) % 2 != 0:
-        result.append(sentences[-1])
-    # 去除空白
-    return [s.strip() for s in result if s.strip()]
+    for i in range(0, len(parts) - 1, 2):
+        s = (parts[i] + parts[i + 1]).strip()
+        if s:
+            result.append(s)
+    if len(parts) % 2 != 0:
+        tail = parts[-1].strip()
+        if tail:
+            result.append(tail)
+    return result
 
-def get_unprocessed_sentences(original_sentences, formatted_sentences, threshold=0.7):
-    unprocessed = []
-    for sent in original_sentences:
-        found = False
-        for fsent in formatted_sentences:
-            if difflib.SequenceMatcher(None, sent, fsent).ratio() > threshold:
-                found = True
+# ====== 高效去重輔助（取代大量 difflib）======
+def _norm_for_dedupe(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r'\s+', '', s)
+    s = (s.replace('，', ',').replace('。', '.')
+           .replace('！', '!').replace('？', '?')
+           .replace('；', ';').replace('（', '(').replace('）', ')'))
+    return s
+
+def _jaccard_trigram(a: str, b: str) -> float:
+    n = 3
+    if len(a) < n or len(b) < n:
+        return 1.0 if a == b else 0.0
+    A = {a[i:i+n] for i in range(len(a)-n+1)}
+    B = {b[i:i+n] for i in range(len(b)-n+1)}
+    un = len(A | B)
+    return (len(A & B) / un) if un else 0.0
+
+def dedupe_against_prev_fast(curr: List[str], prev: List[str],
+                             threshold: float = 0.88, max_prev: int = 12) -> List[str]:
+    # 建議 threshold 0.88~0.92；max_prev 12~16
+    if not curr:
+        return []
+    tail = prev[-max_prev:] if prev else []
+    tail_norm = [_norm_for_dedupe(p) for p in tail]
+
+    out: List[str] = []
+    for s in curr:
+        ns = _norm_for_dedupe(s)
+        # 精確去重（正規化後）
+        if ns in tail_norm:
+            continue
+        # 長度差過大先過濾，省比較成本
+        similar = False
+        for pn in tail_norm:
+            if not pn:
+                continue
+            if abs(len(ns) - len(pn)) > int(max(len(ns), len(pn)) * 0.4):
+                continue
+            if _jaccard_trigram(ns, pn) >= threshold:
+                similar = True
                 break
-        if not found:
-            unprocessed.append(sent)
-    return unprocessed
+        if not similar:
+            out.append(s)
+    return out
 
-def format_transcript_by_chunks(full_transcription, chain, chunk_size=2000, chunk_overlap=0):
-    splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = splitter.split_text(full_transcription)
-    formatted_chunks = []
-    for i, chunk in enumerate(chunks):
-        message_container = st.empty()
-        handler = StreamHandler(message_container)
-        formatted = chain.invoke({"text": chunk}, config={"callbacks": [handler]})
-        # 取出 handler.text（streaming 過程中已經顯示，這裡只是收集結果）
-        formatted_chunks.append(handler.text)
-    return "\n".join(formatted_chunks)
-
-def beautify_transcript(text):
-    # 1. 主題加粗
-    text = re.sub(r'^(主題：.*)$', r'**\1**', text, flags=re.MULTILINE)
-    # 2. 主題後加空行（如果沒有的話）
-    text = re.sub(r'(\*\*主題：.*?\*\*)(\n)(?!\n)', r'\1\n\n', text)
-    # 3. 段落間加空行（兩行以上不重複）
-    text = re.sub(r'([^\n])\n([^\n])', r'\1\n\n\2', text)
-    # 5. 【疑似錯誤】標紅
-    text = re.sub(r'【疑似錯誤】', r'<span style="color:red">【疑似錯誤】</span>', text)
-    # 6. 移除多餘空行（最多兩行）
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    # 7. 去除開頭多餘空行
-    text = text.lstrip('\n')
+def add_cjk_spacing(text: str) -> str:
+    # 修正：原本貼壞的 regex 已移除
+    text = re.sub(r'([\u4e00-\u9fff])([A-Za-z0-9%#@&])', r'\1 \2', text)
+    text = re.sub(r'([A-Za-z0-9%#@&])([\u4e00-\u9fff])', r'\1 \2', text)
     return text
 
-
-# 設置網頁標題和圖標
-st.set_page_config(page_title="Speech to Text Transcription", layout="wide", page_icon="👄")
-#st.title("Speech to text transcription")
-
-# 創建一個表單來上傳文件
-with st.expander(" Speech to text transcription", expanded=True, icon="👄"):
-    with st.form(key="my_form"):
-        f = st.file_uploader("Upload your audio file", type=["wav", "mp3", "mp4", "mpeg", "mpga", "m4a", "webm"])
-        st.info("👆 上傳一個音效文件（支援 .wav, .mp3, .mp4, .mpeg, .mpga, .m4a, .wav, .webm）。")
-        submit_button = st.form_submit_button(label="Transcribe")
-
-# 定義生成器函數來逐步產生轉錄文本
-def stream_transcription(transcription_text):
-    message_container = st.empty()
-    text = ""
-    for word in transcription_text.split():
-        text += word + " "
-        message_container.markdown(text)
-        time.sleep(0.05)  # 控制打字機效果的速度
-
-# 定義轉錄音頻塊的函數
-def transcribe_chunk(chunk, index):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_mp3_file:
-        chunk.export(temp_mp3_file.name, format="mp3")
-        with open(temp_mp3_file.name, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=audio_file,
-                response_format="text",
-                prompt="This audio contains a discussion or presentation. Always preserve the original language of each sentence. If a sentence is in English, output it in English; if in Chinese, output it in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate or alter the language. The audio may cover various topics such as updates, feedback, or informative lectures."
-            )
-        os.remove(temp_mp3_file.name)
-    return transcription.lower()
-
-# 使用 Streamlit 的緩存功能來緩存轉錄結果
-@st.cache_data
-def transcribe_audio(file_path):
-    # 這裡放置轉錄邏輯
-    # 返回轉錄結果
-    return full_transcription
-
-@st.cache_data
-def format_transcription(transcription):
-    # 使用 LangChain 改善文本格式
-    return chain.invoke({"text": transcription})
-
-# 定義 LangChain 的 PromptTemplate
-prompt_template = PromptTemplate(
-    input_variables=["text"],
-    template=(
-        "# Role and Objective\n"
-        "You are an expert transcription editor. Your task is to improve the formatting and readability of a raw transcription text, while strictly preserving the original wording, sentence order, and information.\n\n"
-        "# Instructions\n"
-        "- **Do not change the meaning, order, or language of any sentence.**\n"
-        "- If the text is in Chinese, always use Traditional Chinese (繁體中文)。\n"
-        "- **List the text sentence by sentence, each on a new line.**\n"
-        "- **Do not merge, split, or paraphrase sentences.**\n"
-        "- **Do not add or remove any content.**\n"
-        "- **Do not translate.**\n"
-        "- If you find a sentence that is incomplete or has obvious errors, mark it with 【疑似錯誤】 at the end of the sentence.\n"
-        "- If the input is extremely long, process all content in full (do not skip or summarize any part).\n\n"
-        "## Formatting Rules\n"
-        "1. **Add appropriate headings and subheadings** to organize the content. Use a consistent style (e.g., headings in bold, subheadings in italics).\n"
-        "2. **Highlight key terms or important concepts** using bold or italics for emphasis.\n"
-        "3. **Check and correct any grammatical or spelling errors** (but do not change the original meaning or sentence structure).\n"
-        "4. **Add appropriate punctuation** and split run-on sentences for better readability, but do not merge or paraphrase sentences.\n"
-        "5. **Divide the text into paragraphs** where appropriate, and ensure there is a blank line between paragraphs.\n"
-        "6. **Preserve the original language and style.**\n\n"
-        "# Reasoning Steps\n"
-        "1. Analyze the input text to identify logical sections and possible headings.\n"
-        "2. For each sentence, check for grammar, spelling, and punctuation issues, and correct them if needed.\n"
-        "3. Highlight key terms or concepts.\n"
-        "4. Organize sentences into paragraphs and insert headings/subheadings as appropriate.\n"
-        "5. Mark any incomplete or obviously erroneous sentences with 【疑似錯誤】.\n"
-        "6. Output the result in markdown format, using bold for headings, italics for subheadings, and bold/italics for key terms.\n\n"
-        "# Output Format\n"
-        "- Use markdown formatting.\n"
-        "- Headings: **bold**\n"
-        "- Subheadings: *italics*\n"
-        "- Key terms: **bold** or *italics*\n"
-        "- Each sentence on a new line, in original order.\n"
-        "- Blank line between paragraphs.\n"
-        "- Mark incomplete or erroneous sentences with 【疑似錯誤】.\n\n"
-        "# Example\n"
-        "## Input\n"
-        "text: 這是一段逐字稿內容。今天我們要討論人工智慧。AI的應用越來越廣泛，特別是在醫療和教育領域。這裡有一個例子AI可以協助醫生診斷疾病。謝謝大家的聆聽。\n\n"
-        "## Output\n"
-        "**主題：人工智慧的應用**\n\n"
-        "*引言*\n"
-        "這是一段逐字稿內容。\n"
-        "今天我們要討論**人工智慧**。\n\n"
-        "*AI的應用*\n"
-        "**AI**的應用越來越廣泛，特別是在**醫療**和**教育**領域。\n"
-        "這裡有一個例子：**AI**可以協助醫生診斷疾病。\n\n"
-        "*結語*\n"
-        "謝謝大家的聆聽。\n"
-        "\n"
-        "# Final Instructions\n"
-        "- Think step by step. Carefully follow all formatting and output rules.\n"
-        "- **你必須完整輸出所有內容，嚴禁只展示部分內容或以任何形式要求用戶自行處理剩餘內容。**\n"
-        "- **嚴禁出現「僅展示部分內容」、「後續內容請依規則持續處理」等字眼。**"
-        "- **即使內容極長，也必須盡可能完整輸出，直到平台回應長度達到極限為止。**"
-        "- **如果內容過長導致無法一次輸出全部，請自動繼續輸出剩餘內容，直到全部內容都已呈現，且每次回應都只輸出內容本身，不要加任何說明或省略提示。**"
-        "- **Always preserve the original language of each sentence. If a sentence is in English, output it in English; if in Chinese, output it in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate or alter the language.**"
-        "- Output only the formatted text in markdown, no extra explanation."
-        "## Input Text\n"
-        "{text}\n"
-    )
-)
-
-# 創建一個處理鏈
-formatting_chain = prompt_template | llm | StrOutputParser()
-
-# 分割文件
-text_splitter = CharacterTextSplitter.from_tiktoken_encoder(chunk_size=1500, chunk_overlap=100)
-
-token_max = 250000
-
-# 定義狀態類型
-class SummaryState(TypedDict):
-    content: str
-
-class OverallState(TypedDict):
-    contents: List[str]
-    summaries: Annotated[list, operator.add]
-    collapsed_summaries: List[Document]
-    final_summary: str
-
-# 生成摘要
-async def generate_summary(state: SummaryState):
-    response = await map_chain.ainvoke(state["content"])
-    return {"summaries": [response]}
-
-# 映射摘要
-def map_summaries(state: OverallState):
-    return [Send("generate_summary", {"content": content}) for content in state["contents"]]
-
-# 計算文件長度
-def length_function(documents: List[Document]) -> int:
-    return sum(llm.get_num_tokens(doc.page_content) for doc in documents)
-
-# 收集摘要
-def collect_summaries(state: OverallState):
-    return {"collapsed_summaries": [Document(summary) for summary in state["summaries"]]}
-
-# 生成最終摘要
-async def generate_final_summary(state: OverallState):
-    response = await reduce_chain.ainvoke(state["collapsed_summaries"])
-    return {"final_summary": response}
-
-# 摺疊摘要
-async def collapse_summaries(state: OverallState):
-    doc_lists = split_list_of_docs(state["collapsed_summaries"], length_function, token_max)
-    results = []
-    for doc_list in doc_lists:
-        results.append(await acollapse_docs(doc_list, reduce_chain.ainvoke))
-    return {"collapsed_summaries": results}
-
-# 判斷是否需要摺疊
-def should_collapse(state: OverallState) -> Literal["collapse_summaries", "generate_final_summary"]:
-    num_tokens = length_function(state["collapsed_summaries"])
-    if num_tokens > token_max:
-        return "collapse_summaries"
-    else:
-        return "generate_final_summary"
-
-# 建立狀態圖
-graph = StateGraph(OverallState)
-graph.add_node("generate_summary", generate_summary)
-graph.add_node("collect_summaries", collect_summaries)
-graph.add_node("generate_final_summary", generate_final_summary)
-graph.add_node("collapse_summaries", collapse_summaries)
-
-# 添加邊
-graph.add_conditional_edges(START, map_summaries, ["generate_summary"])
-graph.add_edge("generate_summary", "collect_summaries")
-graph.add_conditional_edges("collect_summaries", should_collapse)
-graph.add_conditional_edges("collapse_summaries", should_collapse)
-graph.add_edge("generate_final_summary", END)
-
-# 編譯應用程式
-app = graph.compile()
-
-# 定義提示模板
-map_template = """
-# 角色與目標
-你是一位專業逐字稿分析師，請閱讀下方逐字稿分段內容，篩選出所有真正重要的主題與重點，並針對每個重點進行詳細說明。**僅根據本段內容，不可補充外部知識或推測未明說的內容。**
-
-# 指令
-- 只根據本段內容，嚴禁補充外部知識或推論。
-- 篩選出所有明確且重要的主題與子主題。
-- 每個主題下，條列真正重要的重點，並針對每個重點進行詳細說明（說明內容需根據本段內容，包含背景、原因、影響、細節等）。
-- 若本段內容有明確的決策、行動項目、因果關係，也請詳細說明。
-- 若發現本段重點可能與其他段落有關聯或尚未完整，請明確標註「此重點可能需與其他段落合併補全」。
-- 使用清楚的分層條列格式：
-    - 主題用「【主題】」
-    - 子主題用「【子主題】」
-    - 重點用「-」
-    - 每個重點下方用縮排方式詳細說明（可多行）。
-    - 重要詞彙用全形括號（如【重點】）
-- 回答請使用繁體中文。
-
-# 推理步驟
-1. 完整閱讀本段內容。
-2. 篩選出所有真正重要的主題與子主題。
-3. 條列每個主題下的重要重點，並針對每個重點進行詳細說明（說明內容需根據本段內容）。
-4. 若有明確決策、行動項目、因果關係，也請詳細說明。
-5. 若發現重點可能與其他段落有關聯或尚未完整，請明確標註。
-6. 不可補充外部知識或推論。
-
-# 輸出格式
-- 依主題分段，主題用「【主題】」，子主題用「【子主題】」，重點用「-」條列，重點下方用縮排詳細說明。
-- 若有跨段重點，請於重點說明後加註「（此重點可能需與其他段落合併補全）」。
-
-# 範例
-【主題】市場策略
-- 【重點觀察】：本次會議強調市場多元化策略。
-    多位與會者認為現有市場已趨於飽和，因此提出應積極開發新興市場，以分散風險並尋求成長動能。
-- 【數據支持】：2024年預計成長20%。
-    財務部門報告指出，若能順利推動多元化策略，2024年營收有望成長20%。
-- 【決策】：將優先投入新興市場。
-    經過討論後，決議將資源優先配置於新興市場，並成立專案小組負責執行。
-
-【主題】產品開發
-- 【測試進度】：目前產品測試進度落後。
-    研發部門回報，因人力資源不足及部分技術瓶頸，導致產品測試進度較原計畫延遲兩週。（此重點可能需與其他段落合併補全）
-
-# 逐字稿分段內容
-{context}
-
-# 最終指令
-請務必只根據本段內容篩選並詳細說明每個重點，不要補充外部知識或推測未明說的內容。如有跨段重點，請明確標註。
-"""
-
-reduce_template = """
-# 角色與目標
-你是一位資深逐字稿分析師，請將下方多個分段主題摘要進行合併、去重、補全與分層整理，並針對每個主題與重點進行詳細說明。**僅根據主題摘要內容，不可補充外部知識或推測未明說的內容。**
-
-# 指令
-- 只根據下方主題摘要內容，嚴禁補充外部知識或推論。
-- 將相關主題歸納為大類，並於每個大類下條列所有重要重點，針對每個重點進行詳細說明（說明內容需根據摘要內容）。
-- 合併主題時，僅在摘要內容明確顯示關聯時才合併，並補全跨段重點，使其內容完整。
-- 對所有重點進行去重、補全、分層，並檢查是否有遺漏主題或重點。
-- 若有明確決策、行動項目、因果關係，也請詳細說明。
-- 使用清楚的分層條列格式：
-    - 主題用「【主題】」
-    - 子主題用「【子主題】」
-    - 重點用「-」
-    - 每個重點下方用縮排方式詳細說明（可多行）。
-- 回答請使用繁體中文。
-
-# 推理步驟
-1. 閱讀所有主題摘要。
-2. 歸納、合併相關主題（僅限明確關聯），並補全跨段重點。
-3. 條列每個大類下的重要重點，並針對每個重點進行詳細說明（說明內容需根據摘要內容）。
-4. 對所有重點進行去重、補全、分層，並檢查是否有遺漏主題或重點。
-5. 若有明確決策、行動項目、因果關係，也請詳細說明。
-6. 不可補充外部知識或推論。
-
-# 輸出格式
-- 依大類分段，主題用「【主題】」，子主題用「【子主題】」，重點用「-」條列，重點下方用縮排詳細說明。
-
-# 範例
-【主題】市場策略
-- 【重點觀察】：強調市場多元化。
-    會議中多位主管認為現有市場成長有限，需積極開發新興市場以分散風險。
-- 【決策】：優先投入新興市場。
-    決議將資源優先配置於新興市場，並成立專案小組負責執行。
-
-【主題】產品開發
-- 【測試進度】：產品測試進度落後。
-    研發部門回報因人力不足及技術瓶頸，導致測試延遲兩週。此重點已整合所有相關段落資訊。
-- 【行動項目】：加派人力支援測試。
-    會議決議由其他部門調派人力支援，確保產品如期上市。
-
-# 主題摘要內容
-{docs}
-
-# 最終指令
-請務必只根據主題摘要內容歸納、去重、補全並詳細說明每個重點，不要補充外部知識或推測未明說的內容。特別注意跨段重點的整合與補全。
-"""
-
-map_prompt = ChatPromptTemplate([("human", map_template)])
-reduce_prompt = ChatPromptTemplate([("human", reduce_template)])
-
-map_chain = map_prompt | llm | StrOutputParser()
-reduce_chain = reduce_prompt | llm | StrOutputParser()
-
-# 定義運行應用程式的異步函數
-async def run_app(split_docs):
-    async for step in app.astream(
-        {"contents": [doc.page_content for doc in split_docs]},
-        {"recursion_limit": 100},
-    ):
-        pass  # 這裡不需要任何操作，只是等待完成
-    return step['generate_final_summary']['final_summary']
-
-# 解析的部分
-def _default_aggregator(messages: Sequence[AnyMessage]) -> AIMessage:
-    for m in messages[::-1]:
-        if m.type == "ai":
-            return m
-    raise ValueError("No AI message found in the sequence.")
-
-
-class RetryStrategy(TypedDict, total=False):
-    """The retry strategy for a tool call."""
-
-    max_attempts: int
-    """The maximum number of attempts to make."""
-    fallback: Optional[
-        Union[
-            Runnable[Sequence[AnyMessage], AIMessage],
-            Runnable[Sequence[AnyMessage], BaseMessage],
-            Callable[[Sequence[AnyMessage]], AIMessage],
-        ]
-    ]
-    """The function to use once validation fails."""
-    aggregate_messages: Optional[Callable[[Sequence[AnyMessage]], AIMessage]]
-
-
-def _bind_validator_with_retries(
-    llm: Union[
-        Runnable[Sequence[AnyMessage], AIMessage],
-        Runnable[Sequence[BaseMessage], BaseMessage],
-    ],
-    *,
-    validator: ValidationNode,
-    retry_strategy: RetryStrategy,
-    tool_choice: Optional[str] = None,
-) -> Runnable[Union[List[AnyMessage], PromptValue], AIMessage]:
-    """Binds a tool validators + retry logic to create a runnable validation graph.
-
-    LLMs that support tool calling can generate structured JSON. However, they may not always
-    perfectly follow your requested schema, especially if the schema is nested or has complex
-    validation rules. This method allows you to bind a validation function to the LLM's output,
-    so that any time the LLM generates a message, the validation function is run on it. If
-    the validation fails, the method will retry the LLM with a fallback strategy, the simplest
-    being just to add a message to the output with the validation errors and a request to fix them.
-
-    The resulting runnable expects a list of messages as input and returns a single AI message.
-    By default, the LLM can optionally NOT invoke tools, making this easier to incorporate into
-    your existing chat bot. You can specify a tool_choice to force the validator to be run on
-    the outputs.
-
-    Args:
-        llm (Runnable): The llm that will generate the initial messages (and optionally fallba)
-        validator (ValidationNode): The validation logic.
-        retry_strategy (RetryStrategy): The retry strategy to use.
-            Possible keys:
-            - max_attempts: The maximum number of attempts to make.
-            - fallback: The LLM or function to use in case of validation failure.
-            - aggregate_messages: A function to aggregate the messages over multiple turns.
-                Defaults to fetching the last AI message.
-        tool_choice: If provided, always run the validator on the tool output.
-
-    Returns:
-        Runnable: A runnable that can be invoked with a list of messages and returns a single AI message.
-    """
-
-    def add_or_overwrite_messages(left: list, right: Union[list, dict]) -> list:
-        """Append messages. If the update is a 'finalized' output, replace the whole list."""
-        if isinstance(right, dict) and "finalize" in right:
-            finalized = right["finalize"]
-            if not isinstance(finalized, list):
-                finalized = [finalized]
-            for m in finalized:
-                if m.id is None:
-                    m.id = str(uuid.uuid4())
-            return finalized
-        res = add_messages(left, right)
-        if not isinstance(res, list):
-            return [res]
-        return res
-
-    class State(TypedDict):
-        messages: Annotated[list, add_or_overwrite_messages]
-        attempt_number: Annotated[int, operator.add]
-        initial_num_messages: int
-        input_format: Literal["list", "dict"]
-
-    builder = StateGraph(State)
-
-    def dedict(x: State) -> list:
-        """Get the messages from the state."""
-        return x["messages"]
-
-    model = dedict | llm | (lambda msg: {"messages": [msg], "attempt_number": 1})
-    fbrunnable = retry_strategy.get("fallback")
-    if fbrunnable is None:
-        fb_runnable = llm
-    elif isinstance(fbrunnable, Runnable):
-        fb_runnable = fbrunnable  # type: ignore
-    else:
-        fb_runnable = RunnableLambda(fbrunnable)
-    fallback = (
-        dedict | fb_runnable | (lambda msg: {"messages": [msg], "attempt_number": 1})
-    )
-
-    def count_messages(state: State) -> dict:
-        return {"initial_num_messages": len(state.get("messages", []))}
-
-    builder.add_node("count_messages", count_messages)
-    builder.add_node("llm", model)
-    builder.add_node("fallback", fallback)
-
-    # To support patch-based retries, we need to be able to
-    # aggregate the messages over multiple turns.
-    # The next sequence selects only the relevant messages
-    # and then applies the validator
-    select_messages = retry_strategy.get("aggregate_messages") or _default_aggregator
-
-    def select_generated_messages(state: State) -> list:
-        """Select only the messages generated within this loop."""
-        selected = state["messages"][state["initial_num_messages"] :]
-        return [select_messages(selected)]
-
-    def endict_validator_output(x: Sequence[AnyMessage]) -> dict:
-        if tool_choice and not x:
-            return {
-                "messages": [
-                    HumanMessage(
-                        content=f"ValidationError: please respond with a valid tool call [tool_choice={tool_choice}].",
-                        additional_kwargs={"is_error": True},
-                    )
-                ]
-            }
-        return {"messages": x}
-
-    validator_runnable = select_generated_messages | validator | endict_validator_output
-    builder.add_node("validator", validator_runnable)
-
-    class Finalizer:
-        """Pick the final message to return from the retry loop."""
-
-        def __init__(self, aggregator: Optional[Callable[[list], AIMessage]] = None):
-            self._aggregator = aggregator or _default_aggregator
-
-        def __call__(self, state: State) -> dict:
-            """Return just the AI message."""
-            initial_num_messages = state["initial_num_messages"]
-            generated_messages = state["messages"][initial_num_messages:]
-            return {
-                "messages": {
-                    "finalize": self._aggregator(generated_messages),
-                }
-            }
-
-    # We only want to emit the final message
-    builder.add_node("finalizer", Finalizer(retry_strategy.get("aggregate_messages")))
-
-    # Define the connectivity
-    builder.add_edge(START, "count_messages")
-    builder.add_edge("count_messages", "llm")
-
-    def route_validator(state: State):
-        if state["messages"][-1].tool_calls or tool_choice is not None:
-            return "validator"
-        return END
-
-    builder.add_conditional_edges("llm", route_validator, ["validator", END])
-    builder.add_edge("fallback", "validator")
-    max_attempts = retry_strategy.get("max_attempts", 3)
-
-    def route_validation(state: State):
-        if state["attempt_number"] > max_attempts:
-            raise ValueError(
-                f"Could not extract a valid value in {max_attempts} attempts."
-            )
-        for m in state["messages"][::-1]:
-            if m.type == "ai":
-                break
-            if m.additional_kwargs.get("is_error"):
-                return "fallback"
-        return "finalizer"
-
-    builder.add_conditional_edges(
-        "validator", route_validation, ["finalizer", "fallback"]
-    )
-
-    builder.add_edge("finalizer", END)
-
-    # These functions let the step be used in a MessageGraph
-    # or a StateGraph with 'messages' as the key.
-    def encode(x: Union[Sequence[AnyMessage], PromptValue]) -> dict:
-        """Ensure the input is the correct format."""
-        if isinstance(x, PromptValue):
-            return {"messages": x.to_messages(), "input_format": "list"}
-        if isinstance(x, list):
-            return {"messages": x, "input_format": "list"}
-        raise ValueError(f"Unexpected input type: {type(x)}")
-
-    def decode(x: State) -> AIMessage:
-        """Ensure the output is in the expected format."""
-        return x["messages"][-1]
-
-    return (
-        encode | builder.compile().with_config(run_name="ValidationGraph") | decode
-    ).with_config(run_name="ValidateWithRetries")
-
-
-def bind_validator_with_retries(
-    llm: BaseChatModel,
-    *,
-    tools: list,
-    tool_choice: Optional[str] = None,
-    max_attempts: int = 3,
-) -> Runnable[Union[List[AnyMessage], PromptValue], AIMessage]:
-    """Binds validators + retry logic ensure validity of generated tool calls.
-
-    LLMs that support tool calling are good at generating structured JSON. However, they may
-    not always perfectly follow your requested schema, especially if the schema is nested or
-    has complex validation rules. This method allows you to bind a validation function to
-    the LLM's output, so that any time the LLM generates a message, the validation function
-    is run on it. If the validation fails, the method will retry the LLM with a fallback
-    strategy, the simples being just to add a message to the output with the validation
-    errors and a request to fix them.
-
-    The resulting runnable expects a list of messages as input and returns a single AI message.
-    By default, the LLM can optionally NOT invoke tools, making this easier to incorporate into
-    your existing chat bot. You can specify a tool_choice to force the validator to be run on
-    the outputs.
-
-    Args:
-        llm (Runnable): The llm that will generate the initial messages (and optionally fallba)
-        validator (ValidationNode): The validation logic.
-        retry_strategy (RetryStrategy): The retry strategy to use.
-            Possible keys:
-            - max_attempts: The maximum number of attempts to make.
-            - fallback: The LLM or function to use in case of validation failure.
-            - aggregate_messages: A function to aggregate the messages over multiple turns.
-                Defaults to fetching the last AI message.
-        tool_choice: If provided, always run the validator on the tool output.
-
-    Returns:
-        Runnable: A runnable that can be invoked with a list of messages and returns a single AI message.
-    """
-    bound_llm = llm.bind_tools(tools, tool_choice=tool_choice)
-    retry_strategy = RetryStrategy(max_attempts=max_attempts)
-    validator = ValidationNode(tools)
-    return _bind_validator_with_retries(
-        bound_llm,
-        validator=validator,
-        tool_choice=tool_choice,
-        retry_strategy=retry_strategy,
-    ).with_config(metadata={"retry_strategy": "default"})
-
-class Respond(BaseModel):
-    """Use to generate the response. Always use when responding to the user"""
-
-    reason: str = Field(description="Step-by-step justification for the answer.")
-    answer: str
-
-tools = [Respond]
-
-bound_llm = bind_validator_with_retries(llm, tools=tools)
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """
-# Role and Objective
-You are a professional meeting transcript analyst. Your job is to deeply analyze the provided meeting transcript (逐字稿), extract actionable insights, and generate a comprehensive, structured summary using the TranscriptSummary function. You must not stop until all relevant information and insights have been fully extracted and organized.
-
-# Instructions
-- Only use the provided transcript as your primary context. If you need to supplement with external knowledge, clearly indicate the source or explain your reasoning.
-- If you are unsure about any information, state so explicitly rather than guessing.
-- Always respond using the TranscriptSummary function, filling every field with as much valuable, relevant, and actionable content as possible.
-- If a field cannot be filled from the transcript, explain why or leave it empty.
-- Do not terminate your response until you are confident that all important points, insights, and recommendations have been covered.
-- Use clear, concise, and professional language in Traditional Chinese.
-- If the transcript is ambiguous or incomplete, list the knowledge gaps and suggest what further information would be needed.
-
-# Reasoning Steps
-1. **Comprehension**: Carefully read and understand the entire transcript.
-2. **Topic Extraction**: Identify all main topics and subtopics discussed.
-3. **Key Moments**: For each topic, extract key moments, decisions, and turning points, and classify them as happy, tense, or sad moments as appropriate.
-4. **Background & Context**: Supplement with relevant industry background, definitions of technical terms, and connections to current regulations or market trends, if applicable.
-5. **Insightful Quotes**: Select the most insightful or representative quotes, and provide analysis of their significance.
-6. **Summary & Next Steps**: Synthesize the overall summary and propose concrete next steps or action items, with justifications.
-7. **Knowledge Gaps**: Explicitly list any missing information or areas requiring further investigation.
-8. **Chain-of-Thought**: For each step, think step by step, and do not skip any reasoning.
-
-# Output Format
-- Always use the TranscriptSummary function to structure your output.
-- Fill in all fields: metadata, key_moments, insightful_quotes, overall_summary, next_steps, other_stuff.
-- Use bullet points and markdown formatting for clarity.
-- For each field, provide as much detail as possible, but avoid unnecessary repetition.
-- If you supplement with external knowledge, clearly mark it as such and explain your reasoning.
-
-# Example
-## Input Transcript
-<transcript>
-主題：新產品上市會議
-主持人：大家好，今天我們討論新產品上市計畫...
-（逐字稿內容略）
-</transcript>
-
-## Output (TranscriptSummary function)
-metadata:
-  title: 新產品上市會議
-  location: 會議室A
-  duration: 1小時
-key_moments:
-  - topic: 市場策略
-    happy_moments: [...]
-    tense_moments: [...]
-    sad_moments: [...]
-    background_info: [...]
-    moments_summary: ...
-insightful_quotes:
-  - quote: "我們必須創新，否則就會被市場淘汰。"
-    speaker: 張經理
-    analysis: 這句話強調了創新對公司未來發展的重要性。
-overall_summary: ...
-next_steps:
-  - 進行市場調查
-  - 完成產品測試
-other_stuff:
-  - content: 會議中提及的法規變動需持續追蹤
-
-# Context
-<transcript>
-{full_transcription}
-</transcript>
-
-# Final Instructions
-Think step by step, and do not stop until you have fully analyzed and summarized all important content from the transcript. If you need to supplement with external knowledge, clearly indicate so and explain your reasoning. Always respond using the TranscriptSummary function.
-"""
-        ),
-        ("placeholder", "{messages}"),
-    ]
-)
-
-chain = prompt | bound_llm
-
-class OutputFormat(BaseModel):
-    sources: str = Field(
-        ...,
-        description="The raw transcript / span you could cite to justify the choice.",
-    )
-    content: str = Field(..., description="The chosen value.")
-
-class Moment(BaseModel):
-    quote: str = Field(..., description="The relevant quote from the transcript.")
-    description: str = Field(..., description="A description of the moment.")
-    expressed_preference: OutputFormat = Field(
-        ..., description="The preference expressed in the moment, based on the context."
-    )
-
-class BackgroundInfo(BaseModel):
-    factoid: OutputFormat = Field(
-        ..., description="Important factoid about the member."
-    )
-    professions: Optional[List[str]] = Field(
-        None, description="List of professions related to the member."
-    )
-    why: str = Field(..., description="Why this is important.")
-
-class KeyMoments(BaseModel):
-    topic: str = Field(..., description="The topic of the key moments.")
-    happy_moments: List[Moment] = Field(
-        ..., description="A list of key moments related to the topic."
-    )
-    tense_moments: List[Moment] = Field(
-        ..., description="Moments where things were a bit tense."
-    )
-    sad_moments: List[Moment] = Field(
-        ..., description="Moments where things where everyone was downtrodden."
-    )
-    background_info: List[BackgroundInfo] = Field(
-        ..., description="A list of background information."
-    )
-    moments_summary: str = Field(..., description="A summary of the key moments.")
-
-class InsightfulQuote(BaseModel):
-    quote: OutputFormat = Field(
-        ..., description="An insightful quote from the transcript."
-    )
-    speaker: str = Field(..., description="The name of the speaker who said the quote.")
-    analysis: str = Field(
-        ..., description="An analysis of the quote and its significance."
-    )
-
-class TranscriptMetadata(BaseModel):
-    title: str = Field(..., description="The title of the transcript.")
-    location: OutputFormat = Field(
-        ..., description="The location where the interview took place. If the location cannot be identified, return 'Unknown'."
-    )
-    duration: str = Field(..., description="The duration of the interview.")
-
-class TranscriptSummary(BaseModel):
-    metadata: TranscriptMetadata = Field(
-        ..., description="Metadata about the transcript."
-    )
-    key_moments: List[KeyMoments] = Field(
-        ..., description="A list of key moments from the interview."
-    )
-    insightful_quotes: List[InsightfulQuote] = Field(
-        ..., description="A list of insightful quotes from the interview."
-    )
-    overall_summary: str = Field(
-        ..., description="An overall summary of the interview."
-    )
-    next_steps: List[str] = Field(
-        ..., description="A list of next steps or action items based on the interview."
-    )
-    other_stuff: List[OutputFormat] = Field(
-        ..., description="Additional relevant information."
-    )
-
-formatted_transcription = ""  # 先初始化
-
-# 處理上傳的文件
-if f is not None:
-    st.audio(f)
-    file_extension = f.name.split('.')[-1]  # 獲取文件的副檔名
-
-    # 初始化 summarize_transcription 變數
-    summarize_transcription = "摘要尚未生成。"
-
-    # 使用 st.status 來顯示整體處理狀態
-    with st.status("Processing audio file...", expanded=True) as status:
+def normalize_symbols(text: str) -> str:
+    text = text.replace("％", "%").replace("＄", "$")
+    text = text.replace("–", "-").replace("—", "-")
+    text = text.replace("\u200b", "").replace("\u200c", "")
+    return text
+
+def pretty_format_sentences(sentences: List[str]) -> List[str]:
+    pretty = []
+    for s in sentences:
+        s2 = add_cjk_spacing(s)
+        s2 = normalize_symbols(s2)
+        pretty.append(s2)
+    return pretty
+
+# 顯示層：逐行『潤飾＋必要時翻譯』為正體中文（台灣用語），穩定版（批次＋分隔符）
+def refine_zh_tw_via_prompt(lines: List[str]) -> List[str]:
+    if not lines:
+        return lines
+    SEP = "\u241E"  # 可視分隔符 ␞
+    MAX_BATCH_CHARS = 9000
+    MAX_BATCH_LINES = 120
+
+    def _refine_batch(batch: List[str]) -> List[str]:
+        blob = SEP.join(batch)
+        dev_msg = (
+            "你將收到多行逐字稿，請逐行『潤飾＋必要時翻譯』為正體中文（台灣用語）。\n"
+            "要求：\n"
+            "1) 保留原意，只做語句潤飾與正體翻譯，不得捏造資訊。\n"
+            "2) 若該行是英文或混雜語言，翻譯為正體中文（台灣用語）。\n"
+            "3) 嚴禁合併/拆分行；嚴禁插入或刪除空行；輸入幾行就輸出幾行。\n"
+            "4) 保留數字、單位、時間、金額、emoji、網址、簡短代碼片段等非語意內容。\n"
+            "5) 用詞採台灣慣用、口吻簡潔專業自然。\n"
+            "6) 行與行由特殊分隔符 ␞（U+241E）連接；請務必保留相同數量的分隔符，不可新增或移除。\n"
+            "只輸出最終文本，不要任何解釋。"
+        )
         try:
-            # 將上傳的文件保存到臨時文件
-            status.update(label="Saving uploaded file...")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as temp_input_file:
-                temp_input_file.write(f.read())
-                temp_input_file_path = temp_input_file.name
+            resp = client.responses.create(
+                model=MODEL_REDUCE,
+                input=[
+                    {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": blob}]},
+                ],
+                text={"format": {"type": "text"}},
+                tools=[],
+            )
+            out = (resp.output_text or "").rstrip("\n")
+            out_lines = out.split(SEP) if SEP in out else out.split("\n")
+            return out_lines if len(out_lines) == len(batch) else batch
+        except Exception:
+            return batch
 
-            # 使用 pydub 讀取和轉換音頻文件
-            status.update(label="Loading audio file...")
-            audio = AudioSegment.from_file(temp_input_file_path, format=file_extension)
+    # 分批處理（此函式在背景工人執行）
+    refined_all: List[str] = []
+    batch: List[str] = []
+    size = 0
+    for s in lines:
+        if (len(batch) >= MAX_BATCH_LINES) or (size + len(s) + 1 > MAX_BATCH_CHARS):
+            refined_all.extend(_refine_batch(batch))
+            batch, size = [], 0
+        batch.append(s)
+        size += len(s) + 1
+    if batch:
+        refined_all.extend(_refine_batch(batch))
+    return refined_all if refined_all else lines
 
-            # 分割音頻文件
-            status.update(label="Splitting audio into chunks...")
-            chunk_length_ms = 1 * 60 * 1000  # 1分鐘
-            chunks = [audio[i:i + chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
-
-            if not chunks:
-                st.error("No audio chunks were created. Please check the audio file format and content.")
-
-            full_transcription = ""
-            progress_bar = st.progress(0)
-            total_chunks = len(chunks)
-
-            status.update(label="Transcribing audio chunks...")
-            # 使用 ThreadPoolExecutor 來並行處理
-            with ThreadPoolExecutor() as executor:
-                futures = [executor.submit(transcribe_chunk, chunk, i) for i, chunk in enumerate(chunks)]
-                for i, f in enumerate(futures):
-                    full_transcription += f.result() + " "
-                    progress = (i + 1) / total_chunks
-                    progress_bar.progress(progress)
-
-            progress_bar.empty()
-
-            # 使用 LangChain 改善文本格式
-            status.update(label="Formatting transcription...")
-            #formatted_transcription = stream_full_formatted_transcription(formatting_chain, full_transcription, judge_llm)
-            final_transcript = format_transcript_by_chunks(full_transcription, formatting_chain)
-
-            status.update(label="Transcription complete!", state="complete", expanded=False)
+# ========== Map-Reduce（GPT‑5 + Responses API）==========
+def map_summarize_blocks(flat_sentences: List[str], chunk_size=DEFAULT_MAP_CHUNK_SIZE) -> List[str]:
+    blocks = []
+    for idx in range(0, len(flat_sentences), chunk_size):
+        part = flat_sentences[idx: idx + chunk_size]
+        dev_msg = (
+            "你是一位會議記錄小幫手，請將下列逐字稿整理為條列式重點（繁體中文）。"
+            "要求：每點具體、避免空泛；若有決策/風險/未決問題/行動項目請清楚標記；"
+            "只輸出條列重點，不要額外說明。"
+        )
+        user_msg = "\n".join(part)
+        try:
+            resp = client.responses.create(
+                model=MODEL_MAP,
+                input=[
+                    {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_msg}]},
+                ],
+                text={"format": {"type": "text"}},
+                tools=[],
+            )
+            content = resp.output_text or ""
+            blocks.append(content.strip())
         except Exception as e:
-            st.error(f"Error processing audio file: {e}")
-            formatted_transcription = "⚠️ 轉錄或格式化時發生錯誤。"
+            blocks.append(f"【API 摘要失敗：{e}】")
+    return blocks
 
-    # 顯示 formatted_transcription
-    tab1, tab2, tab3, tab4 = st.tabs(["轉錄結果", "重點摘要", "內容解析", "原始內容"])
-    with tab1:
-        with st.container():
-            st.markdown(beautify_transcript(final_transcript), unsafe_allow_html=True)
-            st.balloons()
+def reduce_finalize_json(map_blocks: List[str]) -> Dict[str, Any]:
+    dev_msg = (
+        "你是會議記錄總整專家。請將多個分段摘要合併成結構化 JSON，包含：\n"
+        "- metadata: {title, date, location, participants[], duration}\n"
+        "- topics[]: {title, key_points[], decisions[], risks[], open_questions[]}\n"
+        "- decisions[]\n"
+        "- risks[]\n"
+        "- open_questions[]\n"
+        "- action_items[]: {description, owner|null, due_date|null, priority|null (P0~P3), status, source_refs[]}\n"
+        "- overall_summary: string\n"
+        "要求：\n"
+        "1) 嚴禁捏造來源沒有的資訊；未知欄位請留空或 Unknown。\n"
+        "2) 去重、合併相近重點，但不得改變原意。\n"
+        "3) 只輸出 JSON 物件，不要額外說明文字。\n"
+        "4) 確保為合法 JSON。\n\n"
+        "=== 分段摘要 ===\n"
+        + "\n\n".join(f"[Part {i+1}]\n{blk}" for i, blk in enumerate(map_blocks))
+    )
+    try:
+        resp = client.responses.create(
+            model=MODEL_REDUCE,
+            input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
+            text={"format": {"type": "text"}},
+            tools=[],
+        )
+        s = (resp.output_text or "").strip()
+        start = s.find("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1:
+            s = s[start:end+1]
+            return json.loads(s)
+    except Exception as e:
+        return {"overall_summary": f"解析 JSON 失敗，請重試或調整提示。錯誤：{e}", "raw": ""}
+    return {"overall_summary": "解析 JSON 失敗（未知原因）", "raw": ""}
 
-    # 異步計算 summarize_transcription 並在 Tab2 中顯示 spinner
-    async def calculate_summary():
-        # 分割轉錄文本並包裝成 Document 對象
-        split_docs = [Document(page_content=content) for content in text_splitter.split_text(full_transcription)]
-        summarize_transcription = await run_app(split_docs)
-        st.session_state['summarize_transcription'] = summarize_transcription
-        return summarize_transcription
+def reduce_finalize_markdown(map_blocks: List[str]) -> str:
+    dev_msg = (
+        "你是會議記錄總整專家。請將多個分段摘要整併為『單一份最終會議紀錄（Markdown）』。\n"
+        "要求：\n"
+        "1) 僅根據提供的分段摘要整併，嚴禁捏造來源沒有的資訊。\n"
+        "2) 不輸出 metadata（標題/日期/地點/參與者/時長），只要內容本體。\n"
+        "3) 結構：\n"
+        " - 以一段「總結」開場，3~6 句，說清楚整體脈絡與結論。\n"
+        " - 之後用多個小節（## 主題名稱），每節採用短段落敘述為主，可穿插少量條列。\n"
+        " - 若有決策/風險/未決問題，於對應主題內以『決策：』『風險：』『未決：』行內標示。\n"
+        "4) 只輸出純 Markdown 內容，不要額外說明。\n\n"
+        "=== 分段摘要 ===\n"
+        + "\n\n".join(f"[Part {i+1}]\n{blk}" for i, blk in enumerate(map_blocks))
+    )
+    try:
+        resp = client.responses.create(
+            model=MODEL_REDUCE,
+            input=[{"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]}],
+            text={"format": {"type": "text"}},
+            tools=[],
+        )
+        return (resp.output_text or "").strip()
+    except Exception as e:
+        return f"⚠️ 生成會議摘要失敗：{e}"
 
-    with tab2:
-        #with st.spinner('Generating summary...'):
-            #summarize_transcription = asyncio.run(calculate_summary())
-            #st.markdown(summarize_transcription)
+# ========== 並行潤飾：Consumer with worker pool（保順序回填）==========
+# 微批次參數（45~60 分鐘音檔建議值）
+REFINE_MAX_LINES = 80     # 越小：更即時，但 API 次數↑ / 成本↑
+REFINE_MAX_CHARS = 6000   # 可視音檔密度 6k~9k 微調；越大：更省成本，但回饋較慢
+REFINE_MAX_WAIT_S = 0.35  # 佇列塞車時可調小（0.25~0.30），改善延遲；或調大以減少 API 次數
 
-    # 保存轉錄結果到 session_state
-        if 'formatted_transcription' not in st.session_state:
-            st.session_state['formatted_transcription'] = formatted_transcription
-        if 'full_transcription' not in st.session_state:
-            st.session_state['full_transcription'] = full_transcription
+class RefineConsumer:
+    def __init__(self, stream_container, progress_bar, workers: int = 1):
+        # workers 建議 1 起步；看到佇列塞車再升到 2
+        self.q: Queue = Queue(maxsize=6)  # 適度背壓，避免記憶體飆高
+        self.stream_container = stream_container
+        self.progress_bar = progress_bar
+        self.grouped_sentences: List[List[str]] = []
+        self.refined_lines_all: List[str] = []
+        self.unique_sentences_raw_all: List[str] = []  # 給摘要用（去重前的可讀行也可）
+        self._stop = False
+        self._total = 0
+        self._done = 0
+        self.lock = Lock()
 
-    with tab3:
-        with st.container():
+        self.workers = max(1, int(workers))
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.workers)
+        self.batch_id = 0
+        self.next_emit_id = 0
+        self.pending: Dict[int, concurrent.futures.Future] = {}
+        self.batch_buffer: Dict[int, List[str]] = {}
+
+    def set_total(self, n: int):
+        self._total = n
+
+    def put(self, item):
+        # item: List[str]（單段分句）
+        self.q.put(item)
+
+    def stop(self):
+        self._stop = True
+        self.q.put(None)
+
+    def _submit_batch(self, batch_lines: List[str], bid: int):
+        # 丟進工作池做潤飾；保持順序 → 回來時存 buffer，主迴圈依序 emit
+        def _task(lines: List[str]) -> List[str]:
             try:
-                formatted_transcription = st.session_state.get('formatted_transcription', "")
-                transcript = [
-                    (
-                        "Speaker",
-                        full_transcription,
-                    ),
-                ]
+                return refine_zh_tw_via_prompt(lines)
+            except Exception:
+                return lines  # 失敗回退顯示原文
+        fut = self.executor.submit(_task, batch_lines[:])
+        self.pending[bid] = fut
 
-                formatted = "\n".join(f"{x[0]}: {x[1]}" for x in transcript)
+    def _emit_ready(self):
+        # 依序輸出已完成的批次，維持畫面順序穩定
+        emitted_any = False
+        while self.next_emit_id in self.pending and self.pending[self.next_emit_id].done():
+            fut = self.pending.pop(self.next_emit_id)
+            try:
+                refined = fut.result()
+            except Exception:
+                refined = self.batch_buffer.get(self.next_emit_id, [])
+            # 更新累積結果
+            self.refined_lines_all.extend(refined)
+            paras = group_into_paragraphs(refined, max_chars=280, max_sents=4)
+            # 僅更新追加部分，Streamlit 會重繪整塊，體感仍即時
+            existing = "\n\n".join(group_into_paragraphs(self.refined_lines_all, max_chars=280, max_sents=4))
+            self.stream_container.markdown(existing)
+            self.batch_buffer.pop(self.next_emit_id, None)
+            self.next_emit_id += 1
+            emitted_any = True
+        return emitted_any
 
-                tools = [TranscriptSummary]
-                bound_llm = bind_validator_with_retries(
-                    llm,
-                    tools=tools,
-                )
-                prompt = ChatPromptTemplate.from_messages(
-                    [
-                        ("system", "Respond directly using the TranscriptSummary function."),
-                        ("placeholder", "{messages}"),
-                    ]
-                )
+    def run(self):
+        batch_lines: List[str] = []
+        batch_chars = 0
+        last_flush = time.time()
 
-                bound_chain = prompt | bound_llm              
+        while True:
+            try:
+                item = self.q.get(timeout=0.2)
+            except Empty:
+                item = None
+
+            now = time.time()
+            timeup = (now - last_flush) >= REFINE_MAX_WAIT_S
+
+            if item is None:
+                if timeup and batch_lines:
+                    # 送出微批次
+                    bid = self.batch_id
+                    self.batch_buffer[bid] = batch_lines[:]
+                    self._submit_batch(batch_lines, bid)
+                    self.batch_id += 1
+                    batch_lines, batch_chars = [], 0
+                    last_flush = now
+                if self._stop:
+                    # 收尾：送出殘留批次
+                    if batch_lines:
+                        bid = self.batch_id
+                        self.batch_buffer[bid] = batch_lines[:]
+                        self._submit_batch(batch_lines, bid)
+                        self.batch_id += 1
+                        batch_lines, batch_chars = [], 0
+                    # 等待全部完成並依序輸出
+                    while self.pending:
+                        self._emit_ready()
+                        time.sleep(0.05)
+                    break
+                else:
+                    # 嘗試把已完成的批次 emit 出來
+                    self._emit_ready()
+                continue
+
+            # item: 本段的分句結果
+            sents = item
+            # 相鄰視窗去重（避免 1200ms overlap 帶來重複）
+            unique = sents if not self.grouped_sentences else dedupe_against_prev_fast(
+                sents, self.grouped_sentences[-1], threshold=0.88, max_prev=12
+            )
+            self.grouped_sentences.append(unique)
+            flat = pretty_format_sentences(unique)
+
+            # 累計原始可讀行（給摘要/備份使用）
+            self.unique_sentences_raw_all.extend(flat)
+
+            # 累加進微批次緩衝
+            flushed = False
+            for s in flat:
+                if not s.strip():
+                    continue
+                if (len(batch_lines) >= REFINE_MAX_LINES) or (batch_chars + len(s) > REFINE_MAX_CHARS) or timeup:
+                    bid = self.batch_id
+                    self.batch_buffer[bid] = batch_lines[:]
+                    self._submit_batch(batch_lines, bid)
+                    self.batch_id += 1
+                    batch_lines, batch_chars = [], 0
+                    last_flush = now
+                    flushed = True
+                batch_lines.append(s)
+                batch_chars += len(s)
+
+            # 進度更新
+            self._done += 1
+            if self._total:
+                self.progress_bar.progress(min(1.0, self._done / self._total))
+
+            # 若剛好送出批次，就嘗試 emit（避免畫面空窗）
+            if flushed:
+                self._emit_ready()
+
+        # 結束時收工
+        self.executor.shutdown(wait=True)
+
+# ========== STT Producer ==========
+def build_prompt(prev_text: str, glossary: str, style_seed: str, max_tokens: int = 220) -> str:
+    parts = []
+    parts.append("請全程使用正體中文（繁體，台灣用語）。")
+    if style_seed and style_seed.strip():
+        parts.append(style_seed.strip())
+    if glossary and glossary.strip():
+        words = [w.strip() for w in glossary.splitlines() if w.strip()]
+        if words:
+            parts.append("Glossary: " + ", ".join(words))
+    if prev_text and prev_text.strip():
+        tail = prev_text.strip()
+        if len(tail) > 1200:
+            tail = tail[-1200:]
+        parts.append(tail)
+
+    prompt = "\n".join(parts).strip()
+    toks = prompt.split()
+    if len(toks) > max_tokens:
+        prompt = " ".join(toks[-max_tokens:])
+    return prompt
+
+def stream_transcribe_all(
+    chunks: List[AudioSegment],
+    container,
+    progress_bar,
+    use_prompting: bool = False,
+    glossary: str = "",
+    style_seed: str = "",
+    on_sentences=None  # 回呼：把本段的句子送給潤飾佇列
+):
+    all_text = ""
+    rolling_context = ""
+    last_flush = 0.0
+    FLUSH_INTERVAL = 0.15
+
+    for i, chunk in enumerate(chunks):
+        chunk_hash = _hash_bytes(chunk.raw_data)
+        cache_key = f"stt_{MODEL_STT}_{chunk_hash}"
+        cached = cache_get_text(cache_key)
+        if cached:
+            all_text += cached + "\n"
+            rolling_context = (rolling_context + " " + cached).strip()
+            if len(rolling_context) > 5000:
+                rolling_context = rolling_context[-5000:]
+            progress_bar.progress((i + 1) / len(chunks))
+            container.markdown(all_text)
+            # 直接把快取內容也送進潤飾佇列
+            if on_sentences:
+                on_sentences(split_sentences(cached))
+            continue
+
+        full_text = ""
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp_path = tmp.name
+                chunk.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+            with open(tmp_path, "rb") as audio_file:
+                extra_kwargs = {}
+                if use_prompting:
+                    prompt_str = build_prompt(rolling_context, glossary, style_seed, max_tokens=220)
+                    if prompt_str:
+                        extra_kwargs["prompt"] = prompt_str
                 try:
-                    results = bound_chain.invoke(
-                        {
-                            "messages": [
-                                (
-                                    "user",
-                                    f"Extract the summary from the following conversation:\n\n<convo>\n{formatted}\n</convo>"
-                                    "\n\nRemember to respond using the TranscriptSummary function.",
-                                )
-                            ]
-                        },
+                    stream = client.audio.transcriptions.create(
+                        model=MODEL_STT,
+                        file=audio_file,
+                        response_format="text",
+                        prompt=(
+                            "This audio contains a discussion or presentation. Always preserve the original language "
+                            "of each sentence. If a sentence is in English, output it in English; if in Chinese, output it "
+                            "in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate."
+                        ),
+                        stream=True,
+                        **extra_kwargs
                     )
-                except ValueError as e:
-                    print(repr(e))
-                data = results.additional_kwargs
+                except Exception:
+                    try:
+                        stream = client.audio.transcriptions.create(
+                            model=MODEL_STT,
+                            file=audio_file,
+                            response_format="text",
+                            prompt=(
+                                "This audio contains a discussion or presentation. Always preserve the original language "
+                                "of each sentence. If a sentence is in English, output it in English; if in Chinese, output it "
+                                "in Traditional Chinese; if mixed, output the original mixed-language sentence. Do not translate."
+                            ),
+                            stream=True
+                        )
+                        container.warning("此轉錄端點不支援 prompt，引導已自動停用（本次）。")
+                    except Exception as e2:
+                        container.error(f"API 轉錄失敗：{e2}")
+                        stream = None
 
-                # 提取 tool_calls
-                tool_calls = data['tool_calls']
+                if stream is not None:
+                    # 轉錄串流中即時更新畫面
+                    for event in stream:
+                        delta = getattr(event, "delta", None)
+                        final_text = getattr(event, "text", None)
+                        if delta:
+                            full_text += delta
+                            now = time.time()
+                            if now - last_flush > FLUSH_INTERVAL:
+                                container.markdown(all_text + full_text)
+                                last_flush = now
+                        elif final_text:
+                            full_text = final_text
+                            container.markdown(all_text + full_text)
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
-                # 遍歷每個 tool_call
-                for tool_call in tool_calls:
-                    # 提取 Arguments
-                    arguments = tool_call['function']['arguments']
+        cache_set_text(cache_key, full_text.strip())
+        all_text += full_text + "\n"
+        rolling_context = (rolling_context + " " + full_text).strip()
+        if len(rolling_context) > 5000:
+            rolling_context = rolling_context[-5000:]
 
-                    # 解析 Arguments 中的 JSON 字符串
-                    arguments_data = json.loads(arguments)
+        # 分句 → 丟給潤飾佇列
+        if on_sentences:
+            sents = split_sentences(full_text)
+            on_sentences(sents)
 
-                    # 提取 Metadata
-                    metadata = arguments_data['metadata']
-                    st.markdown("### Metadata")
-                    st.markdown(f"- **標題**: {metadata['title']}")
-                    st.markdown(f"- **地點**: {metadata['location']['content']}")
-                    st.markdown(f"- **持續時間**: {metadata['duration']}")
+        progress_bar.progress((i + 1) / len(chunks))
+        container.markdown(all_text)
 
-                    # 提取 Key Moments
-                    key_moments = arguments_data['key_moments']
-                    st.markdown("\n### Key Moments")
-                    for moment in key_moments:
-                        st.markdown(f"- **主題**: {moment['topic']}")
-                        st.markdown(f"  - **時刻總結**: {moment['moments_summary']}")
-                        for info in moment['background_info']:
-                            st.markdown(f"    - **事實**: {info['factoid']['content']}")
-                            st.markdown(f"      - **為什麼重要**: {info['why']}")
+    return all_text.strip()
 
-                    # 提取 Insightful Quotes
-                    insightful_quotes = arguments_data['insightful_quotes']
-                    st.markdown("\n### Insightful Quotes")
-                    for quote in insightful_quotes:
-                        st.markdown(f"- **引用**: {quote['quote']['content']}")
-                        st.markdown(f"  - **講者**: {quote['speaker']}")
-                        st.markdown(f"  - **分析**: {quote['analysis']}")
+# 顯示模式工具：段落群組（僅保留段落模式用）
+def group_into_paragraphs(sentences: List[str], max_chars: int = 260, max_sents: int = 4) -> List[str]:
+    paras, cur, length = [], [], 0
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if cur and (len(cur) >= max_sents or length + len(s) > max_chars):
+            paras.append(" ".join(cur))
+            cur, length = [s], len(s)
+        else:
+            cur.append(s)
+            length += len(s)
+    if cur:
+        paras.append(" ".join(cur))
+    return paras
 
-                    # 提取 Overall Summary
-                    overall_summary = arguments_data['overall_summary']
-                    st.markdown("### Overall Summary:")
-                    st.markdown(f"{overall_summary}")
+def render_topics_only(md: Dict[str, Any], st):
+    st.markdown("#### 主題")
+    topics = md.get("topics", [])
+    for t in topics:
+        st.markdown(f"##### {t.get('title','主題')}")
+        kp = t.get("key_points", [])
+        if kp:
+            st.markdown("\n".join(f"- {x}" for x in kp))
+        if t.get("decisions"):
+            st.markdown("決策：\n" + "\n".join(f"- {x}" for x in t.get("decisions", [])))
+        if t.get("risks"):
+            st.markdown("風險：\n" + "\n".join(f"- {x}" for x in t.get("risks", [])))
+        if t.get("open_questions"):
+            st.markdown("未決問題：\n" + "\n".join(f"- {x}" for x in t.get("open_questions", [])))
 
-                    # 提取 Next Steps
-                    next_steps = arguments_data['next_steps']
-                    st.markdown("\n### Next Steps")
-                    
-                    for step in next_steps:
-                        st.markdown(f"- {step}")
+# ========== 上傳區 ==========
+with st.expander("上傳會議錄音檔案", expanded=True):
+    f = st.file_uploader("請上傳音檔（.wav, .mp3, .m4a, .mp4, .webm）", type=["wav", "mp3", "m4a", "mp4", "webm"])
+    start_btn = st.button("開始 Streaming 轉錄與摘要")
 
-                    # 提取 Other Stuff
-                    other_stuff = arguments_data['other_stuff']
-                    st.markdown("\n### Other Stuff")
-                    for item in other_stuff:
-                        st.markdown(f"- **內容**: {item['content']}")
+# ========== 單一整體收合的進階調整 ==========
+with st.expander("進階調整（全部設定，可選）", expanded=False):
+    st.caption("平常維持預設即可；只有音檔特性特殊時再開啟。")
 
-                    # 提取特定內容
-                    title = arguments_data['metadata']['title']
-                    location = arguments_data['metadata']['location']['content']
-                    duration = arguments_data['metadata']['duration']
-                    key_moments = arguments_data['key_moments']
-                    insightful_quotes = arguments_data['insightful_quotes']
-                    overall_summary = arguments_data['overall_summary']
-                    next_steps = arguments_data['next_steps']
-            
-            except Exception as e:
-                st.markdown(f"發生錯誤: {repr(e)}")
+    st.markdown("###### 音訊前處理")
+    cols = st.columns(2)
+    with cols[0]:
+        do_trim_leading = st.checkbox("去前導靜音（建議開）", value=True)
+        do_normalize = st.checkbox("音量正規化到 -20 dBFS（建議開）", value=True)
+    with cols[1]:
+        use_high_pass = st.checkbox("高通濾波（降低低頻噪）", value=False)
+        hp_hz = st.slider("高通截止頻率 (Hz)", 60, 300, 100, 10, disabled=not use_high_pass)
+        use_low_pass = st.checkbox("低通濾波（降高頻噪）", value=False)
+        lp_hz = st.slider("低通截止頻率 (Hz)", 4000, 12000, 9500, 100, disabled=not use_low_pass)
 
-    with tab4:
-        with st.container():
-            st.markdown(full_transcription)
+    st.markdown("###### Prompt 引導（若端點不支援會自動回退）")
+    use_prompting = st.checkbox("啟用 Prompt 引導（改善專有名詞拼寫與風格一致）", value=False)
+    glossary_input = st.text_area(
+        "專有名詞拼寫清單（每行一個）",
+        height=120,
+        placeholder="例：\nAimee\nShawn\nBBQ\nZyntriQix",
+        disabled=not use_prompting
+    )
+    style_seed = st.text_area(
+        "風格示例（1～3 句示例文本，不是指令）",
+        height=80,
+        placeholder="例：\n保持簡潔、標點一致。例句：we discuss quarterly outlook and risks.",
+        disabled=not use_prompting
+    )
 
-else:
+    st.markdown("###### 並行潤飾控制（塞車怎麼調？）")
+    # 這裡若看到潤飾進度條很慢、或畫面長時間沒新增段落：
+    # - 把「最大等待秒數」調小（例如 0.30 秒），更快吐字但呼叫次數↑
+    # - 把「單批最大行數」調低（例如 60），縮短排隊時間
+    # - 把「工人數」調到 2（需網路/額度足夠；順序已自動維持）
+    REFINE_MAX_WAIT_S = st.slider("微批次最大等待秒數 REFINE_MAX_WAIT_S", 0.10, 0.80, REFINE_MAX_WAIT_S, 0.05)
+    REFINE_MAX_LINES  = st.slider("單批最大行數 REFINE_MAX_LINES", 20, 140, REFINE_MAX_LINES, 5)
+    REFINE_MAX_CHARS  = st.slider("單批最大字數 REFINE_MAX_CHARS", 2000, 12000, REFINE_MAX_CHARS, 500)
+    MAX_STREAM_WORKERS = st.slider("潤飾工人數 MAX_STREAM_WORKERS（1～2）", 1, 2, MAX_STREAM_WORKERS, 1)
+
+if not (f and start_btn):
     st.stop()
+
+# ========== 主流程 ==========
+raw_bytes = f.read()
+st.audio(raw_bytes)
+
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["轉錄結果", "重點摘要", "內容解析", "原始內容"])
+
+with tab1:
+    with st.status("處理中...", expanded=True) as status:
+        status.update(label="儲存與轉檔...")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{f.name.split('.')[-1]}") as temp_input:
+            temp_input.write(raw_bytes)
+            temp_input_path = temp_input.name
+
+        wav_path = temp_input_path
+        if not f.name.lower().endswith(".wav"):
+            wav_path = temp_input_path + ".wav"
+            convert_to_wav(temp_input_path, wav_path)
+
+        status.update(label="載入音檔與前處理...")
+        audio = AudioSegment.from_file(wav_path, format="wav")
+        if do_trim_leading:
+            audio = trim_leading_silence(audio, silence_threshold_db=-30.0, chunk_ms=10)
+        if do_normalize:
+            audio = normalize_loudness(audio, target_dbfs=-20.0)
+        if use_high_pass or use_low_pass:
+            audio = apply_filters(audio, use_high_pass=use_high_pass, hp_hz=hp_hz,
+                                  use_low_pass=use_low_pass, lp_hz=lp_hz)
+
+        status.update(label="靜音切段（附最長/最短保護；找不到靜音會回退固定切）...")
+        chunks = split_audio_on_silence_safe(audio)
+        if not chunks:
+            st.error("無法切出有效音訊段，請檢查音檔或調整參數。")
+            st.stop()
+
+        st.markdown("#### 轉錄結果")
+        stream_container = st.empty()
+        progress_bar = st.progress(0.0)
+
+        # 並行潤飾：啟動消費者
+        refine_progress = st.progress(0.0)
+        consumer = RefineConsumer(stream_container, refine_progress, workers=MAX_STREAM_WORKERS)
+        consumer_thread = Thread(target=consumer.run, daemon=True)
+        consumer_thread.start()
+        consumer.set_total(len(chunks))
+
+        status.update(label="逐段 Streaming 轉錄中（並行潤飾中）...")
+        # 預設啟用潤飾（即使使用者沒調整設定，也會即時出字）
+        all_text = stream_transcribe_all(
+            chunks,
+            stream_container,
+            progress_bar,
+            use_prompting=use_prompting,
+            glossary=glossary_input if use_prompting else "",
+            style_seed=style_seed if use_prompting else "",
+            on_sentences=consumer.put
+        )
+
+        # 通知消費者收尾 + 等待完成
+        consumer.stop()
+        consumer_thread.join()
+
+        # 使用背景潤飾的結果作為可讀內容
+        refined_lines = consumer.refined_lines_all[:] if consumer.refined_lines_all else consumer.unique_sentences_raw_all
+        paras = group_into_paragraphs(refined_lines, max_chars=280, max_sents=4)
+        final_md = "\n\n".join(paras)
+        stream_container.markdown(final_md)
+        st.success("Transcription + Refine complete!")
+
+        status.update(label="整併重點（內部計算）...")
+        # 摘要建議使用已去重的原始句（或潤飾後句）以減少雜訊
+        flat_for_summary = consumer.unique_sentences_raw_all if consumer.unique_sentences_raw_all else split_sentences(all_text)
+        map_blocks_text = map_summarize_blocks(flat_for_summary)
+
+        status.update(label="生成最終會議摘要與內容解析...")
+        final_minutes = reduce_finalize_json(map_blocks_text)
+        final_md_summary = reduce_finalize_markdown(map_blocks_text)
+
+        with tab2:
+            st.markdown(final_md_summary)
+            st.download_button(
+                "下載會議記錄 JSON",
+                data=json.dumps(final_minutes, ensure_ascii=False, indent=2),
+                file_name="meeting_minutes.json",
+                mime="application/json"
+            )
+
+        with tab3:
+            render_topics_only(final_minutes, st)
+
+        with tab4:
+            st.markdown("#### 原始內容（最原始串流輸出，未分句／未去重）")
+            st.code(all_text.strip(), language="text")
+
+        status.update(label="全部完成！", state="complete", expanded=True)
+
+# 清理暫存
+try:
+    os.remove(temp_input_path)
+    if 'wav_path' in locals() and wav_path != temp_input_path:
+        os.remove(wav_path)
+except Exception:
+    pass
