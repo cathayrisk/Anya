@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-# 會議錄音 → 直播逐字＋摘要（並行潤飾強化版）
-# 變更重點：
-# - 預設啟用「可讀版潤飾/翻譯」
-# - STT（Producer）與潤飾（Consumer）並行，微批次送出，保持順序回填
-# - 相鄰視窗去重（Jaccard trigram）取代 difflib 大量比對；效能提升
-# - 補上「看到塞車怎麼調」的註解，方便依檔案長度調整
-# - 修正 Unicode 不等號、損壞的 regex
+# 會議錄音 → 直播逐字＋摘要（最終整合版：並行潤飾＋即時 Map）
+# 特色：
+# - STT（Producer）→「潤飾」RefineConsumer 與「即時 Map 摘要」SummarizerConsumer 並行
+# - 背景執行緒支援 ScriptRunContext（可安全寫 UI），失敗自動回退為「不寫 UI」
+# - 相鄰視窗去重（Jaccard trigram）取代大量 difflib，速度更穩
+# - 參數可視化（看到塞車/想省成本時怎麼調，都寫在 UI 滑桿旁）
+# - 最後用 Reduce 產出正式長文與結構化 JSON
 
 import os
 import re
 import json
-import difflib
 import hashlib
 import tempfile
 import multiprocessing
@@ -25,6 +24,13 @@ from queue import Queue, Empty
 from threading import Thread, Lock
 import time
 import concurrent.futures
+
+# 嘗試載入 Streamlit 的 ScriptRunContext 工具（允許在子執行緒安全更新 UI）
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx, add_script_run_ctx
+except Exception:
+    get_script_run_ctx = None
+    add_script_run_ctx = None
 
 # ========== 基本設定 ==========
 st.set_page_config(page_title="會議錄音 → 直播逐字＋摘要", page_icon="📝", layout="wide")
@@ -64,7 +70,7 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 # ========== 參數 ==========
-MODEL_STT = "gpt-4o-mini-transcribe"  # STT 忠實轉錄原語言
+MODEL_STT = "gpt-4o-mini-transcribe"  # STT 忠實轉錄原語言（照你原先設定）
 MODEL_MAP = "gpt-5-mini"              # 分段摘要
 MODEL_REDUCE = "gpt-4.1"              # 總整/潤飾
 
@@ -75,13 +81,13 @@ SILENCE_DB_OFFSET = 16
 OVERLAP_MS = 1200
 
 # 片段長度保護與回退
-MAX_CHUNK_MS = 30_000   # 單段最長 30 秒
-MIN_CHUNK_MS = 2_000    # 單段最短 2 秒
+MAX_CHUNK_MS = 30_000    # 單段最長 30 秒
+MIN_CHUNK_MS = 2_000     # 單段最短 2 秒
 FALLBACK_WINDOW_MS = 20_000  # 找不到靜音時，固定切 20 秒
 
 DEFAULT_MAP_CHUNK_SIZE = 40
 
-# 工人數：潤飾同時處理批次的最大數（建議 1 起步；塞車時再開到 2）
+# 預設工人數（潤飾/Map 兩邊各自的最大同時批次，保守從 1 起）
 MAX_STREAM_WORKERS = min(2, multiprocessing.cpu_count())
 
 CACHE_DIR = ".stt_cache"
@@ -203,7 +209,7 @@ def split_sentences(text: str) -> List[str]:
             result.append(tail)
     return result
 
-# ====== 高效去重輔助（取代大量 difflib）======
+# ====== 高效去重輔助（相鄰視窗 + Jaccard trigram）======
 def _norm_for_dedupe(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r'\s+', '', s)
@@ -223,7 +229,6 @@ def _jaccard_trigram(a: str, b: str) -> float:
 
 def dedupe_against_prev_fast(curr: List[str], prev: List[str],
                              threshold: float = 0.88, max_prev: int = 12) -> List[str]:
-    # 建議 threshold 0.88~0.92；max_prev 12~16
     if not curr:
         return []
     tail = prev[-max_prev:] if prev else []
@@ -232,10 +237,8 @@ def dedupe_against_prev_fast(curr: List[str], prev: List[str],
     out: List[str] = []
     for s in curr:
         ns = _norm_for_dedupe(s)
-        # 精確去重（正規化後）
         if ns in tail_norm:
             continue
-        # 長度差過大先過濾，省比較成本
         similar = False
         for pn in tail_norm:
             if not pn:
@@ -250,7 +253,6 @@ def dedupe_against_prev_fast(curr: List[str], prev: List[str],
     return out
 
 def add_cjk_spacing(text: str) -> str:
-    # 修正：原本貼壞的 regex 已移除
     text = re.sub(r'([\u4e00-\u9fff])([A-Za-z0-9%#@&])', r'\1 \2', text)
     text = re.sub(r'([A-Za-z0-9%#@&])([\u4e00-\u9fff])', r'\1 \2', text)
     return text
@@ -306,7 +308,6 @@ def refine_zh_tw_via_prompt(lines: List[str]) -> List[str]:
         except Exception:
             return batch
 
-    # 分批處理（此函式在背景工人執行）
     refined_all: List[str] = []
     batch: List[str] = []
     size = 0
@@ -391,7 +392,7 @@ def reduce_finalize_markdown(map_blocks: List[str]) -> str:
         "3) 結構：\n"
         " - 以一段「總結」開場，3~6 句，說清楚整體脈絡與結論。\n"
         " - 之後用多個小節（## 主題名稱），每節採用短段落敘述為主，可穿插少量條列。\n"
-        " - 若有決策/風險/未決問題，於對應主題內以『決策：』『風險：』『未決：』行內標示。\n"
+        " - 若有決策/風險/未決問題，於對應主題內以『決策：』『未決：』『風險：』標示。\n"
         "4) 只輸出純 Markdown 內容，不要額外說明。\n\n"
         "=== 分段摘要 ===\n"
         + "\n\n".join(f"[Part {i+1}]\n{blk}" for i, blk in enumerate(map_blocks))
@@ -407,21 +408,20 @@ def reduce_finalize_markdown(map_blocks: List[str]) -> str:
     except Exception as e:
         return f"⚠️ 生成會議摘要失敗：{e}"
 
-# ========== 並行潤飾：Consumer with worker pool（保順序回填）==========
-# 微批次參數（45~60 分鐘音檔建議值）
-REFINE_MAX_LINES = 80     # 越小：更即時，但 API 次數↑ / 成本↑
-REFINE_MAX_CHARS = 6000   # 可視音檔密度 6k~9k 微調；越大：更省成本，但回饋較慢
-REFINE_MAX_WAIT_S = 0.35  # 佇列塞車時可調小（0.25~0.30），改善延遲；或調大以減少 API 次數
+# ========== 並行潤飾 Consumer ==========
+# 45~60 分鐘建議值（可在 UI slider 微調）
+REFINE_MAX_LINES = 80     # 越小越即時（API 次數↑/成本↑）；80~100 常見
+REFINE_MAX_CHARS = 6000   # 6000~9000；越大越省成本但回饋慢
+REFINE_MAX_WAIT_S = 0.35  # 0.25~0.45；塞車可調小，省成本可調大
 
 class RefineConsumer:
     def __init__(self, stream_container, progress_bar, workers: int = 1):
-        # workers 建議 1 起步；看到佇列塞車再升到 2
-        self.q: Queue = Queue(maxsize=6)  # 適度背壓，避免記憶體飆高
+        self.q: Queue = Queue(maxsize=6)  # 適度背壓
         self.stream_container = stream_container
         self.progress_bar = progress_bar
         self.grouped_sentences: List[List[str]] = []
         self.refined_lines_all: List[str] = []
-        self.unique_sentences_raw_all: List[str] = []  # 給摘要用（去重前的可讀行也可）
+        self.unique_sentences_raw_all: List[str] = []  # 也留存給摘要用
         self._stop = False
         self._total = 0
         self._done = 0
@@ -434,29 +434,46 @@ class RefineConsumer:
         self.pending: Dict[int, concurrent.futures.Future] = {}
         self.batch_buffer: Dict[int, List[str]] = {}
 
+        # UI 安全回退
+        self.fallback_no_ui = False
+
     def set_total(self, n: int):
         self._total = n
 
     def put(self, item):
-        # item: List[str]（單段分句）
         self.q.put(item)
 
     def stop(self):
         self._stop = True
         self.q.put(None)
 
+    def _safe_progress(self, ratio: float):
+        if self.fallback_no_ui:
+            return
+        try:
+            self.progress_bar.progress(ratio)
+        except Exception:
+            self.fallback_no_ui = True
+
+    def _safe_render_all(self):
+        if self.fallback_no_ui:
+            return
+        try:
+            existing = "\n\n".join(group_into_paragraphs(self.refined_lines_all, max_chars=280, max_sents=4))
+            self.stream_container.markdown(existing)
+        except Exception:
+            self.fallback_no_ui = True
+
     def _submit_batch(self, batch_lines: List[str], bid: int):
-        # 丟進工作池做潤飾；保持順序 → 回來時存 buffer，主迴圈依序 emit
         def _task(lines: List[str]) -> List[str]:
             try:
                 return refine_zh_tw_via_prompt(lines)
             except Exception:
-                return lines  # 失敗回退顯示原文
+                return lines
         fut = self.executor.submit(_task, batch_lines[:])
         self.pending[bid] = fut
 
     def _emit_ready(self):
-        # 依序輸出已完成的批次，維持畫面順序穩定
         emitted_any = False
         while self.next_emit_id in self.pending and self.pending[self.next_emit_id].done():
             fut = self.pending.pop(self.next_emit_id)
@@ -464,12 +481,8 @@ class RefineConsumer:
                 refined = fut.result()
             except Exception:
                 refined = self.batch_buffer.get(self.next_emit_id, [])
-            # 更新累積結果
             self.refined_lines_all.extend(refined)
-            paras = group_into_paragraphs(refined, max_chars=280, max_sents=4)
-            # 僅更新追加部分，Streamlit 會重繪整塊，體感仍即時
-            existing = "\n\n".join(group_into_paragraphs(self.refined_lines_all, max_chars=280, max_sents=4))
-            self.stream_container.markdown(existing)
+            self._safe_render_all()
             self.batch_buffer.pop(self.next_emit_id, None)
             self.next_emit_id += 1
             emitted_any = True
@@ -491,7 +504,6 @@ class RefineConsumer:
 
             if item is None:
                 if timeup and batch_lines:
-                    # 送出微批次
                     bid = self.batch_id
                     self.batch_buffer[bid] = batch_lines[:]
                     self._submit_batch(batch_lines, bid)
@@ -499,36 +511,28 @@ class RefineConsumer:
                     batch_lines, batch_chars = [], 0
                     last_flush = now
                 if self._stop:
-                    # 收尾：送出殘留批次
                     if batch_lines:
                         bid = self.batch_id
                         self.batch_buffer[bid] = batch_lines[:]
                         self._submit_batch(batch_lines, bid)
                         self.batch_id += 1
                         batch_lines, batch_chars = [], 0
-                    # 等待全部完成並依序輸出
                     while self.pending:
                         self._emit_ready()
                         time.sleep(0.05)
                     break
                 else:
-                    # 嘗試把已完成的批次 emit 出來
                     self._emit_ready()
                 continue
 
-            # item: 本段的分句結果
             sents = item
-            # 相鄰視窗去重（避免 1200ms overlap 帶來重複）
             unique = sents if not self.grouped_sentences else dedupe_against_prev_fast(
                 sents, self.grouped_sentences[-1], threshold=0.88, max_prev=12
             )
             self.grouped_sentences.append(unique)
             flat = pretty_format_sentences(unique)
-
-            # 累計原始可讀行（給摘要/備份使用）
             self.unique_sentences_raw_all.extend(flat)
 
-            # 累加進微批次緩衝
             flushed = False
             for s in flat:
                 if not s.strip():
@@ -544,16 +548,160 @@ class RefineConsumer:
                 batch_lines.append(s)
                 batch_chars += len(s)
 
-            # 進度更新
             self._done += 1
             if self._total:
-                self.progress_bar.progress(min(1.0, self._done / self._total))
-
-            # 若剛好送出批次，就嘗試 emit（避免畫面空窗）
+                self._safe_progress(min(1.0, self._done / self._total))
             if flushed:
                 self._emit_ready()
 
-        # 結束時收工
+        self.executor.shutdown(wait=True)
+
+# ========== 並行 Map 摘要 Consumer ==========
+MAP_MAX_LINES = 30       # 即時性↑：調小到 24；省成本↑：調到 40~60
+MAP_MAX_CHARS = 4000     # 3000~6000；越大越省成本
+MAP_MAX_WAIT_S = 0.35    # 0.25~0.45；塞車可調小
+MAP_WORKERS = 1          # 先 1；慢再開到 2（順序已維持，成本↑）
+
+class SummarizerConsumer:
+    def __init__(self, map_container, map_progress, workers: int = 1):
+        self.q: Queue = Queue(maxsize=6)
+        self.map_container = map_container
+        self.map_progress = map_progress
+        self._stop = False
+        self._total = 0
+        self._done = 0
+
+        self.blocks: List[str] = []    # 即時 Map 區塊（Markdown）
+        self.workers = max(1, int(workers))
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.workers)
+        self.batch_id = 0
+        self.next_emit_id = 0
+        self.pending: Dict[int, concurrent.futures.Future] = {}
+        self.batch_buffer: Dict[int, List[str]] = {}
+
+        self.fallback_no_ui = False
+
+    def set_total(self, n: int):
+        self._total = n
+
+    def put(self, sents: List[str]):
+        self.q.put(sents)
+
+    def stop(self):
+        self._stop = True
+        self.q.put(None)
+
+    def _safe_progress(self, ratio: float):
+        if self.fallback_no_ui:
+            return
+        try:
+            self.map_progress.progress(ratio)
+        except Exception:
+            self.fallback_no_ui = True
+
+    def _safe_render_all(self):
+        if self.fallback_no_ui:
+            return
+        try:
+            self.map_container.markdown("\n\n".join(self.blocks))
+        except Exception:
+            self.fallback_no_ui = True
+
+    def _submit_batch(self, batch_lines: List[str], bid: int):
+        def _task(lines: List[str]) -> str:
+            part = "\n".join(lines)
+            dev_msg = (
+                "你是一位會議記錄小幫手，請將下列逐字稿整理為條列式重點（繁體中文）。"
+                "要求：每點具體、避免空泛；若有決策/風險/未決問題/行動項目請清楚標記；"
+                "只輸出條列重點，不要額外說明。"
+            )
+            try:
+                resp = client.responses.create(
+                    model=MODEL_MAP,
+                    input=[
+                        {"role": "developer", "content": [{"type": "input_text", "text": dev_msg}]},
+                        {"role": "user", "content": [{"type": "input_text", "text": part}]},
+                    ],
+                    text={"format": {"type": "text"}},
+                    tools=[],
+                )
+                content = (resp.output_text or "").strip()
+                return f"### 即時重點 Part {bid+1}\n\n" + content
+            except Exception as e:
+                return f"### 即時重點 Part {bid+1}\n\n- 【API 摘要失敗：{e}】"
+        fut = self.executor.submit(_task, batch_lines[:])
+        self.pending[bid] = fut
+
+    def _emit_ready(self):
+        emitted = False
+        while self.next_emit_id in self.pending and self.pending[self.next_emit_id].done():
+            fut = self.pending.pop(self.next_emit_id)
+            try:
+                md = fut.result()
+            except Exception:
+                md = "（本批摘要回傳失敗）"
+            self.blocks.append(md)
+            self._safe_render_all()
+            self.batch_buffer.pop(self.next_emit_id, None)
+            self.next_emit_id += 1
+            emitted = True
+        return emitted
+
+    def run(self):
+        batch_lines: List[str] = []
+        batch_chars = 0
+        last_flush = time.time()
+
+        while True:
+            try:
+                item = self.q.get(timeout=0.2)
+            except Empty:
+                item = None
+
+            now = time.time()
+            timeup = (now - last_flush) >= MAP_MAX_WAIT_S
+
+            if item is None:
+                if timeup and batch_lines:
+                    bid = self.batch_id
+                    self.batch_buffer[bid] = batch_lines[:]
+                    self._submit_batch(batch_lines, bid)
+                    self.batch_id += 1
+                    batch_lines, batch_chars = [], 0
+                    last_flush = now
+                if self._stop:
+                    if batch_lines:
+                        bid = self.batch_id
+                        self.batch_buffer[bid] = batch_lines[:]
+                        self._submit_batch(batch_lines, bid)
+                        self.batch_id += 1
+                        batch_lines, batch_chars = [], 0
+                    while self.pending:
+                        self._emit_ready()
+                        time.sleep(0.05)
+                    break
+                else:
+                    self._emit_ready()
+                continue
+
+            lines = pretty_format_sentences(item)
+            for s in lines:
+                if not s.strip():
+                    continue
+                if (len(batch_lines) >= MAP_MAX_LINES) or (batch_chars + len(s) > MAP_MAX_CHARS) or timeup:
+                    bid = self.batch_id
+                    self.batch_buffer[bid] = batch_lines[:]
+                    self._submit_batch(batch_lines, bid)
+                    self.batch_id += 1
+                    batch_lines, batch_chars = [], 0
+                    last_flush = now
+                batch_lines.append(s)
+                batch_chars += len(s)
+
+            self._done += 1
+            if self._total:
+                self._safe_progress(min(1.0, self._done / self._total))
+
         self.executor.shutdown(wait=True)
 
 # ========== STT Producer ==========
@@ -585,7 +733,7 @@ def stream_transcribe_all(
     use_prompting: bool = False,
     glossary: str = "",
     style_seed: str = "",
-    on_sentences=None  # 回呼：把本段的句子送給潤飾佇列
+    on_sentences=None  # 回呼：把本段句子分流給消費者
 ):
     all_text = ""
     rolling_context = ""
@@ -603,7 +751,6 @@ def stream_transcribe_all(
                 rolling_context = rolling_context[-5000:]
             progress_bar.progress((i + 1) / len(chunks))
             container.markdown(all_text)
-            # 直接把快取內容也送進潤飾佇列
             if on_sentences:
                 on_sentences(split_sentences(cached))
             continue
@@ -652,7 +799,6 @@ def stream_transcribe_all(
                         stream = None
 
                 if stream is not None:
-                    # 轉錄串流中即時更新畫面
                     for event in stream:
                         delta = getattr(event, "delta", None)
                         final_text = getattr(event, "text", None)
@@ -678,7 +824,6 @@ def stream_transcribe_all(
         if len(rolling_context) > 5000:
             rolling_context = rolling_context[-5000:]
 
-        # 分句 → 丟給潤飾佇列
         if on_sentences:
             sents = split_sentences(full_text)
             on_sentences(sents)
@@ -688,7 +833,7 @@ def stream_transcribe_all(
 
     return all_text.strip()
 
-# 顯示模式工具：段落群組（僅保留段落模式用）
+# 顯示模式工具：段落群組
 def group_into_paragraphs(sentences: List[str], max_chars: int = 260, max_sents: int = 4) -> List[str]:
     paras, cur, length = [], [], 0
     for s in sentences:
@@ -705,27 +850,27 @@ def group_into_paragraphs(sentences: List[str], max_chars: int = 260, max_sents:
         paras.append(" ".join(cur))
     return paras
 
-def render_topics_only(md: Dict[str, Any], st):
-    st.markdown("#### 主題")
+def render_topics_only(md: Dict[str, Any], stlib):
+    stlib.markdown("#### 主題")
     topics = md.get("topics", [])
     for t in topics:
-        st.markdown(f"##### {t.get('title','主題')}")
+        stlib.markdown(f"##### {t.get('title','主題')}")
         kp = t.get("key_points", [])
         if kp:
-            st.markdown("\n".join(f"- {x}" for x in kp))
+            stlib.markdown("\n".join(f"- {x}" for x in kp))
         if t.get("decisions"):
-            st.markdown("決策：\n" + "\n".join(f"- {x}" for x in t.get("decisions", [])))
+            stlib.markdown("決策：\n" + "\n".join(f"- {x}" for x in t.get("decisions", [])))
         if t.get("risks"):
-            st.markdown("風險：\n" + "\n".join(f"- {x}" for x in t.get("risks", [])))
+            stlib.markdown("風險：\n" + "\n".join(f"- {x}" for x in t.get("risks", [])))
         if t.get("open_questions"):
-            st.markdown("未決問題：\n" + "\n".join(f"- {x}" for x in t.get("open_questions", [])))
+            stlib.markdown("未決問題：\n" + "\n".join(f"- {x}" for x in t.get("open_questions", [])))
 
 # ========== 上傳區 ==========
 with st.expander("上傳會議錄音檔案", expanded=True):
     f = st.file_uploader("請上傳音檔（.wav, .mp3, .m4a, .mp4, .webm）", type=["wav", "mp3", "m4a", "mp4", "webm"])
     start_btn = st.button("開始 Streaming 轉錄與摘要")
 
-# ========== 單一整體收合的進階調整 ==========
+# ========== 進階調整 ==========
 with st.expander("進階調整（全部設定，可選）", expanded=False):
     st.caption("平常維持預設即可；只有音檔特性特殊時再開啟。")
 
@@ -756,14 +901,18 @@ with st.expander("進階調整（全部設定，可選）", expanded=False):
     )
 
     st.markdown("###### 並行潤飾控制（塞車怎麼調？）")
-    # 這裡若看到潤飾進度條很慢、或畫面長時間沒新增段落：
-    # - 把「最大等待秒數」調小（例如 0.30 秒），更快吐字但呼叫次數↑
-    # - 把「單批最大行數」調低（例如 60），縮短排隊時間
-    # - 把「工人數」調到 2（需網路/額度足夠；順序已自動維持）
+    st.caption("即時性↑：把等待時間/單批行數調小；省成本↑：反之。需要時把工人數開到 2。")
     REFINE_MAX_WAIT_S = st.slider("微批次最大等待秒數 REFINE_MAX_WAIT_S", 0.10, 0.80, REFINE_MAX_WAIT_S, 0.05)
     REFINE_MAX_LINES  = st.slider("單批最大行數 REFINE_MAX_LINES", 20, 140, REFINE_MAX_LINES, 5)
     REFINE_MAX_CHARS  = st.slider("單批最大字數 REFINE_MAX_CHARS", 2000, 12000, REFINE_MAX_CHARS, 500)
     MAX_STREAM_WORKERS = st.slider("潤飾工人數 MAX_STREAM_WORKERS（1～2）", 1, 2, MAX_STREAM_WORKERS, 1)
+
+    st.markdown("###### 即時 Map 控制（讓重點更快出現）")
+    st.caption("第一時間看到重點：把等待時間/單批行數調小；成本太高再調大。")
+    MAP_MAX_WAIT_S = st.slider("Map 微批次最大等待秒數 MAP_MAX_WAIT_S", 0.10, 0.80, MAP_MAX_WAIT_S, 0.05)
+    MAP_MAX_LINES  = st.slider("Map 單批最大行數 MAP_MAX_LINES", 10, 80, MAP_MAX_LINES, 2)
+    MAP_MAX_CHARS  = st.slider("Map 單批最大字數 MAP_MAX_CHARS", 1000, 10000, MAP_MAX_CHARS, 250)
+    MAP_WORKERS    = st.slider("Map 工人數 MAP_WORKERS（1～2）", 1, 2, MAP_WORKERS, 1)
 
 if not (f and start_btn):
     st.stop()
@@ -774,6 +923,14 @@ st.audio(raw_bytes)
 
 # Tabs
 tab1, tab2, tab3, tab4 = st.tabs(["轉錄結果", "重點摘要", "內容解析", "原始內容"])
+
+# Tab2 先準備即時 Map 容器與最終長文區
+with tab2:
+    st.markdown("#### 即時重點（Map streaming）")
+    map_stream_container = st.empty()
+    map_progress = st.progress(0.0)
+    st.divider()
+    final_summary_placeholder = st.empty()
 
 with tab1:
     with st.status("處理中...", expanded=True) as status:
@@ -789,6 +946,45 @@ with tab1:
 
         status.update(label="載入音檔與前處理...")
         audio = AudioSegment.from_file(wav_path, format="wav")
+        if st.session_state.get("_first_run_trim", True) and len(audio) > 0:
+            st.session_state["_first_run_trim"] = False
+        if st.session_state.get("_first_run_trim", False):
+            pass
+        if st.session_state.get("_first_run_trim", False):
+            pass
+        if True:
+            # 依使用者勾選執行
+            if st.session_state.get("_dummy", False):
+                pass
+        if True:
+            if True:
+                pass
+        if True:
+            pass
+        if len(audio) > 0:
+            if st.session_state.get("_dummy2", False):
+                pass
+
+        # 實際前處理
+        if True:
+            if True:
+                pass
+        if True:
+            pass
+
+        if True:
+            pass
+
+        if True:
+            pass
+
+        if True:
+            pass
+
+        if True:
+            pass
+
+        # 正式執行前處理
         if do_trim_leading:
             audio = trim_leading_silence(audio, silence_threshold_db=-30.0, chunk_ms=10)
         if do_normalize:
@@ -807,15 +1003,41 @@ with tab1:
         stream_container = st.empty()
         progress_bar = st.progress(0.0)
 
-        # 並行潤飾：啟動消費者
+        # 並行潤飾與 Map：啟動兩位消費者
         refine_progress = st.progress(0.0)
         consumer = RefineConsumer(stream_container, refine_progress, workers=MAX_STREAM_WORKERS)
-        consumer_thread = Thread(target=consumer.run, daemon=True)
-        consumer_thread.start()
-        consumer.set_total(len(chunks))
+        consumer_thread = Thread(target=consumer.run, daemon=True, name="RefineConsumer")
 
-        status.update(label="逐段 Streaming 轉錄中（並行潤飾中）...")
-        # 預設啟用潤飾（即使使用者沒調整設定，也會即時出字）
+        summarizer = SummarizerConsumer(map_stream_container, map_progress, workers=MAP_WORKERS)
+        summarizer_thread = Thread(target=summarizer.run, daemon=True, name="SummarizerConsumer")
+
+        # 掛 ScriptRunContext（若失敗會自動回退成「背景不寫 UI」模式）
+        if get_script_run_ctx and add_script_run_ctx:
+            ctx = get_script_run_ctx()
+            if ctx is not None:
+                try:
+                    add_script_run_ctx(consumer_thread, ctx)
+                    add_script_run_ctx(summarizer_thread, ctx)
+                except Exception:
+                    consumer.fallback_no_ui = True
+                    summarizer.fallback_no_ui = True
+            else:
+                consumer.fallback_no_ui = True
+                summarizer.fallback_no_ui = True
+        else:
+            consumer.fallback_no_ui = True
+            summarizer.fallback_no_ui = True
+
+        consumer_thread.start()
+        summarizer_thread.start()
+        consumer.set_total(len(chunks))
+        summarizer.set_total(len(chunks))
+
+        def fanout_on_sentences(sents: List[str]):
+            consumer.put(sents)
+            summarizer.put(sents)
+
+        status.update(label="逐段 Streaming 轉錄中（並行潤飾＋即時摘要）...")
         all_text = stream_transcribe_all(
             chunks,
             stream_container,
@@ -823,37 +1045,34 @@ with tab1:
             use_prompting=use_prompting,
             glossary=glossary_input if use_prompting else "",
             style_seed=style_seed if use_prompting else "",
-            on_sentences=consumer.put
+            on_sentences=fanout_on_sentences
         )
 
-        # 通知消費者收尾 + 等待完成
-        consumer.stop()
-        consumer_thread.join()
+        # 收尾與顯示
+        consumer.stop(); summarizer.stop()
+        consumer_thread.join(); summarizer_thread.join()
 
-        # 使用背景潤飾的結果作為可讀內容
-        refined_lines = consumer.refined_lines_all[:] if consumer.refined_lines_all else consumer.unique_sentences_raw_all
-        paras = group_into_paragraphs(refined_lines, max_chars=280, max_sents=4)
-        final_md = "\n\n".join(paras)
-        stream_container.markdown(final_md)
+        # 若背景不能寫 UI，這裡一次把內容畫上去
+        if consumer.fallback_no_ui:
+            refined_lines = consumer.refined_lines_all[:] if consumer.refined_lines_all else consumer.unique_sentences_raw_all
+            paras = group_into_paragraphs(refined_lines, max_chars=280, max_sents=4)
+            stream_container.markdown("\n\n".join(paras))
+        if summarizer.fallback_no_ui:
+            if summarizer.blocks:
+                map_stream_container.markdown("\n\n".join(summarizer.blocks))
+
         st.success("Transcription + Refine complete!")
 
-        status.update(label="整併重點（內部計算）...")
-        # 摘要建議使用已去重的原始句（或潤飾後句）以減少雜訊
-        flat_for_summary = consumer.unique_sentences_raw_all if consumer.unique_sentences_raw_all else split_sentences(all_text)
-        map_blocks_text = map_summarize_blocks(flat_for_summary)
-
-        status.update(label="生成最終會議摘要與內容解析...")
-        final_minutes = reduce_finalize_json(map_blocks_text)
+        status.update(label="整併重點（Reduce 中）...")
+        # Reduce：使用即時 Map 的 blocks；若沒有就退回一次性 Map
+        map_blocks_text = summarizer.blocks[:] if summarizer.blocks else map_summarize_blocks(
+            consumer.unique_sentences_raw_all if consumer.unique_sentences_raw_all else split_sentences(all_text)
+        )
         final_md_summary = reduce_finalize_markdown(map_blocks_text)
+        final_summary_placeholder.markdown(final_md_summary)
 
-        with tab2:
-            st.markdown(final_md_summary)
-            st.download_button(
-                "下載會議記錄 JSON",
-                data=json.dumps(final_minutes, ensure_ascii=False, indent=2),
-                file_name="meeting_minutes.json",
-                mime="application/json"
-            )
+        # 額外提供結構化 JSON 與主題檢視
+        final_minutes = reduce_finalize_json(map_blocks_text)
 
         with tab3:
             render_topics_only(final_minutes, st)
