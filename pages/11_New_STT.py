@@ -321,6 +321,36 @@ def group_into_paragraphs(sentences: List[str], max_chars=260, max_sents=4) -> L
     if cur: paras.append(" ".join(cur))
     return paras
 
+# ====== 新增：topics 正規化，避免 'str' 沒有 get 的錯 ======
+def normalize_topics(raw) -> List[Dict[str, Any]]:
+    if not raw:
+        return []
+    # 統一成 list
+    if isinstance(raw, (str, int, float)):
+        raw = [raw]
+    if isinstance(raw, dict):
+        raw = [raw]
+
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            out.append({
+                "title": item.get("title") or item.get("topic") or item.get("name") or "主題",
+                "key_points": item.get("key_points") or [],
+                "decisions": item.get("decisions") or [],
+                "risks": item.get("risks") or [],
+                "open_questions": item.get("open_questions") or [],
+            })
+        else:
+            out.append({
+                "title": str(item),
+                "key_points": [],
+                "decisions": [],
+                "risks": [],
+                "open_questions": [],
+            })
+    return out
+
 # ========== 批次器（只做運算，不碰 UI；主執行緒負責 poll 與 render）==========
 class RefineBatcher:
     def __init__(self, executor: concurrent.futures.ThreadPoolExecutor,
@@ -428,10 +458,10 @@ class MapBatcher:
     def _submit_current_batch(self):
         if not self.batch: return
         bid = self.seq; payload = self.batch[:]
-        self.buffer[bid] = payload
         def _task(lines: List[str], idx: int) -> str:
             content = map_once_to_bullets(lines)
             return f"### 即時重點 Part {idx+1}\n\n{content}"
+        self.buffer[bid] = payload
         self.pending[bid] = self.exec.submit(_task, payload, bid)
         self.seq += 1
         self.batch, self.batch_chars = [], 0
@@ -699,15 +729,26 @@ with tab1:
         final_summary_placeholder.markdown(final_md_summary)
         final_minutes = reduce_finalize_json(map_blocks_text)
 
+        # 類型保護：確保 final_minutes 至少是 dict，避免後續 .get 爆炸
+        if not isinstance(final_minutes, dict):
+            final_minutes = {"overall_summary": str(final_minutes)}
+
         with tab3:
             st.markdown("#### 主題")
-            topics = final_minutes.get("topics", [])
+            # 先正規化 topics，避免 'str' 沒有 get 的錯
+            topics_raw = (final_minutes or {}).get("topics", [])
+            topics = normalize_topics(topics_raw)
+
+            # 除錯開關：需要時可檢視原始 JSON 結構
+            if st.checkbox("顯示 final_minutes（debug）", False):
+                st.json(final_minutes)
+
             for t in topics:
-                st.markdown(f"##### {t.get('title','主題')}")
-                if t.get("key_points"): st.markdown("\n".join(f"- {x}" for x in t["key_points"]))
-                if t.get("decisions"):  st.markdown("決策：\n" + "\n".join(f"- {x}" for x in t.get("decisions", [])))
-                if t.get("risks"):      st.markdown("風險：\n" + "\n".join(f"- {x}" for x in t.get("risks", [])))
-                if t.get("open_questions"): st.markdown("未決問題：\n" + "\n".join(f"- {x}" for x in t.get("open_questions", [])))
+                st.markdown(f"##### {t['title']}")
+                if t["key_points"]:     st.markdown("\n".join(f"- {x}" for x in t["key_points"]))
+                if t["decisions"]:      st.markdown("決策：\n" + "\n".join(f"- {x}" for x in t["decisions"]))
+                if t["risks"]:          st.markdown("風險：\n" + "\n".join(f"- {x}" for x in t["risks"]))
+                if t["open_questions"]: st.markdown("未決問題：\n" + "\n".join(f"- {x}" for x in t["open_questions"]))
 
         with tab4:
             st.markdown("#### 原始內容（最原始串流輸出，未分句／未去重）")
