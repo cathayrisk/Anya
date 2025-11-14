@@ -1030,7 +1030,7 @@ if prompt:
                         st.stop()
 
                     if fr_result["kind"] == "general":
-                        status.update(label="↗️ 切換到深思模式（gpt‑5）", state="running", expanded=False)
+                        status.update(label="↗️ 切換到深思模式（gpt‑5.1）", state="running", expanded=False)
                         need_web = bool(fr_result.get("args", {}).get("need_web"))
                         resp = client.responses.create(
                             model="gpt-5.1-2025-11-13",
