@@ -275,7 +275,7 @@ planner_agent_PROMPT = with_handoff_prefix(
 planner_agent = Agent(
     name="PlannerAgent",
     instructions=planner_agent_PROMPT,
-    model="gpt-5",
+    model="gpt-5.1-2025-11-13",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
 )
@@ -308,11 +308,11 @@ ROUTER_PROMPT = with_handoff_prefix("""
 router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
-    model="gpt-5",
+    model="gpt-5.1-2025-11-13",
     tools=[],
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
-        verbosity="medium",
+        verbosity="low",
     ),
     handoffs=[
         handoff(
@@ -1033,7 +1033,7 @@ if prompt:
                         status.update(label="↗️ 切換到深思模式（gpt‑5）", state="running", expanded=False)
                         need_web = bool(fr_result.get("args", {}).get("need_web"))
                         resp = client.responses.create(
-                            model="gpt-5",
+                            model="gpt-5.1-2025-11-13",
                             input=trimmed_messages,  # 重用短期記憶
                             instructions=ANYA_SYSTEM_PROMPT,
                             tools=[{"type": "web_search"}] if need_web else [],
