@@ -892,46 +892,20 @@ prompt = st.chat_input(
 )
 
 # === FastAgent 串流輔助：使用 Runner.run_streamed ===
-def run_fast_agent_streamed(query: str, placeholder):
+def call_fast_agent_once(query: str) -> str:
     """
-    使用 FastAgent 進行串流回應（同步版）：
-    - 呼叫 Runner.run_streamed 取得 RunResultStreaming
-    - 逐步讀取事件，更新 placeholder
-    - 最後回傳完整文字；若沒讀到 delta，就退回 final_output
+    使用 FastAgent（非串流），取得完整回答文字。
+    之後會配合 fake_stream_markdown 在前端做「假串流」顯示。
     """
-    # 這裡不需要 await，Runner.run_streamed 會直接回傳 RunResultStreaming
-    result_stream = Runner.run_streamed(
-        starting_agent=fast_agent,
-        input=query,
-    )
+    # Runner.run 是 async，這裡用既有的 run_async 幫你跑完它
+    result = run_async(Runner.run(fast_agent, query))
 
-    buf = ""
+    # 嘗試用 final_output，若沒有就退回整個物件轉字串
+    text = getattr(result, "final_output", None)
+    if not text:
+        text = str(result or "")
 
-    # 根據 Agents SDK 文件，stream_events() 會回傳一個可迭代事件序列
-    for event in result_stream.stream_events():
-        et = getattr(event, "type", "")
-
-        # 這裡的型別名稱可能會隨版本變動，若沒反應可以改成 print(event) 看實際結構
-        # 先用較保守的寫法：只要有 delta.text 就串上去
-        delta = getattr(event, "delta", None)
-        if isinstance(delta, str) and delta:
-            buf += delta
-            placeholder.markdown(buf)
-        else:
-            # 有些版本會是物件，裡面有 text 欄位
-            text = getattr(delta, "text", None) if delta is not None else None
-            if isinstance(text, str) and text:
-                buf += text
-                placeholder.markdown(buf)
-
-    # 如果 streaming 過程中沒有任何 delta，退回 final_output
-    if not buf:
-        final_output = getattr(result_stream, "final_output", "") or ""
-        if final_output:
-            buf = str(final_output)
-            placeholder.markdown(buf)
-
-    return buf or "安妮亞找不到答案～（抱歉啦！）"
+    return text or "安妮亞找不到答案～（抱歉啦！）"
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt:
@@ -1032,7 +1006,10 @@ if prompt:
                         fast_query = args.get("query") or user_text or "請根據對話內容回答。"
 
                         # 使用 Agents SDK 的 streaming 介面
-                        final_text = run_fast_agent_streamed(fast_query, placeholder)
+                        fast_text = call_fast_agent_once(fast_query)
+
+                        # 2. 用假串流方式顯示在畫面上
+                        final_text = fake_stream_markdown(fast_text, placeholder)
 
                         # Fast 模式通常不會有來源，但若有上傳檔案仍可列出
                         with sources_container:
