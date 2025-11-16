@@ -892,31 +892,39 @@ prompt = st.chat_input(
 )
 
 # === FastAgent 串流輔助：使用 Runner.run_streamed ===
-async def run_fast_agent_streamed(query: str, placeholder):
+def run_fast_agent_streamed(query: str, placeholder):
     """
-    使用 FastAgent 進行串流回應：
-    - 透過 Runner.run_streamed 取得 RunResultStreaming
-    - 一邊讀取事件，一邊更新 placeholder
-    - 最後回傳完整文字（若事件中拿不到 delta，就退回使用 final_output）
+    使用 FastAgent 進行串流回應（同步版）：
+    - 呼叫 Runner.run_streamed 取得 RunResultStreaming
+    - 逐步讀取事件，更新 placeholder
+    - 最後回傳完整文字；若沒讀到 delta，就退回 final_output
     """
-    result_stream = await Runner.run_streamed(
+    # 這裡不需要 await，Runner.run_streamed 會直接回傳 RunResultStreaming
+    result_stream = Runner.run_streamed(
         starting_agent=fast_agent,
         input=query,
     )
 
     buf = ""
 
-    async for event in result_stream.stream_events():
+    # 根據 Agents SDK 文件，stream_events() 會回傳一個可迭代事件序列
+    for event in result_stream.stream_events():
         et = getattr(event, "type", "")
-        # 這裡的事件型別欄位名稱可能會因 SDK 版本略有不同
-        # 可以依實際情況調整判斷邏輯
-        if et == "message.delta":
-            delta = getattr(event, "delta", None)
-            if isinstance(delta, str) and delta:
-                buf += delta
+
+        # 這裡的型別名稱可能會隨版本變動，若沒反應可以改成 print(event) 看實際結構
+        # 先用較保守的寫法：只要有 delta.text 就串上去
+        delta = getattr(event, "delta", None)
+        if isinstance(delta, str) and delta:
+            buf += delta
+            placeholder.markdown(buf)
+        else:
+            # 有些版本會是物件，裡面有 text 欄位
+            text = getattr(delta, "text", None) if delta is not None else None
+            if isinstance(text, str) and text:
+                buf += text
                 placeholder.markdown(buf)
 
-    # 若上面沒成功從事件中拿到文字，退回用 final_output
+    # 如果 streaming 過程中沒有任何 delta，退回 final_output
     if not buf:
         final_output = getattr(result_stream, "final_output", "") or ""
         if final_output:
@@ -1010,7 +1018,7 @@ if prompt:
 
         try:
             with status_area:
-                with st.status("⚡ 前置判斷中（Router 決定走哪條路）", expanded=False) as status:
+                with st.status("⚡ 思考中...", expanded=False) as status:
                     placeholder = output_area.empty()
 
                     # 前置 Router：決定 fast / general / research
@@ -1020,11 +1028,11 @@ if prompt:
 
                     # === Fast 分支：FastAgent + streaming ===
                     if kind == "fast":
-                        status.update(label="⚡ 使用快速回答模式（FastAgent）", state="running", expanded=False)
+                        status.update(label="⚡ 使用快速回答模式", state="running", expanded=False)
                         fast_query = args.get("query") or user_text or "請根據對話內容回答。"
 
                         # 使用 Agents SDK 的 streaming 介面
-                        final_text = run_async(run_fast_agent_streamed(fast_query, placeholder))
+                        final_text = run_fast_agent_streamed(fast_query, placeholder)
 
                         # Fast 模式通常不會有來源，但若有上傳檔案仍可列出
                         with sources_container:
@@ -1050,6 +1058,7 @@ if prompt:
                         resp = client.responses.create(
                             model="gpt-5.1-2025-11-13",
                             input=trimmed_messages,
+                            reasoning={ "effort": "medium" },
                             instructions=ANYA_SYSTEM_PROMPT,
                             tools=[{"type": "web_search"}] if need_web else [],
                             tool_choice="auto",
