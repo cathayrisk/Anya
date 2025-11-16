@@ -8,6 +8,7 @@ import threading
 from io import BytesIO
 from PIL import Image
 from openai import OpenAI
+from openai.types.responses import ResponseTextDeltaEvent
 import os
 from pypdf import PdfReader, PdfWriter
 
@@ -1166,6 +1167,32 @@ def call_fast_agent_once(query: str) -> str:
 
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
+async def fast_agent_stream(query: str, placeholder) -> str:
+    """
+    使用 FastAgent 真串流：
+    - Runner.run_streamed() 拿到 RunResultStreaming
+    - 透過 result.stream_events() 一邊收 token、一邊更新畫面
+    - 回傳最後完整文字（存到 chat_history 用）
+    """
+    buf = ""
+
+    # 官方文件：Runner.run_streamed(...) 不需要 await，直接回傳 RunResultStreaming
+    result = Runner.run_streamed(fast_agent, input=query)
+
+    async for event in result.stream_events():
+        # 只處理原始文字增量事件
+        if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+            delta = event.data.delta or ""
+            if not delta:
+                continue
+
+            buf += delta
+            # 這裡就是真串流：每拿到一小段就更新 Streamlit 畫面
+            placeholder.markdown(buf)
+
+    # 串流結束，回傳完整內容（讓你存進 chat_history）
+    return buf or "安妮亞找不到答案～（抱歉啦！）"
+
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt:
     user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
@@ -1265,10 +1292,13 @@ if prompt:
                         fast_query = args.get("query") or user_text or "請根據對話內容回答。"
 
                         # 使用 Agents SDK 的 streaming 介面
-                        fast_text = call_fast_agent_once(fast_query)
+                        #fast_text = call_fast_agent_once(fast_query)
 
                         # 2. 用假串流方式顯示在畫面上
-                        final_text = fake_stream_markdown(fast_text, placeholder)
+                        #final_text = fake_stream_markdown(fast_text, placeholder)
+
+                        # 這裡用你原本的 run_async，去跑 async 串流函式
+                        final_text = run_async(fast_agent_stream(fast_query, placeholder))
 
                         # Fast 模式通常不會有來源，但若有上傳檔案仍可列出
                         with sources_container:
