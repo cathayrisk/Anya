@@ -8,7 +8,7 @@ from langchain_community.document_loaders.powerpoint import UnstructuredPowerPoi
 from langchain_community.document_loaders.excel import UnstructuredExcelLoader
 from langchain_community.document_loaders import TextLoader
 from langchain_community.document_loaders.parsers import LLMImageBlobParser
-from langchain.openai import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from PIL import Image
 from io import BytesIO
 import base64
