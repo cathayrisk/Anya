@@ -119,10 +119,10 @@ ROUTER_PROMPT = """
 router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
-    model="gpt-5",
+    model="gpt-5.1",
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
-        reasoning=Reasoning(effort="low"),  # "minimal", "low", "medium", "high"
+        reasoning=Reasoning(effort="medium"),  # "minimal", "low", "medium", "high"
         verbosity="medium",  # "low", "medium", "high"
     ),
     handoffs=[
