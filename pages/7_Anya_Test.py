@@ -1195,7 +1195,11 @@ async def fast_agent_stream(query: str, placeholder) -> str:
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt:
-    user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
+    #user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
+    st.write("DEBUG prompt type:", type(prompt))
+    st.write("DEBUG prompt value:", repr(prompt))
+    user_text = prompt.strip()  # ← 確定你有改成這一行
+    st.write("DEBUG user_text:", repr(user_text))
     images_for_history = []
     docs_for_history = []
     content_blocks = []
