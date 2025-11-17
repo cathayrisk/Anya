@@ -1150,7 +1150,7 @@ for msg in st.session_state.get("chat_history", []):
 prompt = st.chat_input(
     "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
     accept_file="multiple",
-    file_type=["jpg","jpeg","png","webp","gif","pdf"]
+    file_type=["jpg","jpeg","png","webp","gif","pdf"],
 )
 
 # === FastAgent 串流輔助：使用 Runner.run_streamed ===
@@ -1196,12 +1196,15 @@ async def fast_agent_stream(query: str, placeholder) -> str:
     return buf or "安妮亞找不到答案～（抱歉啦！）"
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
-if prompt:
-    #user_text = prompt.text.strip() if getattr(prompt, "text", None) else ""
+if prompt is not None:
+    # Debug 用
     st.write("DEBUG prompt type:", type(prompt))
     st.write("DEBUG prompt value:", repr(prompt))
-    user_text = prompt.strip()  # ← 確定你有改成這一行
+
+    # ✅ 正確拿文字
+    user_text = (prompt.text or "").strip()
     st.write("DEBUG user_text:", repr(user_text))
+
     images_for_history = []
     docs_for_history = []
     content_blocks = []
@@ -1295,7 +1298,7 @@ if prompt:
                     # === Fast 分支：FastAgent + streaming ===
                     if kind == "fast":
                         status.update(label="⚡ 使用快速回答模式", state="running", expanded=False)
-                        fast_query = args.get("query") or user_text or "請根據對話內容回答。"
+                        fast_query = user_text or args.get("query") or "請根據對話內容回答。"
 
                         # 使用 Agents SDK 的 streaming 介面
                         #fast_text = call_fast_agent_once(fast_query)
