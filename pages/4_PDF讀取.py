@@ -1,7 +1,7 @@
 import streamlit as st
 import tempfile
 import os
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from langchain_community.document_loaders.word_document import UnstructuredWordDocumentLoader
 from langchain_community.document_loaders.powerpoint import UnstructuredPowerPointLoader
