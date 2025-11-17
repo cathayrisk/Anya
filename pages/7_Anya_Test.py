@@ -764,8 +764,6 @@ def run_front_router(client: OpenAI, input_messages: list, user_text: str):
       {"kind": "fast" | "general" | "research", "args": {...}}
     """
     import json as _json
-    st.write("DEBUG trimmed_messages:")
-    st.code(json.dumps(trimmed_messages, ensure_ascii=False, indent=2))
 
     resp = client.responses.create(
         model="gpt-5.1",
@@ -1198,8 +1196,8 @@ async def fast_agent_stream(query: str, placeholder) -> str:
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
     # Debug 用
-    st.write("DEBUG prompt type:", type(prompt))
-    st.write("DEBUG prompt value:", repr(prompt))
+    #st.write("DEBUG prompt type:", type(prompt))
+    #st.write("DEBUG prompt value:", repr(prompt))
 
     # ✅ 正確拿文字
     user_text = (prompt.text or "").strip()
