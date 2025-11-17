@@ -764,6 +764,8 @@ def run_front_router(client: OpenAI, input_messages: list, user_text: str):
       {"kind": "fast" | "general" | "research", "args": {...}}
     """
     import json as _json
+    st.write("DEBUG trimmed_messages:")
+    st.code(json.dumps(trimmed_messages, ensure_ascii=False, indent=2))
 
     resp = client.responses.create(
         model="gpt-5.1",
