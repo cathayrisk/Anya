@@ -766,7 +766,7 @@ def run_front_router(client: OpenAI, input_messages: list, user_text: str):
     import json as _json
 
     resp = client.responses.create(
-        model="gpt-5-mini",
+        model="gpt-4.1-mini",
         input=input_messages,
         instructions=FRONT_ROUTER_PROMPT,
         tools=[ESCALATE_FAST_TOOL, ESCALATE_GENERAL_TOOL, ESCALATE_RESEARCH_TOOL],
