@@ -375,6 +375,54 @@ search_agent = Agent(
     model_settings=ModelSettings(tool_choice="required"),
 )
 
+def run_front_router(client: OpenAI, input_messages: list, user_text: str):
+    """
+    新版前置 Router：
+    - 不直接回答，只決定分支：fast / general / research
+    - 回傳格式：
+      {"kind": "fast" | "general" | "research", "args": {...}}
+    """
+    import json as _json
+
+    resp = client.responses.create(
+        model="gpt-4.1-mini",
+        input=input_messages,
+        instructions=FRONT_ROUTER_PROMPT,
+        tools=[ESCALATE_FAST_TOOL, ESCALATE_GENERAL_TOOL, ESCALATE_RESEARCH_TOOL],
+        tool_choice="required",
+        parallel_tool_calls=False,
+        temperature=0,
+        service_tier="priority",
+    )
+
+    tool_name, tool_args = None, {}
+    try:
+        for item in getattr(resp, "output", []) or []:
+            itype = getattr(item, "type", "")
+            if itype in ("tool_call", "function_call") or itype.endswith("_call"):
+                tool_name = getattr(item, "name", None) or getattr(item, "tool_name", None)
+                raw_args = getattr(item, "arguments", None) or getattr(item, "args", None)
+                if isinstance(raw_args, str):
+                    try:
+                        tool_args = _json.loads(raw_args)
+                    except Exception:
+                        tool_args = {}
+                elif isinstance(raw_args, dict):
+                    tool_args = raw_args
+                break
+    except Exception:
+        pass
+
+    if tool_name == "escalate_to_fast":
+        return {"kind": "fast", "args": tool_args or {}}
+    if tool_name == "escalate_to_general":
+        return {"kind": "general", "args": tool_args or {}}
+    if tool_name == "escalate_to_research":
+        return {"kind": "research", "args": tool_args or {}}
+
+    # 解析失敗保險：丟到 general + 需上網
+    return {"kind": "general", "args": {"reason": "uncertain", "query": user_text, "need_web": True}}
+
 # === 1.5.a FastAgent：快速回覆＋被動 web_search ===
 FAST_AGENT_PROMPT = with_handoff_prefix("""
 Developer: # Agentic Reminders
