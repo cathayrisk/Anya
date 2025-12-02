@@ -102,9 +102,9 @@ if user_input:
     st.session_state.messages.append({
         "role": "user",
         "content": user_input,
-        "avatar": "🧑",
+        "avatar": "🐱",
     })
-    with st.chat_message("user", avatar="🧑"):
+    with st.chat_message("user", avatar="🐱"):
         st.markdown(user_input)
 
     # AI 回覆
