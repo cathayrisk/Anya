@@ -27,6 +27,7 @@ wikipedia
 ddgs
 beautifulsoup4
 requests
+kerykeion
 
 # Markdown and text processing
 markdown
