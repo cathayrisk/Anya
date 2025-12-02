@@ -2,12 +2,14 @@
 
 import asyncio
 from datetime import datetime
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 from agents import Agent, Runner, function_tool
 
 # Kerykeion：占星命盤計算
 from kerykeion import AstrologicalSubjectFactory, to_context
+
+from pydantic import BaseModel
 
 # ============================================================
 # 1. 使用者檔案儲存（示範用）
@@ -37,16 +39,49 @@ def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
     return PROFILE_STORE.get(user_id)
 
 
+# ✅ 用 Pydantic BaseModel 定義 profile_delta，避免 Dict[str, Any] 觸發 strict_schema 錯誤
+class ProfileDelta(BaseModel):
+    """可更新的使用者欄位（全部皆為選填）。"""
+
+    name: Optional[str] = None
+    birthdate: Optional[str] = None  # YYYY-MM-DD
+    birth_time: Optional[str] = None  # HH:MM
+    birth_city: Optional[str] = None
+    birth_country: Optional[str] = None
+    lng: Optional[float] = None
+    lat: Optional[float] = None
+    tz_str: Optional[str] = None
+    gender: Optional[str] = None
+    tags: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+
 @function_tool
-def update_user_profile(user_id: str, profile_delta: Dict[str, Any]) -> Dict[str, Any]:
+def update_user_profile(user_id: str, profile_delta: ProfileDelta) -> Dict[str, Any]:
     """
     更新指定 user_id 的使用者檔案。
+
     - profile_delta: 局部更新欄位，例如
       {"birthdate": "1995-08-03", "birth_city": "Taipei", "birth_country": "TW"}
     - 回傳更新後的完整 profile。
     """
-    current = PROFILE_STORE.get(user_id, {})
-    current.update(profile_delta)
+    current = PROFILE_STORE.get(user_id, {}).copy()
+
+    # 只取有設定且不為 None 的欄位
+    delta = profile_delta.model_dump(exclude_none=True, exclude_unset=True)
+
+    # 特別處理 tags：如果已經有，就做簡單合併
+    new_tags = delta.pop("tags", None)
+    if new_tags is not None:
+        existing_tags = current.get("tags", [])
+        if not isinstance(existing_tags, list):
+            existing_tags = [existing_tags]
+        # 合併並去重
+        current["tags"] = list(dict.fromkeys(existing_tags + new_tags))
+
+    # 其他欄位直接覆蓋
+    current.update(delta)
+
     PROFILE_STORE[user_id] = current
     return current
 
@@ -105,7 +140,7 @@ def get_natal_chart_context(
     # 解析日期與時間
     try:
         year, month, day = map(int, birthdate.split("-"))
-    except Exception as e:
+    except Exception:
         return {
             "error": "INVALID_BIRTHDATE",
             "detail": f"無法解析出生日期 '{birthdate}'，請使用 YYYY-MM-DD 格式。",
@@ -168,7 +203,6 @@ def get_natal_chart_context(
             location_info = {
                 "city": city,
                 "nation": nation,
-                # subject 會有解析後的座標 & 時區，可一併回傳
                 "lng": getattr(subject, "lng", None),
                 "lat": getattr(subject, "lat", None),
                 "tz_str": getattr(subject, "tz_str", None),
@@ -211,7 +245,7 @@ def get_natal_chart_context(
 
 profile_agent = Agent(
     name="Profile builder agent",
-    model="gpt-4.1-mini",
+    model="gpt-5.1",
     tools=[get_user_profile, update_user_profile],
     instructions="""
 You are a gentle companion whose role is to gradually understand the user as a person.
@@ -251,7 +285,7 @@ Constraints:
 
 fortune_agent = Agent(
     name="Fortune interpretation agent",
-    model="gpt-4.1-mini",
+    model="gpt-5.1",
     tools=[get_user_profile, get_natal_chart_context],
     instructions="""
 You are a friendly fortune-telling companion who uses multiple systems
@@ -312,7 +346,7 @@ Output style:
 
 counselor_agent = Agent(
     name="Emotional companion agent",
-    model="gpt-4.1-mini",
+    model="gpt-5.1",
     tools=[get_user_profile],
     instructions="""
 You are the main emotional companion whose persona is inspired by Master Yoda from Star Wars.
@@ -386,7 +420,7 @@ Language:
 
 companion_manager_agent = Agent(
     name="Companion fortune manager agent",
-    model="gpt-4.1-mini",
+    model="gpt-5.1",
     instructions="""
 You are the top-level agent that the user talks to directly.
 You orchestrate three specialist agents:
