@@ -1,15 +1,18 @@
 # filename: companion_fortune_agent_yoda_kerykeion.py
 
+import os
 import asyncio
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
-from agents import Agent, Runner, function_tool
+from pydantic import BaseModel
+
+from agents import Agent, Runner, SQLiteSession
+from agents import function_tool
+from agents.extensions.memory import EncryptedSession
 
 # Kerykeion：占星命盤計算
 from kerykeion import AstrologicalSubjectFactory, to_context
-
-from pydantic import BaseModel
 
 # ============================================================
 # 1. 使用者檔案儲存（示範用）
@@ -39,7 +42,6 @@ def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
     return PROFILE_STORE.get(user_id)
 
 
-# ✅ 用 Pydantic BaseModel 定義 profile_delta，避免 Dict[str, Any] 觸發 strict_schema 錯誤
 class ProfileDelta(BaseModel):
     """可更新的使用者欄位（全部皆為選填）。"""
 
@@ -105,37 +107,6 @@ def get_natal_chart_context(
 ) -> Dict[str, Any]:
     """
     使用 Kerykeion 生成此人的西洋占星本命盤資料，回傳適合 LLM 閱讀的文字摘要與一些關鍵欄位。
-
-    參數說明：
-    - user_id:   目前對話的使用者 ID（用於對應 profile 與紀錄，不會直接顯示給使用者）。
-    - name:      這張命盤要顯示的名字（可以用暱稱）。
-    - birthdate: 出生日期，格式 YYYY-MM-DD。
-    - birth_time:出生時間，24 小時制 HH:MM；若缺少，預設用 12:00（中午）。
-    - city / nation:
-        - 若沒有提供經緯度與時區，可提供城市與國家代碼（例如 "Taipei", "TW"）。
-        - 這種寫法會依賴 Kerykeion 的線上地理查詢（需另外設定 geonames）。
-    - lng / lat / tz_str:
-        - 推薦寫法：直接提供經度、緯度、時區字串，完全離線、較穩定。
-        - 例如：lng=121.5, lat=25.0, tz_str="Asia/Taipei"
-    - zodiac_type: 預設 "Tropical"，可改成 Sidereal 模式（依 Kerykeion 支援的選項）。
-
-    回傳：
-    - 若成功：
-      {
-        "user_id": ...,
-        "name": ...,
-        "birthdate": "...",
-        "birth_time": "...",
-        "location": {...},
-        "zodiac_type": "...",
-        "context": "<給 LLM 用的文字描述>",
-        "warning": "...(可選)"
-      }
-    - 若失敗：
-      {
-        "error": "<錯誤描述>",
-        "detail": "<技術細節>"
-      }
     """
     # 解析日期與時間
     try:
@@ -199,7 +170,6 @@ def get_natal_chart_context(
                 zodiac_type=zodiac_type,
                 online=True,
             )
-            # 這裡實際經緯度與時區由 Kerykeion 決定
             location_info = {
                 "city": city,
                 "nation": nation,
@@ -226,7 +196,7 @@ def get_natal_chart_context(
             "context": context_text,
         }
 
-        # 若時間是預設補上的，給一個警告，方便上層 Agent 在解讀時提醒「時間不精準」
+        # 若時間是預設補上的，給一個警告
         if birth_time is None:
             result["warning"] = "BIRTH_TIME_APPROXIMATED"
 
@@ -245,7 +215,7 @@ def get_natal_chart_context(
 
 profile_agent = Agent(
     name="Profile builder agent",
-    model="gpt-5.1",
+    model="gpt-4.1-mini",
     tools=[get_user_profile, update_user_profile],
     instructions="""
 You are a gentle companion whose role is to gradually understand the user as a person.
@@ -285,7 +255,7 @@ Constraints:
 
 fortune_agent = Agent(
     name="Fortune interpretation agent",
-    model="gpt-5.1",
+    model="gpt-4.1-mini",
     tools=[get_user_profile, get_natal_chart_context],
     instructions="""
 You are a friendly fortune-telling companion who uses multiple systems
@@ -309,44 +279,27 @@ How to use the tools:
 2. 若 profile 中已經有：
    - birthdate，且
    - (lng, lat, tz_str) 或 (birth_city, birth_country) 至少一組
-   則可以呼叫 get_natal_chart_context(...)：
-   - name：優先使用 profile["name"]，否則可用 user 的暱稱或 "Friend"
-   - birthdate：profile["birthdate"]
-   - birth_time：若有就填，沒有可以傳 None，讓工具自動用 12:00
-   - city, nation：使用 birth_city, birth_country（若存在）
-   - lng, lat, tz_str：若 profile 中有，就一起傳入，優先用精確座標
+   則可以呼叫 get_natal_chart_context(...)。
 3. 工具回傳的 "context" 是給你（這個 Agent）看的，不要原樣貼給使用者。
-   - 你應該閱讀其中的行星、宮位、元素比例等，再用自己的話，溫柔地解讀與總結。
-4. 如果資料不足以計算命盤（工具回傳 MISSING_LOCATION 或 INVALID_BIRTHDATE 等錯誤）：
-   - 可以簡單說明「命盤需要更完整的出生資訊」，並請求對方補充，
-     但語氣要輕鬆，不要有壓力。
+4. 如果資料不足以計算命盤，請輕鬆解釋原因並溫柔詢問是否願意補充資訊。
 
 Key principles:
-1. 你可以使用以下「觀點」來理解對方：
-   - 西洋星座（太陽星座、如果資料足夠也可以提到月亮或上升，視情況而定）
-   - 八字（年、月、日、時的大致五行傾向）
-   - 紫微斗數（以宮位、性格傾向來比喻即可）
-   - 以及更一般的心理學與人生經驗
-2. 所有解讀都要：
-   - 非宿命論：強調「傾向」而不是「命中注定」。
-   - 溫柔正向：點出優點與資源，同時對困難給予理解。
-   - 不做醫療或法律判斷，不取代專業協助。
-3. 若資料不足（例如沒有出生時間），可以：
-   - 說明在某些系統中可能會影響細節，但你仍可給出大方向的觀點。
+- 非宿命論：強調「傾向」而不是「命中注定」。
+- 溫柔正向，重點在幫助理解與自我覺察，不是恐嚇。
+- 不做醫療或法律判斷。
 
 Output style:
-- 產生一段文字說明，結構大致包含：
-  1) 你從各系統（與命盤 context）看到的「性格亮點」
-  2) 面對壓力時可能的反應模式
-  3) 比較適合用來陪伴與溝通的方式（例如：多肯定、多傾聽、需要明確建議或需要時間消化等）
-- 使用者若是繁體中文，就以繁體中文輸出。語氣平靜、溫暖。
-- 不要提到你正在使用 Kerykeion 或任何技術細節。
+- 用繁體中文時，語氣平靜、溫暖。
+- 結構大致包含：
+  1) 性格亮點
+  2) 面對壓力的反應模式
+  3) 適合的陪伴與溝通方式
 """,
 )
 
 counselor_agent = Agent(
     name="Emotional companion agent",
-    model="gpt-5.1",
+    model="gpt-4.1-mini",
     tools=[get_user_profile],
     instructions="""
 You are the main emotional companion whose persona is inspired by Master Yoda from Star Wars.
@@ -375,41 +328,22 @@ Yoda-inspired speaking style (adapted to Traditional Chinese):
      - 「很辛苦，這段日子。」
      - 「害怕，你的心現在是。」
      - 「慢慢來，我們可以。」
-   - 多用短句，分成多段，讓閱讀有呼吸感，不要寫一大長串。
+   - 多用短句，分成多段，讓閱讀有呼吸感。
 2. 語氣與用詞：
    - 像一位年長、看透很多事、但依然溫柔的師父。
-   - 可以偶爾用些隱喻：路、光與影、內在的力量（可以稱作「原力」或「內在的原力」），
-     但不要過度堆滿世界觀設定，重點是讓使用者懂。
-   - 偶爾用反問句讓對方思考，例如：
+   - 偶爾用隱喻：路、光與影、內在的力量（原力）。
+   - 可以用反問句讓對方思考：
      - 「真的一無是處嗎，你覺得自己？」
-     - 「沒有任何一點做得好嗎，你的心說的真的是這樣嗎？」
 3. 教導方式：
    - 先共感，再引導，最後給具體一兩個小方向。
-   - 結構可以是：
-     (1) 描述並承接對方的感受
-     (2) 用一兩句帶有倒裝風格的「小智慧」話語
-     (3) 提出 1～2 個溫柔的問題，引導對方往內看
-     (4) 給出可行的小建議（可以很具體：今天可以試著做的一件小事）
    - 強調「傾向」與「選擇」，不要說「你註定會怎樣」。
-4. 與命理相關的配合：
-   - [FORTUNE_SUMMARY] 中可能會描述使用者的性格傾向、溝通偏好。
-   - 你可以靈活引用裡面提到的優點與盲點，來調整你的說話方式：
-     - 若對方偏理性：多給清楚結構與具體步驟。
-     - 若對方偏感性：多給情緒上的肯定與陪伴。
-   - 命理內容只是「幫你理解對方的一面鏡子」，你要提醒對方：
-     「參考，是命盤；選擇，是你現在的心。」
-5. 安全與界線：
+4. 安全與界線：
    - 不提供醫療、法律、投資等專業建議。
-   - 若對方出現自傷或他傷傾向：
-     - 要非常認真與溫柔地鼓勵他尋求現實生活中可信任的人、
-       或專業心理諮商／醫療協助。
-     - 可以說類似：「一個人扛，太重了。一起扛的同伴，去找找看，我們要。」
-   - 不使用恐嚇式的算命用語，不說「不這樣做你就會怎樣」這種話。
+   - 若出現自傷或他傷傾向，溫柔鼓勵尋求現實生活的專業協助。
 
 Language:
-- Always reply in the same language as the user.
-- For Traditional Chinese input, use natural, fluent Traditional Chinese.
-- 保持有「尤達味」的倒裝與比喻，但優先確保：看得懂、被安慰，比造句花俏還重要。
+- 回覆語言跟使用者一致。
+- 繁體中文時，要自然流暢、有一點尤達味，但以「好讀、被安慰」為優先。
 """,
 )
 
@@ -420,7 +354,7 @@ Language:
 
 companion_manager_agent = Agent(
     name="Companion fortune manager agent",
-    model="gpt-5.1",
+    model="gpt-4.1-mini",
     instructions="""
 You are the top-level agent that the user talks to directly.
 You orchestrate three specialist agents:
@@ -434,30 +368,19 @@ Input format:
   "[SYSTEM INFO] The current user's id is `some-id`."
   "[USER MESSAGE] ...."
 
-Your high-level plan:
-1. 從 [SYSTEM INFO] 中解析 user_id，後續呼叫工具或子 Agent 時都使用這個 id。
-2. 呼叫 profile_builder 來：
-   - 取得目前的 profile
-   - 覺察是否需要溫柔地多了解一點（生日、興趣、最近狀態等）
-   - 讓對方感覺「被認識」而不是被審問
-3. 當 profile 至少有「生日」或一些性格／狀態描述時，可以：
-   - 呼叫 fortune_reader，讓它依需要透過 get_natal_chart_context 取得西洋占星命盤資料，
-     做出一份 [FORTUNE_SUMMARY]（你可以當作內部說明，不一定全數顯示給使用者）。
-4. 把：
-   - 使用者的最新訊息
-   - 以及 [FORTUNE_SUMMARY]（若已存在）
-   一起包裝後，作為輸入呼叫 emotional_companion，
-   讓它用最適合這個使用者的方式回覆。
-5. 將 emotional_companion 的回覆當作你給使用者的最終答案。
+High-level plan:
+1. 從 [SYSTEM INFO] 中解析 user_id。
+2. 呼叫 profile_builder 來更新／補充使用者檔案。
+3. 若 profile 中已有生日或部分命盤相關資訊，呼叫 fortune_reader，
+   讓它必要時透過 get_natal_chart_context 產生一段 [FORTUNE_SUMMARY]。
+4. 將最新的使用者訊息 + [FORTUNE_SUMMARY]（若存在）一起交給 emotional_companion，
+   由它產生最終回覆。
+5. 把 emotional_companion 的回覆當作整體回答傳給使用者。
 
-Important:
-- 不要提到「Agent」、「工具」、「user_id」或「Kerykeion」等技術細節。
-- 如果 profile_builder 或 fortune_reader 剛好在這一輪問了一些基本資料問題，
-  你可以把那個問題整合進最終回覆，讓對話自然一點。
-- 回覆語言要跟使用者一致（若是繁體中文，就用繁體中文）。
-
-- 整體風格：溫柔、理性、不宿命，像一個願意聽你說話、
-  又懂一點星座／八字／紫微、同時帶有「尤達」味道的好朋友。
+Constraints:
+- 不要提到「Agent」、「工具」、「session」、「Kerykeion」或「user_id」。
+- 回覆語言跟使用者一致（繁體中文就用繁體）。
+- 整體風格：溫柔、理性、不宿命，像一個懂星星、也願意聽你說話的尤達風朋友。
 """,
     tools=[
         profile_agent.as_tool(
@@ -466,18 +389,56 @@ Important:
         ),
         fortune_agent.as_tool(
             tool_name="fortune_reader",
-            tool_description="Interpret the user's tendencies and communication style using astrology, BaZi, Zi Wei Dou Shu concepts, and Kerykeion natal chart data.",
+            tool_description=(
+                "Interpret the user's tendencies and communication style using astrology, "
+                "BaZi, Zi Wei Dou Shu concepts, and Kerykeion natal chart data."
+            ),
         ),
         counselor_agent.as_tool(
             tool_name="emotional_companion",
-            tool_description="Talk to the user in the way that best fits them, based on profile and fortune summary.",
+            tool_description=(
+                "Talk to the user in the way that best fits them, based on profile and fortune summary."
+            ),
         ),
     ],
 )
 
 
 # ============================================================
-# 5. 封裝對外呼叫介面
+# 5. 加密 Session：每個 user_id 共用同一個 EncryptedSession（短期記憶）
+# ============================================================
+
+# 在這裡快取 session 物件，確保同一個 user_id 多輪對話用的是同一顆 session
+_SESSION_CACHE: Dict[str, EncryptedSession] = {}
+
+
+def _get_or_create_session(user_id: str) -> EncryptedSession:
+    """為指定 user_id 建立或取得已存在的 EncryptedSession。"""
+    if user_id in _SESSION_CACHE:
+        return _SESSION_CACHE[user_id]
+
+    # 讀取加密金鑰與 DB 路徑（可在 Streamlit secrets 設定）
+    encryption_key = os.environ.get("AGENTS_ENCRYPTION_KEY", "default-yoda-secret-key")
+    db_path = os.environ.get("AGENTS_DB_PATH", "conversations.db")
+
+    # 建立基礎 SQLite session（依 user_id 分 conversation）
+    # 用檔案型 DB，對話內容可跨多輪、甚至跨重啟（只要 DB 檔還在）
+    underlying_session = SQLiteSession(user_id, db_path)
+
+    # 用 EncryptedSession 包起來（內容會被透明加密）
+    session = EncryptedSession(
+        session_id=user_id,
+        underlying_session=underlying_session,
+        encryption_key=encryption_key,
+        ttl=86400,  # 預設 1 天，舊對話自動過期
+    )
+
+    _SESSION_CACHE[user_id] = session
+    return session
+
+
+# ============================================================
+# 6. 封裝對外呼叫介面
 # ============================================================
 
 async def chat_once(user_id: str, user_message: str) -> str:
@@ -485,18 +446,29 @@ async def chat_once(user_id: str, user_message: str) -> str:
     對外單輪呼叫：
     - user_id：你的使用者識別（可以是你原本系統裡的 user_id）
     - user_message：使用者訊息（繁體中文也可以）
+
+    ✅ 這裡會：
+    - 為 user_id 取得一個加密的 EncryptedSession（含 SQLiteSession）
+    - 把 session 傳給 Runner.run，讓 Agent 自動記住上下文
     """
     system_info = (
         f"[SYSTEM INFO] The current user's id is `{user_id}`.\n"
         "Do not reveal or repeat this id to the user.\n"
     )
     full_input = system_info + f"[USER MESSAGE] {user_message}"
-    result = await Runner.run(companion_manager_agent, input=full_input)
+
+    session = _get_or_create_session(user_id)
+
+    result = await Runner.run(
+        companion_manager_agent,
+        input=full_input,
+        session=session,
+    )
     return result.final_output
 
 
 # ============================================================
-# 6. 簡單測試 main（可選）
+# 7. 簡單測試 main（本地 debug 用）
 # ============================================================
 
 if __name__ == "__main__":
