@@ -5,7 +5,7 @@ import time
 import uuid
 
 # 匯入你之前那支多 Agent + Kerykeion 的檔案
-from companion_fortune_agent_yoda_kerykeion import chat_once
+from yoda.companion_fortune_agent_yoda_kerykeion import chat_once
 
 # 從 Streamlit secrets 讀取 API key
 # 在 .streamlit/secrets.toml 裡面放：
