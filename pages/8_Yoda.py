@@ -1,11 +1,16 @@
+# filename: anya/pages/11_Yoda.py
+
 import streamlit as st
 import asyncio
 import os
 import time
 import uuid
 
-# 匯入你之前那支多 Agent + Kerykeion 的檔案
-from yoda.companion_fortune_agent_yoda_kerykeion import chat_once
+# 這裡改成對應你實際的檔案位置：
+# anya/companion_fortune_agent_yoda_kerykeion/companion_fortune_agent_yoda_kerykeion.py
+from yoda.companion_fortune_agent_yoda_kerykeion import (
+    chat_once,
+)
 
 # 從 Streamlit secrets 讀取 API key
 # 在 .streamlit/secrets.toml 裡面放：
@@ -41,15 +46,15 @@ def emoji_token_stream(full_text, emoji="🌸", cursor_symbol=" "):
         tokens.append(token)
         cursor_visible = not cursor_visible
         cursor = cursor_symbol if cursor_visible else " "
-        safe_text = ''.join(tokens[:-1])
+        safe_text = "".join(tokens[:-1])
         # 1. 先用 emoji 顯示新字
         placeholder.markdown(safe_text + emoji + cursor)
         time.sleep(0.03)
         # 2. 再換成正常字
-        placeholder.markdown(''.join(tokens) + cursor)
+        placeholder.markdown("".join(tokens) + cursor)
         time.sleep(0.01)
     # 最後顯示完整內容（不顯示游標）
-    placeholder.markdown(''.join(tokens))
+    placeholder.markdown("".join(tokens))
 
 
 # ==============================
@@ -63,8 +68,10 @@ st.set_page_config(
 
 st.title("🧙‍♂️ 尤達陪伴占星聊天")
 st.write(
-    "這是一個會用星座、命盤幫你更了解自己，又用尤達大師風格溫柔陪你聊天的 AI 夥伴。\n\n"
-    "可以跟他聊心情、壓力、關係，也可以分享你的生日，讓他用命盤多認識你一點。"
+    "這是一個會用星座、命盤幫你更了解自己，\n"
+    "又用尤達大師風格溫柔陪你聊天的 AI 夥伴。\n\n"
+    "可以跟他聊心情、壓力、關係，也可以分享你的生日與出生地，\n"
+    "讓他用命盤多認識你一點。"
 )
 
 # ==============================
@@ -95,29 +102,33 @@ for msg in st.session_state.messages:
 # ==============================
 # 輸入框
 # ==============================
-user_input = st.chat_input("想跟尤達說什麼？可以聊心情、生活、或告訴他你的生日與出生地。")
+user_input = st.chat_input("想跟尤達說什麼？可以聊心情、生活，或告訴他你的生日與出生地。")
 
 if user_input:
     # 顯示使用者訊息
-    st.session_state.messages.append({
-        "role": "user",
-        "content": user_input,
-        "avatar": "🐱",
-    })
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": user_input,
+            "avatar": "🐱",
+        }
+    )
     with st.chat_message("user", avatar="🐱"):
         st.markdown(user_input)
 
     # AI 回覆
     with st.chat_message("assistant", avatar="🧙‍♂️"):
-        with st.spinner("尤達正在思考你的星星與心情..."):
-            # 呼叫我們之前實作的 chat_once（多 Agent + 命盤 + 尤達人格）
+        with st.spinner("尤達正在感受你的心，以及星星的呢喃..."):
+            # 呼叫我們實作的 chat_once（多 Agent + 命盤 + 尤達人格）
             reply_text = run_async(chat_once(st.session_state.user_id, user_input))
             # 打字動畫
             emoji_token_stream(reply_text, emoji="🌟")
 
         # 存入歷史
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": reply_text,
-            "avatar": "🧙‍♂️",
-        })
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": reply_text,
+                "avatar": "🧙‍♂️",
+            }
+        )
