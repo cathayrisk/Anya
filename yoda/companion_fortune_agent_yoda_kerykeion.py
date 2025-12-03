@@ -828,7 +828,7 @@ Language & formatting:
 
 companion_manager_agent = Agent(
     name="Companion fortune manager agent",
-    model="gpt-5.1",
+    model="gpt-4.1",
     instructions="""
 You are the top-level agent that the user talks to directly.
 You orchestrate three specialist agents:
