@@ -1132,6 +1132,53 @@ def build_trimmed_input_messages(pending_user_content_blocks):
     messages.append({"role": "user", "content": pending_user_content_blocks})
     return messages
 
+def build_fastagent_query_from_history(
+    latest_user_text: str,
+    max_history_messages: int = 12,
+) -> str:
+    """
+    Fast / General / Research 共用的記憶倉庫：st.session_state.chat_history
+
+    這個函式專門給 FastAgent 用：
+    - 從 chat_history 取最後 max_history_messages 則訊息（user + assistant）
+    - 轉成「純文字對話紀錄」
+    - 最後請 FastAgent 根據這些歷史，回答「使用者最後一則訊息」
+
+    這樣 Fast 看到的脈絡，就跟 General / Research 一樣，都是來自同一份 chat_history。
+    """
+    ensure_session_defaults()
+    hist = st.session_state.get("chat_history", [])
+
+    convo_lines = []
+    for msg in hist[-max_history_messages:]:
+        role = msg.get("role")
+        text = (msg.get("text") or "").strip()
+        if not text:
+            continue
+
+        if role == "user":
+            prefix = "使用者"
+        elif role == "assistant":
+            prefix = "安妮亞"
+        else:
+            continue
+
+        convo_lines.append(f"{prefix}：{text}")
+
+    # 保底：如果歷史是空的，至少把這一輪的訊息放進去
+    if not convo_lines and latest_user_text:
+        convo_lines.append(f"使用者：{latest_user_text}")
+
+    history_block = "\n".join(convo_lines) if convo_lines else "（目前沒有可用的歷史對話。）"
+
+    final_query = (
+        "以下是最近的對話紀錄（由舊到新）：\n"
+        f"{history_block}\n\n"
+        "請你完全根據上述對話脈絡，直接用安妮亞的口吻，回答「使用者最後一則訊息」。"
+    )
+
+    return final_query
+
 # === 7. 顯示歷史 ===
 for msg in st.session_state.get("chat_history", []):
     with st.chat_message(msg.get("role", "assistant")):
@@ -1296,16 +1343,29 @@ if prompt is not None:
                     # === Fast 分支：FastAgent + streaming ===
                     if kind == "fast":
                         status.update(label="⚡ 使用快速回答模式", state="running", expanded=False)
-                        fast_query = user_text or args.get("query") or "請根據對話內容回答。"
+                        # 使用者這一輪的原始需求（或 Router 幫你整理好的 query）
+                        raw_fast_query = user_text or args.get("query") or "請根據對話內容回答。"
+                        #fast_query = user_text or args.get("query") or "請根據對話內容回答。"
 
                         # 使用 Agents SDK 的 streaming 介面
                         #fast_text = call_fast_agent_once(fast_query)
 
                         # 2. 用假串流方式顯示在畫面上
                         #final_text = fake_stream_markdown(fast_text, placeholder)
-
+                        
+                        # ✅ 這一步就是「共用記憶」的關鍵：
+                        # 從同一個 st.session_state.chat_history 把最近幾輪對話拿出來，
+                        # 包成一段文字，給 FastAgent 當 input。
+                        fast_query_with_history = build_fastagent_query_from_history(
+                            latest_user_text=raw_fast_query,
+                            max_history_messages=18,  # 想要更長記憶可以調大
+                        )
+                        
                         # 這裡用你原本的 run_async，去跑 async 串流函式
-                        final_text = run_async(fast_agent_stream(fast_query, placeholder))
+                        #final_text = run_async(fast_agent_stream(fast_query, placeholder))
+                        # 用 Agents SDK 的 streaming 介面，輸入的是「帶歷史脈絡」的 query
+                        final_text = run_async(fast_agent_stream(fast_query_with_history, placeholder))
+
 
                         # Fast 模式通常不會有來源，但若有上傳檔案仍可列出
                         with sources_container:
