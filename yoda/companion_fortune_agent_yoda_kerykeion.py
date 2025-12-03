@@ -613,7 +613,7 @@ Constraints:
 fortune_agent = Agent(
     name="Fortune interpretation agent",
     model="gpt-5.1",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="medium", summary="auto")),
+    model_settings=ModelSettings(reasoning=Reasoning(effort="none", summary="auto")),
     tools=[
         get_user_profile,
         get_natal_chart_context,
