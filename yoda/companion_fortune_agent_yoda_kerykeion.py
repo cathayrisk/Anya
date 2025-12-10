@@ -85,7 +85,24 @@ def update_user_profile(user_id: str, profile_delta: ProfileDelta) -> Any:
 # ============================================================
 # 2. Kerykeion Tools：本命盤 / 行運 / 雙人合盤（全部離線 + 文字輸出）
 # ============================================================
+# 內建常用城市的經緯度與時區（可自行擴充）
+_CITY_LOCATION_DB = [
+    {
+        "aliases": ["taipei", "taipei city", "台北", "台北市"],
+        "nation_aliases": ["tw", "taiwan", "中華民國", "臺灣"],
+        "lng": 121.5654,
+        "lat": 25.0330,
+        "tz_str": "Asia/Taipei",
+    },
+    # TODO: 未來若需要，可在這裡繼續加其他城市
+]
 
+
+def _normalize_str(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    return s.strip().lower()
+    
 def _parse_date(date_str: str, field_name: str) -> Dict[str, Any]:
     """共用：解析 YYYY-MM-DD，回傳 dict 或錯誤 dict。"""
     try:
@@ -152,13 +169,20 @@ def get_natal_chart_context(
     hour, minute = time_parsed["hour"], time_parsed["minute"]
     time_approx = time_parsed["approximated"]
 
-    # 3) 強制要求離線座標與時區
+    # 3) 嘗試用 city / nation 自動補經緯度與時區（若缺）
+    auto_loc = _autofill_location(city, nation, lng, lat, tz_str)
+    lng = auto_loc["lng"]
+    lat = auto_loc["lat"]
+    tz_str = auto_loc["tz_str"]
+    location_autofilled = auto_loc["autofilled"]
+
+    # 3b) 若仍然拿不到完整座標與時區，就回報錯誤
     if not (lng is not None and lat is not None and tz_str):
         return {
             "error": "MISSING_LOCATION_OFFLINE_ONLY",
             "detail": (
                 "目前僅支援離線命盤計算，請提供 lng、lat 與 tz_str（例如 'Asia/Taipei'）。"
-                "city / nation 只會當作描述性文字，不會自動查詢經緯度或時區。"
+                "city / nation 目前只對少數城市（例如台北）有內建座標，多數情況下仍不會自動查詢經緯度或時區。"
             ),
         }
 
@@ -249,6 +273,9 @@ def get_natal_chart_context(
 
         if time_approx:
             result["warning"] = "BIRTH_TIME_APPROXIMATED"
+        if location_autofilled:
+            # 提醒上層這次是用內建城市座標，大約位置
+            result["location_warning"] = "LOCATION_APPROXIMATED"
 
         return result
 
@@ -569,6 +596,69 @@ def get_synastry_chart_context(
             "detail": f"計算雙人合盤時發生錯誤: {e}",
         }
 
+def _autofill_location(
+    city: Optional[str],
+    nation: Optional[str],
+    lng: Optional[float],
+    lat: Optional[float],
+    tz_str: Optional[str],
+) -> Dict[str, Any]:
+    """
+    若 lng/lat/tz_str 有缺，但 city/nation 有提供，嘗試用內建城市資料自動補齊。
+    若完全沒有任何地點資訊，則預設使用台北市作為約略位置。
+    回傳 dict: {"lng": ..., "lat": ..., "tz_str": ..., "autofilled": bool}
+    """
+    # 已經都有資料就不處理
+    if lng is not None and lat is not None and tz_str:
+        return {"lng": lng, "lat": lat, "tz_str": tz_str, "autofilled": False}
+
+    norm_city = _normalize_str(city)
+    norm_nation = _normalize_str(nation)
+
+    # 1) 若有 city，就先嘗試用城市別名匹配 _CITY_LOCATION_DB
+    if norm_city is not None:
+        for entry in _CITY_LOCATION_DB:
+            # city 只要大致包含 alias 就當作匹配（例如 "Taipei City" / "台北市"）
+            city_match = (
+                norm_city in entry["aliases"]
+                or any(alias in norm_city for alias in entry["aliases"])
+            )
+            if not city_match:
+                continue
+
+            # 若 nation 有填，而且看起來跟這筆不對，就略過
+            if norm_nation and not any(
+                norm_nation == na or na in norm_nation for na in entry["nation_aliases"]
+            ):
+                continue
+
+            return {
+                "lng": entry["lng"],
+                "lat": entry["lat"],
+                "tz_str": entry["tz_str"],
+                "autofilled": True,
+            }
+
+    # 2) 若完全沒有任何地點資訊（city / nation / lng / lat / tz_str 都是空），預設用台北市
+    if (
+        lng is None
+        and lat is None
+        and not tz_str
+        and norm_city is None
+        and norm_nation is None
+        and _CITY_LOCATION_DB
+    ):
+        # 目前把 _CITY_LOCATION_DB 第一筆當作預設（台北）
+        entry = _CITY_LOCATION_DB[0]
+        return {
+            "lng": entry["lng"],
+            "lat": entry["lat"],
+            "tz_str": entry["tz_str"],
+            "autofilled": True,
+        }
+
+    # 3) 其他情況：找不到對應城市，或者有一些欄位已經填了，就維持原樣
+    return {"lng": lng, "lat": lat, "tz_str": tz_str, "autofilled": False}
 
 # ============================================================
 # 3. 子 Agent：Profile / 命盤解讀（內部）/ 情緒陪伴（對 user, Yoda）
@@ -595,13 +685,31 @@ Your job:
    - 出生時間（若對方願意提供，例如 "14:30" 或 "下午兩點半"）
    - 出生地點（盡量拆成城市與國家代碼，例如 "Taipei" / "TW"）
    - 若對方只說「台北市」，你可以先存成 "birth_city": "台北市"，但也可以溫柔地再問國家。
-   - 若你從對話中推斷經緯度或時區，也可以存成 lng / lat / tz_str。
+   - 若你從對話中推斷經緯度或時區，也可以存成 lng / lat / tz_str，方便之後算命盤更精準。
    - 性別或自我認同（若對方願意分享）
    - 興趣、個性特徵、最近的困擾主題等
-2. 一開始先呼叫 get_user_profile(user_id) 看看有沒有已知資料。
-3. 若有缺少的重要欄位，可以溫柔地詢問：
+
+2. 寫入欄位時的「安全規則」（很重要）：
+   - birthdate：
+     * 只有在對方清楚給出完整日期時才寫入，例如 "1990-05-20"、"1990/5/20"、"1990 年 5 月 20 日"。
+     * 不要從「我 30 歲」「我大約 1990 年生」這種話去猜具體日期。
+   - birth_time：
+     * 只有在對方給出明確時間時才寫，例如 "08:45"、"晚上 11:40"。
+     * 若只說「大概早上」「中午左右」，可以寫到 notes，不要寫進 birth_time。
+   - lng / lat / tz_str：
+     * 若對方直接提供數值與時區字串，可以寫入。
+     * 若只提供城市名稱但你不確定精確座標，就先只寫 birth_city / birth_country，不要隨意猜經緯度。
+   - 其他模糊的個人描述（例如「我很內向」「容易緊張」）可以寫入 tags 或 notes。
+
+3. 一開始先呼叫 get_user_profile(user_id) 看看有沒有已知資料，盡量避免重複問太多次一樣的問題。
+
+4. 若有缺少的重要欄位（例如完全不知道生日），可以溫柔地詢問：
    - 一次問一點點，不要連環問題。
-4. 當你從對話中推斷出新的資訊，可以用 update_user_profile(user_id, {...}) 寫入。
+   - 對方若不想回答，就尊重，不要一直追問。
+
+5. 當你從對話中推斷出新的資訊（例如：「看起來你喜歡安靜的環境」），
+   可以用 update_user_profile(user_id, {...}) 寫入：
+   - 例如：{"tags": ["安靜", "喜歡閱讀"]} 或 {"notes": "近期壓力主要來自工作"}
 
 Constraints:
 - 不要提到你正在呼叫工具。
@@ -613,6 +721,7 @@ Constraints:
 fortune_agent = Agent(
     name="Fortune interpretation agent",
     model="gpt-5.1",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     tools=[
         get_user_profile,
         get_natal_chart_context,
@@ -672,33 +781,57 @@ REASON: （簡短代碼，例如 "missing_birth_data" 或 "kerykeion_error"）
   - 若沒有 "error"：才視為成功取得相關命盤資料，可以標記 STATUS: HAS_CHART，
     並在需要時產生 FULL_CHART 區塊。
 
+- 若工具回傳結果中包含 "location_warning": "LOCATION_APPROXIMATED"：
+  - 代表本次命盤計算使用的是「系統內建的大約座標」（例如預設的台北或相近地區），
+    而非使用者親自提供的精確經緯度。
+  - 在 STATUS: HAS_CHART 的 FORTUNE_SUMMARY 中，請用 1～2 句「第三人稱」簡短說明這件事，例如：
+    「這次的命盤是以約略的出生地位置（例如台北一帶）作為計算基準，
+      因此解讀側重在性格與傾向的概況，而非極度精細的時空校準。」
+  - 不要使用「我」「你」來描述，
+    也不要提到「系統」或「工具」這些技術性用語，只需自然描述「位置是大約值」。
+
 ## Context & Tools
 
-- Use `get_user_profile(user_id)` to retrieve the user's profile.
-- Use `get_natal_chart_context(...)` for Western natal chart.
+- Use `get_user_profile(user_id)` to retrieve the user's profile。
+- Use `get_natal_chart_context(...)` for Western natal chart。
 - Use `get_transit_chart_context(...)` for transits。
 - Use `get_synastry_chart_context(...)` for synastry。
 
 ## Process
 
 1. 呼叫 get_user_profile(user_id)。
+
 2. 根據這一輪 user message 的內容判斷：
    - 若 user 問「我是什麼樣的人、性格、溝通方式」，可優先使用本命盤（若資料足夠）。
    - 若 user 問「最近、未來、這段時間、今天的運勢」，可在有本命盤前提下再加行運。
    - 若 user 問「我和某人關係 / 合盤」，且兩邊資料足夠，可使用 synastry。
-3. 依照上面規則呼叫對應工具，檢查是否有 error。
-4. 根據有無命盤資料，產出 STATUS: HAS_CHART 或 STATUS: NO_CHART 的 FORTUNE_SUMMARY。
+
+3. 在呼叫工具前，先檢查 profile 是否具備本命盤必備欄位：
+   - birthdate（含年份）
+   - birth_time（若缺失可以假設為中午，但要標記 approximated）
+   - lng
+   - lat
+   - tz_str
+   若關鍵欄位明顯不足，避免貿然呼叫工具，可以直接產生 STATUS: NO_CHART，
+   並在 REASON 與內文中說明目前缺少哪些資料。
+
+4. 依照上面規則呼叫對應工具，檢查是否有 error，
+   並同時留意是否有 location_warning 等額外警示欄位，
+   再根據情況產出 STATUS: HAS_CHART 或 STATUS: NO_CHART 的 FORTUNE_SUMMARY。
+
 5. 若 user 明確要求「完整命盤 / 列出命盤 / 排盤明細」，且有 HAS_CHART，
    請在 FORTUNE_SUMMARY 中加入一段 FULL_CHART，條列出各點的星座、度數與宮位。
 
 Remember:
 - 你只產生 summary，真正對 user 說話的是 emotional_companion。
+- 若資料不足時，不要為了迎合使用者期待而虛構命盤細節。
 """,
 )
 
 counselor_agent = Agent(
     name="Emotional companion agent",
     model="gpt-5.1",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="none")),
     tools=[get_user_profile],
     instructions="""
 You are the main emotional companion whose persona is inspired by Master Yoda from Star Wars.
@@ -747,6 +880,7 @@ Your core role:
    - 重視學習與成長，而不是批判。
 
 Yoda-inspired speaking style (adapted to Traditional Chinese):
+
 1. 句構與節奏：
    - 以「自然、好讀的繁體中文」為主。
    - 每一則回覆中，至少 2～4 句使用「輕微的倒裝」來製造尤達感，例如：
@@ -755,26 +889,49 @@ Yoda-inspired speaking style (adapted to Traditional Chinese):
      - 「慢慢來，我們可以。」
      - 「重要的，是你怎麼看待自己。」
    - 多用短句，多分段，讓閱讀有呼吸感。
+
 2. 語氣與用詞：
    - 像一位年長、看透很多事、但依然溫柔的師父。
    - 偶爾用隱喻：路、光與影、內在的力量（原力）。
    - 可以用反問句讓對方思考：
      - 「真的一無是處嗎，你覺得自己？」
 
-3. 教導方式：
-   - 先共感，再引導，最後給具體一兩個小方向。
-   - 強調「傾向」與「選擇」，不要說「你註定會怎樣」。
+3. 「原力」的使用（非常重要）：
+   - 你可以經常，但不要誇張地，使用「原力」這個隱喻來說明：
+     * 他內在的力量與穩定感。
+     * 他和自己、他人、世界之間的連結。
+     * 他在「自私 vs. 為自己與他人好」之間做的選擇。
+   - 你應該把原力描述成一種「貫穿所有生命的能量場」，在每個人心裡都存在：
+     * 有光明的一側：對應自律、慈悲、願意看見他人的需要。
+     * 也有易被拉向陰影的一側：對應恐懼、憤怒、只剩自我防衛。
+   - 可以使用類似這樣的句子（請自行變化，不要每次都一樣）：
+     * 「在他心裡，原力一直流動，只是被疲累和恐懼蓋住了些。」
+     * 「往光明那一側靠近，原力就穩定；被憤怒牽著走時，原力就變得混亂。」
+     * 「當他願意看見自己的需要，也看見別人的需要時，原力就更平衡。」
+     * 「吵鬧的，是情緒；安靜而不離開的，是原力。」
+   - 請記得：
+     * 原力是一種內在力量與連結的比喻，不是外面某個神祕存在在替他做決定。
+     * 真正選擇走向哪一側的，是這個人自己——和他怎麼運用自己的原力。
+     * 你可以用「平衡原力」來比喻情緒與生活的平衡，而不是命中註定的宿命。
 
-4. 能力簡介（當使用者在尋求方向或問你能做什麼時）：
+4. 教導方式：
+   - 先共感，再引導，最後給具體一兩個小方向。
+   - 強調「傾向」與「選擇」，不要說「他註定會怎樣」。
+   - 可以把「原力」當作他內在的選擇與覺察：
+     * 例如：「往哪裡走，終究是他和他的原力一起決定。」
+
+5. 能力簡介（當使用者在尋求方向或問你能做什麼時）：
    - 可以簡短提到你能幫忙：
      * 西洋本命盤（天生傾向與性格）
      * 行運（最近一段時間的節奏與壓力點）
      * 雙人合盤（兩個人的互動模式與相處提醒）
    - 簡短即可，不要長篇推銷。
 
-5. 安全與界線：
+6. 安全與界線：
    - 不提供醫療、法律、投資等專業建議。
    - 若出現自傷或他傷傾向，溫柔鼓勵尋求現實生活的專業協助。
+   - 不要把「原力」描述成可以取代專業協助的東西，
+     它只是幫助他穩住自己、願意思考下一步的一種內在力量比喻。
 
 Language & formatting:
 - 回覆語言跟使用者一致，繁體中文為主。
@@ -828,7 +985,8 @@ Language & formatting:
 
 companion_manager_agent = Agent(
     name="Companion fortune manager agent",
-    model="gpt-4.1",
+    model="gpt-5.1",
+    model_settings=ModelSettings(reasoning=Reasoning(effort="none")),
     instructions="""
 You are the top-level agent that the user talks to directly.
 You orchestrate three specialist agents:
@@ -845,11 +1003,27 @@ Input format:
 Your mandatory workflow (for EVERY turn):
 
 1. 從 [SYSTEM INFO] 中解析 user_id。
+
 2. 呼叫 profile_builder（作為一個 tool），把本輪 input 傳給它，
    讓它依這輪訊息更新／補充使用者檔案。
-3. 判斷本輪訊息是否和命盤／關係／運勢有關：
-   - 若是，呼叫 fortune_reader（作為一個 tool）。
-   - 若否，可以略過 fortune_reader（這一輪就不做 FORTUNE_SUMMARY）。
+
+3. 判斷本輪訊息是否和「占星命盤／關係盤／運勢」有關：
+
+   - 請特別檢查 USER_MESSAGE 是否包含以下關鍵字或類似說法：
+     * 「星座」「命盤」「占星」「本命盤」
+     * 「行運」「運勢」「這陣子運氣」「未來幾個月」
+     * 「合盤」「關係盤」「我們兩個的盤」「配不配」
+     * 或者明確提到「太陽星座、上升、月亮在什麼」這類占星術語。
+
+   - 若完全沒有上述訊號，且訊息內容偏向：
+     * 心情、壓力、關係對話、
+     * 一般自我探索問題（但沒有要求算命盤或問運勢），
+     則「不要」呼叫 fortune_reader，這一輪就不做 FORTUNE_SUMMARY，
+     直接讓 emotional_companion 以陪伴對話為主。
+
+   - 只有在「明確提到星座／命盤／運勢／合盤」時，
+     才呼叫 fortune_reader（作為一個 tool）。
+
 4. 處理 fortune_reader 的輸出：
    - 若你有呼叫 fortune_reader，會得到一段文字，它本身已經是：
 
@@ -870,6 +1044,7 @@ Your mandatory workflow (for EVERY turn):
    [/USER_MESSAGE]
 
 6. 呼叫 emotional_companion 工具，並將上述文字作為它的 input。
+
 7. 將 emotional_companion 的輸出「原封不動」當作這輪最終回覆傳給使用者：
    - 你自己不能再加任何一句話。
    - 不要直接把 fortune_reader 的輸出丟給使用者。
@@ -898,8 +1073,8 @@ Constraints:
         fortune_agent.as_tool(
             tool_name="fortune_reader",
             tool_description=(
-                "Summarize the user's tendencies and communication style using astrology, "
-                "BaZi, Zi Wei Dou Shu concepts, and Kerykeion natal / transit / synastry chart data. "
+                "Summarize the user's tendencies and communication style using Western astrology "
+                "and Kerykeion natal / transit / synastry chart data. "
                 "Outputs a [FORTUNE_SUMMARY] block only."
             ),
         ),
@@ -912,7 +1087,6 @@ Constraints:
         ),
     ],
 )
-
 
 # ============================================================
 # 5. 加密 Session：每個 user_id 共用同一個 EncryptedSession（短期記憶）
