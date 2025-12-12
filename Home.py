@@ -1386,7 +1386,7 @@ if prompt is not None:
 
                     # === General 分支：gpt‑5.1 + ANYA_SYSTEM_PROMPT + web_search（可選） ===
                     if kind == "general":
-                        status.update(label="↗️ 切換到深思模式（gpt‑5.1）", state="running", expanded=False)
+                        status.update(label="↗️ 切換到深思模式（gpt‑5.2）", state="running", expanded=False)
                         need_web = bool(args.get("need_web"))
                         resp = client.responses.create(
                             model="gpt-5.2",
