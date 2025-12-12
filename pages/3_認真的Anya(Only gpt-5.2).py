@@ -393,7 +393,7 @@ if st.session_state.pending_ai and st.session_state.pending_content:
             trimmed_messages = build_trimmed_input_messages(st.session_state.pending_content)
 
             response = client.responses.create(
-                model="gpt-5.1-2025-11-13",
+                model="gpt-5.2",
                 input=trimmed_messages,  # ← 不再用 previous_response_id，而是送修剪後的 messages
                 tools=[{"type": "web_search"}],
                 tool_choice="auto",
