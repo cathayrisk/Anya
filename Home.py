@@ -1341,6 +1341,22 @@ if prompt is not None:
                     kind = fr_result.get("kind")
                     args = fr_result.get("args", {}) or {}
 
+                    # 🔧 重點修正：只要這一輪有圖片或檔案，一律不要走 FastAgent
+                    has_image_or_file = any(
+                        b.get("type") in ("input_image", "input_file")
+                        for b in content_blocks
+                    )
+
+                    if has_image_or_file and kind == "fast":
+                        # 強制升級成 general，讓 gpt-5.2 的 multimodal 路線處理圖片/PDF
+                        kind = "general"
+                        # Router 給的 args 不重要，這裡補一個簡單原因＋查詢字串
+                        args = {
+                            "reason": "contains_image_or_file",
+                            "query": user_text or args.get("query") or "",
+                            "need_web": False,
+                        }
+
                     # === Fast 分支：FastAgent + streaming ===
                     if kind == "fast":
                         status.update(label="⚡ 使用快速回答模式", state="running", expanded=False)
