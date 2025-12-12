@@ -595,6 +595,7 @@ fast_agent = Agent(
     instructions=FAST_AGENT_PROMPT,
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
+        temperature=0,
         tool_choice="auto",
     ),
 )
