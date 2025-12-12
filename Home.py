@@ -293,7 +293,7 @@ planner_agent_PROMPT = with_handoff_prefix(
 planner_agent = Agent(
     name="PlannerAgent",
     instructions=planner_agent_PROMPT,
-    model="gpt-5.1-2025-11-13",
+    model="gpt-5.2",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
 )
@@ -591,7 +591,7 @@ https://example.com/2
 
 fast_agent = Agent(
     name="FastAgent",
-    model="gpt-5.1",
+    model="gpt-5.2",
     instructions=FAST_AGENT_PROMPT,
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
@@ -613,7 +613,7 @@ ROUTER_PROMPT = with_handoff_prefix("""
 router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
-    model="gpt-5.1-2025-11-13",
+    model="gpt-5.2",
     tools=[],
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
@@ -1389,7 +1389,7 @@ if prompt is not None:
                         status.update(label="↗️ 切換到深思模式（gpt‑5.1）", state="running", expanded=False)
                         need_web = bool(args.get("need_web"))
                         resp = client.responses.create(
-                            model="gpt-5.1-2025-11-13",
+                            model="gpt-5.2",
                             input=trimmed_messages,
                             reasoning={ "effort": "medium" },
                             instructions=ANYA_SYSTEM_PROMPT,
@@ -1625,7 +1625,7 @@ if prompt is not None:
 
                     else:
                         resp = client.responses.create(
-                            model="gpt-5",
+                            model="gpt-5.2",
                             input=trimmed_messages,
                             instructions=ANYA_SYSTEM_PROMPT,
                             tools=[{"type": "web_search"}],
