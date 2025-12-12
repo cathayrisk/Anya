@@ -720,7 +720,7 @@ Constraints:
 
 fortune_agent = Agent(
     name="Fortune interpretation agent",
-    model="gpt-5.1",
+    model="gpt-5.2",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     tools=[
         get_user_profile,
@@ -830,7 +830,7 @@ Remember:
 
 counselor_agent = Agent(
     name="Emotional companion agent",
-    model="gpt-5.1",
+    model="gpt-5.2",
     model_settings=ModelSettings(reasoning=Reasoning(effort="none")),
     tools=[get_user_profile],
     instructions="""
@@ -985,7 +985,7 @@ Language & formatting:
 
 companion_manager_agent = Agent(
     name="Companion fortune manager agent",
-    model="gpt-5.1",
+    model="gpt-5.2",
     model_settings=ModelSettings(reasoning=Reasoning(effort="none")),
     instructions="""
 You are the top-level agent that the user talks to directly.
