@@ -150,20 +150,34 @@ def file_bytes_to_data_url(filename: str, data: bytes) -> str:
     return f"data:{mime};base64,{b64}"
 
 # === 1.3 PDF 工具：頁碼解析 / 實際切頁 ===
+# =========================
+# ✅ 直接用這個版本「整段替換」你原本的 parse_page_ranges_from_text()
+# =========================
 def parse_page_ranges_from_text(text: str) -> list[int]:
+    """
+    只在使用者明確提到「頁/page」語意時才解析頁碼，避免把 URL/date(2025-12-13...) 誤判為頁碼。
+    """
     if not text:
         return []
+
+    # 1) 先移除 URL，避免像 2025-12-13-21-13-16 被誤判成頁碼範圍
+    text_wo_urls = re.sub(r"https?://\S+", " ", text)
+
+    # 2) 若使用者沒有明確提到頁碼語意，就不解析（避免誤判）
+    has_page_hint = bool(re.search(r"(頁|page|pages|第\s*\d+\s*頁)", text_wo_urls, flags=re.IGNORECASE))
+    if not has_page_hint:
+        return []
+
     pages = set()
 
-    # 區間格式
+    # 區間格式（保留「有頁碼語意」的形式；拿掉純數字-數字那種容易誤判的 pattern）
     range_patterns = [
-        r'第\s*(\d+)\s*[-~至到]\s*(\d+)\s*頁',
-        r'(\d+)\s*[-–—]\s*(\d+)\s*頁',
-        r'p(?:age)?s?\s*(\d+)\s*[-–—]\s*(\d+)',
-        r'(?<!\w)(\d+)\s*[-–—]\s*(\d+)(?!\w)',
+        r"第\s*(\d+)\s*[-~至到]\s*(\d+)\s*頁",
+        r"(\d+)\s*[-–—]\s*(\d+)\s*頁",
+        r"p(?:age)?s?\s*(\d+)\s*[-–—]\s*(\d+)",
     ]
     for pat in range_patterns:
-        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+        for m in re.finditer(pat, text_wo_urls, flags=re.IGNORECASE):
             a, b = int(m.group(1)), int(m.group(2))
             if a > 0 and b >= a:
                 for p in range(a, b + 1):
@@ -171,22 +185,25 @@ def parse_page_ranges_from_text(text: str) -> list[int]:
 
     # 單一頁
     single_patterns = [
-        r'第\s*(\d+)\s*頁',
-        r'p(?:age)?\s*(\d+)',
+        r"第\s*(\d+)\s*頁",
+        r"p(?:age)?\s*(\d+)",
     ]
     for pat in single_patterns:
-        for m in re.finditer(pat, text, flags=re.IGNORECASE):
+        for m in re.finditer(pat, text_wo_urls, flags=re.IGNORECASE):
             p = int(m.group(1))
             if p > 0:
                 pages.add(p)
 
     # 逗號分隔（在有「頁/page」字樣時才啟用）
-    if re.search(r'(頁|page|pages|p[^\w])', text, flags=re.IGNORECASE):
-        for m in re.finditer(r'(?<!\d)(\d+)(?:\s*,\s*(\d+))+', text):
+    if re.search(r"(頁|page|pages)", text_wo_urls, flags=re.IGNORECASE):
+        for m in re.finditer(r"(?<!\d)(\d+)(?:\s*,\s*(\d+))+", text_wo_urls):
             nums = [int(x) for x in m.group(0).split(",") if x.strip().isdigit()]
             for n in nums:
                 if n > 0:
                     pages.add(n)
+
+    # 3) 額外保護：頁碼不太可能到 2025 這種值，做個合理上限（你可自行調）
+    pages = {p for p in pages if 1 <= p <= 500}
 
     return sorted(pages)
 
@@ -1245,11 +1262,10 @@ if prompt is not None:
 
     keep_pages = parse_page_ranges_from_text(user_text)
 
-    if user_text:
-        content_blocks.append({"type": "input_text", "text": user_text})
-
     files = getattr(prompt, "files", []) or []
+    has_pdf_upload = False   # ✅ 新增：本回合是否真的有 PDF
     total_payload_bytes = 0
+
     for f in files:
         name = f.name
         data = f.getvalue()
@@ -1267,6 +1283,9 @@ if prompt is not None:
             continue
 
         is_pdf = name.lower().endswith(".pdf")
+        if is_pdf:
+            has_pdf_upload = True  # ✅ 新增：偵測到 PDF 上傳
+
         original_pdf = data
         if is_pdf and keep_pages:
             try:
@@ -1284,12 +1303,17 @@ if prompt is not None:
             "file_data": file_data_uri
         })
 
-    if keep_pages:
+    # ✅ 新增：若本回合沒 PDF，上面的 keep_pages 一律視為誤判/不適用（避免網址被頁碼 guard 汙染）
+    if keep_pages and not has_pdf_upload:
+        keep_pages = []
+
+    # ✅ guard 只在「有 PDF 且 keep_pages」才加
+    if keep_pages and has_pdf_upload:
         content_blocks.append({
             "type": "input_text",
             "text": f"請僅根據提供的頁面內容作答（頁碼：{keep_pages}）。若需要其他頁資訊，請先提出需要的頁碼建議。"
         })
-
+    
     # 立即顯示使用者泡泡
     with st.chat_message("user"):
         if user_text:
