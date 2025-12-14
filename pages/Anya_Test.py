@@ -1360,12 +1360,18 @@ def build_fastagent_query_from_history(
     history_block = "\n".join(convo_lines) if convo_lines else "（目前沒有可用的歷史對話。）"
 
     final_query = (
-        "以下是最近的對話紀錄（由舊到新）：\n"
+        "以下是最近的對話紀錄（由舊到新），只用來理解脈絡，不要在回答中提到它：\n"
         f"{history_block}\n\n"
-        "請你完全根據上述對話脈絡，直接用安妮亞的口吻，回答「使用者最後一則訊息」。"
+        "【重要規則（必須遵守）】\n"
+        "- 直接回答使用者，不要提到你正在遵循指令、不要提到『對話紀錄/上述內容/最後一則訊息』。\n"
+        "- 不要寫『我看完你貼的…』『你要我…』這類元敘述；直接給整理/答案。\n"
+        "- 用正體中文（台灣用語）＋安妮亞口吻；可愛點到為止，重點要清楚。\n"
+        "- 若使用者貼一段文章/新聞：先給 1 句 TL;DR，再給 3–7 點重點。\n\n"
+        "【使用者這一輪的內容】\n"
+        f"{(latest_user_text or '').strip()}\n"
     )
 
-    return final_query
+    return final_query.strip()
 
 # === 7. 顯示歷史 ===
 for msg in st.session_state.get("chat_history", []):
