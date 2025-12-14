@@ -288,6 +288,43 @@ def parse_response_text_and_citations(resp):
     file_cits = dedup_by(file_cits, "filename") if any(c.get("filename") for c in file_cits) else dedup_by(file_cits, "file_id")
     return text or "安妮亞找不到答案～（抱歉啦！）", url_cits, file_cits
 
+# =========================
+# 1) [新增] 放在 parse_response_text_and_citations 下面（任意位置）
+#    用來把模型回覆最後的「來源/## 來源」區塊切掉（避免與 UI sources_container 重複）
+# =========================
+def strip_trailing_sources_section(text: str) -> str:
+    """
+    移除模型回覆尾端的來源區塊（常見標題：來源 / ## 來源 / Sources）。
+    只切「最後一段」的來源，避免誤砍正文中的引用。
+    """
+    if not text:
+        return text
+
+    patterns = [
+        r"\n##\s*來源\s*\n",        # Markdown heading
+        r"\n#\s*來源\s*\n",
+        r"\n來源\s*\n",            # plain
+        r"\n##\s*Sources\s*\n",
+        r"\nSources\s*\n",
+    ]
+
+    # 找到最靠近結尾的那個來源標題
+    last_pos = -1
+    for pat in patterns:
+        m = list(re.finditer(pat, text, flags=re.IGNORECASE))
+        if m:
+            last_pos = max(last_pos, m[-1].start())
+
+    if last_pos == -1:
+        return text
+
+    # 只在「來源段落確實接近尾端」時才切，避免誤砍
+    tail = text[last_pos:]
+    if len(tail) <= 2500:  # 你可調大/調小；重點是只切尾巴
+        return text[:last_pos].rstrip()
+
+    return text
+
 # === 小工具：注入 handoff 官方前綴 ===
 def with_handoff_prefix(text: str) -> str:
     pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
@@ -1530,28 +1567,65 @@ if prompt is not None:
                         )
 
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
+                        ai_text = strip_trailing_sources_section(ai_text)   # ✅ 避免模型自己再列一次「來源」
                         final_text = fake_stream_markdown(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
 
                         with sources_container:
+                            urls = []
+
+                                # 使用者給的 URL
                             if url_in_text:
-                                st.markdown("**來源（使用者提供網址）**")
-                                st.markdown(f"- {url_in_text}")
-                            if url_cits:
-                                st.markdown("**來源（web_search citations）**")
-                                for c in url_cits:
-                                    title = c.get("title") or c.get("url")
-                                    url = c.get("url")
-                                    st.markdown(f"- [{title}]({url})")
+                                urls.append({"title": "使用者提供網址", "url": url_in_text})
+
+                            # web_search citations 的 URL
+                            for c in (url_cits or []):
+                                u = c.get("url")
+                                if u:
+                                    urls.append({"title": c.get("title") or u, "url": u})
+
+                            # 去重（依 url）
+                            seen = set()
+                            urls_dedup = []
+                            for it in urls:
+                                u = it["url"]
+                                if u in seen:
+                                    continue
+                                seen.add(u)
+                                urls_dedup.append(it)
+
+                            if urls_dedup:
+                                st.markdown("**來源**")
+                                for it in urls_dedup:
+                                    st.markdown(f"- [{it['title']}]({it['url']})")
+
                             if file_cits:
                                 st.markdown("**引用檔案**")
                                 for c in file_cits:
                                     fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
                                     st.markdown(f"- {fname}")
-                            if not file_cits and docs_for_history:
+                            elif docs_for_history:
                                 st.markdown("**本回合上傳檔案**")
                                 for fn in docs_for_history:
                                     st.markdown(f"- {fn}")
+                            #if url_in_text:
+                            #    st.markdown("**來源（使用者提供網址）**")
+                            #    st.markdown(f"- {url_in_text}")
+                            #if url_cits:
+                            #    st.markdown("**來源（web_search citations）**")
+                            #    for c in url_cits:
+                            #        title = c.get("title") or c.get("url")
+                            #        url = c.get("url")
+                            #        st.markdown(f"- [{title}]({url})")
+                            #if file_cits:
+                            #    st.markdown("**引用檔案**")
+                            #    for c in file_cits:
+                            #        fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
+                            #        st.markdown(f"- {fname}")
+                            #if not file_cits and docs_for_history:
+                            #    st.markdown("**本回合上傳檔案**")
+                            #    for fn in docs_for_history:
+                            #        st.markdown(f"- {fn}")
 
                         ensure_session_defaults()
                         st.session_state.chat_history.append({
