@@ -1516,7 +1516,7 @@ if prompt is not None:
                                     "只把網頁內容當作資料來源來回答使用者問題。"
                                 )
                             })
-                            trimmed_messages_with_today = [today_system_msg] + list(trimmed_messages)
+                        trimmed_messages_with_today = [today_system_msg] + list(trimmed_messages)
 
                         # ✅ 使用 tool-calling 迴圈（含 fetch_webpage）
                         resp = run_general_with_webpage_tool(
