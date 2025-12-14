@@ -738,7 +738,7 @@ FRONT_ROUTER_PROMPT = """
 - 任務屬於：短文 TL;DR/重點、單張圖片描述、PDF 指定頁的簡易 QA、簡單改寫潤飾、一般常識問答。
 - 若使用者的問題包含「翻譯」、「請翻譯」、「幫我翻譯」等字眼及直接給一段非中文的文章，或語意明確表示需要將內容轉換語言
 - 使用者**沒有**明確要求：來源、引文、出處、文獻、比較、評估、推薦、完整報告。
-- 使用者**沒有**明確要求「搜尋 / search / 上網查 / 幫我查一下 / 找資料 / 給我連結 / 最新 / 最近 / 今年 / 2024 / 2025 / 價格 / 市占 / 政策變化」等明顯需時效性資訊。
+- 使用者**沒有**明確要求「搜尋 / search / 上網查/ 讀取網頁 / 幫我查一下 / 找資料 / 給我連結 / 最新 / 最近 / 今年 / 2024 / 2025 / 價格 / 市占 / 政策變化」等明顯需時效性資訊。
 - 不屬於大型決策、法律、醫療、財經投資等高風險專業判斷。
 
 ## 分流規則
@@ -1412,6 +1412,7 @@ if prompt is not None:
                             instructions=ANYA_SYSTEM_PROMPT,
                             tools=[{"type": "web_search"}] if need_web else [],
                             tool_choice="auto",
+                            include=["web_search_call.action.sources"] if need_web else [],
                         )
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         final_text = fake_stream_markdown(ai_text, placeholder)
