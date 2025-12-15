@@ -40,6 +40,8 @@ from agents.models import is_gpt_5_default
 from openai.types.shared.reasoning import Reasoning
 from pydantic import BaseModel
 from typing import Literal, Optional, List, Any
+import inspect
+import atexit
 
 # === 0. Trimming / 大小限制（可調） ===
 TRIM_LAST_N_USER_TURNS = 18                 # 短期記憶：最近 N 個 user 回合
@@ -102,23 +104,49 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty
         placeholder.markdown(empty_msg)
     return text
 
+class AsyncLoopRunner:
+    """
+    在背景 thread 常駐一個 event loop：
+    - 避免 asyncio.run() 每次開/關 loop，導致串流 close 掉到 loop 外
+    - 適合 Streamlit 這種同步主線程 + 需要跑 async 串流的情境
+    """
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run(self, coro):
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result()
+
+    def stop(self):
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:
+            pass
+        try:
+            self._thread.join(timeout=2)
+        except Exception:
+            pass
+        try:
+            self._loop.close()
+        except Exception:
+            pass
+
+@st.cache_resource(show_spinner=False)
+def get_async_runner() -> AsyncLoopRunner:
+    runner = AsyncLoopRunner()
+    atexit.register(runner.stop)
+    return runner
+
 # 穩定版：確保 coroutine 一定被 await
 def run_async(coro):
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        result_container = {}
-        def _runner():
-            result_container["value"] = asyncio.run(coro)
-        t = threading.Thread(target=_runner)
-        t.start()
-        t.join()
-        return result_container.get("value")
-    else:
-        return asyncio.run(coro)
+    # 取代 asyncio.run(coro)：改丟到背景 loop 跑
+    return get_async_runner().run(coro)
 
 # === 1.1 圖片工具：縮圖 & data URL ===
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -1401,16 +1429,32 @@ def call_fast_agent_once(query: str) -> str:
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
 async def fast_agent_stream(query: str, placeholder) -> str:
+    """
+    串流時一定要 try/finally：
+    - 即使中途例外/取消，也要在 loop 還活著時把串流關掉
+    """
     buf = ""
     result = Runner.run_streamed(fast_agent, input=query)
 
-    async for event in result.stream_events():
-        if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
-            delta = event.data.delta or ""
-            if not delta:
-                continue
-            buf += delta
-            placeholder.markdown(buf)
+    try:
+        async for event in result.stream_events():
+            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                delta = event.data.delta or ""
+                if not delta:
+                    continue
+                buf += delta
+                placeholder.markdown(buf)
+    finally:
+        # 不同 agents 版本可能提供 close/aclose；都試試看
+        close_fn = getattr(result, "aclose", None) or getattr(result, "close", None)
+        if close_fn:
+            try:
+                maybe = close_fn()
+                if inspect.isawaitable(maybe):
+                    await maybe
+            except Exception:
+                # 關閉失敗不影響主流程（至少我們已經 try/finally 了）
+                pass
 
     return buf or "安妮亞找不到答案～（抱歉啦！）"
 
