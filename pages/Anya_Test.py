@@ -94,7 +94,7 @@ def ensure_session_defaults():
 ensure_session_defaults()
 
 # === 共用：假串流打字效果 ===
-def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
+def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
     buf = ""
     for i in range(0, len(text), step_chars):
         buf = text[: i + step_chars]
