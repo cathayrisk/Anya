@@ -774,6 +774,7 @@ fast_agent = Agent(
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
         temperature=0,
+        verbosity="low",
         tool_choice="auto",
     ),
 )
