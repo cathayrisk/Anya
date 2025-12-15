@@ -145,8 +145,37 @@ def get_async_runner() -> AsyncLoopRunner:
 
 # 穩定版：確保 coroutine 一定被 await
 def run_async(coro):
-    # 取代 asyncio.run(coro)：改丟到背景 loop 跑
-    return get_async_runner().run(coro)
+    """
+    給「不會呼叫 Streamlit UI（st.* / placeholder.*）」的 coroutine 用。
+    - 一般情況用 asyncio.run（在主執行緒跑）
+    - 若剛好已在 running loop（少見），才退到 thread 裡 asyncio.run
+      （注意：thread 內不能碰 Streamlit UI）
+    """
+    try:
+        asyncio.get_running_loop()
+        loop_running = True
+    except RuntimeError:
+        loop_running = False
+
+    if not loop_running:
+        return asyncio.run(coro)
+
+    # fallback：已在 running loop 時（理論上 Streamlit 很少遇到）
+    result_container = {"value": None, "error": None}
+
+    def _runner():
+        try:
+            result_container["value"] = asyncio.run(coro)
+        except Exception as e:
+            result_container["error"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join()
+
+    if result_container["error"] is not None:
+        raise result_container["error"]
+    return result_container["value"]
 
 # === 1.1 圖片工具：縮圖 & data URL ===
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -1429,34 +1458,12 @@ def call_fast_agent_once(query: str) -> str:
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
 async def fast_agent_stream(query: str, placeholder) -> str:
-    """
-    串流時一定要 try/finally：
-    - 即使中途例外/取消，也要在 loop 還活著時把串流關掉
-    """
-    buf = ""
-    result = Runner.run_streamed(fast_agent, input=query)
-
-    try:
-        async for event in result.stream_events():
-            if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
-                delta = event.data.delta or ""
-                if not delta:
-                    continue
-                buf += delta
-                placeholder.markdown(buf)
-    finally:
-        # 不同 agents 版本可能提供 close/aclose；都試試看
-        close_fn = getattr(result, "aclose", None) or getattr(result, "close", None)
-        if close_fn:
-            try:
-                maybe = close_fn()
-                if inspect.isawaitable(maybe):
-                    await maybe
-            except Exception:
-                # 關閉失敗不影響主流程（至少我們已經 try/finally 了）
-                pass
-
-    return buf or "安妮亞找不到答案～（抱歉啦！）"
+    # 保留函式名以免你其他地方還在呼叫，但內容改成「不串流」
+    result = await Runner.run(fast_agent, query)
+    text = getattr(result, "final_output", None)
+    if not text:
+        text = str(result or "")
+    return text or "安妮亞找不到答案～（抱歉啦！）"
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
@@ -1589,6 +1596,9 @@ if prompt is not None:
                         # ✅ 新增：日期只進本回合 query，不進 chat_history
                         fast_query_runtime = f"{today_line}\n\n{fast_query_with_history}".strip()
                         final_text = run_async(fast_agent_stream(fast_query_runtime, placeholder))
+                        
+                        # 再在主執行緒用你原本的假串流更新 UI（這裡才碰 placeholder）
+                        final_text = fake_stream_markdown(final_text, placeholder)
 
                         with sources_container:
                             if docs_for_history:
