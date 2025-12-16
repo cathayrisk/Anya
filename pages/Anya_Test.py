@@ -1459,12 +1459,22 @@ def call_fast_agent_once(query: str) -> str:
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
 async def fast_agent_stream(query: str, placeholder) -> str:
-    # 保留函式名以免你其他地方還在呼叫，但內容改成「不串流」
-    result = await Runner.run(fast_agent, query)
-    text = getattr(result, "final_output", None)
-    if not text:
-        text = str(result or "")
-    return text or "安妮亞找不到答案～（抱歉啦！）"
+    """
+    ✅ 真串流：一邊收到 token，一邊更新 Streamlit placeholder
+    """
+    buf = ""
+    result = Runner.run_streamed(fast_agent, input=query)
+
+    async for event in result.stream_events():
+        # Agents SDK 會把底層 OpenAI Responses 的 delta 包在 raw_response_event
+        if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+            delta = event.data.delta or ""
+            if not delta:
+                continue
+            buf += delta
+            placeholder.markdown(buf)
+
+    return buf or "安妮亞找不到答案～（抱歉啦！）"
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
@@ -1598,9 +1608,6 @@ if prompt is not None:
                         fast_query_runtime = f"{today_line}\n\n{fast_query_with_history}".strip()
                         final_text = run_async(fast_agent_stream(fast_query_runtime, placeholder))
                         
-                        # 再在主執行緒用你原本的假串流更新 UI（這裡才碰 placeholder）
-                        final_text = fake_stream_markdown(final_text, placeholder)
-
                         with sources_container:
                             if docs_for_history:
                                 st.markdown("**本回合上傳檔案**")
