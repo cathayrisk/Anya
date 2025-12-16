@@ -40,6 +40,8 @@ from agents.models import is_gpt_5_default
 from openai.types.shared.reasoning import Reasoning
 from pydantic import BaseModel
 from typing import Literal, Optional, List, Any
+import inspect
+import atexit
 
 # === 0. Trimming / 大小限制（可調） ===
 TRIM_LAST_N_USER_TURNS = 18                 # 短期記憶：最近 N 個 user 回合
@@ -92,7 +94,7 @@ def ensure_session_defaults():
 ensure_session_defaults()
 
 # === 共用：假串流打字效果 ===
-def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
+def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
     buf = ""
     for i in range(0, len(text), step_chars):
         buf = text[: i + step_chars]
@@ -102,23 +104,78 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.03, empty
         placeholder.markdown(empty_msg)
     return text
 
+class AsyncLoopRunner:
+    """
+    在背景 thread 常駐一個 event loop：
+    - 避免 asyncio.run() 每次開/關 loop，導致串流 close 掉到 loop 外
+    - 適合 Streamlit 這種同步主線程 + 需要跑 async 串流的情境
+    """
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run(self, coro):
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result()
+
+    def stop(self):
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:
+            pass
+        try:
+            self._thread.join(timeout=2)
+        except Exception:
+            pass
+        try:
+            self._loop.close()
+        except Exception:
+            pass
+
+@st.cache_resource(show_spinner=False)
+def get_async_runner() -> AsyncLoopRunner:
+    runner = AsyncLoopRunner()
+    atexit.register(runner.stop)
+    return runner
+
 # 穩定版：確保 coroutine 一定被 await
 def run_async(coro):
+    """
+    給「不會呼叫 Streamlit UI（st.* / placeholder.*）」的 coroutine 用。
+    - 一般情況用 asyncio.run（在主執行緒跑）
+    - 若剛好已在 running loop（少見），才退到 thread 裡 asyncio.run
+      （注意：thread 內不能碰 Streamlit UI）
+    """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
+        loop_running = True
     except RuntimeError:
-        loop = None
+        loop_running = False
 
-    if loop and loop.is_running():
-        result_container = {}
-        def _runner():
-            result_container["value"] = asyncio.run(coro)
-        t = threading.Thread(target=_runner)
-        t.start()
-        t.join()
-        return result_container.get("value")
-    else:
+    if not loop_running:
         return asyncio.run(coro)
+
+    # fallback：已在 running loop 時（理論上 Streamlit 很少遇到）
+    result_container = {"value": None, "error": None}
+
+    def _runner():
+        try:
+            result_container["value"] = asyncio.run(coro)
+        except Exception as e:
+            result_container["error"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join()
+
+    if result_container["error"] is not None:
+        raise result_container["error"]
+    return result_container["value"]
 
 # === 1.1 圖片工具：縮圖 & data URL ===
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -610,6 +667,26 @@ FAST_AGENT_PROMPT = with_handoff_prefix(
   • 若無足夠資訊使用工具，請先向用戶詢問 1–3 個關鍵問題。
   • 變換範例與用語，避免重複、罐頭式回答。
 
+# ✅ 翻譯任務的 TL;DR（依情緒選色 + 整段同色，嚴格遵守）
+- 只要本次任務屬於「翻譯」或「把一段外語內容翻成中文」（包含新聞、公告、貼文、訪談），
+  你必須在回覆最前面先輸出 1 行 TL;DR（先不要開始逐句翻譯）。
+- TL;DR 顏色由「翻譯內容的整體情緒/語氣」決定（情緒理解；只選一個）：
+  - 正面新聞/內容 → 使用 green
+  - 負面新聞/內容 → 使用 orange
+  - 中性或難分辨 → 使用 blue（預設）
+
+- TL;DR 的格式必須完全固定如下（不要改結構）：
+  > :<COLOR>-badge[TL;DR] :<COLOR>[**一句話關鍵摘要（≤ 30 字）**]
+
+  約束：
+  - <COLOR> 只能是 green / orange / blue。
+  - 除了徽章的 [TL;DR] 文字以外，摘要整段也必須用同色 :<COLOR>[...] 包住（硬性規定）。
+  - 禁止輸出「TL;DR：」純文字標頭。
+
+- 翻譯任務固定輸出順序：
+  1) TL;DR（依情緒選色）
+  2) 完整逐句翻譯（正體中文、忠實、名詞一致、不摘要）
+
 # ROLE & OBJECTIVE — FastAgent 子人格設定
 你是安妮亞（Anya Forger）的一個「快速回應小分身」（FastAgent），來自《SPY×FAMILY 間諜家家酒》的小女孩版本。
 
@@ -717,6 +794,7 @@ fast_agent = Agent(
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
         temperature=0,
+        verbosity="low",
         tool_choice="auto",
     ),
 )
@@ -1401,10 +1479,14 @@ def call_fast_agent_once(query: str) -> str:
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
 async def fast_agent_stream(query: str, placeholder) -> str:
+    """
+    ✅ 真串流：一邊收到 token，一邊更新 Streamlit placeholder
+    """
     buf = ""
     result = Runner.run_streamed(fast_agent, input=query)
 
     async for event in result.stream_events():
+        # Agents SDK 會把底層 OpenAI Responses 的 delta 包在 raw_response_event
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             delta = event.data.delta or ""
             if not delta:
@@ -1545,7 +1627,7 @@ if prompt is not None:
                         # ✅ 新增：日期只進本回合 query，不進 chat_history
                         fast_query_runtime = f"{today_line}\n\n{fast_query_with_history}".strip()
                         final_text = run_async(fast_agent_stream(fast_query_runtime, placeholder))
-
+                        
                         with sources_container:
                             if docs_for_history:
                                 st.markdown("**本回合上傳檔案**")
