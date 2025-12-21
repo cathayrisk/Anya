@@ -645,17 +645,18 @@ planner_agent = Agent(
 
 search_INSTRUCTIONS = with_handoff_prefix(
     "You are a research assistant. Given a search term, you search the web for that term and "
-    "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 words. "
-    "Capture the main points. Write succinctly, ignore fluff. Only the summary text.\n"
+    "produce a concise summary of the results. The summary must be 2-3 paragraphs and less than 300 "
+    "grammar. This will be consumed by someone synthesizing a report, so its vital you capture the "
+    "essence and ignore any fluff. Do not include any additional commentary other than the summary itself."
     "請務必以正體中文回應，並遵循台灣用語習慣。"
 )
 
 search_agent = Agent(
     name="SearchAgent",
-    model="gpt-4.1",
+    model="gpt-5.2",
     instructions=search_INSTRUCTIONS,
     tools=[WebSearchTool()],
-    model_settings=ModelSettings(tool_choice="required"),
+    #model_settings=ModelSettings(tool_choice="required"),
 )
 
 # === 1.5.a FastAgent：快速回覆＋被動 web_search ===
