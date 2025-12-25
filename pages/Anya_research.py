@@ -1281,7 +1281,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
                 val = cols[0].checkbox(" ", value=bool(r.use_ocr), key=f"ocr_{idx}")
                 st.session_state.file_rows[idx].use_ocr = bool(val)
 
-            short = truncate_filename(r.name, 30)
+            short = truncate_filename(r.name, 20)
             with cols[1]:
                 st.markdown(short)
                 st.badge("Full name", icon=":material/info:", color="gray", help=r.name)
