@@ -1,26 +1,21 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-研究報告助手（FAISS + OpenAI embeddings + LangExtract KG + Chat + Workflow UI）
+研究報告助手（FAISS + OpenAI embeddings + Lazy LangExtract KG + Chat + Workflow UI）
 領域：總經 / 金融 / 財務 / 氣候風險 / 永續金融
 
-重點：
-- 文件管理（上傳/清單/OCR/建索引/清空）全部在 popover（width="content"）
-- 文件清單：使用OCR 最前；檔名截斷；完整檔名用 st.badge(help=...) tooltip；不顯示 file_id
-- 建索引加速：
-  1) PDF 文字抽取優先 PyMuPDF（若有）
-  2) LangExtract 逐頁並行（ThreadPoolExecutor）
-  3) OCR 逐頁小並行（避免 rate limit）
-  4) embeddings 大批次（減少 round-trip）
-  5) 增量索引（只處理新檔或 OCR 設定變更）
-- 預設輸出加速：
-  - 只對「新/變更」報告產出
-  - 一次 LLM 產三份（SUMMARY/CLAIMS/CHAIN），並嚴格檢查每個 bullet 都要有引用
-- Chat：Workflow UI（RETRIEVE/GRADE/TRANSFORM/GENERATE/CHECK）+ ✅/❌ + 秒數 + relevant chunk 展開全文
-- 呈現：引用用 st.badge 顯示（文字本體更乾淨），但內部仍用引用字串做嚴格檢查
+✅ 這版核心：LangExtract/KG 只在「需要 KG 才能回答」時，對 relevant chunks 做抽取（Lazy/on-demand）
+- 建索引：OCR（勾了才做）+ chunk + embeddings（FAISS）
+- 預設輸出：摘要/核心主張/推論鏈（一次生成三份；只對新/變更報告跑）
+- Chat：Workflow UI + grading/retry + 引用 badges
+- KG：自動/關閉/強制 模式；自動模式用規則判斷是否需要 KG；需要時只對 relevant chunks 抽取，並做快取
 
 環境：
-- OPENAI_API_KEY 或 st.secrets["OPENAI_KEY"] 擇一
+- st.secrets["OPENAI_KEY"] 或環境變數 OPENAI_API_KEY
+
+依賴：
+streamlit, openai, langextract[openai], numpy, faiss-cpu, networkx, pypdf
+（推薦）pymupdf：PDF 快速抽字與 OCR rasterize
 """
 
 from __future__ import annotations
@@ -65,8 +60,10 @@ OCR_MODEL = "gpt-4.1-mini"  # 若你確認 gpt-5.2 支援 vision，可改成 gpt
 # 效能參數（可調）
 # =========================
 EMBED_BATCH_SIZE = 256
-LX_MAX_WORKERS = 6
-OCR_MAX_WORKERS = 2
+
+OCR_MAX_WORKERS = 2               # OCR 很貴、也易被 rate limit；建議小
+LX_MAX_WORKERS_QUERY = 4          # 問答時 LangExtract 并行（可視 rate limit 調）
+LX_MAX_CHUNKS_PER_QUERY = 8       # 最多對幾個 relevant chunks 跑 LangExtract（避免太慢）
 
 
 # =========================
@@ -162,8 +159,8 @@ def gen_yesno(client: OpenAI, system: str, user: str) -> str:
 # =========================
 @dataclass
 class FileRow:
-    file_id: str          # 內部用
-    file_sig: str         # sha1(bytes)
+    file_id: str
+    file_sig: str
     name: str
     ext: str
     bytes_len: int
@@ -297,7 +294,7 @@ class FaissStore:
 
 
 # =========================
-# KG
+# KG（Query-time）
 # =========================
 @dataclass
 class Prov:
@@ -342,11 +339,18 @@ class KnowledgeGraph:
             return
         if r not in ALLOWED_RELATIONS:
             return
+
         if s not in self.g:
             self.g.add_node(s, label=s)
         if o not in self.g:
             self.g.add_node(o, label=o)
-        self.g.add_edge(s, o, key=str(uuid.uuid4()), relation=r, prov=asdict(prov), attrs=attrs or {})
+
+        self.g.add_edge(
+            s, o, key=str(uuid.uuid4()),
+            relation=r,
+            prov=asdict(prov),
+            attrs=attrs or {},
+        )
 
     def find_nodes_in_query(self, query: str, max_n: int = 2) -> List[str]:
         q = norm_space(query)
@@ -356,7 +360,7 @@ class KnowledgeGraph:
                 hits.append(n)
         return hits[:max_n]
 
-    def bfs_context(self, start: str, max_edges: int = 18) -> List[Dict[str, Any]]:
+    def bfs_edges(self, start: str, max_edges: int = 18) -> List[Dict[str, Any]]:
         if start not in self.g:
             return []
         out = []
@@ -368,7 +372,7 @@ class KnowledgeGraph:
 
 
 # =========================
-# LangExtract
+# LangExtract（Lazy）
 # =========================
 def lx_prompt() -> str:
     return (
@@ -390,14 +394,14 @@ def lx_examples() -> List[lx.data.ExampleData]:
         text=t1,
         extractions=[
             lx.data.Extraction(
-                extraction_class="claim",
-                extraction_text="US CPI inflation to decelerate in 2025Q2",
-                attributes={"theme": "inflation_outlook", "confidence": "medium"},
-            ),
-            lx.data.Extraction(
                 extraction_class="relation",
                 extraction_text="as energy prices fall",
                 attributes={"subject": "energy prices", "relation": "DECREASES", "object": "US CPI inflation", "time": "2025Q2"},
+            ),
+            lx.data.Extraction(
+                extraction_class="claim",
+                extraction_text="keep policy restrictive through mid-2025",
+                attributes={"theme": "policy_outlook"},
             ),
         ],
     )
@@ -410,7 +414,7 @@ def run_langextract(text: str, api_key: str) -> lx.data.AnnotatedDocument:
         examples=lx_examples(),
         model_id=LX_MODEL,
         api_key=api_key,
-        extraction_passes=2,
+        extraction_passes=1,      # Lazy 模式先用 1 pass 省時間（需要再加）
         max_char_buffer=1200,
         max_workers=8,
         fence_output=True,
@@ -544,7 +548,6 @@ def generate_default_outputs_bundle_with_guard(client: OpenAI, title: str, ctx: 
         "2) 每個區塊都必須是純 bullet（每行以 - 開頭），不要段落。\n"
         "3) 每個 bullet 句尾必須附引用，格式固定：[報告 p頁 | chunk_id]\n"
     )
-
     base_user = (
         f"請針對報告《{title}》一次輸出三份內容：\n"
         f"- SUMMARY：8~14 bullets（結論/預測/假設/風險/限制/市場含意）\n"
@@ -552,56 +555,45 @@ def generate_default_outputs_bundle_with_guard(client: OpenAI, title: str, ctx: 
         f"- CHAIN：6~12 bullets（傳導：驅動→中介→結論→風險）\n\n"
         f"資料：\n{ctx}\n\n"
         f"現在請輸出：\n"
-        f"### SUMMARY\n"
-        f"(bullets...)\n"
-        f"### CLAIMS\n"
-        f"(bullets...)\n"
-        f"### CHAIN\n"
-        f"(bullets...)\n"
+        f"### SUMMARY\n(bullets...)\n### CLAIMS\n(bullets...)\n### CHAIN\n(bullets...)\n"
     )
 
     user = base_user
     for _ in range(max_retries + 1):
         out = gen_text(client, system, user, model=LLM_MODEL)
         parts = _split_default_bundle(out)
-
         ok_s, _ = bullets_all_have_citations(parts.get("summary", ""))
         ok_c, _ = bullets_all_have_citations(parts.get("claims", ""))
         ok_h, _ = bullets_all_have_citations(parts.get("chain", ""))
-
         if ok_s and ok_c and ok_h:
             return {"summary": parts["summary"], "claims": parts["claims"], "chain": parts["chain"]}
-
         user = base_user + "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告 p頁 | chunk_id]。"
 
     return {"summary": "", "claims": "", "chain": ""}
 
 
 # =========================
-# 索引（增量 + 并行 + 批次）
+# 建索引（只做 OCR + chunk + embeddings；不做 LangExtract）
 # =========================
-def build_indices_incremental(
+def build_indices_incremental_no_kg(
     client: OpenAI,
-    api_key: str,
     file_rows: List[FileRow],
     file_bytes_map: Dict[str, bytes],
     store: Optional[FaissStore],
-    kg: KnowledgeGraph,
     processed_keys: set,
     chunk_size: int = 900,
     overlap: int = 150,
-) -> Tuple[FaissStore, KnowledgeGraph, Dict[str, Any], set, List[str]]:
+) -> Tuple[FaissStore, Dict[str, Any], set, List[str]]:
     if store is None:
         dim = embed_texts(client, ["dim_probe"]).shape[1]
         store = FaissStore(dim)
 
-    stats = {"new_reports": 0, "new_chunks": 0, "kg_nodes": 0, "kg_edges": 0}
+    stats = {"new_reports": 0, "new_chunks": 0}
     new_titles: List[str] = []
 
     new_chunks: List[Chunk] = []
     new_texts: List[str] = []
 
-    # to_process: (sha1, use_ocr) 沒處理過才跑
     to_process = []
     for r in file_rows:
         key = (r.file_sig, bool(r.use_ocr))
@@ -615,7 +607,7 @@ def build_indices_incremental(
         stats["new_reports"] += 1
         new_titles.append(title)
 
-        # pages
+        # pages (OCR only if you checked)
         if row.ext == ".pdf":
             if row.use_ocr:
                 pages = ocr_pdf_pages_with_openai_parallel(client, data)
@@ -638,52 +630,6 @@ def build_indices_incremental(
                 new_chunks.append(Chunk(cid, report_id, title, page_no if isinstance(page_no, int) else None, ch))
                 new_texts.append(ch)
 
-        # LangExtract：逐頁并行
-        def lx_one_page(page_no: Optional[int], page_text: str):
-            if not page_text:
-                return []
-            ann = run_langextract(page_text, api_key=api_key)
-            out_edges = []
-            for e in ann.extractions:
-                cls = getattr(e, "extraction_class", "")
-                etext = getattr(e, "extraction_text", "")
-                attrs = getattr(e, "attributes", {}) or {}
-                cstart = getattr(e, "char_start", None)
-                cend = getattr(e, "char_end", None)
-
-                snippet = page_text[:220]
-                if cstart is not None and cend is not None and 0 <= cstart < len(page_text):
-                    snippet = page_text[max(0, cstart - 80): min(len(page_text), cend + 80)]
-
-                prov = Prov(
-                    report_id=report_id,
-                    title=title,
-                    page=page_no if isinstance(page_no, int) else None,
-                    char_start=cstart,
-                    char_end=cend,
-                    snippet=snippet,
-                )
-
-                if cls == "relation":
-                    s = attrs.get("subject", "")
-                    r = attrs.get("relation", "")
-                    o = attrs.get("object", "")
-                    out_edges.append((s, r, o, prov, attrs))
-                elif cls == "claim":
-                    claim_node = f"CLAIM: {norm_space(etext)}"
-                    out_edges.append((title, "MENTIONS", claim_node, prov, attrs))
-            return out_edges
-
-        with ThreadPoolExecutor(max_workers=LX_MAX_WORKERS) as ex:
-            futs = {ex.submit(lx_one_page, pno, ptxt): pno for pno, ptxt in pages}
-            for fut in as_completed(futs):
-                try:
-                    edges = fut.result()
-                except Exception:
-                    edges = []
-                for s, r, o, prov, attrs in edges:
-                    kg.add_edge(s=s, r=r, o=o, prov=prov, attrs=attrs)
-
         processed_keys.add((row.file_sig, bool(row.use_ocr)))
 
     # embeddings：大批次
@@ -695,16 +641,14 @@ def build_indices_incremental(
         store.add(vecs, new_chunks)
 
     stats["new_chunks"] = len(new_chunks)
-    stats["kg_nodes"] = kg.g.number_of_nodes()
-    stats["kg_edges"] = kg.g.number_of_edges()
-    return store, kg, stats, processed_keys, sorted(set(new_titles))
+    return store, stats, processed_keys, sorted(set(new_titles))
 
 
 # =========================
-# 預設輸出：挑選 chunk context
+# 預設輸出：挑 chunk context
 # =========================
 def pick_chunks_for_report(all_chunks: List[Chunk], title: str, max_n: int = 12) -> List[Chunk]:
-    kw = re.compile(r"(conclusion|outlook|risk|implication|forecast|scenario|inflation|rate|credit|spread|emission|transition|physical)", re.I)
+    kw = re.compile(r"(conclusion|outlook|risk|implication|forecast|scenario|inflation|rate|credit|spread|emission|transition|physical|policy)", re.I)
 
     def score(c: Chunk) -> float:
         s = 0.0
@@ -728,10 +672,163 @@ def render_chunks_with_ids(chunks: List[Chunk], max_chars_each: int = 900) -> st
 
 
 # =========================
+# Lazy KG：判斷是否需要 KG + 對 relevant chunks 抽取
+# =========================
+KG_KEYWORDS = [
+    # multi-hop / causal / mechanism
+    "傳導", "機制", "因果", "造成", "導致", "影響", "如何影響", "為何", "為什麼",
+    "關聯", "之間關係", "路徑", "鏈", "interplay", "mechanism",
+    # comparison / conflict / versions
+    "矛盾", "衝突", "一致", "不一致", "比較", "差異", "新版", "舊版", "更新",
+    # aggregation / set operations
+    "有哪些因素", "共同", "交集", "重疊", "排名", "計數", "多少", "去重",
+    # rules / constraints
+    "規則", "限制", "例外", "條件", "合規", "不符合", "排除",
+]
+
+def need_kg_auto(question: str) -> bool:
+    q = norm_space(question)
+    return any(k in q for k in KG_KEYWORDS)
+
+def build_kg_hints_block_from_edges(kg: KnowledgeGraph, question: str, max_edges: int = 18) -> str:
+    starts = kg.find_nodes_in_query(question, max_n=2)
+    if not starts:
+        # 若 query 中沒有任何 node 字面匹配，先不硬做 entity linking（避免多一次 LLM）
+        return ""
+    lines = []
+    for s in starts:
+        edges = kg.bfs_edges(s, max_edges=max_edges)
+        for e in edges:
+            prov = e.get("prov") or {}
+            title = prov.get("title", "Unknown")
+            page = prov.get("page", "-")
+            chunk_id = prov.get("chunk_id", prov.get("chunkId", ""))  # 兼容
+            if not chunk_id:
+                chunk_id = prov.get("snippet_id", "") or "unknown"
+            # 保證 citation 形式一致
+            citation = f"[{title} p{page if page else '-'} | {chunk_id}]"
+            lines.append(f"- {e['u']} --[{e['rel']}]--> {e['v']} {citation}")
+            if len(lines) >= max_edges:
+                break
+        if len(lines) >= max_edges:
+            break
+    return "【KG 線索】\n" + "\n".join(lines) if lines else ""
+
+def lazy_langextract_kg_for_chunks(
+    api_key: str,
+    chunks: List[Chunk],
+    lx_cache: Dict[str, Any],
+) -> Tuple[KnowledgeGraph, int]:
+    """
+    對 chunks 做 LangExtract 抽取（有快取就不重跑），回傳 query-time KG 與新增邊數
+    cache 格式：lx_cache[chunk_id] = list of edges {s,r,o,prov,attrs}
+    """
+    kg = KnowledgeGraph()
+    new_edges = 0
+
+    def extract_one(ch: Chunk) -> Tuple[str, List[Dict[str, Any]]]:
+        if ch.chunk_id in lx_cache:
+            return ch.chunk_id, lx_cache[ch.chunk_id]
+
+        ann = run_langextract(ch.text, api_key=api_key)
+        extracted = []
+
+        for e in ann.extractions:
+            cls = getattr(e, "extraction_class", "")
+            attrs = getattr(e, "attributes", {}) or {}
+            etext = getattr(e, "extraction_text", "") or ""
+            cstart = getattr(e, "char_start", None)
+            cend = getattr(e, "char_end", None)
+
+            snippet = ch.text[:220]
+            if cstart is not None and cend is not None and 0 <= cstart < len(ch.text):
+                snippet = ch.text[max(0, cstart - 80): min(len(ch.text), cend + 80)]
+
+            prov = Prov(
+                report_id=ch.report_id,
+                title=ch.title,
+                page=ch.page,
+                char_start=cstart,
+                char_end=cend,
+                snippet=snippet,
+            )
+            prov_dict = asdict(prov)
+            prov_dict["chunk_id"] = ch.chunk_id
+
+            if cls == "relation":
+                s = attrs.get("subject", "")
+                r = attrs.get("relation", "")
+                o = attrs.get("object", "")
+                extracted.append({"s": s, "r": r, "o": o, "prov": prov_dict, "attrs": attrs})
+            elif cls == "claim":
+                # claim 先掛在報告名底下（可用於之後做對比/彙總）
+                claim_node = f"CLAIM: {norm_space(etext)}"
+                extracted.append({"s": ch.title, "r": "MENTIONS", "o": claim_node, "prov": prov_dict, "attrs": attrs})
+
+        lx_cache[ch.chunk_id] = extracted
+        return ch.chunk_id, extracted
+
+    # 并行跑（注意 rate limit，worker 別太大）
+    with ThreadPoolExecutor(max_workers=LX_MAX_WORKERS_QUERY) as ex:
+        futs = {ex.submit(extract_one, ch): ch.chunk_id for ch in chunks}
+        for fut in as_completed(futs):
+            _cid = futs[fut]
+            try:
+                _cid, extracted = fut.result()
+            except Exception:
+                extracted = []
+
+            for item in extracted:
+                prov = item.get("prov") or {}
+                prov_obj = Prov(
+                    report_id=prov.get("report_id", ""),
+                    title=prov.get("title", ""),
+                    page=prov.get("page", None),
+                    char_start=prov.get("char_start", None),
+                    char_end=prov.get("char_end", None),
+                    snippet=prov.get("snippet", ""),
+                )
+                # 讓 KG 的 prov 帶 chunk_id
+                prov_dict = asdict(prov_obj)
+                prov_dict["chunk_id"] = prov.get("chunk_id", "")
+                # 用 kg.add_edge 內部 schema filter
+                before_edges = kg.g.number_of_edges()
+                kg.add_edge(item.get("s", ""), item.get("r", ""), item.get("o", ""), prov_obj, attrs=item.get("attrs"))
+                # 重新覆蓋 prov（含 chunk_id）
+                # networkx MultiDiGraph add_edge 會存 prov=asdict(prov_obj)；我們把 chunk_id 放在 snippet 旁邊有點怪
+                # => 這裡用「額外加一個 prov_chunk_id」存（不影響 BFS 顯示的 citation 我們自己拼 chunk_id）
+                # 但為了簡化：citation 時從 prov_obj 取不到 chunk_id，所以我們在 build_kg_hints_block_from_edges 時從 prov_dict 塞 chunk_id
+                after_edges = kg.g.number_of_edges()
+                if after_edges > before_edges:
+                    new_edges += (after_edges - before_edges)
+
+    return kg, new_edges
+
+
+# =========================
 # Chat workflow（UI）
 # =========================
+def build_context_from_chunks(items: List[Dict[str, Any]], top_k: int = 8) -> str:
+    items = sorted(items, key=lambda x: x["score"], reverse=True)[:top_k]
+    parts = []
+    for it in items:
+        ch: Chunk = it["chunk"]
+        parts.append(f"[{ch.title} p{ch.page if ch.page else '-'} | {ch.chunk_id}]\n{ch.text}")
+    return "\n\n".join(parts) if parts else "（找不到任何相關內容）"
+
 def want_bullets(question: str) -> bool:
     return bool(re.search(r"(列出|有哪些|所有|清單|彙總|摘要|總結)", question))
+
+def generate_answer_from_context(client: OpenAI, question: str, context: str) -> str:
+    if want_bullets(question):
+        user = f"Context:\n{context}\n\nQuestion:\n{question}"
+        return generate_with_bullet_citation_guard(client, user, max_retries=1)
+    user = (
+        "請回答問題，依序：結論→依據（引用）→推論/解釋。\n"
+        "每段至少1個引用 [報告 p頁 | chunk_id]。\n\n"
+        f"Context:\n{context}\n\nQuestion:\n{question}"
+    )
+    return generate_with_paragraph_citation_guard(client, user, max_retries=1)
 
 def grade_doc_relevance(client: OpenAI, question: str, doc_text: str) -> str:
     system = "你是文件相關性評分者。片段能支持回答=>yes，否則=>no。"
@@ -757,41 +854,16 @@ def build_retrieval_packages(client: OpenAI, store: FaissStore, question: str, t
     hits = store.search(qvec, k=top_k)
     return [{"chunk": ch, "score": score} for score, ch in hits]
 
-def build_context_from_chunks(items: List[Dict[str, Any]], top_k: int = 8) -> str:
-    items = sorted(items, key=lambda x: x["score"], reverse=True)[:top_k]
-    parts = []
-    for it in items:
-        ch: Chunk = it["chunk"]
-        parts.append(f"[{ch.title} p{ch.page if ch.page else '-'} | {ch.chunk_id}]\n{ch.text}")
-    return "\n\n".join(parts) if parts else "（找不到任何相關內容）"
-
-def generate_answer_from_context(client: OpenAI, question: str, context: str) -> str:
-    if want_bullets(question):
-        user = f"Context:\n{context}\n\nQuestion:\n{question}"
-        return generate_with_bullet_citation_guard(client, user, max_retries=1)
-    user = (
-        "請回答問題，依序：結論→依據（引用）→推論/解釋。\n"
-        "每段至少1個引用 [報告 p頁 | chunk_id]。\n\n"
-        f"Context:\n{context}\n\nQuestion:\n{question}"
-    )
-    return generate_with_paragraph_citation_guard(client, user, max_retries=1)
-
 def _step_table(step_state: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows = []
-    for name, info in step_state.items():
-        rows.append({
-            "Step": name,
-            "Status": info.get("status", "PENDING"),
-            "Seconds": info.get("seconds", None),
-            "Note": info.get("note", ""),
-        })
-    return rows
+    return [{"Step": k, "Status": v.get("status"), "Seconds": v.get("seconds"), "Note": v.get("note")} for k, v in step_state.items()]
 
 def run_chat_workflow_with_ui(
     client: OpenAI,
+    api_key: str,
     store: FaissStore,
     question: str,
     *,
+    kg_mode: str,  # "OFF" / "AUTO" / "FORCE"
     max_query_rewrites: int = 2,
     max_generate_retries: int = 2,
     top_k: int = 10,
@@ -804,6 +876,7 @@ def run_chat_workflow_with_ui(
     step_state = {
         "RETRIEVE": {"status": "PENDING", "seconds": None, "note": ""},
         "GRADE": {"status": "PENDING", "seconds": None, "note": ""},
+        "KG_EXTRACT": {"status": "SKIP", "seconds": None, "note": "not triggered"},
         "TRANSFORM": {"status": "PENDING", "seconds": None, "note": ""},
         "GENERATE": {"status": "PENDING", "seconds": None, "note": ""},
         "CHECK": {"status": "PENDING", "seconds": None, "note": ""},
@@ -915,10 +988,77 @@ def run_chat_workflow_with_ui(
                     "render_mode": "text",
                 }
 
-        # GENERATE + CHECK
-        context = build_context_from_chunks(relevant, top_k=8)
+        # === Lazy KG decide ===
+        use_kg = False
+        if kg_mode == "FORCE":
+            use_kg = True
+        elif kg_mode == "AUTO":
+            use_kg = need_kg_auto(q)
+        else:
+            use_kg = False
+
+        # context: chunks + (optional) KG hints
+        base_context = build_context_from_chunks(relevant, top_k=8)
+
+        kg_hints = ""
+        if use_kg:
+            tkg = time.perf_counter()
+            try:
+                # 取 top relevant chunks 做抽取（避免太慢）
+                rel_sorted = sorted(relevant, key=lambda x: x["score"], reverse=True)
+                target_chunks = [it["chunk"] for it in rel_sorted[:LX_MAX_CHUNKS_PER_QUERY]]
+
+                # Lazy LangExtract（有快取更快）
+                kg, new_edges = lazy_langextract_kg_for_chunks(
+                    api_key=api_key,
+                    chunks=target_chunks,
+                    lx_cache=st.session_state.lx_cache,
+                )
+
+                # 產生 KG hints（帶 citation）
+                # 注意：KG 內部 prov 沒 chunk_id，citation 用 prov 補不到，因此這裡保守：直接從 cache item prov_dict 讀 chunk_id
+                # 我們用「從 cache 重建一份簡化 hints」來保證 citation 完整：
+                hint_lines = []
+                starts = kg.find_nodes_in_query(q, max_n=2)
+                if starts:
+                    # 只做 BFS，不做 entity linking
+                    for s in starts:
+                        for u, v, k, data in nx.edge_bfs(kg.g, s):
+                            rel = data.get("relation")
+                            prov = data.get("prov") or {}
+                            title = prov.get("title", u"Unknown")
+                            page = prov.get("page", "-")
+                            chunk_id = prov.get("chunk_id", "")  # 可能沒有
+                            if not chunk_id:
+                                # 嘗試從 lx_cache 找到含 u/r/v 的那筆
+                                for ch in target_chunks:
+                                    cached = st.session_state.lx_cache.get(ch.chunk_id, [])
+                                    for item in cached:
+                                        if item.get("s") == u and norm_rel(item.get("r", "")) == rel and item.get("o") == v:
+                                            chunk_id = ch.chunk_id
+                                            title = ch.title
+                                            page = ch.page if ch.page is not None else "-"
+                                            break
+                                    if chunk_id:
+                                        break
+                            citation = f"[{title} p{page} | {chunk_id if chunk_id else 'unknown'}]"
+                            hint_lines.append(f"- {u} --[{rel}]--> {v} {citation}")
+                            if len(hint_lines) >= 18:
+                                break
+                        if len(hint_lines) >= 18:
+                            break
+                kg_hints = "【KG 線索】\n" + "\n".join(hint_lines) if hint_lines else ""
+
+                set_step("KG_EXTRACT", "✅ OK", time.perf_counter() - tkg, note=f"chunks={len(target_chunks)}, new_edges≈{new_edges}")
+            except Exception as e:
+                set_step("KG_EXTRACT", "❌ FAIL", time.perf_counter() - tkg, note=str(e))
+                kg_hints = ""
+
+        # final context
+        context = "\n\n".join([p for p in [kg_hints, base_context] if p.strip()])
         final_context = context
 
+        # GENERATE + CHECK
         for gen_round in range(max_generate_retries + 1):
             t3 = time.perf_counter()
             st.markdown(f"### GENERATE（round {gen_round}）")
@@ -987,8 +1127,8 @@ def run_chat_workflow_with_ui(
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="研究報告助手（最終完整版）", layout="wide")
-st.title("研究報告助手（最終完整版）")
+st.set_page_config(page_title="研究報告助手（Lazy KG）", layout="wide")
+st.title("研究報告助手（Lazy KG：只有需要時才跑 LangExtract）")
 
 OPENAI_API_KEY = get_openai_api_key()
 client = get_client(OPENAI_API_KEY)
@@ -1001,8 +1141,6 @@ if "file_bytes" not in st.session_state:
     st.session_state.file_bytes: Dict[str, bytes] = {}
 if "store" not in st.session_state:
     st.session_state.store: Optional[FaissStore] = None
-if "kg" not in st.session_state:
-    st.session_state.kg = KnowledgeGraph()
 if "processed_keys" not in st.session_state:
     st.session_state.processed_keys = set()  # {(sha1, use_ocr)}
 if "default_outputs_cache" not in st.session_state:
@@ -1011,6 +1149,9 @@ if "report_key_by_title" not in st.session_state:
     st.session_state.report_key_by_title = {}
 if "chat_history" not in st.session_state:
     st.session_state.chat_history: List[Dict[str, Any]] = []
+if "lx_cache" not in st.session_state:
+    st.session_state.lx_cache = {}  # chunk_id -> extracted items (edges/claims)
+
 
 def push_default_outputs_to_chat(default_outputs: Dict[str, Dict[str, str]]):
     st.session_state.chat_history.append({
@@ -1045,10 +1186,19 @@ def render_chat_message(msg: Dict[str, Any]):
 
 
 # =========================
-# ✅ 文件管理：全部包在 popover（寬度用 content 比較美）
+# 文件管理（全部在 popover）
 # =========================
 with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="content"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
+
+    kg_mode = st.radio(
+        "Knowledge Graph（影響 Chat 時是否會 Lazy 跑 LangExtract）",
+        options=["AUTO", "OFF", "FORCE"],
+        index=0,
+        horizontal=True,
+        help="AUTO：偵測到因果/傳導/規則/彙總等問題才跑；OFF：永不跑；FORCE：每次問答都跑（慢）",
+        key="kg_mode",
+    )
 
     up = st.file_uploader(
         "上傳文件",
@@ -1067,7 +1217,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
             ext = os.path.splitext(f.name)[1].lower()
             fid = str(uuid.uuid4())[:10]
             sig = sha1_bytes(data)
-
             st.session_state.file_bytes[fid] = data
 
             pages = None
@@ -1111,7 +1260,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
     if not st.session_state.file_rows:
         st.info("尚未上傳文件。")
     else:
-        # 自畫表格：窄 popover 也好看
         header_cols = st.columns([1, 4, 1, 1, 1, 1])
         header_cols[0].markdown("**OCR**")
         header_cols[1].markdown("**檔名**")
@@ -1123,7 +1271,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
         for idx, r in enumerate(st.session_state.file_rows):
             cols = st.columns([1, 4, 1, 1, 1, 1])
 
-            # OCR checkbox（圖片固定 True；txt 固定 False）
             if r.ext in (".png", ".jpg", ".jpeg"):
                 st.session_state.file_rows[idx].use_ocr = True
                 cols[0].checkbox(" ", value=True, key=f"ocr_{idx}", disabled=True)
@@ -1134,7 +1281,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
                 val = cols[0].checkbox(" ", value=bool(r.use_ocr), key=f"ocr_{idx}")
                 st.session_state.file_rows[idx].use_ocr = bool(val)
 
-            # 檔名截斷 + badge tooltip 顯示完整檔名
             short = truncate_filename(r.name, 30)
             with cols[1]:
                 st.markdown(short)
@@ -1146,20 +1292,25 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
             cols[5].markdown("OCR" if r.likely_scanned else "")
 
         st.divider()
-        b1, b2 = st.columns([1, 1])
+        b1, b2, b3 = st.columns([1, 1, 1])
         build_btn = b1.button("🚀 建立索引 + 預設輸出", type="primary", width="stretch")
         clear_btn = b2.button("🧹 清空全部", width="stretch")
+        clear_lx_cache_btn = b3.button("🧽 清 LangExtract 快取", width="stretch")
 
         if clear_btn:
             st.session_state.file_rows = []
             st.session_state.file_bytes = {}
             st.session_state.store = None
-            st.session_state.kg = KnowledgeGraph()
             st.session_state.processed_keys = set()
             st.session_state.default_outputs_cache = {}
             st.session_state.report_key_by_title = {}
             st.session_state.chat_history = []
+            st.session_state.lx_cache = {}
             st.rerun()
+
+        if clear_lx_cache_btn:
+            st.session_state.lx_cache = {}
+            st.success("已清除 LangExtract 快取。")
 
         if build_btn:
             need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
@@ -1167,29 +1318,24 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
                 st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf，再重試。")
                 st.stop()
 
-            # 1) 增量索引
-            with st.status("建索引中（增量 + 并行 + 大批次 embeddings）...", expanded=True) as s:
+            # 1) 建索引（不跑 LangExtract）
+            with st.status("建索引中（增量：OCR + embeddings；不做 LangExtract）...", expanded=True) as s:
                 t0 = time.perf_counter()
-                store, kg, stats, processed_keys, new_titles = build_indices_incremental(
+                store, stats, processed_keys, new_titles = build_indices_incremental_no_kg(
                     client=client,
-                    api_key=api_key,
                     file_rows=st.session_state.file_rows,
                     file_bytes_map=st.session_state.file_bytes,
                     store=st.session_state.store,
-                    kg=st.session_state.kg,
                     processed_keys=st.session_state.processed_keys,
                 )
                 st.session_state.store = store
-                st.session_state.kg = kg
                 st.session_state.processed_keys = processed_keys
                 s.write(f"新增報告數：{stats['new_reports']}")
                 s.write(f"新增 chunks：{stats['new_chunks']}")
-                s.write(f"KG nodes={stats['kg_nodes']} edges={stats['kg_edges']}")
                 s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
                 s.update(state="complete")
 
-            # 2) 預設輸出：只跑新/變更，且一次生成三份
-            # report_key = f"{file_sig}:{use_ocr}"
+            # 2) 預設輸出：只跑新/變更；一次生成三份
             titles_now = []
             title_to_key = {}
             for r in st.session_state.file_rows:
@@ -1226,7 +1372,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
                         }
                     s2.update(state="complete")
 
-            # 3) 組合目前存在的 titles 的輸出（快取）
+            # 3) 推送到 chat（本次存在的報告）
             default_outputs = {}
             for title in sorted(set(titles_now)):
                 cached = st.session_state.default_outputs_cache.get(title)
@@ -1248,13 +1394,13 @@ if st.session_state.store is None:
 else:
     st.success(
         f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)} / "
-        f"KG nodes={st.session_state.kg.g.number_of_nodes()} edges={st.session_state.kg.g.number_of_edges()}"
+        f"LangExtract快取chunks={len(st.session_state.lx_cache)}"
     )
 
 st.divider()
 
 # Chat 主畫面
-st.subheader("Chat（Workflow + 引用 badges）")
+st.subheader("Chat（需要時才跑 LangExtract/KG）")
 
 for msg in st.session_state.chat_history:
     render_chat_message(msg)
@@ -1268,11 +1414,13 @@ if prompt:
     render_chat_message(st.session_state.chat_history[-1])
 
     with st.chat_message("assistant"):
-        with st.status("Workflow：RETRIEVE → GRADE → TRANSFORM → GENERATE → CHECK", expanded=True) as status:
+        with st.status("Workflow：RETRIEVE → GRADE → (必要時) KG_EXTRACT → TRANSFORM → GENERATE → CHECK", expanded=True) as status:
             result = run_chat_workflow_with_ui(
                 client=client,
+                api_key=api_key,
                 store=st.session_state.store,
                 question=prompt,
+                kg_mode=st.session_state.get("kg_mode", "AUTO"),
                 max_query_rewrites=2,
                 max_generate_retries=2,
                 top_k=10,
@@ -1293,5 +1441,4 @@ if prompt:
             st.markdown("### Context（節錄）")
             st.text((result.get("context", "") or "")[:12000])
 
-    # 存回 history（這裡存純文字即可；重畫時也能 badge）
     st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": result["final_answer"]})
