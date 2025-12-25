@@ -48,6 +48,8 @@ pydub==0.25.1
 openpyxl
 langchain-pymupdf4llm
 unstructured[all-docs]
+langextract[openai]
+streamlit-agraph
 
 # Web page processing tools
 bs4
