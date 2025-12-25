@@ -1138,7 +1138,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
             short = truncate_filename(r.name, 30)
             with cols[1]:
                 st.markdown(short)
-                st.badge("Full name", icon=":material_info:", color="gray", help=r.name)
+                st.badge("Full name", icon=":material/info:", color="gray", help=r.name)
 
             cols[2].markdown(str(r.pages if r.pages is not None else "-"))
             cols[3].markdown(str(r.extracted_chars))
