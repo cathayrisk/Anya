@@ -4,22 +4,23 @@
 研究報告助手（FAISS + OpenAI embeddings + LangExtract KG + Chat + Workflow UI）
 領域：總經 / 金融 / 財務 / 氣候風險 / 永續金融
 
-你要求的重點（本版已全部滿足）：
-1) 上傳文件 → 表格顯示字數/token → OCR 勾選 → 建立索引 / 清空：全部包在同一個 st.popover 裡
-2) 回答輸出：文字本體更乾淨，來源改用 st.badge 呈現（更好看）
-   - 內部仍維持嚴格引用檢查（預設輸出每個 bullet 必須有引用；Chat 清單類每 bullet 引用；一般回答每段至少 1 引用）
-3) Chat workflow：UI 顯示 RETRIEVE / GRADE / TRANSFORM / GENERATE / CHECK
-   - 每一步顯示 ✅/❌ + 耗時（秒）
-   - 顯示 query history
-   - relevant chunks 表格 + expander 展開全文
-   - hallucination/answer yes-no grading + retry
+重點：
+- 文件管理（上傳/清單/OCR/建索引/清空）全部在 popover（width="content"）
+- 文件清單：使用OCR 最前；檔名截斷；完整檔名用 st.badge(help=...) tooltip；不顯示 file_id
+- 建索引加速：
+  1) PDF 文字抽取優先 PyMuPDF（若有）
+  2) LangExtract 逐頁並行（ThreadPoolExecutor）
+  3) OCR 逐頁小並行（避免 rate limit）
+  4) embeddings 大批次（減少 round-trip）
+  5) 增量索引（只處理新檔或 OCR 設定變更）
+- 預設輸出加速：
+  - 只對「新/變更」報告產出
+  - 一次 LLM 產三份（SUMMARY/CLAIMS/CHAIN），並嚴格檢查每個 bullet 都要有引用
+- Chat：Workflow UI（RETRIEVE/GRADE/TRANSFORM/GENERATE/CHECK）+ ✅/❌ + 秒數 + relevant chunk 展開全文
+- 呈現：引用用 st.badge 顯示（文字本體更乾淨），但內部仍用引用字串做嚴格檢查
 
-環境變數：
-- OPENAI_API_KEY 必填
-
-依賴：
-streamlit, openai, langextract[openai], pypdf, numpy, faiss-cpu, networkx
-OCR 額外：pymupdf（fitz）
+環境：
+- OPENAI_API_KEY 或 st.secrets["OPENAI_KEY"] 擇一
 """
 
 from __future__ import annotations
@@ -30,8 +31,10 @@ import io
 import uuid
 import math
 import time
+import hashlib
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import numpy as np
@@ -59,7 +62,15 @@ OCR_MODEL = "gpt-4.1-mini"  # 若你確認 gpt-5.2 支援 vision，可改成 gpt
 
 
 # =========================
-# 小工具：字數/token 估算、文字清理
+# 效能參數（可調）
+# =========================
+EMBED_BATCH_SIZE = 256
+LX_MAX_WORKERS = 6
+OCR_MAX_WORKERS = 2
+
+
+# =========================
+# 小工具
 # =========================
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
@@ -83,12 +94,31 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
         i = max(0, j - overlap)
     return out
 
+def sha1_bytes(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()
+
+def truncate_filename(name: str, max_len: int = 30) -> str:
+    if len(name) <= max_len:
+        return name
+    base, ext = os.path.splitext(name)
+    keep = max(10, max_len - len(ext) - 1)
+    return f"{base[:keep]}…{ext}"
+
 
 # =========================
 # OpenAI helpers
 # =========================
-def get_client() -> OpenAI:
-    return OpenAI()
+def get_openai_api_key() -> str:
+    if "OPENAI_KEY" in st.secrets and st.secrets["OPENAI_KEY"]:
+        return st.secrets["OPENAI_KEY"]
+    if os.environ.get("OPENAI_API_KEY"):
+        return os.environ["OPENAI_API_KEY"]
+    if os.environ.get("OPENAI_KEY"):
+        return os.environ["OPENAI_KEY"]
+    raise RuntimeError("Missing OpenAI API key. Set st.secrets['OPENAI_KEY'] or env OPENAI_API_KEY.")
+
+def get_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key)
 
 def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
     resp = client.embeddings.create(
@@ -109,9 +139,7 @@ def gen_text(client: OpenAI, system: str, user: str, model: str = LLM_MODEL) -> 
             {"role": "user", "content": user},
         ],
     )
-    if getattr(resp, "output_text", None):
-        return resp.output_text
-    return str(resp)
+    return resp.output_text if getattr(resp, "output_text", None) else str(resp)
 
 def gen_yesno(client: OpenAI, system: str, user: str) -> str:
     out = gen_text(
@@ -130,36 +158,50 @@ def gen_yesno(client: OpenAI, system: str, user: str) -> str:
 
 
 # =========================
-# 檔案讀取 / 掃描偵測 / OCR
+# 檔案 / OCR
 # =========================
 @dataclass
 class FileRow:
-    file_id: str
+    file_id: str          # 內部用
+    file_sig: str         # sha1(bytes)
     name: str
     ext: str
     bytes_len: int
-
     pages: Optional[int]
     extracted_chars: int
     token_est: int
-
     blank_pages: Optional[int]
     blank_ratio: Optional[float]
-
     likely_scanned: bool
     use_ocr: bool
 
-
-def extract_pdf_text_pages(pdf_bytes: bytes) -> List[Tuple[int, str]]:
+def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> List[Tuple[int, str]]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    pages = []
+    out = []
     for i, p in enumerate(reader.pages):
         try:
             t = p.extract_text() or ""
         except Exception:
             t = ""
-        pages.append((i + 1, norm_space(t)))
-    return pages
+        out.append((i + 1, norm_space(t)))
+    return out
+
+def extract_pdf_text_pages_pymupdf(pdf_bytes: bytes) -> List[Tuple[int, str]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    for i in range(doc.page_count):
+        page = doc.load_page(i)
+        t = page.get_text("text") or ""
+        out.append((i + 1, norm_space(t)))
+    return out
+
+def extract_pdf_text_pages(pdf_bytes: bytes) -> List[Tuple[int, str]]:
+    if HAS_PYMUPDF:
+        try:
+            return extract_pdf_text_pages_pymupdf(pdf_bytes)
+        except Exception:
+            return extract_pdf_text_pages_pypdf(pdf_bytes)
+    return extract_pdf_text_pages_pypdf(pdf_bytes)
 
 def analyze_pdf_text_quality(pdf_pages: List[Tuple[int, str]], min_chars_per_page: int = 40) -> Tuple[int, int, float]:
     if not pdf_pages:
@@ -177,9 +219,7 @@ def should_suggest_ocr(ext: str, pages: Optional[int], extracted_chars: int, bla
     if blank_ratio is not None and blank_ratio >= 0.6:
         return True
     avg = extracted_chars / max(1, pages)
-    if avg < 120:
-        return True
-    return False
+    return avg < 120
 
 def ocr_image_bytes_with_openai(client: OpenAI, image_bytes: bytes, model: str = OCR_MODEL) -> str:
     system = "你是一個OCR工具。只輸出可見文字與表格內容（若有表格用 Markdown 表格）。中文請用繁體中文。不要加評論。"
@@ -196,26 +236,36 @@ def ocr_image_bytes_with_openai(client: OpenAI, image_bytes: bytes, model: str =
     )
     return resp.output_text if getattr(resp, "output_text", None) else str(resp)
 
-def ocr_pdf_pages_with_openai(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> List[Tuple[int, str]]:
+def ocr_pdf_pages_with_openai_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> List[Tuple[int, str]]:
     if not HAS_PYMUPDF:
         raise RuntimeError("未安裝 pymupdf（fitz），無法做 PDF OCR。請 pip install pymupdf")
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out: List[Tuple[int, str]] = []
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
 
-    for i in range(doc.page_count):
+    def render_page(i: int) -> Tuple[int, bytes]:
         page = doc.load_page(i)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes("png")
-        text = norm_space(ocr_image_bytes_with_openai(client, img_bytes))
-        out.append((i + 1, text))
-    return out
+        return i + 1, pix.tobytes("png")
+
+    page_imgs = [render_page(i) for i in range(doc.page_count)]
+
+    results: Dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as ex:
+        futs = {ex.submit(ocr_image_bytes_with_openai, client, img_bytes): page_no for page_no, img_bytes in page_imgs}
+        for fut in as_completed(futs):
+            page_no = futs[fut]
+            try:
+                results[page_no] = norm_space(fut.result())
+            except Exception:
+                results[page_no] = ""
+
+    return [(p, results.get(p, "")) for p, _ in page_imgs]
 
 
 # =========================
-# FAISS store
+# FAISS
 # =========================
 @dataclass
 class Chunk:
@@ -234,7 +284,7 @@ class FaissStore:
         self.index.add(vecs)
         self.chunks.extend(chunks)
 
-    def search(self, qvec: np.ndarray, k: int = 6) -> List[Tuple[float, Chunk]]:
+    def search(self, qvec: np.ndarray, k: int = 8) -> List[Tuple[float, Chunk]]:
         if self.index.ntotal == 0:
             return []
         scores, idx = self.index.search(qvec.astype(np.float32), k)
@@ -247,7 +297,7 @@ class FaissStore:
 
 
 # =========================
-# KG（NetworkX MultiDiGraph）：保留 provenance
+# KG
 # =========================
 @dataclass
 class Prov:
@@ -292,18 +342,11 @@ class KnowledgeGraph:
             return
         if r not in ALLOWED_RELATIONS:
             return
-
         if s not in self.g:
             self.g.add_node(s, label=s)
         if o not in self.g:
             self.g.add_node(o, label=o)
-
-        self.g.add_edge(
-            s, o, key=str(uuid.uuid4()),
-            relation=r,
-            prov=asdict(prov),
-            attrs=attrs or {},
-        )
+        self.g.add_edge(s, o, key=str(uuid.uuid4()), relation=r, prov=asdict(prov), attrs=attrs or {})
 
     def find_nodes_in_query(self, query: str, max_n: int = 2) -> List[str]:
         q = norm_space(query)
@@ -325,7 +368,7 @@ class KnowledgeGraph:
 
 
 # =========================
-# LangExtract：只抽 claim / relation
+# LangExtract
 # =========================
 def lx_prompt() -> str:
     return (
@@ -356,38 +399,9 @@ def lx_examples() -> List[lx.data.ExampleData]:
                 extraction_text="as energy prices fall",
                 attributes={"subject": "energy prices", "relation": "DECREASES", "object": "US CPI inflation", "time": "2025Q2"},
             ),
-            lx.data.Extraction(
-                extraction_class="relation",
-                extraction_text="keep policy restrictive through mid-2025",
-                attributes={"subject": "The Fed", "relation": "TIGHTENS", "object": "policy stance", "time": "mid-2025"},
-            ),
         ],
     )
-    t2 = (
-        "Under the NGFS Net Zero 2050 scenario, transition risk increases for the energy sector, "
-        "while physical risk remains elevated in coastal real estate."
-    )
-    ex2 = lx.data.ExampleData(
-        text=t2,
-        extractions=[
-            lx.data.Extraction(
-                extraction_class="relation",
-                extraction_text="Under the NGFS Net Zero 2050 scenario",
-                attributes={"subject": "Report", "relation": "ASSUMES_SCENARIO", "object": "NGFS Net Zero 2050"},
-            ),
-            lx.data.Extraction(
-                extraction_class="relation",
-                extraction_text="transition risk increases for the energy sector",
-                attributes={"subject": "transition risk", "relation": "AFFECTS", "object": "energy sector", "polarity": "increase"},
-            ),
-            lx.data.Extraction(
-                extraction_class="relation",
-                extraction_text="physical risk remains elevated in coastal real estate",
-                attributes={"subject": "physical risk", "relation": "AFFECTS", "object": "coastal real estate", "polarity": "high"},
-            ),
-        ],
-    )
-    return [ex1, ex2]
+    return [ex1]
 
 def run_langextract(text: str, api_key: str) -> lx.data.AnnotatedDocument:
     return lx.extract(
@@ -407,9 +421,8 @@ def run_langextract(text: str, api_key: str) -> lx.data.AnnotatedDocument:
 # =========================
 # 引用檢查 + badge 呈現
 # =========================
-CIT_RE = re.compile(r"\[[^\]]+\|\s*[^\]]+\]")  # [報告 p頁 | chunk_id]
+CIT_RE = re.compile(r"\[[^\]]+\|\s*[^\]]+\]")  # [title pX | chunk_id]
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
-# 解析引用：[{title} p{page} | {chunk_id}]
 CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\|\s*([A-Za-z0-9_\-]+)\]")
 
 def bullets_all_have_citations(md: str) -> Tuple[bool, List[str]]:
@@ -417,9 +430,8 @@ def bullets_all_have_citations(md: str) -> Tuple[bool, List[str]]:
     lines = (md or "").splitlines()
     has_bullet = any(BULLET_RE.match(l) for l in lines)
     for line in lines:
-        if BULLET_RE.match(line):
-            if not CIT_RE.search(line):
-                bad_lines.append(line)
+        if BULLET_RE.match(line) and not CIT_RE.search(line):
+            bad_lines.append(line)
     if not has_bullet:
         return False, ["（沒有產出任何 bullet 條列）"]
     return (len(bad_lines) == 0), bad_lines
@@ -437,40 +449,31 @@ def paragraphs_all_have_citations(md: str) -> Tuple[bool, List[str]]:
 def generate_with_bullet_citation_guard(client: OpenAI, user: str, max_retries: int = 2) -> str:
     system = (
         "你是嚴謹的研究助理。\n"
-        "硬性規則：\n"
-        "1) 只能根據我提供的資料回答，不可腦補。\n"
-        "2) 你必須輸出「純 bullet 條列」（每行以 - 開頭）。不要輸出段落。\n"
-        "3) 每一個 bullet 的句尾都必須附引用，格式固定：[報告 p頁 | chunk_id]\n"
-        "4) 若你無法替某 bullet 找到引用，請不要寫那個 bullet，改寫或刪掉。\n"
+        "規則：只能根據資料回答，不可腦補；輸出純 bullet（每行 - 開頭）；每個 bullet 句尾必須有引用 [報告 p頁 | chunk_id]。\n"
     )
-
     last = ""
     for _ in range(max_retries + 1):
         out = gen_text(client, system, user, model=LLM_MODEL)
-        ok, _bad = bullets_all_have_citations(out)
+        ok, _ = bullets_all_have_citations(out)
         if ok:
             return out
         last = out
-        user = user + "\n\n【強制修正】請重新輸出純 bullet，並保證每個 bullet 句尾都有 [報告 p頁 | chunk_id]。"
+        user += "\n\n【強制修正】重寫：每個 bullet 句尾都要有 [報告 p頁 | chunk_id]。"
     return last
 
 def generate_with_paragraph_citation_guard(client: OpenAI, user: str, max_retries: int = 2) -> str:
     system = (
         "你是嚴謹的研究助理。\n"
-        "硬性規則：\n"
-        "1) 只能根據我提供的 Context 回答，不可腦補。\n"
-        "2) 請用 2~4 段回答。\n"
-        "3) 每一段至少要有 1 個引用，格式固定：[報告 p頁 | chunk_id]\n"
-        "4) 若做不到引用，請刪掉那段並改寫。\n"
+        "規則：只能根據 Context 回答，不可腦補；2~4 段；每段至少 1 個引用 [報告 p頁 | chunk_id]。\n"
     )
     last = ""
     for _ in range(max_retries + 1):
         out = gen_text(client, system, user, model=LLM_MODEL)
-        ok, _bad = paragraphs_all_have_citations(out)
+        ok, _ = paragraphs_all_have_citations(out)
         if ok:
             return out
         last = out
-        user = user + "\n\n【強制修正】上一版有段落缺引用。請確保每段至少一個 [報告 p頁 | chunk_id]。"
+        user += "\n\n【強制修正】重寫：每段至少 1 個 [報告 p頁 | chunk_id]。"
     return last
 
 def _parse_citations(cits: List[str]) -> List[Dict[str, str]]:
@@ -479,14 +482,11 @@ def _parse_citations(cits: List[str]) -> List[Dict[str, str]]:
         m = CIT_PARSE_RE.search(c)
         if not m:
             parsed.append({"title": "來源", "page": "-", "chunk_id": c.strip("[]")})
-            continue
-        parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip(), "chunk_id": m.group(3).strip()})
+        else:
+            parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip(), "chunk_id": m.group(3).strip()})
     return parsed
 
 def _render_badges(parsed: List[Dict[str, str]], color: str = "blue", icon: Optional[str] = ":material_bookmark:"):
-    """
-    將多個 badge 盡量排成同一列（每列最多 4 個）
-    """
     if not parsed:
         return
     per_row = 4
@@ -503,12 +503,6 @@ def _render_badges(parsed: List[Dict[str, str]], color: str = "blue", icon: Opti
                 st.badge(label, icon=icon, color=color, help=f"{title} p{page} | {chunk_id}")
 
 def render_bullets_with_badges(md_bullets: str, badge_color: str = "blue"):
-    """
-    md_bullets: 內容是多行以 '-' 開頭的 bullet，且行尾含引用 [title pX | chunk_id]
-    這裡會：
-      - 顯示乾淨 bullet（移除引用）
-      - 在 bullet 下方用 st.badge 顯示來源
-    """
     lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
     for line in lines:
         if not BULLET_RE.match(line):
@@ -516,13 +510,9 @@ def render_bullets_with_badges(md_bullets: str, badge_color: str = "blue"):
         cits = CIT_RE.findall(line)
         clean = CIT_RE.sub("", line).strip()
         st.markdown(clean)
-        parsed = _parse_citations(cits)
-        _render_badges(parsed, color=badge_color)
+        _render_badges(_parse_citations(cits), color=badge_color)
 
 def render_text_with_badges(md_text: str, badge_color: str = "gray"):
-    """
-    一般段落回答：保持段落文字乾淨，把所有引用收集成 badges 放在最後。
-    """
     cits = CIT_RE.findall(md_text or "")
     clean = CIT_RE.sub("", md_text or "").strip()
     st.markdown(clean if clean else "（無內容）")
@@ -533,42 +523,109 @@ def render_text_with_badges(md_text: str, badge_color: str = "gray"):
 
 
 # =========================
-# 建索引：FAISS + KG
+# ✅ 一次生成三份預設輸出（SUMMARY/CLAIMS/CHAIN）
 # =========================
-def build_indices(
+def _split_default_bundle(text: str) -> Dict[str, str]:
+    t = (text or "").strip()
+    pattern = re.compile(
+        r"###\s*SUMMARY\s*(.*?)###\s*CLAIMS\s*(.*?)###\s*CHAIN\s*(.*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    m = pattern.search(t)
+    if not m:
+        return {"summary": "", "claims": "", "chain": ""}
+    return {"summary": m.group(1).strip(), "claims": m.group(2).strip(), "chain": m.group(3).strip()}
+
+def generate_default_outputs_bundle_with_guard(client: OpenAI, title: str, ctx: str, max_retries: int = 2) -> Dict[str, str]:
+    system = (
+        "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
+        "硬性規則：\n"
+        "1) 你必須輸出三個區塊，且順序/標題固定：### SUMMARY、### CLAIMS、### CHAIN。\n"
+        "2) 每個區塊都必須是純 bullet（每行以 - 開頭），不要段落。\n"
+        "3) 每個 bullet 句尾必須附引用，格式固定：[報告 p頁 | chunk_id]\n"
+    )
+
+    base_user = (
+        f"請針對報告《{title}》一次輸出三份內容：\n"
+        f"- SUMMARY：8~14 bullets（結論/預測/假設/風險/限制/市場含意）\n"
+        f"- CLAIMS：8~14 bullets（可驗證主張）\n"
+        f"- CHAIN：6~12 bullets（傳導：驅動→中介→結論→風險）\n\n"
+        f"資料：\n{ctx}\n\n"
+        f"現在請輸出：\n"
+        f"### SUMMARY\n"
+        f"(bullets...)\n"
+        f"### CLAIMS\n"
+        f"(bullets...)\n"
+        f"### CHAIN\n"
+        f"(bullets...)\n"
+    )
+
+    user = base_user
+    for _ in range(max_retries + 1):
+        out = gen_text(client, system, user, model=LLM_MODEL)
+        parts = _split_default_bundle(out)
+
+        ok_s, _ = bullets_all_have_citations(parts.get("summary", ""))
+        ok_c, _ = bullets_all_have_citations(parts.get("claims", ""))
+        ok_h, _ = bullets_all_have_citations(parts.get("chain", ""))
+
+        if ok_s and ok_c and ok_h:
+            return {"summary": parts["summary"], "claims": parts["claims"], "chain": parts["chain"]}
+
+        user = base_user + "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告 p頁 | chunk_id]。"
+
+    return {"summary": "", "claims": "", "chain": ""}
+
+
+# =========================
+# 索引（增量 + 并行 + 批次）
+# =========================
+def build_indices_incremental(
     client: OpenAI,
     api_key: str,
     file_rows: List[FileRow],
     file_bytes_map: Dict[str, bytes],
+    store: Optional[FaissStore],
+    kg: KnowledgeGraph,
+    processed_keys: set,
     chunk_size: int = 900,
     overlap: int = 150,
-) -> Tuple[FaissStore, KnowledgeGraph, Dict[str, Any]]:
-    dim = embed_texts(client, ["dim_probe"]).shape[1]
-    store = FaissStore(dim)
-    kg = KnowledgeGraph()
+) -> Tuple[FaissStore, KnowledgeGraph, Dict[str, Any], set, List[str]]:
+    if store is None:
+        dim = embed_texts(client, ["dim_probe"]).shape[1]
+        store = FaissStore(dim)
 
-    stats = {"reports": 0, "chunks": 0, "kg_nodes": 0, "kg_edges": 0}
+    stats = {"new_reports": 0, "new_chunks": 0, "kg_nodes": 0, "kg_edges": 0}
+    new_titles: List[str] = []
 
-    all_chunks: List[Chunk] = []
-    all_texts: List[str] = []
+    new_chunks: List[Chunk] = []
+    new_texts: List[str] = []
 
-    for row in file_rows:
+    # to_process: (sha1, use_ocr) 沒處理過才跑
+    to_process = []
+    for r in file_rows:
+        key = (r.file_sig, bool(r.use_ocr))
+        if key not in processed_keys:
+            to_process.append(r)
+
+    for row in to_process:
         data = file_bytes_map[row.file_id]
         report_id = row.file_id
         title = os.path.splitext(row.name)[0]
-        stats["reports"] += 1
+        stats["new_reports"] += 1
+        new_titles.append(title)
 
-        pages: List[Tuple[Optional[int], str]] = []
+        # pages
         if row.ext == ".pdf":
             if row.use_ocr:
-                pages = [(p, t) for p, t in ocr_pdf_pages_with_openai(client, data)]
+                pages = ocr_pdf_pages_with_openai_parallel(client, data)
             else:
-                pages = [(p, t) for p, t in extract_pdf_text_pages(data)]
+                pages = extract_pdf_text_pages(data)
         elif row.ext == ".txt":
             pages = [(None, norm_space(data.decode("utf-8", errors="ignore")))]
         elif row.ext in (".png", ".jpg", ".jpeg"):
-            text = norm_space(ocr_image_bytes_with_openai(client, data))
-            pages = [(None, text)]
+            txt = norm_space(ocr_image_bytes_with_openai(client, data))
+            pages = [(None, txt)]
         else:
             pages = [(None, "")]
 
@@ -578,23 +635,15 @@ def build_indices(
                 continue
             for i, ch in enumerate(chunk_text(page_text, chunk_size=chunk_size, overlap=overlap)):
                 cid = f"{report_id}_p{page_no if page_no else 'na'}_c{i}"
-                all_chunks.append(
-                    Chunk(
-                        chunk_id=cid,
-                        report_id=report_id,
-                        title=title,
-                        page=page_no if isinstance(page_no, int) else None,
-                        text=ch,
-                    )
-                )
-                all_texts.append(ch)
+                new_chunks.append(Chunk(cid, report_id, title, page_no if isinstance(page_no, int) else None, ch))
+                new_texts.append(ch)
 
-        # LangExtract -> KG（page 級）
-        for page_no, page_text in pages:
+        # LangExtract：逐頁并行
+        def lx_one_page(page_no: Optional[int], page_text: str):
             if not page_text:
-                continue
+                return []
             ann = run_langextract(page_text, api_key=api_key)
-
+            out_edges = []
             for e in ann.extractions:
                 cls = getattr(e, "extraction_class", "")
                 etext = getattr(e, "extraction_text", "")
@@ -619,28 +668,40 @@ def build_indices(
                     s = attrs.get("subject", "")
                     r = attrs.get("relation", "")
                     o = attrs.get("object", "")
-                    kg.add_edge(s=s, r=r, o=o, prov=prov, attrs=attrs)
+                    out_edges.append((s, r, o, prov, attrs))
                 elif cls == "claim":
                     claim_node = f"CLAIM: {norm_space(etext)}"
-                    kg.add_edge(s=title, r="MENTIONS", o=claim_node, prov=prov, attrs=attrs)
+                    out_edges.append((title, "MENTIONS", claim_node, prov, attrs))
+            return out_edges
 
-    # embed chunks
-    if all_texts:
+        with ThreadPoolExecutor(max_workers=LX_MAX_WORKERS) as ex:
+            futs = {ex.submit(lx_one_page, pno, ptxt): pno for pno, ptxt in pages}
+            for fut in as_completed(futs):
+                try:
+                    edges = fut.result()
+                except Exception:
+                    edges = []
+                for s, r, o, prov, attrs in edges:
+                    kg.add_edge(s=s, r=r, o=o, prov=prov, attrs=attrs)
+
+        processed_keys.add((row.file_sig, bool(row.use_ocr)))
+
+    # embeddings：大批次
+    if new_texts:
         vecs_list = []
-        bs = 64
-        for i in range(0, len(all_texts), bs):
-            vecs_list.append(embed_texts(client, all_texts[i:i+bs]))
+        for i in range(0, len(new_texts), EMBED_BATCH_SIZE):
+            vecs_list.append(embed_texts(client, new_texts[i:i+EMBED_BATCH_SIZE]))
         vecs = np.vstack(vecs_list)
-        store.add(vecs, all_chunks)
+        store.add(vecs, new_chunks)
 
-    stats["chunks"] = len(store.chunks)
+    stats["new_chunks"] = len(new_chunks)
     stats["kg_nodes"] = kg.g.number_of_nodes()
     stats["kg_edges"] = kg.g.number_of_edges()
-    return store, kg, stats
+    return store, kg, stats, processed_keys, sorted(set(new_titles))
 
 
 # =========================
-# 預設輸出（摘要/核心主張/推論鏈）→ 推送到 Chat（注意：Chat 內仍保留原始含引用的版本，渲染時改 badge）
+# 預設輸出：挑選 chunk context
 # =========================
 def pick_chunks_for_report(all_chunks: List[Chunk], title: str, max_n: int = 12) -> List[Chunk]:
     kw = re.compile(r"(conclusion|outlook|risk|implication|forecast|scenario|inflation|rate|credit|spread|emission|transition|physical)", re.I)
@@ -665,119 +726,52 @@ def render_chunks_with_ids(chunks: List[Chunk], max_chars_each: int = 900) -> st
         parts.append(head + "\n" + c.text[:max_chars_each])
     return "\n\n".join(parts)
 
-def make_default_outputs_for_report(client: OpenAI, all_chunks: List[Chunk], title: str) -> Dict[str, str]:
-    reps = pick_chunks_for_report(all_chunks, title, max_n=12)
-    ctx = render_chunks_with_ids(reps)
-
-    summary_user = (
-        f"請針對報告《{title}》輸出「摘要」：\n"
-        f"- 請輸出 8~14 個 bullet\n"
-        f"- 每個 bullet 都要包含一個具體資訊點（結論/預測/假設/風險/情境/限制/市場含意）\n"
-        f"- 每個 bullet 句尾必須有引用 [報告 p頁 | chunk_id]\n\n"
-        f"資料：\n{ctx}"
-    )
-    claims_user = (
-        f"請針對報告《{title}》輸出「核心主張」：\n"
-        f"- 請輸出 8~14 個 bullet\n"
-        f"- 每個 bullet 是一條可驗證主張（含條件/情境/期間更好）\n"
-        f"- 每個 bullet 句尾必須有引用 [報告 p頁 | chunk_id]\n\n"
-        f"資料：\n{ctx}"
-    )
-    chain_user = (
-        f"請針對報告《{title}》輸出「推論鏈/傳導機制」：\n"
-        f"- 請輸出 6~12 個 bullet\n"
-        f"- 格式示例：驅動因子 → 中介變數 → 結論/市場含意 → 風險/不確定性\n"
-        f"- 每個 bullet 句尾必須有引用 [報告 p頁 | chunk_id]\n\n"
-        f"資料：\n{ctx}"
-    )
-
-    summary = generate_with_bullet_citation_guard(client, summary_user, max_retries=2)
-    claims = generate_with_bullet_citation_guard(client, claims_user, max_retries=2)
-    chain = generate_with_bullet_citation_guard(client, chain_user, max_retries=2)
-    return {"summary": summary, "claims": claims, "chain": chain}
-
 
 # =========================
-# Chat Workflow（UI：✅/❌ + 耗時 + 產物漂亮呈現）
+# Chat workflow（UI）
 # =========================
 def want_bullets(question: str) -> bool:
     return bool(re.search(r"(列出|有哪些|所有|清單|彙總|摘要|總結)", question))
 
 def grade_doc_relevance(client: OpenAI, question: str, doc_text: str) -> str:
-    system = (
-        "你是負責評估文件片段與使用者問題是否相關的評分者。"
-        "若片段含有可用來回答問題的關鍵事實或推論線索，回 yes；否則回 no。"
-        "不需要嚴格，只要排除明顯不相關。"
-    )
+    system = "你是文件相關性評分者。片段能支持回答=>yes，否則=>no。"
     user = f"Question:\n{question}\n\nDocument:\n{doc_text[:2200]}"
     return gen_yesno(client, system, user)
 
 def rewrite_question(client: OpenAI, question: str) -> str:
-    system = (
-        "你是將使用者問題改寫成更適合向量檢索的查詢語句的專家。"
-        "請保留原意，補上可檢索的關鍵字（例如：通膨、利率、殖利率曲線、信用利差、NGFS、transition risk、physical risk、WACI…）。"
-        "輸出一行改寫後的問題即可。"
-    )
+    system = "你是檢索 query 改寫者。保留原意，補上可檢索關鍵字。輸出一行改寫後問題。"
     return gen_text(client, system, question, model=LLM_MODEL).strip()
 
 def grade_hallucination(client: OpenAI, context: str, answer: str) -> str:
-    system = (
-        "你是負責判斷回答是否有被 Context 支持的評分者。"
-        "若回答的關鍵主張都能在 Context 找到支持（包含引用片段），回 yes；若有編造或超出 Context，回 no。"
-    )
+    system = "判斷回答是否被 context 支持。支持=>yes，否則=>no。"
     user = f"Context:\n{context[:9000]}\n\nAnswer:\n{answer[:4500]}"
     return gen_yesno(client, system, user)
 
 def grade_answer(client: OpenAI, question: str, answer: str) -> str:
-    system = (
-        "你是負責判斷回答是否真正回應使用者問題的評分者。"
-        "若回答有直接回覆問題、且結構清楚，回 yes；否則回 no。"
-    )
+    system = "判斷回答是否回應問題。是=>yes，否=>no。"
     user = f"Question:\n{question}\n\nAnswer:\n{answer[:4500]}"
     return gen_yesno(client, system, user)
 
-def build_retrieval_packages(
-    client: OpenAI,
-    store: FaissStore,
-    kg: KnowledgeGraph,
-    question: str,
-    top_k: int = 10,
-) -> Tuple[List[Dict[str, Any]], str]:
+def build_retrieval_packages(client: OpenAI, store: FaissStore, question: str, top_k: int = 10) -> List[Dict[str, Any]]:
     qvec = embed_texts(client, [question])
     hits = store.search(qvec, k=top_k)
-    retrieved = [{"chunk": ch, "score": score} for score, ch in hits]
+    return [{"chunk": ch, "score": score} for score, ch in hits]
 
-    vec_parts = []
-    for score, ch in hits:
-        vec_parts.append(f"[{ch.title} p{ch.page if ch.page else '-'} | {ch.chunk_id} | score={score:.3f}]\n{ch.text}")
-
-    kg_parts = []
-    starts = kg.find_nodes_in_query(question, max_n=2)
-    for s in starts:
-        edges = kg.bfs_context(s, max_edges=18)
-        for e in edges:
-            prov = e.get("prov") or {}
-            src = f"{prov.get('title','')} p{prov.get('page') if prov.get('page') else '-'}"
-            kg_parts.append(
-                f"- {e['u']} --[{e['rel']}]--> {e['v']} 〔來源：{src}〕\n"
-                f"  snippet: {str(prov.get('snippet',''))[:180]}"
-            )
-
+def build_context_from_chunks(items: List[Dict[str, Any]], top_k: int = 8) -> str:
+    items = sorted(items, key=lambda x: x["score"], reverse=True)[:top_k]
     parts = []
-    if kg_parts:
-        parts.append("【KG 線索】\n" + "\n".join(kg_parts[:24]))
-    if vec_parts:
-        parts.append("【檢索片段】\n" + "\n\n".join(vec_parts))
-
-    context = "\n\n".join(parts) if parts else "（找不到任何相關內容）"
-    return retrieved, context
+    for it in items:
+        ch: Chunk = it["chunk"]
+        parts.append(f"[{ch.title} p{ch.page if ch.page else '-'} | {ch.chunk_id}]\n{ch.text}")
+    return "\n\n".join(parts) if parts else "（找不到任何相關內容）"
 
 def generate_answer_from_context(client: OpenAI, question: str, context: str) -> str:
     if want_bullets(question):
         user = f"Context:\n{context}\n\nQuestion:\n{question}"
         return generate_with_bullet_citation_guard(client, user, max_retries=1)
     user = (
-        "請回答問題，並務必依照：結論 → 依據（引用）→ 推論/解釋（若為意義/為何/機制）。\n\n"
+        "請回答問題，依序：結論→依據（引用）→推論/解釋。\n"
+        "每段至少1個引用 [報告 p頁 | chunk_id]。\n\n"
         f"Context:\n{context}\n\nQuestion:\n{question}"
     )
     return generate_with_paragraph_citation_guard(client, user, max_retries=1)
@@ -796,7 +790,6 @@ def _step_table(step_state: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
 def run_chat_workflow_with_ui(
     client: OpenAI,
     store: FaissStore,
-    kg: KnowledgeGraph,
     question: str,
     *,
     max_query_rewrites: int = 2,
@@ -808,7 +801,6 @@ def run_chat_workflow_with_ui(
     final_context = ""
     final_answer = ""
 
-    # 即時 step summary
     step_state = {
         "RETRIEVE": {"status": "PENDING", "seconds": None, "note": ""},
         "GRADE": {"status": "PENDING", "seconds": None, "note": ""},
@@ -822,7 +814,7 @@ def run_chat_workflow_with_ui(
 
     def update_step_summary():
         step_summary_ph.markdown("#### Step Summary（✅/❌ + 耗時）")
-        step_summary_ph.dataframe(_step_table(step_state), use_container_width=True, hide_index=True)
+        step_summary_ph.dataframe(_step_table(step_state), width="stretch", hide_index=True)
 
     def set_step(name: str, status: str, seconds: Optional[float] = None, note: str = ""):
         step_state[name]["status"] = status
@@ -837,97 +829,72 @@ def run_chat_workflow_with_ui(
     q = question
 
     for rewrite_round in range(max_query_rewrites + 1):
-        # ---------- RETRIEVE ----------
+        # RETRIEVE
         t0 = time.perf_counter()
-        try:
-            retrieved, raw_context = build_retrieval_packages(client, store, kg, q, top_k=top_k)
-            set_step("RETRIEVE", "✅ OK", time.perf_counter() - t0, note=f"top_k={top_k}, got={len(retrieved)}")
-        except Exception as e:
-            set_step("RETRIEVE", "❌ FAIL", time.perf_counter() - t0, note=str(e))
-            return {
-                "final_answer": "檢索階段失敗，請查看 debug。",
-                "query_history": query_history,
-                "context": "",
-                "logs": logs + [f"[ERROR] RETRIEVE: {e}"],
-                "render_mode": "text",
-            }
+        retrieved = build_retrieval_packages(client, store, q, top_k=top_k)
+        set_step("RETRIEVE", "✅ OK", time.perf_counter() - t0, note=f"top_k={top_k}, got={len(retrieved)}")
 
         st.markdown(f"### RETRIEVE（round {rewrite_round}）")
-        retrieved_rows = []
-        for it in retrieved:
+        st.dataframe(
+            [{
+                "score": round(float(it["score"]), 4),
+                "報告": it["chunk"].title,
+                "頁": it["chunk"].page if it["chunk"].page is not None else "-",
+                "chunk_id": it["chunk"].chunk_id,
+                "preview": (it["chunk"].text[:140] + "…") if len(it["chunk"].text) > 140 else it["chunk"].text,
+            } for it in retrieved],
+            width="stretch",
+            hide_index=True,
+        )
+
+        # GRADE
+        t1 = time.perf_counter()
+        relevant: List[Dict[str, Any]] = []
+        graded_rows = []
+        prog = st.progress(0, text="grading…")
+        for i, it in enumerate(retrieved):
             ch: Chunk = it["chunk"]
-            retrieved_rows.append({
+            verdict = grade_doc_relevance(client, q, ch.text)
+            graded_rows.append({
+                "grade": verdict,
                 "score": round(float(it["score"]), 4),
                 "報告": ch.title,
                 "頁": ch.page if ch.page is not None else "-",
                 "chunk_id": ch.chunk_id,
                 "preview": (ch.text[:140] + "…") if len(ch.text) > 140 else ch.text,
             })
-        st.dataframe(retrieved_rows, use_container_width=True, hide_index=True)
+            if verdict == "yes":
+                relevant.append(it)
+            prog.progress((i + 1) / max(1, len(retrieved)), text=f"grading… {i+1}/{len(retrieved)}")
 
-        # ---------- GRADE ----------
-        t1 = time.perf_counter()
-        relevant: List[Dict[str, Any]] = []
-        graded_rows = []
+        set_step("GRADE", "✅ OK", time.perf_counter() - t1, note=f"relevant={len(relevant)}/{len(retrieved)}")
 
         st.markdown("### GRADE（doc relevance yes/no）")
-        prog = st.progress(0, text="grading…")
-
-        try:
-            for i, it in enumerate(retrieved):
-                ch: Chunk = it["chunk"]
-                verdict = grade_doc_relevance(client, q, ch.text)
-
-                graded_rows.append({
-                    "grade": verdict,
-                    "score": round(float(it["score"]), 4),
-                    "報告": ch.title,
-                    "頁": ch.page if ch.page is not None else "-",
-                    "chunk_id": ch.chunk_id,
-                    "preview": (ch.text[:140] + "…") if len(ch.text) > 140 else ch.text,
-                })
-                if verdict == "yes":
-                    relevant.append(it)
-
-                prog.progress((i + 1) / max(1, len(retrieved)), text=f"grading… {i+1}/{len(retrieved)}")
-
-            set_step("GRADE", "✅ OK", time.perf_counter() - t1, note=f"relevant={len(relevant)}/{len(retrieved)}")
-        except Exception as e:
-            set_step("GRADE", "❌ FAIL", time.perf_counter() - t1, note=str(e))
-            return {
-                "final_answer": "文件評分階段失敗，請查看 debug。",
-                "query_history": query_history,
-                "context": raw_context,
-                "logs": logs + [f"[ERROR] GRADE: {e}"],
-                "render_mode": "text",
-            }
-
-        st.dataframe(graded_rows, use_container_width=True, hide_index=True)
+        st.dataframe(graded_rows, width="stretch", hide_index=True)
 
         st.markdown("### Relevant Chunks（YES）")
         if not relevant:
             st.info("這一輪沒有找到相關 chunks（全部被判定 no）。")
         else:
             rel_sorted = sorted(relevant, key=lambda x: x["score"], reverse=True)[:top_k]
-            rel_rows = []
-            for it in rel_sorted:
-                ch = it["chunk"]
-                rel_rows.append({
+            st.dataframe(
+                [{
                     "score": round(float(it["score"]), 4),
-                    "報告": ch.title,
-                    "頁": ch.page if ch.page is not None else "-",
-                    "chunk_id": ch.chunk_id,
-                    "preview": (ch.text[:180] + "…") if len(ch.text) > 180 else ch.text,
-                })
-            st.dataframe(rel_rows, use_container_width=True, hide_index=True)
-
+                    "報告": it["chunk"].title,
+                    "頁": it["chunk"].page if it["chunk"].page is not None else "-",
+                    "chunk_id": it["chunk"].chunk_id,
+                    "preview": (it["chunk"].text[:180] + "…") if len(it["chunk"].text) > 180 else it["chunk"].text,
+                } for it in rel_sorted],
+                width="stretch",
+                hide_index=True,
+            )
             st.markdown("#### 展開看全文")
             for it in rel_sorted:
                 ch = it["chunk"]
                 with st.expander(f"{ch.title} p{ch.page if ch.page else '-'} | {ch.chunk_id} | score={it['score']:.3f}"):
                     st.text(ch.text)
 
-        # ---------- TRANSFORM（沒 relevant 才改寫） ----------
+        # TRANSFORM：沒 relevant 才改寫
         if not relevant:
             if rewrite_round < max_query_rewrites:
                 t2 = time.perf_counter()
@@ -940,32 +907,25 @@ def run_chat_workflow_with_ui(
                 continue
             else:
                 set_step("TRANSFORM", "❌ SKIP", None, note="rewrite limit reached")
-                final_answer = "資料不足：檢索不到足夠相關內容。你可以換個問法或上傳更多報告。"
-                final_context = raw_context
-                return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": "text"}
+                return {
+                    "final_answer": "資料不足：檢索不到足夠相關內容。你可以換個問法或上傳更多報告。",
+                    "query_history": query_history,
+                    "context": "",
+                    "logs": logs,
+                    "render_mode": "text",
+                }
 
-        # build context from relevant
-        rel_sorted = sorted(relevant, key=lambda x: x["score"], reverse=True)[:min(top_k, len(relevant))]
-        vec_parts = []
-        for it in rel_sorted:
-            ch = it["chunk"]
-            vec_parts.append(f"[{ch.title} p{ch.page if ch.page else '-'} | {ch.chunk_id} | score={it['score']:.3f}]\n{ch.text}")
-
-        kg_part = ""
-        if "【KG 線索】" in raw_context:
-            kg_part = raw_context.split("【檢索片段】")[0].strip()
-
-        context = "\n\n".join([p for p in [kg_part, "【檢索片段】\n" + "\n\n".join(vec_parts)] if p.strip()])
+        # GENERATE + CHECK
+        context = build_context_from_chunks(relevant, top_k=8)
         final_context = context
 
-        # ---------- GENERATE + CHECK loop ----------
         for gen_round in range(max_generate_retries + 1):
             t3 = time.perf_counter()
             st.markdown(f"### GENERATE（round {gen_round}）")
             ans = generate_answer_from_context(client, q, context)
             set_step("GENERATE", "✅ OK", time.perf_counter() - t3, note=f"gen_round={gen_round}")
 
-            st.markdown("#### Draft answer（含引用；呈現會用 badge）")
+            st.markdown("#### Draft answer（呈現用 badge）")
             if want_bullets(q):
                 render_bullets_with_badges(ans, badge_color="blue")
             else:
@@ -982,7 +942,13 @@ def run_chat_workflow_with_ui(
 
             if hall == "yes" and good == "yes":
                 final_answer = ans
-                return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": ("bullets" if want_bullets(q) else "text")}
+                return {
+                    "final_answer": final_answer,
+                    "query_history": query_history,
+                    "context": final_context,
+                    "logs": logs,
+                    "render_mode": ("bullets" if want_bullets(q) else "text"),
+                }
 
             if hall == "no":
                 continue
@@ -1001,64 +967,56 @@ def run_chat_workflow_with_ui(
             continue
 
         set_step("TRANSFORM", "❌ SKIP", None, note="rewrite limit reached")
-        final_answer = "資料不足：已多次嘗試仍無法產生可被證據支持且回應問題的答案。建議換問法或增加資料。"
-        return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": "text"}
+        return {
+            "final_answer": "資料不足：已多次嘗試仍無法產生可被證據支持且回應問題的答案。建議換問法或增加資料。",
+            "query_history": query_history,
+            "context": final_context,
+            "logs": logs,
+            "render_mode": "text",
+        }
 
-    final_answer = "資料不足：工作流未能完成。"
-    return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": "text"}
+    return {
+        "final_answer": "資料不足：工作流未能完成。",
+        "query_history": query_history,
+        "context": final_context,
+        "logs": logs,
+        "render_mode": "text",
+    }
 
 
 # =========================
-# Streamlit UI（不使用 tabs；文件管理全部包在 popover）
+# Streamlit UI
 # =========================
-st.set_page_config(page_title="研究報告助手（Workflow UI + Badges）", layout="wide")
-st.title("研究報告助手（Workflow UI + Badges）")
+st.set_page_config(page_title="研究報告助手（最終完整版）", layout="wide")
+st.title("研究報告助手（最終完整版）")
 
-def get_openai_api_key() -> str:
-    # 1) Streamlit secrets 優先（你現在用的方式）
-    if "OPENAI_KEY" in st.secrets and st.secrets["OPENAI_KEY"]:
-        return st.secrets["OPENAI_KEY"]
-
-    # 2) 次選：標準環境變數
-    if os.environ.get("OPENAI_API_KEY"):
-        return os.environ["OPENAI_API_KEY"]
-
-    # 3) 最後：你也可以加上 fallback 讀 OPENAI_KEY 環境變數
-    if os.environ.get("OPENAI_KEY"):
-        return os.environ["OPENAI_KEY"]
-
-    raise RuntimeError("Missing OpenAI API key. Set st.secrets['OPENAI_KEY'] or env OPENAI_API_KEY.")
-
-# 統一只拿一次
 OPENAI_API_KEY = get_openai_api_key()
-
-# OpenAI SDK client（建議全程都用這個）
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# LangExtract 若要 api_key 參數，也用同一個
-api_key = OPENAI_API_KEY
+client = get_client(OPENAI_API_KEY)
+api_key = OPENAI_API_KEY  # LangExtract 用同一把 key
 
 # Session State
 if "file_rows" not in st.session_state:
     st.session_state.file_rows: List[FileRow] = []
 if "file_bytes" not in st.session_state:
     st.session_state.file_bytes: Dict[str, bytes] = {}
-
 if "store" not in st.session_state:
     st.session_state.store: Optional[FaissStore] = None
 if "kg" not in st.session_state:
     st.session_state.kg = KnowledgeGraph()
-if "default_outputs" not in st.session_state:
-    st.session_state.default_outputs: Dict[str, Dict[str, str]] = {}
+if "processed_keys" not in st.session_state:
+    st.session_state.processed_keys = set()  # {(sha1, use_ocr)}
+if "default_outputs_cache" not in st.session_state:
+    st.session_state.default_outputs_cache = {}  # {title: {report_key, summary, claims, chain}}
+if "report_key_by_title" not in st.session_state:
+    st.session_state.report_key_by_title = {}
 if "chat_history" not in st.session_state:
     st.session_state.chat_history: List[Dict[str, Any]] = []
 
 def push_default_outputs_to_chat(default_outputs: Dict[str, Dict[str, str]]):
-    # 用「結構化訊息」存進 history，渲染時用 badge
     st.session_state.chat_history.append({
         "role": "assistant",
         "kind": "text",
-        "content": "我先把上傳報告的「預設輸出」整理好囉（摘要/核心主張/推論鏈；每個 bullet 都有引用）。你接下來可以直接在下方問問題。",
+        "content": "我先把上傳報告的預設輸出整理好囉（摘要/核心主張/推論鏈；每個 bullet 都有引用）。你接下來可以直接問問題。",
     })
     for title, out in default_outputs.items():
         st.session_state.chat_history.append({
@@ -1073,7 +1031,7 @@ def push_default_outputs_to_chat(default_outputs: Dict[str, Dict[str, str]]):
 def render_chat_message(msg: Dict[str, Any]):
     role = msg.get("role", "assistant")
     with st.chat_message(role):
-        kind = msg.get("kind", "md")
+        kind = msg.get("kind", "text")
         if kind == "default_outputs":
             st.markdown(f"## 預設輸出：{msg['title']}")
             st.markdown("### 1) 報告摘要")
@@ -1085,11 +1043,13 @@ def render_chat_message(msg: Dict[str, Any]):
         else:
             st.markdown(msg.get("content", ""))
 
+
 # =========================
-# ✅ 文件管理 popover（你要求：從上傳到建索引都在這裡）
+# ✅ 文件管理：全部包在 popover（寬度用 content 比較美）
 # =========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引）"):
+with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="content"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
+
     up = st.file_uploader(
         "上傳文件",
         type=["pdf", "txt", "png", "jpg", "jpeg"],
@@ -1098,15 +1058,16 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）"):
     )
 
     if up:
-        existing_keys = {(r.name, r.bytes_len) for r in st.session_state.file_rows}
+        existing = {(r.name, r.bytes_len) for r in st.session_state.file_rows}
         for f in up:
             data = f.read()
-            key = (f.name, len(data))
-            if key in existing_keys:
+            if (f.name, len(data)) in existing:
                 continue
 
             ext = os.path.splitext(f.name)[1].lower()
             fid = str(uuid.uuid4())[:10]
+            sig = sha1_bytes(data)
+
             st.session_state.file_bytes[fid] = data
 
             pages = None
@@ -1131,6 +1092,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）"):
             st.session_state.file_rows.append(
                 FileRow(
                     file_id=fid,
+                    file_sig=sig,
                     name=f.name,
                     ext=ext,
                     bytes_len=len(data),
@@ -1144,68 +1106,58 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）"):
                 )
             )
 
-    st.markdown("### 文件清單（可逐檔勾選 OCR）")
+    st.markdown("### 文件清單（重點欄位置前）")
+
     if not st.session_state.file_rows:
         st.info("尚未上傳文件。")
     else:
-        table_data = []
-        for r in st.session_state.file_rows:
-            note = ""
-            if r.ext == ".pdf" and r.likely_scanned:
-                note = "可能掃描PDF，建議 OCR"
-            elif r.ext in (".png", ".jpg", ".jpeg"):
-                note = "圖片檔：一定 OCR"
-            elif r.ext == ".txt":
-                note = "文字檔：不需要 OCR"
+        # 自畫表格：窄 popover 也好看
+        header_cols = st.columns([1, 4, 1, 1, 1, 1])
+        header_cols[0].markdown("**OCR**")
+        header_cols[1].markdown("**檔名**")
+        header_cols[2].markdown("**頁**")
+        header_cols[3].markdown("**字數**")
+        header_cols[4].markdown("**tok**")
+        header_cols[5].markdown("**建議**")
 
-            table_data.append({
-                "file_id": r.file_id,
-                "檔名": r.name,
-                "格式": r.ext,
-                "頁數": r.pages if r.pages is not None else "-",
-                "抽到字數(全文)": r.extracted_chars,
-                "token估算(粗估)": r.token_est,
-                "空白頁/頁數": f"{r.blank_pages}/{r.pages}" if r.blank_pages is not None and r.pages else "-",
-                "空白頁比例": f"{r.blank_ratio:.2f}" if r.blank_ratio is not None else "-",
-                "建議OCR": r.likely_scanned,
-                "使用OCR": r.use_ocr,
-                "備註": note,
-            })
+        for idx, r in enumerate(st.session_state.file_rows):
+            cols = st.columns([1, 4, 1, 1, 1, 1])
 
-        disabled_cols = ["file_id", "檔名", "格式", "頁數", "抽到字數(全文)", "token估算(粗估)", "空白頁/頁數", "空白頁比例", "建議OCR", "備註"]
-        edited = st.data_editor(
-            table_data,
-            use_container_width=True,
-            hide_index=True,
-            disabled=disabled_cols,
-            column_config={
-                "使用OCR": st.column_config.CheckboxColumn("使用OCR", help="PDF 字數太少時建議勾選 OCR（會更慢且花費較高）"),
-            },
-        )
-
-        use_ocr_map = {row["file_id"]: bool(row["使用OCR"]) for row in edited}
-        for i, r in enumerate(st.session_state.file_rows):
+            # OCR checkbox（圖片固定 True；txt 固定 False）
             if r.ext in (".png", ".jpg", ".jpeg"):
-                st.session_state.file_rows[i].use_ocr = True
+                st.session_state.file_rows[idx].use_ocr = True
+                cols[0].checkbox(" ", value=True, key=f"ocr_{idx}", disabled=True)
             elif r.ext == ".txt":
-                st.session_state.file_rows[i].use_ocr = False
+                st.session_state.file_rows[idx].use_ocr = False
+                cols[0].checkbox(" ", value=False, key=f"ocr_{idx}", disabled=True)
             else:
-                st.session_state.file_rows[i].use_ocr = use_ocr_map.get(r.file_id, r.use_ocr)
+                val = cols[0].checkbox(" ", value=bool(r.use_ocr), key=f"ocr_{idx}")
+                st.session_state.file_rows[idx].use_ocr = bool(val)
 
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            build_btn = st.button("🚀 建立索引 + 預設輸出", type="primary")
-        with c2:
-            clear_btn = st.button("🧹 清空全部")
-        with c3:
-            st.caption("會建立：FAISS + LangExtract KG + 預設輸出（摘要/主張/推論鏈）並推送到 Chat。")
+            # 檔名截斷 + badge tooltip 顯示完整檔名
+            short = truncate_filename(r.name, 30)
+            with cols[1]:
+                st.markdown(short)
+                st.badge("Full name", icon=":material_info:", color="gray", help=r.name)
+
+            cols[2].markdown(str(r.pages if r.pages is not None else "-"))
+            cols[3].markdown(str(r.extracted_chars))
+            cols[4].markdown(str(r.token_est))
+            cols[5].markdown("OCR" if r.likely_scanned else "")
+
+        st.divider()
+        b1, b2 = st.columns([1, 1])
+        build_btn = b1.button("🚀 建立索引 + 預設輸出", type="primary", width="stretch")
+        clear_btn = b2.button("🧹 清空全部", width="stretch")
 
         if clear_btn:
             st.session_state.file_rows = []
             st.session_state.file_bytes = {}
             st.session_state.store = None
             st.session_state.kg = KnowledgeGraph()
-            st.session_state.default_outputs = {}
+            st.session_state.processed_keys = set()
+            st.session_state.default_outputs_cache = {}
+            st.session_state.report_key_by_title = {}
             st.session_state.chat_history = []
             st.rerun()
 
@@ -1215,31 +1167,84 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）"):
                 st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf，再重試。")
                 st.stop()
 
-            with st.status("建索引中（向量 + KG）...", expanded=True) as s1:
-                store, kg, stats = build_indices(
+            # 1) 增量索引
+            with st.status("建索引中（增量 + 并行 + 大批次 embeddings）...", expanded=True) as s:
+                t0 = time.perf_counter()
+                store, kg, stats, processed_keys, new_titles = build_indices_incremental(
                     client=client,
                     api_key=api_key,
                     file_rows=st.session_state.file_rows,
                     file_bytes_map=st.session_state.file_bytes,
+                    store=st.session_state.store,
+                    kg=st.session_state.kg,
+                    processed_keys=st.session_state.processed_keys,
                 )
                 st.session_state.store = store
                 st.session_state.kg = kg
-                s1.update(label=f"完成索引：chunks={stats['chunks']} / KG nodes={stats['kg_nodes']} edges={stats['kg_edges']}", state="complete")
+                st.session_state.processed_keys = processed_keys
+                s.write(f"新增報告數：{stats['new_reports']}")
+                s.write(f"新增 chunks：{stats['new_chunks']}")
+                s.write(f"KG nodes={stats['kg_nodes']} edges={stats['kg_edges']}")
+                s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
+                s.update(state="complete")
 
-            titles = sorted({c.title for c in st.session_state.store.chunks})
-            with st.status("產生預設輸出（每個 bullet 必須引用；呈現改用 badge）...", expanded=True) as s2:
-                default_outputs = {}
-                for title in titles:
-                    default_outputs[title] = make_default_outputs_for_report(client, st.session_state.store.chunks, title)
-                st.session_state.default_outputs = default_outputs
-                s2.update(label="預設輸出完成", state="complete")
+            # 2) 預設輸出：只跑新/變更，且一次生成三份
+            # report_key = f"{file_sig}:{use_ocr}"
+            titles_now = []
+            title_to_key = {}
+            for r in st.session_state.file_rows:
+                title = os.path.splitext(r.name)[0]
+                titles_now.append(title)
+                title_to_key[title] = f"{r.file_sig}:{int(bool(r.use_ocr))}"
+
+            to_regen_titles = []
+            for title in sorted(set(titles_now)):
+                rk = title_to_key.get(title)
+                old_rk = st.session_state.report_key_by_title.get(title)
+                if (title not in st.session_state.default_outputs_cache) or (old_rk != rk):
+                    to_regen_titles.append(title)
+
+            st.session_state.report_key_by_title.update(title_to_key)
+
+            with st.status("產生預設輸出（只跑新/變更；一次生成三份）...", expanded=True) as s2:
+                if not to_regen_titles:
+                    s2.write("沒有偵測到新報告或變更（沿用快取）。")
+                    s2.update(state="complete")
+                else:
+                    s2.write(f"需要重新產生：{len(to_regen_titles)} 份報告")
+                    for i, title in enumerate(to_regen_titles, start=1):
+                        s2.write(f"[{i}/{len(to_regen_titles)}] 產生：{title}")
+                        reps = pick_chunks_for_report(st.session_state.store.chunks, title, max_n=12)
+                        ctx = render_chunks_with_ids(reps)
+                        bundle = generate_default_outputs_bundle_with_guard(client, title, ctx, max_retries=2)
+                        rk = title_to_key[title]
+                        st.session_state.default_outputs_cache[title] = {
+                            "report_key": rk,
+                            "summary": bundle["summary"],
+                            "claims": bundle["claims"],
+                            "chain": bundle["chain"],
+                        }
+                    s2.update(state="complete")
+
+            # 3) 組合目前存在的 titles 的輸出（快取）
+            default_outputs = {}
+            for title in sorted(set(titles_now)):
+                cached = st.session_state.default_outputs_cache.get(title)
+                if cached:
+                    default_outputs[title] = {
+                        "summary": cached["summary"],
+                        "claims": cached["claims"],
+                        "chain": cached["chain"],
+                    }
 
             st.session_state.chat_history = []
-            push_default_outputs_to_chat(st.session_state.default_outputs)
+            push_default_outputs_to_chat(default_outputs)
+            st.rerun()
 
-# popover 外：顯示簡短狀態（不含上傳/建索引 UI）
+
+# popover 外：狀態
 if st.session_state.store is None:
-    st.info("尚未建立索引。請點上方「📦 文件管理（上傳 / OCR / 建索引）」開始。")
+    st.info("尚未建立索引。請點「📦 文件管理（上傳 / OCR / 建索引）」開始。")
 else:
     st.success(
         f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)} / "
@@ -1248,8 +1253,8 @@ else:
 
 st.divider()
 
-# ===== Chat 主畫面（唯一）=====
-st.subheader("Chat（回答來源用 badge 顯示）")
+# Chat 主畫面
+st.subheader("Chat（Workflow + 引用 badges）")
 
 for msg in st.session_state.chat_history:
     render_chat_message(msg)
@@ -1263,20 +1268,18 @@ if prompt:
     render_chat_message(st.session_state.chat_history[-1])
 
     with st.chat_message("assistant"):
-        with st.status("Workflow running…（會逐步顯示 RETRIEVE / GRADE / TRANSFORM / GENERATE / CHECK）", expanded=True) as status:
+        with st.status("Workflow：RETRIEVE → GRADE → TRANSFORM → GENERATE → CHECK", expanded=True) as status:
             result = run_chat_workflow_with_ui(
                 client=client,
                 store=st.session_state.store,
-                kg=st.session_state.kg,
                 question=prompt,
                 max_query_rewrites=2,
                 max_generate_retries=2,
                 top_k=10,
             )
-            status.update(label="Workflow done", state="complete", expanded=False)
+            status.update(state="complete", expanded=False)
 
         st.markdown("## 最終回答")
-        # 最終呈現也用 badge（依問題型態）
         if result.get("render_mode") == "bullets":
             render_bullets_with_badges(result["final_answer"], badge_color="blue")
         else:
@@ -1290,19 +1293,5 @@ if prompt:
             st.markdown("### Context（節錄）")
             st.text((result.get("context", "") or "")[:12000])
 
-    # 將「原始含引用的答案」存入 history，之後重畫仍可 badge 呈現
-    st.session_state.chat_history.append({
-        "role": "assistant",
-        "kind": "answer",
-        "render_mode": result.get("render_mode", "text"),
-        "raw": result.get("final_answer", ""),
-    })
-
-    # 重畫最後一則（讓 history 跟畫面一致）
-    # （這裡用一個一致的格式：存 raw，顯示時 badge）
-    with st.chat_message("assistant"):
-        st.markdown("##（已加入對話紀錄）")
-        if result.get("render_mode") == "bullets":
-            render_bullets_with_badges(result.get("final_answer", ""), badge_color="blue")
-        else:
-            render_text_with_badges(result.get("final_answer", ""), badge_color="gray")
+    # 存回 history（這裡存純文字即可；重畫時也能 badge）
+    st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": result["final_answer"]})
