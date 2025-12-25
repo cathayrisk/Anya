@@ -1014,8 +1014,29 @@ def run_chat_workflow_with_ui(
 st.set_page_config(page_title="研究報告助手（Workflow UI + Badges）", layout="wide")
 st.title("研究報告助手（Workflow UI + Badges）")
 
-client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
-api_key=st.secrets["OPENAI_KEY"]
+def get_openai_api_key() -> str:
+    # 1) Streamlit secrets 優先（你現在用的方式）
+    if "OPENAI_KEY" in st.secrets and st.secrets["OPENAI_KEY"]:
+        return st.secrets["OPENAI_KEY"]
+
+    # 2) 次選：標準環境變數
+    if os.environ.get("OPENAI_API_KEY"):
+        return os.environ["OPENAI_API_KEY"]
+
+    # 3) 最後：你也可以加上 fallback 讀 OPENAI_KEY 環境變數
+    if os.environ.get("OPENAI_KEY"):
+        return os.environ["OPENAI_KEY"]
+
+    raise RuntimeError("Missing OpenAI API key. Set st.secrets['OPENAI_KEY'] or env OPENAI_API_KEY.")
+
+# 統一只拿一次
+OPENAI_API_KEY = get_openai_api_key()
+
+# OpenAI SDK client（建議全程都用這個）
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# LangExtract 若要 api_key 參數，也用同一個
+api_key = OPENAI_API_KEY
 
 # Session State
 if "file_rows" not in st.session_state:
