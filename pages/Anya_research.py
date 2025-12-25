@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 import numpy as np
+import pandas as pd
 import faiss
 import networkx as nx
 from pypdf import PdfReader
@@ -34,7 +35,8 @@ except Exception:
 # =========================
 # Streamlit config（只呼叫一次）
 # =========================
-st.set_page_config(page_title="研究報告助手）", layout="wide")
+st.set_page_config(page_title="研究報告助手（Workflow UI + Badges）", layout="wide")
+st.title("研究報告助手（Workflow UI + Badges）")
 
 
 # =========================
@@ -60,7 +62,7 @@ LX_MAX_WORKERS_QUERY = 4
 LX_MAX_CHUNKS_PER_QUERY = 8
 
 CORPUS_DEFAULT_MAX_CHUNKS = 24
-CORPUS_PER_REPORT_QUOTA = 6  # 讓預設輸出更分散頁碼
+CORPUS_PER_REPORT_QUOTA = 6
 
 # web_search 觸發（預設 OFF；切到 AUTO 才會用）
 MIN_RELEVANT_FOR_NO_WEB = 3
@@ -99,7 +101,7 @@ def sha1_bytes(data: bytes) -> str:
 def sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:10]
 
-def truncate_filename(name: str, max_len: int = 30) -> str:
+def truncate_filename(name: str, max_len: int = 44) -> str:
     if len(name) <= max_len:
         return name
     base, ext = os.path.splitext(name)
@@ -166,7 +168,6 @@ def call_gpt52_reasoning(
 
     out_text = resp.output_text
     sources = None
-
     if enable_web_search and include_sources:
         try:
             sources_list = []
@@ -244,9 +245,9 @@ class FileRow:
     extracted_chars: int
     token_est: int
 
-    # ✅ 新增：文字頁統計小工具
-    text_pages: Optional[int]          # 有抽到文字的頁數
-    text_pages_ratio: Optional[float]  # 文字頁比例（0~1）
+    # 文字頁小工具
+    text_pages: Optional[int]
+    text_pages_ratio: Optional[float]
 
     blank_pages: Optional[int]
     blank_ratio: Optional[float]
@@ -285,10 +286,6 @@ def analyze_pdf_text_quality(
     pdf_pages: list[Tuple[int, str]],
     min_chars_per_page: int = 40,
 ) -> Tuple[int, int, float, int, float]:
-    """
-    回傳：
-      total_chars, blank_pages, blank_ratio, text_pages, text_pages_ratio
-    """
     if not pdf_pages:
         return 0, 0, 1.0, 0, 0.0
     lens = [len(t) for _, t in pdf_pages]
@@ -378,7 +375,7 @@ class FaissStore:
 
 
 # =========================
-# 引用顯示（略：沿用你現有）
+# 引用顯示（badge directive 方式）
 # =========================
 CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\|\s*[A-Za-z0-9_\-]+\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
@@ -407,6 +404,15 @@ def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
         badges = [_badge_directive(f"{it['title']} p{it['page']} · {it['chunk_id']}", badge_color) for it in parsed]
         st.markdown(clean + (" " + " ".join(badges) if badges else ""))
 
+def render_text_with_badges(md_text: str, badge_color: str = "gray"):
+    cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\|\s*[A-Za-z0-9_\-]+\]", md_text or "")]
+    clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\|\s*[A-Za-z0-9_\-]+\]", "", md_text or "").strip()
+    st.markdown(clean if clean else "（無內容）")
+    parsed = _parse_citations(sorted(set(cits)))
+    if parsed:
+        badges = [_badge_directive(f"{it['title']} p{it['page']} · {it['chunk_id']}", badge_color) for it in parsed]
+        st.markdown("來源：" + " ".join(badges))
+
 def bullets_all_have_citations(md: str) -> bool:
     lines = (md or "").splitlines()
     if not any(BULLET_RE.match(l) for l in lines):
@@ -418,7 +424,7 @@ def bullets_all_have_citations(md: str) -> bool:
 
 
 # =========================
-# Planner（Pydantic 修正保持不變）
+# Planner（Pydantic v2 修正）
 # =========================
 class RetrievalQueryItem(BaseModel):
     reason: str = Field(...)
@@ -434,12 +440,15 @@ RetrievalPlan.model_rebuild()
 def plan_retrieval_queries(client: OpenAI, question: str) -> RetrievalPlan:
     system = """
 你是 Planner。目標：把使用者問題拆成 5~12 條向量檢索 queries（每條要有 reason），以最大化覆蓋率。
+- 覆蓋：中國/內地/香港/上海，不動產類型（住宅/商辦/零售/物流倉儲/酒店/數據中心/工業/長租等）、時間（2024-2026 / 報告年份）、指標（租金/空置率/供給/需求/cap rate/利率/政策/信用/REITs）
+- 跨類型排序/傳導/彙總/跨文件串鏈 → needs_kg=true
 輸出純 JSON（RetrievalPlan）。
 """
     user = f"使用者問題：{question}\n\n請輸出 RetrievalPlan JSON。"
     raw = call_json_planner(client, system=system, user=user)
     m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     raw = m.group(0) if m else raw
+
     try:
         plan = RetrievalPlan.model_validate_json(raw)
     except ValidationError:
@@ -447,12 +456,16 @@ def plan_retrieval_queries(client: OpenAI, question: str) -> RetrievalPlan:
         m2 = re.search(r"\{.*\}", raw2, flags=re.DOTALL)
         raw2 = m2.group(0) if m2 else raw2
         plan = RetrievalPlan.model_validate_json(raw2)
+
     plan.queries = [q for q in plan.queries if q.query.strip()]
     if not plan.queries:
         plan.queries = [RetrievalQueryItem(reason="fallback", query=question)]
     return plan
 
 
+# =========================
+# Multi-query retrieval + coverage
+# =========================
 def retrieve_by_plan(
     client: OpenAI,
     store: FaissStore,
@@ -474,7 +487,12 @@ def retrieve_by_plan(
             for score, ch in hits:
                 cur = by_id.get(ch.chunk_id)
                 if (cur is None) or (score > cur["score"]):
-                    by_id[ch.chunk_id] = {"chunk": ch, "score": float(score), "via_query": item.query, "via_reason": item.reason}
+                    by_id[ch.chunk_id] = {
+                        "chunk": ch,
+                        "score": float(score),
+                        "via_query": item.query,
+                        "via_reason": item.reason,
+                    }
         else:
             misses.append({"query": item.query, "reason": item.reason})
 
@@ -485,7 +503,53 @@ def retrieve_by_plan(
 
 
 # =========================
-# 建索引（不含 LangExtract）—略（同你現有）
+# WebSearch agent（只做背景）
+# =========================
+WEBSEARCH_AGENT_INSTRUCTIONS = (
+    "You are a research assistant. Given a search term, you search the web for that term and "
+    "produce a concise background summary. The summary must be 2-3 paragraphs and less than 300 words. "
+    "Capture main points. Ignore fluff. Output ONLY the summary."
+)
+
+def web_search_agent(client: OpenAI, search_term: str) -> Dict[str, Any]:
+    summary, sources = call_gpt52_reasoning(
+        client,
+        system=WEBSEARCH_AGENT_INSTRUCTIONS,
+        user=f"Search term: {search_term}",
+        effort="medium",
+        enable_web_search=True,
+        include_sources=True,
+    )
+    summary = norm_space(summary)
+    cid = f"web_{sha1_text(search_term + summary)}"
+    return {"title": f"WebSearch:{truncate_filename(search_term, 26)}", "chunk_id": cid, "text": summary, "sources": sources or [], "search_term": search_term}
+
+
+# =========================
+# Grading / Transform
+# =========================
+def grade_documents(client: OpenAI, question: str, doc_text: str) -> str:
+    system = "你是負責評估所取得文件與使用者問題相關性的評分者。不需嚴格測試。"
+    user = f"Retrieved:\n{doc_text[:2200]}\n\nQuestion:\n{question}"
+    return call_yesno_grader(client, system=system, user=user)
+
+def grade_hallucinations(client: OpenAI, documents: str, generation: str) -> str:
+    system = "你是評估生成內容是否受到 Context 支持的評分者。"
+    user = f"Facts:\n{documents[:9000]}\n\nAnswer:\n{generation[:4500]}"
+    return call_yesno_grader(client, system=system, user=user)
+
+def grade_answer_adaptive(client: OpenAI, question: str, generation: str) -> str:
+    system = "你是評估回答是否回應問題的評分者。若資料不足但有清楚交代缺口＋提供支持部分，也算 yes。"
+    user = f"Question:\n{question}\n\nAnswer:\n{generation}"
+    return call_yesno_grader(client, system=system, user=user)
+
+def transform_query(client: OpenAI, question: str) -> str:
+    system = "把問題改寫成更適合向量檢索的版本（補地區/資產類型/指標/時間）。只輸出一行。"
+    return call_gpt52_transform_effort_none(client, system=system, user=question).strip()
+
+
+# =========================
+# Indexing（增量：OCR + embeddings）
 # =========================
 def build_indices_incremental_no_kg(
     client: OpenAI,
@@ -551,11 +615,264 @@ def build_indices_incremental_no_kg(
 
 
 # =========================
+# 預設輸出（一次三份）
+# =========================
+def _split_default_bundle(text: str) -> Dict[str, str]:
+    t = (text or "").strip()
+    pattern = re.compile(
+        r"###\s*SUMMARY\s*(.*?)###\s*CLAIMS\s*(.*?)###\s*CHAIN\s*(.*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    m = pattern.search(t)
+    if not m:
+        return {"summary": "", "claims": "", "chain": ""}
+    return {"summary": m.group(1).strip(), "claims": m.group(2).strip(), "chain": m.group(3).strip()}
+
+def pick_corpus_chunks_for_default(all_chunks: list[Chunk]) -> list[Chunk]:
+    by_title: Dict[str, list[Chunk]] = {}
+    for c in all_chunks:
+        by_title.setdefault(c.title, []).append(c)
+
+    kw = re.compile(
+        r"(outlook|risk|implication|forecast|scenario|inflation|rate|credit|spread|cap rate|vacancy|supply|demand|rental|office|retail|residential|logistics|hotel|reits)",
+        re.I,
+    )
+
+    def score(c: Chunk) -> float:
+        s = 0.0
+        if kw.search(c.text or ""):
+            s += 6.0
+        if c.page is not None:
+            s += max(0.0, 2.0 - min(2.0, float(c.page) / 6.0))
+        s += min(2.0, len(c.text) / 1400.0)
+        return s
+
+    chosen: list[Chunk] = []
+    for title, chunks in sorted(by_title.items(), key=lambda x: x[0]):
+        by_page: Dict[int, list[Chunk]] = {}
+        for c in chunks:
+            p = c.page if c.page is not None else 0
+            by_page.setdefault(p, []).append(c)
+
+        page_best = []
+        for p, cs in by_page.items():
+            cs = sorted(cs, key=score, reverse=True)
+            page_best.append(cs[0])
+
+        page_best = sorted(page_best, key=score, reverse=True)
+        chosen.extend(page_best[:CORPUS_PER_REPORT_QUOTA])
+
+    chosen = sorted(chosen, key=score, reverse=True)[:CORPUS_DEFAULT_MAX_CHUNKS]
+    return chosen
+
+def render_chunks_with_ids(chunks: list[Chunk], max_chars_each: int = 900) -> str:
+    parts = []
+    for c in chunks:
+        head = f"[{c.title} p{c.page if c.page else '-'} | {c.chunk_id}]"
+        parts.append(head + "\n" + c.text[:max_chars_each])
+    return "\n\n".join(parts)
+
+def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_retries: int = 2) -> Dict[str, str]:
+    system = (
+        "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
+        "硬性規則：\n"
+        "1) 你必須輸出三個區塊，且順序/標題固定：### SUMMARY、### CLAIMS、### CHAIN。\n"
+        "2) 每個區塊都必須是純 bullet（每行以 - 開頭），不要段落。\n"
+        "3) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁 | chunk_id]\n"
+        "4) 引用中的『報告名稱』必須是資料片段方括號內的那個名稱。\n"
+    )
+    user = (
+        f"請針對《{title}》一次輸出三份內容（融合多份報告）：\n"
+        f"- SUMMARY：8~14 bullets\n"
+        f"- CLAIMS：8~14 bullets\n"
+        f"- CHAIN：6~12 bullets\n\n"
+        f"資料：\n{ctx}\n"
+    )
+
+    last = ""
+    for _ in range(max_retries + 1):
+        out, _ = call_gpt52_reasoning(client, system=system, user=user, effort="medium")
+        parts = _split_default_bundle(out)
+        ok = bullets_all_have_citations(parts["summary"]) and bullets_all_have_citations(parts["claims"]) and bullets_all_have_citations(parts["chain"])
+        if ok:
+            return parts
+        last = out
+        user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁 | chunk_id]。"
+    return _split_default_bundle(last)
+
+
+# =========================
+# Generate（web 只做背景）
+# =========================
+def wants_ranking(question: str) -> bool:
+    q = norm_space(question)
+    return any(k in q for k in ["排序", "排名", "看好", "看壞", "從好到壞", "從壞到好", "優先順序"])
+
+def generate_bullets_guard(client: OpenAI, question: str, context: str, max_retries: int = 2) -> str:
+    system = (
+        "你是嚴謹的研究助理。\n"
+        "硬性規則：\n"
+        "1) 只能根據 Context 回答，不可腦補。\n"
+        "2) 只能輸出純 bullet（每行以 - 開頭），不要段落。\n"
+        "3) 每個 bullet 句尾必須有引用：[報告名稱 p頁 | chunk_id]\n"
+        "4) 若資料不足以對某些類型排序，必須在 bullet 中明確說明缺口（仍要引用）。\n"
+        "5) 【以指定資料為主】排序/看好看壞/排名結論不得引用 WebSearch:*；Web 只能做背景。\n"
+        "6) Context 中標記 WEB_ONLY_BACKGROUND 的段落只能作背景引用。\n"
+    )
+    user = f"Context:\n{context}\n\nQuestion:\n{question}\n\n請用條列回答。"
+    last = ""
+    for _ in range(max_retries + 1):
+        out, _ = call_gpt52_reasoning(client, system=system, user=user, effort="medium")
+        if bullets_all_have_citations(out):
+            if wants_ranking(question):
+                bad = False
+                for line in out.splitlines():
+                    if BULLET_RE.match(line) and any(k in line for k in ["排序", "看好", "看壞", "優先", "排名", "由好到壞", "由壞到好", " > "]):
+                        if is_web_citation_in_line(line):
+                            bad = True
+                            break
+                if bad:
+                    last = out
+                    user += "\n\n【強制修正】重寫：排序/看好看壞/排名 bullet 不得引用 WebSearch:*；只能引用上傳報告來源。"
+                    continue
+            return out
+        last = out
+        user += "\n\n【強制修正】重寫：每個 bullet 句尾都要有 [報告名稱 p頁 | chunk_id]。"
+    return last
+
+def build_context_from_chunks(items: list[Dict[str, Any]], top_k: int = 10) -> str:
+    items = sorted(items, key=lambda x: x["score"], reverse=True)[:top_k]
+    parts = []
+    for it in items:
+        ch: Chunk = it["chunk"]
+        parts.append(f"[{ch.title} p{ch.page if ch.page is not None else '-'} | {ch.chunk_id}]\n{ch.text}")
+    return "\n\n".join(parts) if parts else "（找不到任何相關內容）"
+
+def build_context_from_web_items(web_items: list[Dict[str, Any]]) -> str:
+    parts = []
+    for w in web_items:
+        parts.append("WEB_ONLY_BACKGROUND")
+        parts.append(f"[{w['title']} p- | {w['chunk_id']}]\n{w['text']}")
+        if w.get("sources"):
+            src_lines = []
+            for s in w["sources"][:6]:
+                if isinstance(s, dict):
+                    t = s.get("title") or s.get("source") or "source"
+                    u = s.get("url") or ""
+                    src_lines.append(f"- {t} {u}".strip())
+            if src_lines:
+                parts.append("Sources:\n" + "\n".join(src_lines))
+    return "\n\n".join(parts)
+
+
+# =========================
+# Workflow（簡化但含你要的：PLAN/RETRIEVE/GRADE/WEB/GENERATE/CHECK）
+# =========================
+def run_workflow(
+    client: OpenAI,
+    store: FaissStore,
+    question: str,
+    *,
+    web_mode: str,
+) -> Dict[str, Any]:
+    # PLAN
+    plan = plan_retrieval_queries(client, question)
+    st.markdown("### PLAN")
+    st.dataframe([{"query": it.query, "reason": it.reason} for it in plan.queries], width="stretch", hide_index=True)
+
+    # RETRIEVE
+    retrieved, coverage = retrieve_by_plan(client, store, plan, top_k_per_query=4, max_total=18)
+    st.markdown("### RETRIEVE")
+    st.dataframe(
+        [{
+            "score": round(float(it["score"]), 4),
+            "報告": it["chunk"].title,
+            "頁": it["chunk"].page if it["chunk"].page is not None else "-",
+            "chunk_id": it["chunk"].chunk_id,
+            "matched_query": it["via_query"],
+            "preview": (it["chunk"].text[:120] + "…") if len(it["chunk"].text) > 120 else it["chunk"].text,
+        } for it in retrieved],
+        width="stretch",
+        hide_index=True,
+    )
+    with st.expander("Coverage details"):
+        st.write(coverage)
+
+    # GRADE_DOCS
+    relevant = []
+    graded_rows = []
+    for it in retrieved:
+        ch: Chunk = it["chunk"]
+        verdict = grade_documents(client, question, ch.text)
+        graded_rows.append({"grade": verdict, "報告": ch.title, "頁": ch.page if ch.page is not None else "-", "chunk_id": ch.chunk_id})
+        if verdict == "yes":
+            relevant.append(it)
+    st.markdown("### GRADE_DOCS（yes/no）")
+    st.dataframe(graded_rows, width="stretch", hide_index=True)
+
+    # WEB_SEARCH（background-only；預設 OFF）
+    web_items = []
+    if web_mode == "AUTO":
+        hit_ratio = coverage.get("hit_ratio", 1.0)
+        trigger = None
+        if hit_ratio < MIN_COVERAGE_RATIO:
+            trigger = f"coverage hit_ratio={hit_ratio:.2f} < {MIN_COVERAGE_RATIO}"
+        elif len(relevant) < MIN_RELEVANT_FOR_NO_WEB:
+            trigger = f"relevant={len(relevant)} < {MIN_RELEVANT_FOR_NO_WEB}"
+
+        if trigger:
+            st.markdown("### WEB_SEARCH（background-only）")
+            st.info(trigger)
+
+            miss_terms = [m["query"] for m in coverage.get("misses", [])[:MAX_WEB_SEARCHES]]
+            if len(miss_terms) < MAX_WEB_SEARCHES:
+                for it in plan.queries:
+                    if it.query not in miss_terms:
+                        miss_terms.append(it.query)
+                    if len(miss_terms) >= MAX_WEB_SEARCHES:
+                        break
+
+            web_rows = []
+            for term in miss_terms[:MAX_WEB_SEARCHES]:
+                w = web_search_agent(client, term)
+                web_items.append(w)
+                web_rows.append({"search_term": term, "chunk_id": w["chunk_id"], "sources": len(w.get("sources") or [])})
+            st.dataframe(web_rows, width="stretch", hide_index=True)
+            with st.expander("Web sources"):
+                for w in web_items:
+                    st.markdown(f"**{w['search_term']}** → `{w['chunk_id']}`")
+                    for s in (w.get("sources") or [])[:10]:
+                        st.write(s)
+
+    if not relevant and not web_items:
+        return {"answer": "資料不足：檢索不到足夠相關內容。建議改問法或上傳更多報告。", "context": ""}
+
+    # GENERATE
+    ctx_parts = []
+    if relevant:
+        ctx_parts.append(build_context_from_chunks(relevant, top_k=10))
+    if web_items:
+        ctx_parts.append(build_context_from_web_items(web_items))
+    context = "\n\n".join([p for p in ctx_parts if p.strip()])
+
+    st.markdown("### GENERATE")
+    ans = generate_bullets_guard(client, question, context, max_retries=2)
+    render_bullets_inline_badges(ans, badge_color="green")
+
+    # CHECK
+    st.markdown("### CHECK")
+    hall = grade_hallucinations(client, context, ans)
+    ok = grade_answer_adaptive(client, question, ans)
+    st.write({"hallucination": hall, "answer_ok": ok})
+
+    return {"answer": ans, "context": context}
+
+
+# =========================
 # Session init
 # =========================
 OPENAI_API_KEY = get_openai_api_key()
 client = get_client(OPENAI_API_KEY)
-api_key = OPENAI_API_KEY
 
 if "file_rows" not in st.session_state:
     st.session_state.file_rows = []
@@ -565,21 +882,90 @@ if "store" not in st.session_state:
     st.session_state.store = None
 if "processed_keys" not in st.session_state:
     st.session_state.processed_keys = set()
+if "default_outputs" not in st.session_state:
+    st.session_state.default_outputs = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 
 # =========================
-# Popover：文件管理（✅ 加上文字頁小工具顯示）
+# File table helpers（pandas / data_editor）
 # =========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引 / 設定）", width="content"):
+def file_rows_to_df(rows: list[FileRow]) -> pd.DataFrame:
+    recs = []
+    for r in rows:
+        if r.ext == ".pdf":
+            pages_str = "-" if r.pages is None else str(r.pages)
+            text_pages_str = "-" if r.text_pages is None else str(r.text_pages)
+            text_ratio_str = "-" if r.text_pages_ratio is None else f"{r.text_pages_ratio:.0%}"
+        else:
+            pages_str = "-" if r.pages is None else str(r.pages)
+            text_pages_str = "-"
+            text_ratio_str = "-"
+
+        if r.ext == ".pdf" and r.likely_scanned:
+            suggest = "建議 OCR"
+        elif r.ext in (".png", ".jpg", ".jpeg"):
+            suggest = "必 OCR"
+        else:
+            suggest = ""
+
+        recs.append({
+            "_file_id": r.file_id,               # 保留給同步用（不顯示）
+            "使用OCR": bool(r.use_ocr),
+            "檔名": truncate_filename(r.name, 52),
+            "格式": r.ext.replace(".", ""),
+            "頁數": pages_str,
+            "文字頁": text_pages_str,
+            "文字%": text_ratio_str,
+            "token估算": int(r.token_est),
+            "建議": suggest,
+        })
+    return pd.DataFrame(recs)
+
+def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
+    # 以 file_id 對齊回寫 OCR 欄位
+    id_to_row_idx = {r.file_id: i for i, r in enumerate(rows)}
+    for _, rec in df.iterrows():
+        fid = rec.get("_file_id")
+        if fid not in id_to_row_idx:
+            continue
+        i = id_to_row_idx[fid]
+
+        ext = rows[i].ext
+        # 強制規則：圖檔一定 OCR；txt 一定不 OCR
+        if ext in (".png", ".jpg", ".jpeg"):
+            rows[i].use_ocr = True
+        elif ext == ".txt":
+            rows[i].use_ocr = False
+        else:
+            rows[i].use_ocr = bool(rec.get("使用OCR", rows[i].use_ocr))
+
+
+# =========================
+# Popover：文件管理（pandas + data_editor）
+# =========================
+with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="content"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
 
-    kg_mode = st.radio("KG 模式", options=["AUTO", "OFF", "FORCE"], index=0, horizontal=True, key="kg_mode")
-    web_mode = st.radio("Web search（只做背景）", options=["OFF", "AUTO"], index=0, horizontal=True, key="web_mode")
+    web_mode = st.radio(
+        "Web search（只做背景）",
+        options=["OFF", "AUTO"],
+        index=0,
+        horizontal=True,
+        help="OFF：完全不使用網路；AUTO：檢索 coverage 不足或 relevant 太少才補背景",
+        key="web_mode",
+    )
 
-    up = st.file_uploader("上傳文件", type=["pdf", "txt", "png", "jpg", "jpeg"], accept_multiple_files=True, key="uploader")
-    if up:
+    uploaded = st.file_uploader(
+        "上傳文件",
+        type=["pdf", "txt", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded:
         existing = {(r.name, r.bytes_len) for r in st.session_state.file_rows}
-        for f in up:
+        for f in uploaded:
             data = f.read()
             if (f.name, len(data)) in existing:
                 continue
@@ -605,7 +991,14 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / 設定）", widt
 
             token_est = estimate_tokens_from_chars(extracted_chars)
             likely_scanned = should_suggest_ocr(ext, pages, extracted_chars, blank_ratio)
-            use_ocr = True if ext in (".png", ".jpg", ".jpeg") else bool(likely_scanned)
+
+            # default OCR decision
+            if ext in (".png", ".jpg", ".jpeg"):
+                use_ocr = True
+            elif ext == ".txt":
+                use_ocr = False
+            else:
+                use_ocr = bool(likely_scanned)
 
             st.session_state.file_rows.append(
                 FileRow(
@@ -626,74 +1019,46 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / 設定）", widt
                 )
             )
 
-    if st.session_state.file_rows:
-        st.markdown("### 文件清單（OCR / 檔名 / 頁(文X) / tok / 建議）")
-        header = st.columns([1, 6, 1, 1, 1])
-        header[0].markdown("**OCR**")
-        header[1].markdown("**檔名**")
-        header[2].markdown("**頁**")
-        header[3].markdown("**tok**")
-        header[4].markdown("**建議**")
+    st.markdown("### 文件清單（可逐檔勾選 OCR）")
 
-        for idx, r in enumerate(st.session_state.file_rows):
-            cols = st.columns([1, 6, 1, 1, 1])
+    if not st.session_state.file_rows:
+        st.info("尚未上傳文件。")
+    else:
+        df = file_rows_to_df(st.session_state.file_rows)
 
-            if r.ext in (".png", ".jpg", ".jpeg"):
-                st.session_state.file_rows[idx].use_ocr = True
-                cols[0].checkbox(" ", value=True, key=f"ocr_{idx}", disabled=True)
-            elif r.ext == ".txt":
-                st.session_state.file_rows[idx].use_ocr = False
-                cols[0].checkbox(" ", value=False, key=f"ocr_{idx}", disabled=True)
-            else:
-                st.session_state.file_rows[idx].use_ocr = cols[0].checkbox(" ", value=bool(r.use_ocr), key=f"ocr_{idx}")
+        edited = st.data_editor(
+            df.drop(columns=["_file_id"]),  # 不顯示 file_id
+            key="file_table_editor",
+            width="stretch",
+            hide_index=True,
+            disabled=["檔名", "格式", "頁數", "文字頁", "文字%", "token估算", "建議"],  # 只允許改「使用OCR」
+            column_config={
+                "使用OCR": st.column_config.CheckboxColumn("使用OCR", help="逐檔選擇是否啟用 OCR（PDF 可選；圖檔固定OCR；TXT固定不OCR）"),
+                "token估算": st.column_config.NumberColumn("token估算", help="粗估 token，用於快速判斷抽取量是否偏少"),
+                "文字頁": st.column_config.TextColumn("文字頁", help="PDF 中抽到足夠文字的頁數（<=40字視為空白頁）"),
+                "文字%": st.column_config.TextColumn("文字%", help="文字頁/總頁 的比例（越低越可能是掃描圖）"),
+                "建議": st.column_config.TextColumn("建議", help="依抽取量推測是否建議 OCR"),
+            },
+        )
 
-            short = truncate_filename(r.name, 34)
-
-            # ✅ tooltip 加入「文字頁比例」資訊
-            tip = [f"原檔名：{r.name}"]
-            if r.ext == ".pdf":
-                if r.pages is not None and r.text_pages is not None and r.text_pages_ratio is not None:
-                    tip.append(f"文字頁：{r.text_pages}/{r.pages}（{r.text_pages_ratio:.0%}）")
-                if r.blank_pages is not None and r.blank_ratio is not None:
-                    tip.append(f"空白頁（<=40 chars）：{r.blank_pages}/{r.pages}（{r.blank_ratio:.0%}）")
-                tip.append(f"抽取字數：{r.extracted_chars}")
-            tip_str = "\n".join(tip)
-
-            with cols[1]:
-                name_cols = st.columns([12, 1])
-                name_cols[0].markdown(short)
-                name_cols[1].badge(" ", icon=":material/info:", color="gray", width="content", help=tip_str)
-
-            # ✅ 頁欄位顯示：總頁（文X）
-            if r.pages is None:
-                pages_str = "-"
-            else:
-                if r.ext == ".pdf" and r.text_pages is not None:
-                    pages_str = f"{r.pages}（文{r.text_pages}）"
-                else:
-                    pages_str = str(r.pages)
-
-            cols[2].markdown(pages_str)
-            cols[3].markdown(str(r.token_est))
-
-            with cols[4]:
-                if r.likely_scanned and r.ext == ".pdf":
-                    st.badge("建議 OCR", icon=":material/warning:", color="orange", width="content")
-                elif r.ext in (".png", ".jpg", ".jpeg"):
-                    st.badge("必 OCR", icon=":material/image:", color="orange", width="content")
-                else:
-                    st.markdown("")
+        # 把 editor 的 OCR 選擇回寫到 session（用 df + file_id 對齊）
+        # 注意：data_editor 回傳 df 沒有 _file_id，所以我們用原 df 的順序回寫
+        df_for_sync = df.copy()
+        df_for_sync["使用OCR"] = edited["使用OCR"].values
+        sync_df_to_file_rows(df_for_sync, st.session_state.file_rows)
 
         st.divider()
-        b1, b2 = st.columns([1, 1])
-        build_btn = b1.button("🚀 建立索引", type="primary", width="stretch")
-        clear_btn = b2.button("🧹 清空全部", width="stretch")
+        col1, col2 = st.columns([1, 1])
+        build_btn = col1.button("🚀 建立索引 + 預設輸出", type="primary", width="stretch")
+        clear_btn = col2.button("🧹 清空全部", width="stretch")
 
         if clear_btn:
             st.session_state.file_rows = []
             st.session_state.file_bytes = {}
             st.session_state.store = None
             st.session_state.processed_keys = set()
+            st.session_state.default_outputs = None
+            st.session_state.chat_history = []
             st.rerun()
 
         if build_btn:
@@ -702,7 +1067,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / 設定）", widt
                 st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf。")
                 st.stop()
 
-            with st.status("建索引中（增量：OCR + embeddings）...", expanded=True) as s:
+            with st.status("建索引中（OCR + embeddings）...", expanded=True) as s:
                 t0 = time.perf_counter()
                 store, stats, processed_keys = build_indices_incremental_no_kg(
                     client,
@@ -718,12 +1083,71 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / 設定）", widt
                 s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
                 s.update(state="complete")
 
+            # 預設輸出（一次三份）→ push 到 chat
+            with st.status("產生預設輸出（摘要/主張/推論鏈）...", expanded=True) as s2:
+                chosen = pick_corpus_chunks_for_default(st.session_state.store.chunks)
+                ctx = render_chunks_with_ids(chosen)
+                bundle = generate_default_outputs_bundle(client, "整體融合（全部上傳報告）", ctx, max_retries=2)
+                st.session_state.default_outputs = bundle
+                s2.update(state="complete")
+
+            st.session_state.chat_history = []
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "kind": "default",
+                "title": "整體融合（全部上傳報告）",
+                **st.session_state.default_outputs,
+            })
+            st.rerun()
+
 
 # =========================
-# 主畫面（簡化：只顯示索引狀態）
+# 主畫面：狀態 + Chat
 # =========================
 if st.session_state.store is None:
-    st.info("尚未建立索引。請先在 popover 建索引。")
+    st.info("尚未建立索引。請先在 popover 上傳並建立索引。")
     st.stop()
 
 st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
+
+st.divider()
+st.subheader("Chat（Workflow UI + Badges）")
+
+# 顯示 chat history
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg.get("role", "assistant")):
+        if msg.get("kind") == "default":
+            st.markdown(f"## 預設輸出：{msg.get('title','')}")
+            st.markdown("### 1) 報告摘要（融合多份報告）")
+            render_bullets_inline_badges(msg.get("summary", ""), badge_color="green")
+            st.markdown("### 2) 核心主張（融合多份報告）")
+            render_bullets_inline_badges(msg.get("claims", ""), badge_color="violet")
+            st.markdown("### 3) 推論鏈（融合多份報告）")
+            render_bullets_inline_badges(msg.get("chain", ""), badge_color="orange")
+        else:
+            st.markdown(msg.get("content", ""))
+
+# 使用者提問
+prompt = st.chat_input("請輸入問題（例如：中國/香港不動產概況、各類資產看好/看壞排序與原因…）")
+if prompt:
+    st.session_state.chat_history.append({"role": "user", "kind": "text", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.status("Workflow：PLAN → RETRIEVE → GRADE_DOCS → (AUTO) WEB_SEARCH(background-only) → GENERATE → CHECK", expanded=True) as status:
+            result = run_workflow(
+                client=client,
+                store=st.session_state.store,
+                question=prompt,
+                web_mode=st.session_state.get("web_mode", "OFF"),
+            )
+            status.update(state="complete", expanded=False)
+
+        st.markdown("## 最終回答")
+        render_bullets_inline_badges(result.get("answer", ""), badge_color="green")
+
+        with st.expander("Debug（context 節錄）"):
+            st.text((result.get("context") or "")[:12000])
+
+    st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": result.get("answer", "")})
