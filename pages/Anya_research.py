@@ -4,23 +4,22 @@
 研究報告助手（FAISS + OpenAI embeddings + LangExtract KG + Chat + Workflow UI）
 領域：總經 / 金融 / 財務 / 氣候風險 / 永續金融
 
-你要求的重點：
-- UI 不用 tabs
-- st.popover 上傳 + 表格顯示（頁數/字數/token/空白頁比例/建議OCR/使用OCR）
-- OCR：逐檔勾選（掃描 PDF 會自動建議）
-- 向量：FAISS + text-embedding-3-small（固定）
-- LLM：gpt-5.2（固定）
-- LangExtract：gpt-5.2（固定）
-- 預設輸出：摘要/核心主張/推論鏈（每個 bullet 必須引用 [報告 p頁 | chunk_id]）
-- Chat：grading（yes/no）+ 自動重試；UI 顯示 RETRIEVE / GRADE / TRANSFORM / GENERATE + 中間產物漂亮呈現
-- UI 強化：每一步顯示 ✅/❌ + 耗時（秒）；relevant chunks 有 expander 看全文
+你要求的重點（本版已全部滿足）：
+1) 上傳文件 → 表格顯示字數/token → OCR 勾選 → 建立索引 / 清空：全部包在同一個 st.popover 裡
+2) 回答輸出：文字本體更乾淨，來源改用 st.badge 呈現（更好看）
+   - 內部仍維持嚴格引用檢查（預設輸出每個 bullet 必須有引用；Chat 清單類每 bullet 引用；一般回答每段至少 1 引用）
+3) Chat workflow：UI 顯示 RETRIEVE / GRADE / TRANSFORM / GENERATE / CHECK
+   - 每一步顯示 ✅/❌ + 耗時（秒）
+   - 顯示 query history
+   - relevant chunks 表格 + expander 展開全文
+   - hallucination/answer yes-no grading + retry
 
 環境變數：
 - OPENAI_API_KEY 必填
 
 依賴：
 streamlit, openai, langextract[openai], pypdf, numpy, faiss-cpu, networkx
-OCR 額外：pymupdf
+OCR 額外：pymupdf（fitz）
 """
 
 from __future__ import annotations
@@ -66,7 +65,6 @@ def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def estimate_tokens_from_chars(n_chars: int) -> int:
-    # 粗估：每 token 約 3.6 chars（中英混合折衷）
     if n_chars <= 0:
         return 0
     return max(1, int(math.ceil(n_chars / 3.6)))
@@ -89,6 +87,8 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
 # =========================
 # OpenAI helpers
 # =========================
+def get_client() -> OpenAI:
+    return OpenAI()
 
 def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
     resp = client.embeddings.create(
@@ -405,10 +405,12 @@ def run_langextract(text: str, api_key: str) -> lx.data.AnnotatedDocument:
 
 
 # =========================
-# 引用檢查
+# 引用檢查 + badge 呈現
 # =========================
 CIT_RE = re.compile(r"\[[^\]]+\|\s*[^\]]+\]")  # [報告 p頁 | chunk_id]
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
+# 解析引用：[{title} p{page} | {chunk_id}]
+CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\|\s*([A-Za-z0-9_\-]+)\]")
 
 def bullets_all_have_citations(md: str) -> Tuple[bool, List[str]]:
     bad_lines = []
@@ -470,6 +472,64 @@ def generate_with_paragraph_citation_guard(client: OpenAI, user: str, max_retrie
         last = out
         user = user + "\n\n【強制修正】上一版有段落缺引用。請確保每段至少一個 [報告 p頁 | chunk_id]。"
     return last
+
+def _parse_citations(cits: List[str]) -> List[Dict[str, str]]:
+    parsed = []
+    for c in cits:
+        m = CIT_PARSE_RE.search(c)
+        if not m:
+            parsed.append({"title": "來源", "page": "-", "chunk_id": c.strip("[]")})
+            continue
+        parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip(), "chunk_id": m.group(3).strip()})
+    return parsed
+
+def _render_badges(parsed: List[Dict[str, str]], color: str = "blue", icon: Optional[str] = ":material_bookmark:"):
+    """
+    將多個 badge 盡量排成同一列（每列最多 4 個）
+    """
+    if not parsed:
+        return
+    per_row = 4
+    for i in range(0, len(parsed), per_row):
+        row = parsed[i:i+per_row]
+        cols = st.columns(len(row))
+        for col, item in zip(cols, row):
+            title = item["title"]
+            title_short = title if len(title) <= 18 else (title[:18] + "…")
+            page = item["page"]
+            chunk_id = item["chunk_id"]
+            label = f"{title_short} p{page} · {chunk_id}"
+            with col:
+                st.badge(label, icon=icon, color=color, help=f"{title} p{page} | {chunk_id}")
+
+def render_bullets_with_badges(md_bullets: str, badge_color: str = "blue"):
+    """
+    md_bullets: 內容是多行以 '-' 開頭的 bullet，且行尾含引用 [title pX | chunk_id]
+    這裡會：
+      - 顯示乾淨 bullet（移除引用）
+      - 在 bullet 下方用 st.badge 顯示來源
+    """
+    lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
+    for line in lines:
+        if not BULLET_RE.match(line):
+            continue
+        cits = CIT_RE.findall(line)
+        clean = CIT_RE.sub("", line).strip()
+        st.markdown(clean)
+        parsed = _parse_citations(cits)
+        _render_badges(parsed, color=badge_color)
+
+def render_text_with_badges(md_text: str, badge_color: str = "gray"):
+    """
+    一般段落回答：保持段落文字乾淨，把所有引用收集成 badges 放在最後。
+    """
+    cits = CIT_RE.findall(md_text or "")
+    clean = CIT_RE.sub("", md_text or "").strip()
+    st.markdown(clean if clean else "（無內容）")
+    parsed = _parse_citations(sorted(set(cits)))
+    if parsed:
+        st.markdown("**來源：**")
+        _render_badges(parsed, color=badge_color, icon=":material_source:")
 
 
 # =========================
@@ -580,7 +640,7 @@ def build_indices(
 
 
 # =========================
-# 預設輸出（摘要/核心主張/推論鏈）→ 推送到 Chat
+# 預設輸出（摘要/核心主張/推論鏈）→ 推送到 Chat（注意：Chat 內仍保留原始含引用的版本，渲染時改 badge）
 # =========================
 def pick_chunks_for_report(all_chunks: List[Chunk], title: str, max_n: int = 12) -> List[Chunk]:
     kw = re.compile(r"(conclusion|outlook|risk|implication|forecast|scenario|inflation|rate|credit|spread|emission|transition|physical)", re.I)
@@ -635,20 +695,6 @@ def make_default_outputs_for_report(client: OpenAI, all_chunks: List[Chunk], tit
     claims = generate_with_bullet_citation_guard(client, claims_user, max_retries=2)
     chain = generate_with_bullet_citation_guard(client, chain_user, max_retries=2)
     return {"summary": summary, "claims": claims, "chain": chain}
-
-def push_default_outputs_to_chat(default_outputs: Dict[str, Dict[str, str]]):
-    st.session_state.chat_history.append({
-        "role": "assistant",
-        "content": "我先把上傳報告的「預設輸出」整理好囉（摘要/核心主張/推論鏈；每個 bullet 都有引用）。你接下來可以直接在下方問問題。",
-    })
-    for title, out in default_outputs.items():
-        md = (
-            f"## 預設輸出：{title}\n\n"
-            f"### 1) 報告摘要\n{out['summary']}\n\n"
-            f"### 2) 核心主張\n{out['claims']}\n\n"
-            f"### 3) 推論鏈 / 傳導機制\n{out['chain']}\n"
-        )
-        st.session_state.chat_history.append({"role": "assistant", "content": md})
 
 
 # =========================
@@ -757,15 +803,6 @@ def run_chat_workflow_with_ui(
     max_generate_retries: int = 2,
     top_k: int = 10,
 ) -> Dict[str, Any]:
-    """
-    UI 內顯示：
-    - Step Summary（✅/❌ + 秒）
-    - Query history
-    - Retrieved / Graded table
-    - Relevant chunks expander（全文）
-    - Draft answer
-    - Hallucination/Answer grade
-    """
     query_history: List[str] = [question]
     logs: List[str] = []
     final_context = ""
@@ -812,9 +849,9 @@ def run_chat_workflow_with_ui(
                 "query_history": query_history,
                 "context": "",
                 "logs": logs + [f"[ERROR] RETRIEVE: {e}"],
+                "render_mode": "text",
             }
 
-        # Pretty retrieved table
         st.markdown(f"### RETRIEVE（round {rewrite_round}）")
         retrieved_rows = []
         for it in retrieved:
@@ -862,11 +899,11 @@ def run_chat_workflow_with_ui(
                 "query_history": query_history,
                 "context": raw_context,
                 "logs": logs + [f"[ERROR] GRADE: {e}"],
+                "render_mode": "text",
             }
 
         st.dataframe(graded_rows, use_container_width=True, hide_index=True)
 
-        # Relevant chunks expander（全文）
         st.markdown("### Relevant Chunks（YES）")
         if not relevant:
             st.info("這一輪沒有找到相關 chunks（全部被判定 no）。")
@@ -890,7 +927,7 @@ def run_chat_workflow_with_ui(
                 with st.expander(f"{ch.title} p{ch.page if ch.page else '-'} | {ch.chunk_id} | score={it['score']:.3f}"):
                     st.text(ch.text)
 
-        # 若沒有 relevant：TRANSFORM
+        # ---------- TRANSFORM（沒 relevant 才改寫） ----------
         if not relevant:
             if rewrite_round < max_query_rewrites:
                 t2 = time.perf_counter()
@@ -898,14 +935,14 @@ def run_chat_workflow_with_ui(
                 new_q = rewrite_question(client, q)
                 query_history.append(new_q)
                 query_hist_ph.code("\n".join([f"{i}. {qq}" for i, qq in enumerate(query_history)]))
-                set_step("TRANSFORM", "✅ OK", time.perf_counter() - t2, note="rewrite applied")
+                set_step("TRANSFORM", "✅ OK", time.perf_counter() - t2, note="rewrite applied (no relevant docs)")
                 q = new_q
                 continue
             else:
                 set_step("TRANSFORM", "❌ SKIP", None, note="rewrite limit reached")
                 final_answer = "資料不足：檢索不到足夠相關內容。你可以換個問法或上傳更多報告。"
                 final_context = raw_context
-                return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs}
+                return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": "text"}
 
         # build context from relevant
         rel_sorted = sorted(relevant, key=lambda x: x["score"], reverse=True)[:min(top_k, len(relevant))]
@@ -928,8 +965,11 @@ def run_chat_workflow_with_ui(
             ans = generate_answer_from_context(client, q, context)
             set_step("GENERATE", "✅ OK", time.perf_counter() - t3, note=f"gen_round={gen_round}")
 
-            st.markdown("#### Draft answer")
-            st.markdown(ans)
+            st.markdown("#### Draft answer（含引用；呈現會用 badge）")
+            if want_bullets(q):
+                render_bullets_with_badges(ans, badge_color="blue")
+            else:
+                render_text_with_badges(ans, badge_color="gray")
 
             t4 = time.perf_counter()
             st.markdown("### CHECK（hallucination / answer）")
@@ -942,13 +982,10 @@ def run_chat_workflow_with_ui(
 
             if hall == "yes" and good == "yes":
                 final_answer = ans
-                return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs}
+                return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": ("bullets" if want_bullets(q) else "text")}
 
-            # hallucination fail -> regenerate (same query)
             if hall == "no":
                 continue
-
-            # answer fail -> break to transform
             if good == "no":
                 break
 
@@ -959,23 +996,23 @@ def run_chat_workflow_with_ui(
             new_q = rewrite_question(client, q)
             query_history.append(new_q)
             query_hist_ph.code("\n".join([f"{i}. {qq}" for i, qq in enumerate(query_history)]))
-            set_step("TRANSFORM", "✅ OK", time.perf_counter() - t2, note="rewrite applied")
+            set_step("TRANSFORM", "✅ OK", time.perf_counter() - t2, note="rewrite applied (generation not ok)")
             q = new_q
             continue
 
         set_step("TRANSFORM", "❌ SKIP", None, note="rewrite limit reached")
         final_answer = "資料不足：已多次嘗試仍無法產生可被證據支持且回應問題的答案。建議換問法或增加資料。"
-        return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs}
+        return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": "text"}
 
     final_answer = "資料不足：工作流未能完成。"
-    return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs}
+    return {"final_answer": final_answer, "query_history": query_history, "context": final_context, "logs": logs, "render_mode": "text"}
 
 
 # =========================
-# Streamlit UI（不使用 tabs）
+# Streamlit UI（不使用 tabs；文件管理全部包在 popover）
 # =========================
-st.set_page_config(page_title="研究報告助手（Workflow UI）", layout="wide")
-st.title("研究報告助手（FAISS + LangExtract + Chat + Workflow UI）")
+st.set_page_config(page_title="研究報告助手（Workflow UI + Badges）", layout="wide")
+st.title("研究報告助手（Workflow UI + Badges）")
 
 client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
 api_key=st.secrets["OPENAI_KEY"]
@@ -993,17 +1030,52 @@ if "kg" not in st.session_state:
 if "default_outputs" not in st.session_state:
     st.session_state.default_outputs: Dict[str, Dict[str, str]] = {}
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history: List[Dict[str, str]] = []
+    st.session_state.chat_history: List[Dict[str, Any]] = []
 
+def push_default_outputs_to_chat(default_outputs: Dict[str, Dict[str, str]]):
+    # 用「結構化訊息」存進 history，渲染時用 badge
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "kind": "text",
+        "content": "我先把上傳報告的「預設輸出」整理好囉（摘要/核心主張/推論鏈；每個 bullet 都有引用）。你接下來可以直接在下方問問題。",
+    })
+    for title, out in default_outputs.items():
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "kind": "default_outputs",
+            "title": title,
+            "summary": out["summary"],
+            "claims": out["claims"],
+            "chain": out["chain"],
+        })
 
-# ===== 上傳 popover =====
-with st.popover("📤 上傳文件"):
-    st.caption("支援 PDF/TXT/PNG/JPG。PDF 若抽到文字偏少會自動建議 OCR（逐檔可勾選）。")
+def render_chat_message(msg: Dict[str, Any]):
+    role = msg.get("role", "assistant")
+    with st.chat_message(role):
+        kind = msg.get("kind", "md")
+        if kind == "default_outputs":
+            st.markdown(f"## 預設輸出：{msg['title']}")
+            st.markdown("### 1) 報告摘要")
+            render_bullets_with_badges(msg["summary"], badge_color="green")
+            st.markdown("### 2) 核心主張")
+            render_bullets_with_badges(msg["claims"], badge_color="violet")
+            st.markdown("### 3) 推論鏈 / 傳導機制")
+            render_bullets_with_badges(msg["chain"], badge_color="orange")
+        else:
+            st.markdown(msg.get("content", ""))
+
+# =========================
+# ✅ 文件管理 popover（你要求：從上傳到建索引都在這裡）
+# =========================
+with st.popover("📦 文件管理（上傳 / OCR / 建索引）", use_container_width=True):
+    st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
     up = st.file_uploader(
-        "選擇檔案",
+        "上傳文件",
         type=["pdf", "txt", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
+        key="uploader",
     )
+
     if up:
         existing_keys = {(r.name, r.bytes_len) for r in st.session_state.file_rows}
         for f in up:
@@ -1051,140 +1123,165 @@ with st.popover("📤 上傳文件"):
                 )
             )
 
-# ===== 檔案表格 + OCR 勾選 =====
-st.subheader("已上傳文件")
-if not st.session_state.file_rows:
-    st.info("還沒有上傳文件。點「📤 上傳文件」開始。")
+    st.markdown("### 文件清單（可逐檔勾選 OCR）")
+    if not st.session_state.file_rows:
+        st.info("尚未上傳文件。")
+    else:
+        table_data = []
+        for r in st.session_state.file_rows:
+            note = ""
+            if r.ext == ".pdf" and r.likely_scanned:
+                note = "可能掃描PDF，建議 OCR"
+            elif r.ext in (".png", ".jpg", ".jpeg"):
+                note = "圖片檔：一定 OCR"
+            elif r.ext == ".txt":
+                note = "文字檔：不需要 OCR"
+
+            table_data.append({
+                "file_id": r.file_id,
+                "檔名": r.name,
+                "格式": r.ext,
+                "頁數": r.pages if r.pages is not None else "-",
+                "抽到字數(全文)": r.extracted_chars,
+                "token估算(粗估)": r.token_est,
+                "空白頁/頁數": f"{r.blank_pages}/{r.pages}" if r.blank_pages is not None and r.pages else "-",
+                "空白頁比例": f"{r.blank_ratio:.2f}" if r.blank_ratio is not None else "-",
+                "建議OCR": r.likely_scanned,
+                "使用OCR": r.use_ocr,
+                "備註": note,
+            })
+
+        disabled_cols = ["file_id", "檔名", "格式", "頁數", "抽到字數(全文)", "token估算(粗估)", "空白頁/頁數", "空白頁比例", "建議OCR", "備註"]
+        edited = st.data_editor(
+            table_data,
+            use_container_width=True,
+            hide_index=True,
+            disabled=disabled_cols,
+            column_config={
+                "使用OCR": st.column_config.CheckboxColumn("使用OCR", help="PDF 字數太少時建議勾選 OCR（會更慢且花費較高）"),
+            },
+        )
+
+        use_ocr_map = {row["file_id"]: bool(row["使用OCR"]) for row in edited}
+        for i, r in enumerate(st.session_state.file_rows):
+            if r.ext in (".png", ".jpg", ".jpeg"):
+                st.session_state.file_rows[i].use_ocr = True
+            elif r.ext == ".txt":
+                st.session_state.file_rows[i].use_ocr = False
+            else:
+                st.session_state.file_rows[i].use_ocr = use_ocr_map.get(r.file_id, r.use_ocr)
+
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            build_btn = st.button("🚀 建立索引 + 預設輸出", type="primary", use_container_width=True)
+        with c2:
+            clear_btn = st.button("🧹 清空全部", use_container_width=True)
+        with c3:
+            st.caption("會建立：FAISS + LangExtract KG + 預設輸出（摘要/主張/推論鏈）並推送到 Chat。")
+
+        if clear_btn:
+            st.session_state.file_rows = []
+            st.session_state.file_bytes = {}
+            st.session_state.store = None
+            st.session_state.kg = KnowledgeGraph()
+            st.session_state.default_outputs = {}
+            st.session_state.chat_history = []
+            st.rerun()
+
+        if build_btn:
+            need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
+            if need_ocr and not HAS_PYMUPDF:
+                st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf，再重試。")
+                st.stop()
+
+            with st.status("建索引中（向量 + KG）...", expanded=True) as s1:
+                store, kg, stats = build_indices(
+                    client=client,
+                    api_key=api_key,
+                    file_rows=st.session_state.file_rows,
+                    file_bytes_map=st.session_state.file_bytes,
+                )
+                st.session_state.store = store
+                st.session_state.kg = kg
+                s1.update(label=f"完成索引：chunks={stats['chunks']} / KG nodes={stats['kg_nodes']} edges={stats['kg_edges']}", state="complete")
+
+            titles = sorted({c.title for c in st.session_state.store.chunks})
+            with st.status("產生預設輸出（每個 bullet 必須引用；呈現改用 badge）...", expanded=True) as s2:
+                default_outputs = {}
+                for title in titles:
+                    default_outputs[title] = make_default_outputs_for_report(client, st.session_state.store.chunks, title)
+                st.session_state.default_outputs = default_outputs
+                s2.update(label="預設輸出完成", state="complete")
+
+            st.session_state.chat_history = []
+            push_default_outputs_to_chat(st.session_state.default_outputs)
+
+# popover 外：顯示簡短狀態（不含上傳/建索引 UI）
+if st.session_state.store is None:
+    st.info("尚未建立索引。請點上方「📦 文件管理（上傳 / OCR / 建索引）」開始。")
 else:
-    table_data = []
-    for r in st.session_state.file_rows:
-        note = ""
-        if r.ext == ".pdf" and r.likely_scanned:
-            note = "文字抽取偏少，可能是掃描PDF，建議 OCR"
-        elif r.ext in (".png", ".jpg", ".jpeg"):
-            note = "圖片檔：一定會 OCR"
-        elif r.ext == ".txt":
-            note = "文字檔：不需要 OCR"
-
-        table_data.append({
-            "file_id": r.file_id,
-            "檔名": r.name,
-            "格式": r.ext,
-            "頁數": r.pages if r.pages is not None else "-",
-            "抽到字數(全文)": r.extracted_chars,
-            "token估算(粗估)": r.token_est,
-            "空白頁/頁數": f"{r.blank_pages}/{r.pages}" if r.blank_pages is not None and r.pages else "-",
-            "空白頁比例": f"{r.blank_ratio:.2f}" if r.blank_ratio is not None else "-",
-            "建議OCR": r.likely_scanned,
-            "使用OCR": r.use_ocr,
-            "備註": note,
-        })
-
-    disabled_cols = ["file_id", "檔名", "格式", "頁數", "抽到字數(全文)", "token估算(粗估)", "空白頁/頁數", "空白頁比例", "建議OCR", "備註"]
-    edited = st.data_editor(
-        table_data,
-        use_container_width=True,
-        hide_index=True,
-        disabled=disabled_cols,
-        column_config={
-            "使用OCR": st.column_config.CheckboxColumn("使用OCR", help="PDF 字數太少時建議勾選 OCR（會更慢且花費較高）"),
-        },
+    st.success(
+        f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)} / "
+        f"KG nodes={st.session_state.kg.g.number_of_nodes()} edges={st.session_state.kg.g.number_of_edges()}"
     )
-
-    use_ocr_map = {row["file_id"]: bool(row["使用OCR"]) for row in edited}
-    for i, r in enumerate(st.session_state.file_rows):
-        if r.ext in (".png", ".jpg", ".jpeg"):
-            st.session_state.file_rows[i].use_ocr = True
-        elif r.ext == ".txt":
-            st.session_state.file_rows[i].use_ocr = False
-        else:
-            st.session_state.file_rows[i].use_ocr = use_ocr_map.get(r.file_id, r.use_ocr)
-
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        build_btn = st.button("🚀 建立索引 + 預設輸出", type="primary", use_container_width=True)
-    with c2:
-        clear_btn = st.button("🧹 清空", use_container_width=True)
-    with c3:
-        st.caption("會建立：FAISS + LangExtract KG + 預設輸出（摘要/核心主張/推論鏈）→ 推送到 Chat。")
-
-    if clear_btn:
-        st.session_state.file_rows = []
-        st.session_state.file_bytes = {}
-        st.session_state.store = None
-        st.session_state.kg = KnowledgeGraph()
-        st.session_state.default_outputs = {}
-        st.session_state.chat_history = []
-        st.rerun()
-
-    if build_btn:
-        need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
-        if need_ocr and not HAS_PYMUPDF:
-            st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf，再重試。")
-            st.stop()
-
-        with st.status("建索引中（向量 + KG）...", expanded=True) as s1:
-            store, kg, stats = build_indices(
-                client=client,
-                api_key=api_key,
-                file_rows=st.session_state.file_rows,
-                file_bytes_map=st.session_state.file_bytes,
-            )
-            st.session_state.store = store
-            st.session_state.kg = kg
-            s1.update(label=f"完成索引：chunks={stats['chunks']} / KG nodes={stats['kg_nodes']} edges={stats['kg_edges']}", state="complete")
-
-        titles = sorted({c.title for c in st.session_state.store.chunks})
-        with st.status("產生預設輸出（摘要/核心主張/推論鏈；每個 bullet 必須引用）...", expanded=True) as s2:
-            default_outputs = {}
-            for title in titles:
-                default_outputs[title] = make_default_outputs_for_report(client, st.session_state.store.chunks, title)
-            st.session_state.default_outputs = default_outputs
-            s2.update(label="預設輸出完成", state="complete")
-
-        st.session_state.chat_history = []
-        push_default_outputs_to_chat(st.session_state.default_outputs)
 
 st.divider()
 
 # ===== Chat 主畫面（唯一）=====
-st.subheader("Chat（Workflow：RETRIEVE / GRADE / TRANSFORM / GENERATE；含 ✅/❌ + 耗時 + 展開全文）")
+st.subheader("Chat（回答來源用 badge 顯示）")
 
 for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    render_chat_message(msg)
 
 if st.session_state.store is None:
-    st.info("請先上傳文件並建立索引。")
-else:
-    prompt = st.chat_input("輸入問題：理解含意/為何這樣陳述/傳導機制/重組新報告/列出所有…")
-    if prompt:
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    st.stop()
 
-        with st.chat_message("assistant"):
-            with st.status("Workflow running…", expanded=True) as status:
-                result = run_chat_workflow_with_ui(
-                    client=client,
-                    store=st.session_state.store,
-                    kg=st.session_state.kg,
-                    question=prompt,
-                    max_query_rewrites=2,
-                    max_generate_retries=2,
-                    top_k=10,
-                )
-                status.update(label="Workflow done", state="complete", expanded=False)
+prompt = st.chat_input("輸入問題：理解含意/為何這樣陳述/傳導機制/重組新報告/列出所有…")
+if prompt:
+    st.session_state.chat_history.append({"role": "user", "kind": "text", "content": prompt})
+    render_chat_message(st.session_state.chat_history[-1])
 
-            st.markdown("## 最終回答")
-            st.markdown(result["final_answer"])
+    with st.chat_message("assistant"):
+        with st.status("Workflow running…（會逐步顯示 RETRIEVE / GRADE / TRANSFORM / GENERATE / CHECK）", expanded=True) as status:
+            result = run_chat_workflow_with_ui(
+                client=client,
+                store=st.session_state.store,
+                kg=st.session_state.kg,
+                question=prompt,
+                max_query_rewrites=2,
+                max_generate_retries=2,
+                top_k=10,
+            )
+            status.update(label="Workflow done", state="complete", expanded=False)
 
-            with st.expander("查看 debug（query history / logs / context）"):
-                st.markdown("### Query history")
-                st.code("\n".join([f"{i}. {q}" for i, q in enumerate(result.get("query_history", []))]))
-                st.markdown("### Logs")
-                st.text("\n".join(result.get("logs", [])))
-                st.markdown("### Context（節錄）")
-                st.text((result.get("context", "") or "")[:12000])
+        st.markdown("## 最終回答")
+        # 最終呈現也用 badge（依問題型態）
+        if result.get("render_mode") == "bullets":
+            render_bullets_with_badges(result["final_answer"], badge_color="blue")
+        else:
+            render_text_with_badges(result["final_answer"], badge_color="gray")
 
-        st.session_state.chat_history.append({"role": "assistant", "content": result["final_answer"]})
+        with st.expander("查看 debug（query history / logs / context）"):
+            st.markdown("### Query history")
+            st.code("\n".join([f"{i}. {q}" for i, q in enumerate(result.get("query_history", []))]))
+            st.markdown("### Logs")
+            st.text("\n".join(result.get("logs", [])))
+            st.markdown("### Context（節錄）")
+            st.text((result.get("context", "") or "")[:12000])
+
+    # 將「原始含引用的答案」存入 history，之後重畫仍可 badge 呈現
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "kind": "answer",
+        "render_mode": result.get("render_mode", "text"),
+        "raw": result.get("final_answer", ""),
+    })
+
+    # 重畫最後一則（讓 history 跟畫面一致）
+    # （這裡用一個一致的格式：存 raw，顯示時 badge）
+    with st.chat_message("assistant"):
+        st.markdown("##（已加入對話紀錄）")
+        if result.get("render_mode") == "bullets":
+            render_bullets_with_badges(result.get("final_answer", ""), badge_color="blue")
+        else:
+            render_text_with_badges(result.get("final_answer", ""), badge_color="gray")
