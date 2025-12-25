@@ -34,8 +34,7 @@ except Exception:
 # =========================
 # Streamlit config（只呼叫一次）
 # =========================
-st.set_page_config(page_title="研究報告助手（Web只做背景）", layout="wide")
-st.title("研究報告助手（Web只做背景）")
+st.set_page_config(page_title="研究報告助手）", layout="wide")
 
 
 # =========================
