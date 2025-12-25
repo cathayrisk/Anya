@@ -949,7 +949,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", width="conten
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
 
     web_mode = st.radio(
-        "Web search（只做背景）",
+        "Web search",
         options=["OFF", "AUTO"],
         index=0,
         horizontal=True,
@@ -1118,11 +1118,11 @@ for msg in st.session_state.chat_history:
     with st.chat_message(msg.get("role", "assistant")):
         if msg.get("kind") == "default":
             st.markdown(f"## 預設輸出：{msg.get('title','')}")
-            st.markdown("### 1) 報告摘要（融合多份報告）")
+            st.markdown("### 1) 報告摘要")
             render_bullets_inline_badges(msg.get("summary", ""), badge_color="green")
-            st.markdown("### 2) 核心主張（融合多份報告）")
+            st.markdown("### 2) 核心主張")
             render_bullets_inline_badges(msg.get("claims", ""), badge_color="violet")
-            st.markdown("### 3) 推論鏈（融合多份報告）")
+            st.markdown("### 3) 推論鏈")
             render_bullets_inline_badges(msg.get("chain", ""), badge_color="orange")
         else:
             st.markdown(msg.get("content", ""))
