@@ -490,7 +490,7 @@ def _parse_citations(cits: List[str]) -> List[Dict[str, str]]:
             parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip(), "chunk_id": m.group(3).strip()})
     return parsed
 
-def _render_badges(parsed: List[Dict[str, str]], color: str = "blue", icon: Optional[str] = ":material_bookmark:"):
+def _render_badges(parsed: List[Dict[str, str]], color: str = "blue", icon: Optional[str] = ":material/bookmark:"):
     if not parsed:
         return
     per_row = 4
@@ -523,7 +523,7 @@ def render_text_with_badges(md_text: str, badge_color: str = "gray"):
     parsed = _parse_citations(sorted(set(cits)))
     if parsed:
         st.markdown("**來源：**")
-        _render_badges(parsed, color=badge_color, icon=":material_source:")
+        _render_badges(parsed, color=badge_color, icon=":material/source:")
 
 
 # =========================
