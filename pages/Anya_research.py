@@ -89,8 +89,6 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
 # =========================
 # OpenAI helpers
 # =========================
-def get_client() -> OpenAI:
-    return OpenAI()
 
 def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
     resp = client.embeddings.create(
@@ -979,12 +977,8 @@ def run_chat_workflow_with_ui(
 st.set_page_config(page_title="研究報告助手（Workflow UI）", layout="wide")
 st.title("研究報告助手（FAISS + LangExtract + Chat + Workflow UI）")
 
-api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-if not api_key:
-    st.error("請先設定環境變數 OPENAI_API_KEY。")
-    st.stop()
-
-client = get_client()
+client = OpenAI(api_key=st.secrets["OPENAI_KEY"])
+api_key=st.secrets["OPENAI_KEY"]
 
 # Session State
 if "file_rows" not in st.session_state:
@@ -1003,7 +997,7 @@ if "chat_history" not in st.session_state:
 
 
 # ===== 上傳 popover =====
-with st.popover("📤 上傳文件", use_container_width=True):
+with st.popover("📤 上傳文件"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若抽到文字偏少會自動建議 OCR（逐檔可勾選）。")
     up = st.file_uploader(
         "選擇檔案",
