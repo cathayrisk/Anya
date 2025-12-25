@@ -1288,8 +1288,7 @@ def run_adaptive_rag(
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="研究報告助手（Coverage-based WebSearch，預設關）", layout="wide")
-st.title("研究報告助手（Coverage-based WebSearch，預設關）")
+st.set_page_config(page_title="研究報告助手", layout="wide")
 
 OPENAI_API_KEY = get_openai_api_key()
 client = get_client(OPENAI_API_KEY)
