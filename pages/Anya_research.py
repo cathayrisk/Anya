@@ -1088,7 +1088,7 @@ def render_chat_message(msg: Dict[str, Any]):
 # =========================
 # ✅ 文件管理 popover（你要求：從上傳到建索引都在這裡）
 # =========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引）", use_container_width=True):
+with st.popover("📦 文件管理（上傳 / OCR / 建索引）"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
     up = st.file_uploader(
         "上傳文件",
@@ -1194,9 +1194,9 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引）", use_container
 
         c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
-            build_btn = st.button("🚀 建立索引 + 預設輸出", type="primary", use_container_width=True)
+            build_btn = st.button("🚀 建立索引 + 預設輸出", type="primary")
         with c2:
-            clear_btn = st.button("🧹 清空全部", use_container_width=True)
+            clear_btn = st.button("🧹 清空全部")
         with c3:
             st.caption("會建立：FAISS + LangExtract KG + 預設輸出（摘要/主張/推論鏈）並推送到 Chat。")
 
