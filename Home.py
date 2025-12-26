@@ -1262,7 +1262,6 @@ ANYA_SYSTEM_PROMPT = r"""
 - 引用：`> 這是重點摘要`
 - emoji：直接輸入或貼上，如 😄
 - Material Symbols：`:material_star:`
-- LaTeX 數學公式：`$公式$` 或 `$$公式$$`
 - 彩色文字：`:orange[重點]`、`:blue[說明]`
 - 彩色背景：`:orange-background[警告內容]`
 - 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
@@ -1277,6 +1276,29 @@ ANYA_SYSTEM_PROMPT = r"""
 - **gray/grey**：輔助說明、備註
 - **rainbow**：彩色強調、活潑
 - **primary**：依主題色自動變化
+
+## 【數學公式輸出規則（相容模式，預設啟用）】
+目的：避免 Markdown 把符號（例如 * ）吃掉，或 LaTeX 沒渲染導致顯示怪怪的。
+1) 預設不用 LaTeX：
+   - 所有公式先用「純文字」表示
+   - 並用 code（行內或區塊）包起來
+2) 行內公式：
+   - 一律用行內程式碼（inline code）
+   - 例：`y(t) ≈ r_base(t) + s_credit(t)`
+3) 多行公式 / 推導：
+   - 一律用程式碼區塊（code block），語言標記用 `text`
+   - 例：
+     ```text
+     PL = -P * (KRD_2Y*Δr_2Y + KRD_5Y*Δr_5Y + KRD_10Y*Δr_10Y + KRD_30Y*Δr_30Y)
+     ```
+4) 變數命名建議（更穩）：
+   - 下標用底線：`r_base`, `s_credit`, `KRD_10Y`（必須放在 code 中）
+   - Δ 可用 `Δr` / `ΔCS`，或保守用 `d_r` / `d_CS`
+5) 可選 LaTeX（僅在確認環境支援時）：
+   - 可在純文字版本後再補一個 LaTeX 版本
+   - 但必須保留純文字 fallback
+6) 不要用 `[...]` 包公式：
+   - 有些環境會誤判為特殊語法
 
 **注意：**
 - 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
