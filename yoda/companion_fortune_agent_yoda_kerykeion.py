@@ -43,7 +43,6 @@ class ProfileDelta(BaseModel):
     birthdate: Optional[str] = None  # YYYY-MM-DD
     birth_time: Optional[str] = None  # HH:MM
 
-    # 地點欄位：仍保留欄位，但系統會自動補台北
     birth_city: Optional[str] = None
     birth_country: Optional[str] = None
     lng: Optional[float] = None
@@ -54,7 +53,6 @@ class ProfileDelta(BaseModel):
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
 
-    # Forrest 定調
     consult_goal: Optional[str] = None
     consult_focus: Optional[str] = None  # self/relationship/career/timing/block/other
 
@@ -69,7 +67,6 @@ def _get_user_profile_impl(user_id: str) -> Any:
 
 
 def _ensure_default_taipei_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
-    """強制補台北預設，避免任何地點/時區缺漏導致流程追問。"""
     if not profile.get("birth_city"):
         profile["birth_city"] = DEFAULT_CITY
     if not profile.get("birth_country"):
@@ -99,9 +96,6 @@ def _update_user_profile_impl(
     consult_goal: Optional[str] = None,
     consult_focus: Optional[str] = None,
 ) -> Any:
-    """
-    真正更新 profile 的實作（strict schema 友善，無 Dict[str, Any]）。
-    """
     current = PROFILE_STORE.get(user_id, {}).copy()
 
     delta_model = ProfileDelta(
@@ -121,7 +115,6 @@ def _update_user_profile_impl(
     )
     delta = delta_model.model_dump(exclude_none=True, exclude_unset=True)
 
-    # tags 合併去重
     new_tags = delta.pop("tags", None)
     if new_tags is not None:
         existing_tags = current.get("tags", [])
@@ -136,7 +129,6 @@ def _update_user_profile_impl(
     return current
 
 
-# tools（strict schema 安全）
 get_user_profile = function_tool(_get_user_profile_impl)
 update_user_profile = function_tool(_update_user_profile_impl)
 
@@ -203,7 +195,6 @@ def get_natal_chart_context(
     hour, minute = time_parsed["hour"], time_parsed["minute"]
     time_approx = time_parsed["approximated"]
 
-    # 固定台北（工具層保險）
     lng = DEFAULT_LNG if lng is None else lng
     lat = DEFAULT_LAT if lat is None else lat
     tz_str = DEFAULT_TZ if not tz_str else tz_str
@@ -333,13 +324,7 @@ def get_transit_chart_context(
             try:
                 dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
             except Exception:
-                return {
-                    "error": "INVALID_TRANSIT_DATETIME",
-                    "detail": (
-                        f"無法解析 transit_datetime '{transit_datetime}'，"
-                        "請使用 'YYYY-MM-DD HH:MM' 或 'YYYY-MM-DDTHH:MM' 格式。"
-                    ),
-                }
+                return {"error": "INVALID_TRANSIT_DATETIME", "detail": f"無法解析 transit_datetime '{transit_datetime}'"}
         else:
             tz = pytz.timezone(tz_str)
             dt = datetime.now(tz)
@@ -546,54 +531,60 @@ profile_agent = Agent(
 你是溫柔的資料整理者。
 注意：產品決策已固定使用台北預設，因此不要追問任何地點/時區相關問題。
 
-update_user_profile 必須用具名參數呼叫（不能傳 dict）。
-
-你主要要補：
-- birthdate（YYYY-MM-DD）
-- birth_time（HH:MM）
-- consult_goal / consult_focus
+偏好（可選）：
+- 若使用者表達「不想要作業/小步驟」，可把 tags 加上 pref_no_steps。
 """,
 )
 
 fortune_agent = Agent(
     name="Fortune interpretation agent",
     model="gpt-5.2",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="medium"),verbosity="low",),
+    model_settings=ModelSettings(reasoning=Reasoning(effort="medium", verbosity="low")),
     tools=[get_user_profile, get_natal_chart_context, get_transit_chart_context, get_synastry_chart_context],
     instructions=r"""
 System: Internal-only fortune interpretation module.
 You NEVER talk to the end user directly.
 
-方法論：以 Steven Forrest「天空三部曲」的方法（不引用原文）輸出心理占星＋生命敘事架構：
-- 《內在的天空》：從基本元素走出「靈魂意圖/成長契機」（不宿命）。
-- 《昨日的天空》：以南北月交點（含相位）作為「舊路/慣性」與「今生方向」的敘事主軸。
-- 《變幻的天空》：以行運作為「把預測改成選擇建議」的時間敘事；本系統目前只有行運(transit)，不要腦補推運技法。
+你要把 Steven Forrest 三書的方法當作「鏡頭」而非「每次固定三段報告」：
+- Inner Sky 鏡頭：本命核心劇本（我是誰/我怎麼運作）
+- Yesterday’s Sky 鏡頭：南北交點敘事（舊路/熟悉慣性 vs 今生方向）
+- Changing Sky 鏡頭：行運作為季節（不做事件預言，改成選擇建議）
 
-重要禁詞（輸出會直接顯示給使用者）：
+=== 禁止事項 ===
 - 禁止出現：出生地、時區、DST、日光節約、日光節約時間
 - 若要談精準度，只能用「盤面精準度」。
-- 禁止使用英文段標：INNER_SKY / YESTERDAYS_SKY / CHANGING_SKY
+- 禁止英文段標：INNER_SKY / YESTERDAYS_SKY / CHANGING_SKY
+- 禁止盤面幻想：只能用工具 context 中真的出現的配置；不存在就不要寫。
 
-資料策略：
-1) 必須先 get_user_profile(user_id)，取得 birthdate/birth_time。
-2) 只要有 birthdate 就嘗試排本命盤：get_natal_chart_context(...)
-3) consult_goal 若缺：不要 NO_CHART；預設：
-   CONSULT_GOAL = 全面整理（預設）
-   CONSULT_FOCUS = other
+=== 何時用哪些鏡頭（重點） ===
+0) 永遠先回答問題本身（聚焦回應）。
+1) 只在需要時補鏡頭（最多 1–2 個）：
+   - 問「我為什麼會一直重複同樣模式/卡關/像命運循環」=> 補 Yesterday’s Sky（交點敘事）
+   - 問「最近/接下來」=> 補 Changing Sky（若有 transit）
+   - 問「我到底是什麼樣的人/天賦是什麼」=> 補 Inner Sky
+2) 只有使用者明確要求「全面整理/完整解讀/完整解析」才用三段展開（全面整理模式）。
 
-NO_CHART 只允許在：
+=== 昨日的天空（交點敘事）強制規則 ===
+只要你有寫「交點敘事」：
+- 必須提到：南交點/北交點/月交點 至少其一
+- 主線是：南交點=舊路/熟悉慣性（可用前世/業力作象徵敘事，但提醒不是可驗證歷史）
+         北交點=今生方向
+- 相位只有工具輸出有才可提
+
+=== consult_goal ===
+consult_goal 缺失不能造成 NO_CHART：
+- 預設 CONSULT_GOAL=全面整理（預設），CONSULT_FOCUS=other
+
+=== NO_CHART 僅允許於 ===
 - 缺 birthdate（missing_birth_data）
-- synastry 缺對方必要資料（missing_partner_data）
-- kerykeion_error
-- other
+- synastry 缺對方資料（missing_partner_data）
+- kerykeion_error / other
 
-非常重要：禁止盤面幻想
-- 你只能根據工具回傳的 chart context 出現的配置來描述。
-- 找不到的星體/小行星/點位就不要寫（例如 Chiron/凱龍若工具輸出不存在就不能提）。
-- 不要猜上升、行星落宮、相位。
+=== 落地（不要每次都像交作業） ===
+- 若 profile.tags 有 pref_no_steps：優先 QUESTIONS 或 ANCHOR/BOUNDARY_REMINDER
+- 使用者明確要行動清單才用 PRACTICE/ACTIONS
 
-輸出格式（嚴格）：只能輸出一個區塊，不可多字。
-並且「不要使用英文段標」，段標只能用以下中文固定用語，順序固定。
+=== 輸出格式（嚴格：只能輸出一個區塊） ===
 
 [FORTUNE_SUMMARY]
 STATUS: HAS_CHART 或 NO_CHART
@@ -601,33 +592,41 @@ CHART_TYPES: "natal" / "natal+transit" / "natal+synastry"
 CONSULT_GOAL: ...
 CONSULT_FOCUS: ...
 
-（HAS_CHART 時必須有三段敘事，段標用中文，順序固定；每段 4–10 行，第三人稱敘事）
+（HAS_CHART：兩種模式擇一）
+
+【聚焦回應模式】
+聚焦回應：
+（2–10 行：先回答問題本身）
+（可選）交點敘事：
+（2–8 行：若出現則需交點字樣）
+（可選）更成熟的選擇：
+（2–8 行：若含 transit 用季節/天氣隱喻，不做事件預言）
+
+【全面整理模式】
 你內在的核心劇本：
-- 以《內在的天空》的方式：上升＋守護星、太陽/月亮、元素/模式/半球、行星落宮、主要相位整合
-- 語氣要像「靈魂意圖/此生課題」，但不宿命、不恐嚇
-
+（4–10 行）
 你曾用來活下來的方式：
-- 必須以《昨日的天空》為主軸（強制）：
-  * 南交點（星座/宮位）= 舊路/熟悉慣性/前世象徵（象徵敘事，不當作可驗證歷史）
-  * 北交點（星座/宮位）= 今生方向/靈魂想長成的樣子
-  * 行星與南交點相位（若工具輸出有才可提）= 哪些習慣像天賦、哪些後來變限制
-- 不要把它寫成「月亮四宮土星」那種一般童年心理學主段落；此段主軸必須是交點敘事
-
+（4–10 行：交點敘事為主）
 你接下來更成熟的選擇：
-- 若 CHART_TYPES 含 transit：用《變幻的天空》精神把行運說成季節/天氣，提供選擇點與練習，不做事件預言
-- 若無 transit：用北交點方向＋本命關鍵張力，描述「此刻如何更成熟地做選擇」
-- 結尾必須落到可執行
+（4–10 行：行運=季節，不做事件預言）
 
-（最後落地：全部都要出現）
 THEME: ...
 SHADOW: ...
 GIFT: ...
 CHOICE: ...
+
+（落地段：至少一種）
 PRACTICE: ...
 ACTIONS:
 - 1) ...
 - 2) ...
-- 3) ...（可 1–3 條）
+或
+QUESTIONS:
+- 1) ...
+- 2) ...
+或
+ANCHOR: ...
+BOUNDARY_REMINDER: ...
 
 （使用者要求完整命盤時才加）
 [FULL_CHART]
@@ -636,10 +635,20 @@ ACTIONS:
 
 [/FORTUNE_SUMMARY]
 
-NO_CHART 時仍要輸出：
-- STATUS/REASON/CONSULT_GOAL/CONSULT_FOCUS
-- THEME/SHADOW/GIFT/CHOICE/PRACTICE（第三人稱）
-- 禁止任何盤面細節
+NO_CHART：
+[FORTUNE_SUMMARY]
+STATUS: NO_CHART
+REASON: missing_birth_data / missing_partner_data / kerykeion_error / other
+CONSULT_GOAL: 全面整理（預設）
+CONSULT_FOCUS: other
+THEME: ...
+SHADOW: ...
+GIFT: ...
+CHOICE: ...
+QUESTIONS:
+- 1) ...
+- 2) ...
+[/FORTUNE_SUMMARY]
 """,
 )
 
@@ -663,15 +672,9 @@ Context:
 - 若有 [FORTUNE_SUMMARY]：你只能用它轉述/安撫/落地，不可新增任何占星細節。
 - 若沒有 [FORTUNE_SUMMARY]：只做情緒陪伴與定調問題，不要假裝有命盤內容。
 
-# PROFILE_HINT
-- 若看到 consult_goal/consult_focus：可用來更貼近使用者，但不要像在揭露資料。
-  用「若我沒理解錯，你在意的可能是…」這種措辭。
-
 # 原力（The Force）— 溫柔但有界線版
 - 原力是隱喻：覺察、呼吸、界線、價值選擇。
 - 每次回覆提到「原力」最多 0～2 次；禁止權威口吻（禁：原力告訴你/你必須）。
-- 允許感受，但也要守界線：同時做到共感與界線提醒。
-- 提到原力後，下一句要接具體可做的小步驟（5～20 分鐘級）。
 
 # Yoda style
 - 至少 2～4 句輕微倒裝
@@ -679,37 +682,25 @@ Context:
 - 多用短句分段
 - 不做醫療/法律/投資建議；若有自傷他傷傾向，鼓勵現實專業協助
 
-# FORTUNE_SUMMARY 使用規則
-- STATUS: HAS_CHART：
-  * 只能轉述/改寫摘要內容，不可新增占星細節（不得腦補星座/度數/宮位/相位）。
-  * 把 PRACTICE 變成 1～2 個可執行小步驟。
-  * 若包含 [FULL_CHART]：用 Markdown 區塊把 FULL_CHART 原樣呈現（不要大幅刪改）。
-- STATUS: NO_CHART：
-  * 不提占星細節。
-  * 若缺 consult_goal：用 1～2 個短問題定調（不審問、可選擇）。
-
-Language:
-- 繁體中文
-- 可用適度 Markdown
-- 不提 tools / user_id / Agent
-
-# 硬性禁詞（請嚴格遵守）
+# 硬性禁詞
 - 回覆中禁止出現：出生地、時區、DST、日光節約、日光節約時間
 - 若要談精準度，只能說「盤面精準度」。
 
-# Steven Forrest 三書方法論的「轉譯」規則（加強版）
-- 若 FORTUNE_SUMMARY 內包含三段：
-  「你內在的核心劇本」、「你曾用來活下來的方式」、「你接下來更成熟的選擇」
-  你回覆時也必須用同樣三段式來「解釋與陪伴」，順序一致，且段標用中文（不要 INNER_SKY 等英文）。
-- 第二段「你曾用來活下來的方式」：要明確點出這是以南北月交點敘事在談「舊路/熟悉慣性」與「今生方向」，
-  但語氣要溫柔：不要用恐嚇或宿命語。
-- 最後務必落地：把 ACTIONS 或 PRACTICE 轉成 1–2 個「今天/這週能做」的小步驟（5–20 分鐘級）。
+# 回覆策略（避免無趣）
+- 以使用者問題為主，不要硬拆三段。
+- fortune 是「聚焦回應模式」：就照它的節奏，先回答，再溫柔承接。
+- fortune 是「全面整理模式」：才用三段中文敘事回應。
+
+# 落地方式（避免作業感）
+- 若 fortune 有 QUESTIONS：挑 1–2 題溫柔問
+- 若有 ANCHOR/BOUNDARY_REMINDER：給一句能帶著走的話（不要求做事）
+- 只有使用者明確要步驟時，才轉成可做的小步驟
 """,
 )
 
 
 # ============================================================
-# 4. 輸出格式檢查器：fortune_agent 產物驗證 + 自動重試
+# 4. 輸出格式檢查器 + 自動重試（依本輪是否要求全面整理決定嚴格度）
 # ============================================================
 
 _BANNED_STRINGS = [
@@ -717,35 +708,14 @@ _BANNED_STRINGS = [
     "INNER_SKY", "YESTERDAYS_SKY", "CHANGING_SKY",
 ]
 
-_REQUIRED_SECTIONS_HAS_CHART = [
+_REQUIRED_FIELDS_BASE = ["STATUS:", "CHART_TYPES:", "CONSULT_GOAL:", "CONSULT_FOCUS:"]
+_REQUIRED_FIELDS_HAS_CHART_CORE = ["THEME:", "SHADOW:", "GIFT:", "CHOICE:"]
+_ALLOWED_GROUNDING_MARKERS = ["PRACTICE:", "ACTIONS:", "QUESTIONS:", "ANCHOR:", "BOUNDARY_REMINDER:"]
+
+_REQUIRED_SECTIONS_TRILOGY = [
     "你內在的核心劇本：",
     "你曾用來活下來的方式：",
     "你接下來更成熟的選擇：",
-]
-
-_REQUIRED_FIELDS_BASE = [
-    "STATUS:",
-    "CHART_TYPES:",
-    "CONSULT_GOAL:",
-    "CONSULT_FOCUS:",
-]
-
-_REQUIRED_FIELDS_HAS_CHART = [
-    "THEME:",
-    "SHADOW:",
-    "GIFT:",
-    "CHOICE:",
-    "PRACTICE:",
-    "ACTIONS:",
-]
-
-_REQUIRED_FIELDS_NO_CHART = [
-    "REASON:",
-    "THEME:",
-    "SHADOW:",
-    "GIFT:",
-    "CHOICE:",
-    "PRACTICE:",
 ]
 
 
@@ -763,17 +733,13 @@ def _normalize_fortune_block(text: str) -> str:
 def _extract_fortune_summary_block(text: str) -> Optional[str]:
     t = _normalize_fortune_block(text)
     m = re.search(r"\[FORTUNE_SUMMARY\][\s\S]*?\[/FORTUNE_SUMMARY\]", t)
-    if not m:
-        return None
-    return m.group(0).strip()
+    return m.group(0).strip() if m else None
 
 
 def _is_only_one_fortune_block(text: str) -> bool:
     t = _normalize_fortune_block(text)
     block = _extract_fortune_summary_block(t)
-    if not block:
-        return False
-    return t == block
+    return bool(block) and (t == block)
 
 
 def _parse_status(block: str) -> Optional[str]:
@@ -781,14 +747,17 @@ def _parse_status(block: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _validate_fortune_output(raw_text: str) -> Tuple[bool, List[str], Optional[str]]:
+def _has_any_grounding(block: str) -> bool:
+    return any(marker in block for marker in _ALLOWED_GROUNDING_MARKERS)
+
+
+def _validate_fortune_output(raw_text: str, require_trilogy: bool) -> Tuple[bool, List[str], Optional[str]]:
     problems: List[str] = []
     t = _normalize_fortune_block(raw_text)
-
     block = _extract_fortune_summary_block(t)
+
     if not block:
-        problems.append("缺少 [FORTUNE_SUMMARY]...[/FORTUNE_SUMMARY] 區塊")
-        return False, problems, None
+        return False, ["缺少 [FORTUNE_SUMMARY]...[/FORTUNE_SUMMARY] 區塊"], None
 
     if not _is_only_one_fortune_block(t):
         problems.append("輸出包含 fortune 區塊以外的多餘文字（必須只輸出 fortune 區塊）")
@@ -807,33 +776,37 @@ def _validate_fortune_output(raw_text: str) -> Tuple[bool, List[str], Optional[s
         return False, problems, block
 
     if status == "HAS_CHART":
-        for sec in _REQUIRED_SECTIONS_HAS_CHART:
-            if sec not in block:
-                problems.append(f"HAS_CHART 缺少中文段落標題：{sec}")
-
-        for key in _REQUIRED_FIELDS_HAS_CHART:
+        for key in _REQUIRED_FIELDS_HAS_CHART_CORE:
             if key not in block:
                 problems.append(f"HAS_CHART 缺少欄位：{key}")
 
-        # ACTIONS 至少一條
-        if "ACTIONS:" in block and not re.search(r"ACTIONS:\s*\n-\s*1\)", block):
-            problems.append("ACTIONS 需包含至少一條條列（例如 '- 1) ...'）")
+        if not _has_any_grounding(block):
+            problems.append("HAS_CHART 必須包含落地段：PRACTICE/ACTIONS 或 QUESTIONS 或 ANCHOR/BOUNDARY_REMINDER 其一")
 
-        # Yesterday's Sky 段落應包含交點語彙（至少提到一個）
-        # （這個檢查不會要求一定有「前世」字眼，只要交點主軸存在即可）
-        if "你曾用來活下來的方式：" in block:
-            seg = block.split("你曾用來活下來的方式：", 1)[1]
-            seg = seg.split("你接下來更成熟的選擇：", 1)[0]
-            if ("南交點" not in seg) and ("北交點" not in seg) and ("月交點" not in seg):
-                problems.append("第二段需以南北月交點為主軸（至少提到南交點/北交點/月交點）")
+        if require_trilogy:
+            for sec in _REQUIRED_SECTIONS_TRILOGY:
+                if sec not in block:
+                    problems.append(f"全面整理模式缺少段落標題：{sec}")
+        else:
+            # 聚焦模式：至少要有「聚焦回應：」
+            if "聚焦回應：" not in block:
+                problems.append("聚焦回應模式缺少『聚焦回應：』段落（請先回答問題本身）")
+
+        # 若出現交點敘事，至少要提到交點字樣
+        if "交點敘事：" in block:
+            if ("南交點" not in block) and ("北交點" not in block) and ("月交點" not in block):
+                problems.append("交點敘事需至少提到南交點/北交點/月交點其中之一")
 
     else:
-        for key in _REQUIRED_FIELDS_NO_CHART:
-            if key not in block:
-                problems.append(f"NO_CHART 缺少欄位：{key}")
+        if "REASON:" not in block:
+            problems.append("NO_CHART 缺少欄位：REASON:")
+        for k in ["THEME:", "SHADOW:", "GIFT:", "CHOICE:"]:
+            if k not in block:
+                problems.append(f"NO_CHART 缺少欄位：{k}")
+        if ("QUESTIONS:" not in block) and ("ANCHOR:" not in block):
+            problems.append("NO_CHART 需包含 QUESTIONS 或 ANCHOR 其一（避免空泛）")
 
-    ok = len(problems) == 0
-    return ok, problems, block
+    return (len(problems) == 0), problems, block
 
 
 async def _run_fortune_checked(
@@ -841,6 +814,7 @@ async def _run_fortune_checked(
     system_info: str,
     user_message: str,
     session: EncryptedSession,
+    require_trilogy: bool,
     max_attempts: int = 2,
 ) -> Optional[str]:
     last_block: Optional[str] = None
@@ -854,44 +828,48 @@ async def _run_fortune_checked(
                 "上一次輸出未通過格式檢查，這次務必完全修正。\n"
                 "問題如下（逐一修正）：\n"
                 + "\n".join([f"- {p}" for p in last_problems])
-                + "\n要求：只能輸出一個 [FORTUNE_SUMMARY] 區塊；三段段標必須用中文；不得出現禁詞/英文段標。\n"
-                "[/FORMAT_HINT]\n"
+                + "\n要求：只能輸出一個 [FORTUNE_SUMMARY] 區塊；不得出現禁詞/英文段標。\n"
+                + ("（本次為全面整理：三段中文段標必須齊全）\n" if require_trilogy else "（本次為聚焦回應：必須先回答問題本身）\n")
+                + "[/FORMAT_HINT]\n"
             )
 
         full_input = system_info + format_hint + f"[USER MESSAGE] {user_message}"
         r = await Runner.run(fortune_agent, input=full_input, session=session)
         raw = (r.final_output or "").strip()
 
-        ok, problems, block = _validate_fortune_output(raw)
+        ok, problems, block = _validate_fortune_output(raw, require_trilogy=require_trilogy)
         last_problems = problems
         last_block = block
 
         if ok and block:
             return block
 
-    # 失敗：回傳最後一次 block（不快取），讓 counselor 至少能接住
     return last_block
 
 
 # ============================================================
-# 5. Orchestrator：快取 + synastry 換對象 bust + fortune format retry
+# 5. Orchestrator：快取 + synastry bust + 偏好
 # ============================================================
 
 AstroIntent = Literal["yes", "maybe", "no"]
 RequestKind = Literal["natal", "transit", "synastry", "unknown"]
 
 _ASTRO_KEYWORDS_YES = [
-    "星座", "命盤", "占星", "本命盤", "全面整理", "完整解讀", "解讀", "看盤", "排盤", "排盤解析",
+    "星座", "命盤", "占星", "本命盤", "解讀", "看盤", "排盤", "排盤解析",
     "行運", "運勢", "流年", "推運", "次限", "太陽弧",
     "合盤", "關係盤", "配不配", "我們兩個",
     "上升", "月亮", "太陽星座", "宮位", "相位",
+    "全面整理", "完整解讀", "完整解析", "全盤",
 ]
 
 _FULL_CHART_KEYWORDS = ["完整命盤", "排盤明細", "完整盤", "命盤明細", "原始輸出", "FULL_CHART"]
 
+_NO_STEPS_CUES = [
+    "不要小步驟", "不要作業", "別叫我做", "不要練習", "不要任務", "不要行動清單",
+    "不要每天", "不要每次", "不想做小步驟", "不想被指派",
+]
 
-def _now_ts() -> float:
-    return time.time()
+_WANTS_ACTION_CUES = ["怎麼做", "具體要做什麼", "給我行動", "行動方案", "步驟", "清單", "實作", "可執行"]
 
 
 def _get_fortune_cache_ttl() -> int:
@@ -901,6 +879,10 @@ def _get_fortune_cache_ttl() -> int:
 def _wants_full_chart(msg: str) -> bool:
     s = msg or ""
     return any(k in s for k in _FULL_CHART_KEYWORDS) or ("#fullchart" in s.lower())
+
+
+def _wants_full_reading(msg: str) -> bool:
+    return bool(re.search(r"(全面整理|完整解讀|完整解析|全盤|全面|完整看盤)", msg or ""))
 
 
 def _classify_astro_intent(user_message: str) -> AstroIntent:
@@ -916,7 +898,7 @@ def _infer_request_kind(user_message: str) -> RequestKind:
         return "synastry"
     if any(k in s for k in ["行運", "運勢", "流年", "推運", "次限", "太陽弧", "未來幾個月", "最近這幾個月", "未來一年"]):
         return "transit"
-    if any(k in s for k in ["命盤", "本命盤", "星座", "上升", "月亮", "太陽星座", "全面整理", "完整解讀", "解讀", "看盤", "排盤", "排盤解析"]):
+    if any(k in s for k in ["命盤", "本命盤", "星座", "上升", "月亮", "太陽星座", "解讀", "看盤", "排盤", "排盤解析", "全面整理", "完整解讀", "完整解析", "全盤"]):
         return "natal"
     return "unknown"
 
@@ -943,15 +925,22 @@ def _extract_birth_date_time(msg: str) -> Dict[str, Any]:
     return out
 
 
+def _wants_no_steps(msg: str) -> bool:
+    s = msg or ""
+    return any(cue in s for cue in _NO_STEPS_CUES)
+
+
+def _wants_action_mode(msg: str) -> bool:
+    s = msg or ""
+    return any(cue in s for cue in _WANTS_ACTION_CUES)
+
+
 def _profile_fingerprint(profile: Dict[str, Any]) -> Tuple:
-    # 你已寫死台北，所以快取指紋主要看：出生日期/時間
-    # 額外加 consult_goal/focus：避免使用者換題目卻命中舊快取
-    return (
-        profile.get("birthdate"),
-        profile.get("birth_time"),
-        profile.get("consult_goal"),
-        profile.get("consult_focus"),
-    )
+    tags = profile.get("tags") or []
+    if not isinstance(tags, list):
+        tags = [tags]
+    pref_no_steps = "pref_no_steps" in tags
+    return (profile.get("birthdate"), profile.get("birth_time"), pref_no_steps)
 
 
 def _fortune_contains_full_chart(fortune_summary: str) -> bool:
@@ -973,7 +962,7 @@ def _get_cached_fortune(user_id: str, request_kind: RequestKind, profile: Dict[s
     entry = _FORTUNE_CACHE.get(key)
     if not entry:
         return None
-    if (_now_ts() - float(entry.get("created_at", 0))) > _get_fortune_cache_ttl():
+    if (time.time() - float(entry.get("created_at", 0))) > _get_fortune_cache_ttl():
         return None
     if entry.get("profile_fp") != _profile_fingerprint(profile):
         return None
@@ -985,7 +974,7 @@ def _get_cached_fortune(user_id: str, request_kind: RequestKind, profile: Dict[s
 def _set_cached_fortune(user_id: str, request_kind: RequestKind, profile: Dict[str, Any], fortune_summary: str) -> None:
     key = (user_id, request_kind)
     _FORTUNE_CACHE[key] = {
-        "created_at": _now_ts(),
+        "created_at": time.time(),
         "request_kind": request_kind,
         "profile_fp": _profile_fingerprint(profile),
         "fortune_summary": fortune_summary,
@@ -993,14 +982,25 @@ def _set_cached_fortune(user_id: str, request_kind: RequestKind, profile: Dict[s
     }
 
 
-async def _run_counselor(user_message: str, session: EncryptedSession, fortune_summary: Optional[str], wants_full: bool) -> str:
+def _build_profile_hint(profile: Dict[str, Any]) -> str:
+    tags = profile.get("tags") or []
+    if not isinstance(tags, list):
+        tags = [tags]
+    pref_no_steps = "pref_no_steps" in tags
+    parts = []
+    if pref_no_steps:
+        parts.append("pref_no_steps: true")
+    return "[PROFILE_HINT]\n" + "\n".join(parts) + "\n[/PROFILE_HINT]\n\n" if parts else ""
+
+
+async def _run_counselor(user_message: str, session: EncryptedSession, fortune_summary: Optional[str], wants_full: bool, profile_hint: str) -> str:
     if fortune_summary and not wants_full:
         fortune_summary = _strip_full_chart_block(fortune_summary)
 
     if fortune_summary:
-        counselor_input = f"{fortune_summary}\n\n[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
+        counselor_input = f"{profile_hint}{fortune_summary}\n\n[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
     else:
-        counselor_input = f"[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
+        counselor_input = f"{profile_hint}[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
 
     r = await Runner.run(counselor_agent, input=counselor_input, session=session)
     return (r.final_output or "").strip() or "剛剛有點小狀況，但我有聽見你。先別急，慢慢來。"
@@ -1031,7 +1031,7 @@ def _get_or_create_session(user_id: str) -> EncryptedSession:
 
 
 # ============================================================
-# 7. 對外單輪呼叫（含 fortune 格式檢查 + 自動重試）
+# 7. 對外單輪呼叫
 # ============================================================
 
 async def chat_once(user_id: str, user_message: str) -> str:
@@ -1041,20 +1041,36 @@ async def chat_once(user_id: str, user_message: str) -> str:
     )
     session = _get_or_create_session(user_id)
 
-    # (A) 強制補台北預設（避免任何追問）
     _update_user_profile_impl(user_id=user_id)
 
-    # (B) 解析日期/時間（若有）
     dt_delta = _extract_birth_date_time(user_message)
     if dt_delta:
         _update_user_profile_impl(user_id=user_id, **dt_delta)
 
+    if _wants_no_steps(user_message):
+        profile = _get_user_profile_impl(user_id) or {}
+        tags = profile.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [tags]
+        if "pref_no_steps" not in tags:
+            _update_user_profile_impl(user_id=user_id, tags=tags + ["pref_no_steps"])
+
+    if _wants_action_mode(user_message):
+        profile = _get_user_profile_impl(user_id) or {}
+        tags = profile.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [tags]
+        if "pref_no_steps" in tags:
+            _update_user_profile_impl(user_id=user_id, tags=[t for t in tags if t != "pref_no_steps"])
+
     profile = _get_user_profile_impl(user_id) or {}
     profile = _ensure_default_taipei_fields(profile)
+    profile_hint = _build_profile_hint(profile)
 
     astro_intent = _classify_astro_intent(user_message)
     wants_full = _wants_full_chart(user_message)
     request_kind = _infer_request_kind(user_message)
+    require_trilogy = _wants_full_reading(user_message)
 
     needs_fortune = wants_full or (astro_intent == "yes")
 
@@ -1064,9 +1080,8 @@ async def chat_once(user_id: str, user_message: str) -> str:
         if not (request_kind == "synastry" and _synastry_partner_change_hint(user_message)):
             cached = _get_cached_fortune(user_id, request_kind, profile, wants_full=wants_full)
 
-        # 命中快取也先驗一次，避免舊爛格式
         if cached:
-            ok, _, _ = _validate_fortune_output(cached)
+            ok, _, _ = _validate_fortune_output(cached, require_trilogy=require_trilogy)
             if ok:
                 fortune_summary = cached
             else:
@@ -1078,16 +1093,15 @@ async def chat_once(user_id: str, user_message: str) -> str:
                 system_info=system_info,
                 user_message=user_message,
                 session=session,
+                require_trilogy=require_trilogy,
                 max_attempts=int(os.environ.get("FORTUNE_FORMAT_RETRY", "2")),
             )
-
-            # 只快取「通過檢查」的版本
             if fortune_summary:
-                ok, _, _ = _validate_fortune_output(fortune_summary)
+                ok, _, _ = _validate_fortune_output(fortune_summary, require_trilogy=require_trilogy)
                 if ok:
                     _set_cached_fortune(user_id, request_kind, profile, fortune_summary)
 
-    return await _run_counselor(user_message, session, fortune_summary, wants_full=wants_full)
+    return await _run_counselor(user_message, session, fortune_summary, wants_full=wants_full, profile_hint=profile_hint)
 
 
 # ============================================================
@@ -1095,10 +1109,8 @@ async def chat_once(user_id: str, user_message: str) -> str:
 # ============================================================
 
 if __name__ == "__main__":
-
     async def main():
         uid = "demo-user-001"
-        print(await chat_once(uid, "我的生日是2012/09/03 出生時間在13:30 出生地在台北市 幫我排盤解析"))
-        print(await chat_once(uid, "我想看完整命盤排盤明細（FULL_CHART）"))
-
+        print(await chat_once(uid, "我的生日是2012/09/03 出生時間在13:30 幫我排盤解析：我為什麼很容易焦慮？"))
+        print(await chat_once(uid, "可以幫我全面整理嗎？"))
     asyncio.run(main())
