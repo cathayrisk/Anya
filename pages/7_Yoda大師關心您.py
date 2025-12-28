@@ -5,7 +5,7 @@ import asyncio
 import os
 import time
 import uuid
-
+from typing import Optional
 # 這裡改成對應你實際的檔案位置：
 # anya/companion_fortune_agent_yoda_kerykeion/companion_fortune_agent_yoda_kerykeion.py
 from yoda.companion_fortune_agent_yoda_kerykeion import (
