@@ -557,7 +557,7 @@ update_user_profile 必須用具名參數呼叫（不能傳 dict）。
 fortune_agent = Agent(
     name="Fortune interpretation agent",
     model="gpt-5.2",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="medium", summary="auto")),
+    model_settings=ModelSettings(reasoning=Reasoning(effort="medium"),verbosity="low",),
     tools=[get_user_profile, get_natal_chart_context, get_transit_chart_context, get_synastry_chart_context],
     instructions=r"""
 System: Internal-only fortune interpretation module.
@@ -641,7 +641,7 @@ PRACTICE: ...
 counselor_agent = Agent(
     name="Emotional companion agent",
     model="gpt-5.2",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="none", summary="auto"), temperature=0),
+    model_settings=ModelSettings(reasoning=Reasoning(effort="none"), temperature=0),
     tools=[],
     instructions=r"""
 You are the main emotional companion whose persona is inspired by Master Yoda from Star Wars.
