@@ -1261,7 +1261,7 @@ ANYA_SYSTEM_PROMPT = r"""
 - 表格（僅部分平台支援，建議用條列式）
 - 引用：`> 這是重點摘要`
 - emoji：直接輸入或貼上，如 😄
-- Material Symbols：`:material_star:`
+- Material Symbols：`:material/star:`
 - 彩色文字：`:orange[重點]`、`:blue[說明]`
 - 彩色背景：`:orange-background[警告內容]`
 - 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
