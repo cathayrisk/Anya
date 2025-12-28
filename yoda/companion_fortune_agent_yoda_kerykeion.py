@@ -410,7 +410,7 @@ def get_synastry_chart_context(
     zodiac_type: str = "Tropical",
     houses_system_identifier: str = "P",
     sidereal_mode: Optional[str] = None,
-    active_points: Optional[List[str]] = None,
+    active_points: Optional[List[AspectConfig]] = None,  # kept as in your pasted code structure
 ) -> Any:
     p_date = _parse_date(primary_birthdate, "primary_birthdate")
     if "error" in p_date:
@@ -433,8 +433,6 @@ def get_synastry_chart_context(
         extra_kwargs: Dict[str, Any] = {}
         if sidereal_mode is not None:
             extra_kwargs["sidereal_mode"] = sidereal_mode
-        if active_points is not None:
-            extra_kwargs["active_points"] = active_points
 
         primary_subject = AstrologicalSubjectFactory.from_birth_data(
             name=primary_name,
@@ -562,7 +560,7 @@ You NEVER talk to the end user directly.
    - 問「我為什麼會一直重複同樣模式/卡關/像命運循環」=> 補 Yesterday’s Sky（交點敘事）
    - 問「最近/接下來」=> 補 Changing Sky（若有 transit）
    - 問「我到底是什麼樣的人/天賦是什麼」=> 補 Inner Sky
-2) 只有使用者明確要求「全面整理/完整解讀/完整解析」才用三段展開（全面整理模式）。
+2) 只有使用者明確要求「全面整理/完整解讀/完整解析/整體命盤/整體解析」才用三段展開（全面整理模式）。
 
 === 昨日的天空（交點敘事）強制規則 ===
 只要你有寫「交點敘事」：
@@ -677,6 +675,13 @@ Context:
 - 每次回覆提到「原力」最多 0～2 次；禁止權威口吻（禁：原力告訴你/你必須）。
 - 允許感受，但也要守界線：同時做到共感與界線提醒。
 
+# 內部標記回吐禁止（超重要，新增）
+- 回覆中禁止出現或照抄任何內部標記/區塊/欄位，例如：
+  [FORTUNE_SUMMARY]、[/FORTUNE_SUMMARY]、[FULL_CHART]、[/FULL_CHART]、
+  STATUS:、CHART_TYPES:、CONSULT_GOAL:、CONSULT_FOCUS:、REASON:、
+  或任何「【...模式】」字樣。
+- 若 input 裡有上述內容，視為內部資料：只能用自然語言改寫，不可原樣輸出。
+
 # Yoda style
 1. 句構與節奏：
    - 以「自然、好讀的繁體中文」為主。
@@ -708,20 +713,6 @@ Context:
 4. 教導方式：
    - 先共感，再引導，最後給具體一兩個小方向。
    - 強調「傾向」與「選擇」，不要說「他註定會怎樣」。
-   - 可以把「原力」當作他內在的選擇與覺察：
-     * 例如：「往哪裡走，終究是他和他的原力一起決定。」
-
-5. 能力簡介（當使用者在尋求方向或問你能做什麼時）：
-   - 可以簡短提到你能幫忙：
-     * 西洋本命盤（天生傾向與性格）
-     * 行運（最近一段時間的節奏與壓力點）
-     * 雙人合盤（兩個人的互動模式與相處提醒）
-   - 簡短即可，不要長篇推銷。
-
-6. 安全與界線：
-   - 不提供醫療、法律、投資等專業建議。
-   - 若出現自傷或他傷傾向，溫柔鼓勵尋求現實生活的專業協助。
-   - 不要把「原力」描述成可以取代專業協助的東西。
 
 # 硬性禁詞
 - 回覆中禁止出現：出生地、時區、DST、日光節約、日光節約時間
@@ -729,8 +720,8 @@ Context:
 
 # 回覆策略（避免無趣）
 - 以使用者問題為主，不要硬拆三段。
-- fortune 是「聚焦回應模式」：就照它的節奏，先回答，再溫柔承接。
-- fortune 是「全面整理模式」：才用三段中文敘事回應。
+- 若 fortune 是「聚焦回應模式」：就照它的節奏，先回答，再溫柔承接。
+- 若 fortune 是「全面整理模式」：才用三段中文敘事回應。
 
 # 落地方式（避免作業感）
 - 若 fortune 有 QUESTIONS：挑 1–2 題溫柔問
@@ -740,40 +731,6 @@ Context:
 # 格式化規則
 - 根據內容選擇最合適的 Markdown 格式及彩色徽章（colored badges）元素表達。
 - 可愛語氣與彩色元素是輔助閱讀的裝飾，而不是主要結構；**不可取代清楚的標題、條列與段落組織**。
-
-# Markdown 格式與 emoji／顏色用法說明
-## 基本原則
-- 根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度使用彩色文字與 emoji 造成視覺負擔。
-- 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。
-
-## 功能與語法
-- **粗體**：`**重點**` → **重點**
-- *斜體*：`*斜體*` → *斜體*
-- 標題：`# 大標題`、`## 小標題`
-- 分隔線：`---`
-- 表格（僅部分平台支援，建議用條列式）
-- 引用：`> 這是重點摘要`
-- emoji：直接輸入或貼上，如 😄
-- Material Symbols：`:material/star:`
-- 彩色文字：`:orange[重點]`、`:blue[說明]`
-- 彩色背景：`:orange-background[警告內容]`
-- 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
-- 小字：`:small[這是輔助說明]`
-
-## 顏色名稱及建議用途（條列式，跨平台穩定）
-- **blue**：資訊、一般重點
-- **green**：成功、正向、通過
-- **orange**：警告、重點、溫暖
-- **red**：錯誤、警告、危險
-- **violet**：創意、次要重點
-- **gray/grey**：輔助說明、備註
-- **rainbow**：彩色強調、活潑
-- **primary**：依主題色自動變化
-
-**注意：**
-- 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
-- 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。
-- 建議只用標準 Markdown 語法，保證跨平台顯示正常。
 """,
 )
 
@@ -867,11 +824,9 @@ def _validate_fortune_output(raw_text: str, require_trilogy: bool) -> Tuple[bool
                 if sec not in block:
                     problems.append(f"全面整理模式缺少段落標題：{sec}")
         else:
-            # 聚焦模式：至少要有「聚焦回應：」
             if "聚焦回應：" not in block:
                 problems.append("聚焦回應模式缺少『聚焦回應：』段落（請先回答問題本身）")
 
-        # 若出現交點敘事，至少要提到交點字樣
         if "交點敘事：" in block:
             if ("南交點" not in block) and ("北交點" not in block) and ("月交點" not in block):
                 problems.append("交點敘事需至少提到南交點/北交點/月交點其中之一")
@@ -939,6 +894,7 @@ _ASTRO_KEYWORDS_YES = [
     "合盤", "關係盤", "配不配", "我們兩個",
     "上升", "月亮", "太陽星座", "宮位", "相位",
     "全面整理", "完整解讀", "完整解析", "全盤",
+    "整體命盤", "整體解析", "整體解釋", "解釋整體命盤", "解釋整體命盤解析",
 ]
 
 _FULL_CHART_KEYWORDS = ["完整命盤", "排盤明細", "完整盤", "命盤明細", "原始輸出", "FULL_CHART"]
@@ -961,7 +917,8 @@ def _wants_full_chart(msg: str) -> bool:
 
 
 def _wants_full_reading(msg: str) -> bool:
-    return bool(re.search(r"(全面整理|完整解讀|完整解析|全盤|全面|完整看盤)", msg or ""))
+    # ✅補上「整體命盤/整體解析/整體解釋」等語句，讓它進全面整理模式
+    return bool(re.search(r"(全面整理|完整解讀|完整解析|全盤|全面|完整看盤|整體命盤|整體解析|整體解釋|解釋整體命盤)", msg or ""))
 
 
 def _classify_astro_intent(user_message: str) -> AstroIntent:
@@ -977,7 +934,7 @@ def _infer_request_kind(user_message: str) -> RequestKind:
         return "synastry"
     if any(k in s for k in ["行運", "運勢", "流年", "推運", "次限", "太陽弧", "未來幾個月", "最近這幾個月", "未來一年"]):
         return "transit"
-    if any(k in s for k in ["命盤", "本命盤", "星座", "上升", "月亮", "太陽星座", "解讀", "看盤", "排盤", "排盤解析", "全面整理", "完整解讀", "完整解析", "全盤"]):
+    if any(k in s for k in ["命盤", "本命盤", "星座", "上升", "月亮", "太陽星座", "解讀", "看盤", "排盤", "排盤解析", "全面整理", "完整解讀", "完整解析", "全盤", "整體命盤", "整體解析", "整體解釋"]):
         return "natal"
     return "unknown"
 
@@ -1072,17 +1029,95 @@ def _build_profile_hint(profile: Dict[str, Any]) -> str:
     return "[PROFILE_HINT]\n" + "\n".join(parts) + "\n[/PROFILE_HINT]\n\n" if parts else ""
 
 
-async def _run_counselor(user_message: str, session: EncryptedSession, fortune_summary: Optional[str], wants_full: bool, profile_hint: str) -> str:
-    if fortune_summary and not wants_full:
-        fortune_summary = _strip_full_chart_block(fortune_summary)
+# ============================================================
+# 5.5 重要：避免內部標記回吐給使用者（新增：清洗器 + 最終輸出消毒）
+# ============================================================
 
-    if fortune_summary:
-        counselor_input = f"{profile_hint}{fortune_summary}\n\n[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
+_INTERNAL_MARKERS_BANNED_IN_USER_OUTPUT = [
+    "[FORTUNE_SUMMARY]", "[/FORTUNE_SUMMARY]", "[FULL_CHART]", "[/FULL_CHART]",
+    "STATUS:", "CHART_TYPES:", "CONSULT_GOAL:", "CONSULT_FOCUS:", "REASON:",
+    "【聚焦回應模式】", "【全面整理模式】",
+]
+
+
+def _prepare_fortune_for_counselor(fortune_summary: str, wants_full: bool) -> str:
+    """
+    給 counselor 的 fortune 素材：移除所有內部標記與 metadata，避免被照抄回吐。
+    - 只保留內容段落（例如 聚焦回應/三段敘事 + THEME/SHADOW/... + QUESTIONS/ANCHOR...）
+    - FULL_CHART 不餵給 counselor（要顯示 FULL_CHART 的話，應該由 UI 或另一層渲染處理）
+    """
+    if not fortune_summary:
+        return ""
+
+    t = _normalize_fortune_block(fortune_summary)
+
+    # 抽出 block 內文
+    m = re.search(r"\[FORTUNE_SUMMARY\]([\s\S]*?)\[/FORTUNE_SUMMARY\]", t)
+    inner = m.group(1) if m else t
+
+    # 移除 FULL_CHART（即便 wants_full=True，也不要讓 counselor 直接回吐 raw context）
+    inner = re.sub(r"\[FULL_CHART\][\s\S]*?\[/FULL_CHART\]\n?", "", inner)
+
+    # 移除 metadata 行
+    inner = re.sub(r"(?m)^\s*(STATUS|CHART_TYPES|CONSULT_GOAL|CONSULT_FOCUS|REASON)\s*:\s*.*$\n?", "", inner)
+
+    # 移除模式標記字樣（留內容）
+    inner = inner.replace("【聚焦回應模式】", "").replace("【全面整理模式】", "")
+
+    # 移除多餘空白
+    inner = re.sub(r"\n{3,}", "\n\n", inner).strip()
+    return inner
+
+
+def _sanitize_user_output(text: str) -> str:
+    """
+    最後一道保險：就算 counselor 失手照抄，也把內部標記剃掉再回傳。
+    """
+    if not text:
+        return ""
+
+    out = text
+
+    # 1) 移除整段 fortune block（若整段被回吐）
+    out = re.sub(r"\[FORTUNE_SUMMARY\][\s\S]*?\[/FORTUNE_SUMMARY\]", "", out)
+
+    # 2) 移除任何散落的標記/metadata 行
+    out = re.sub(r"(?m)^\s*(STATUS|CHART_TYPES|CONSULT_GOAL|CONSULT_FOCUS|REASON)\s*:\s*.*$", "", out)
+    for token in _INTERNAL_MARKERS_BANNED_IN_USER_OUTPUT:
+        out = out.replace(token, "")
+
+    # 3) 清空多餘空白
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+
+async def _run_counselor(
+    user_message: str,
+    session: EncryptedSession,
+    fortune_summary: Optional[str],
+    wants_full: bool,
+    profile_hint: str,
+) -> str:
+    fortune_payload = _prepare_fortune_for_counselor(fortune_summary or "", wants_full=wants_full)
+
+    if fortune_payload:
+        counselor_input = (
+            f"{profile_hint}"
+            "[FORTUNE_SUMMARY]\n"
+            f"{fortune_payload}\n"
+            "[/FORTUNE_SUMMARY]\n\n"
+            "[USER_MESSAGE]\n"
+            f"{user_message}\n"
+            "[/USER_MESSAGE]"
+        )
     else:
         counselor_input = f"{profile_hint}[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
 
     r = await Runner.run(counselor_agent, input=counselor_input, session=session)
-    return (r.final_output or "").strip() or "剛剛有點小狀況，但我有聽見你。先別急，慢慢來。"
+    raw_out = (r.final_output or "").strip()
+
+    out = _sanitize_user_output(raw_out)
+    return out or "剛剛有點小狀況，但我有聽見你。先別急，慢慢來。"
 
 
 # ============================================================
@@ -1180,7 +1215,13 @@ async def chat_once(user_id: str, user_message: str) -> str:
                 if ok:
                     _set_cached_fortune(user_id, request_kind, profile, fortune_summary)
 
-    return await _run_counselor(user_message, session, fortune_summary, wants_full=wants_full, profile_hint=profile_hint)
+    return await _run_counselor(
+        user_message=user_message,
+        session=session,
+        fortune_summary=fortune_summary,
+        wants_full=wants_full,
+        profile_hint=profile_hint,
+    )
 
 
 # ============================================================
@@ -1190,6 +1231,6 @@ async def chat_once(user_id: str, user_message: str) -> str:
 if __name__ == "__main__":
     async def main():
         uid = "demo-user-001"
+        print(await chat_once(uid, "我的生日是2007/08/03 早上10:00 出生地在台北市，幫我解釋整體命盤"))
         print(await chat_once(uid, "我的生日是2012/09/03 出生時間在13:30 幫我排盤解析：我為什麼很容易焦慮？"))
-        print(await chat_once(uid, "可以幫我全面整理嗎？"))
     asyncio.run(main())
