@@ -18,7 +18,7 @@ pydantic
 pdf2image
 pypandoc
 python-docx
-sentence-transformers
+#sentence-transformers
 pymupdf4llm
 
 # Web tools and research
