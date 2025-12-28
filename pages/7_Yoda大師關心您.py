@@ -16,15 +16,23 @@ from agents.extensions.memory import EncryptedSession
 from agents import ModelSettings
 from openai.types.shared.reasoning import Reasoning
 
-# Kerykeion：占星命盤計算（離線模式 + ChartDataFactory）
 from kerykeion import AstrologicalSubjectFactory, ChartDataFactory, to_context
-
 import pytz
 
 
 # ============================================================
+# 0. 產品決策：地點/時區一律固定台北（避免追問）
+# ============================================================
+
+DEFAULT_CITY = "台北市"
+DEFAULT_COUNTRY = "TW"
+DEFAULT_TZ = "Asia/Taipei"
+DEFAULT_LNG = 121.5654
+DEFAULT_LAT = 25.0330
+
+
+# ============================================================
 # 1. 使用者檔案儲存（示範用：記憶體版）
-#    注意：程式重啟會遺失。如需長期保存請改成 SQLite table。
 # ============================================================
 
 PROFILE_STORE: Dict[str, Dict[str, Any]] = {}
@@ -34,16 +42,19 @@ class ProfileDelta(BaseModel):
     name: Optional[str] = None
     birthdate: Optional[str] = None  # YYYY-MM-DD
     birth_time: Optional[str] = None  # HH:MM
+
+    # 地點欄位：仍保留欄位，但系統會自動補台北
     birth_city: Optional[str] = None
     birth_country: Optional[str] = None
     lng: Optional[float] = None
     lat: Optional[float] = None
     tz_str: Optional[str] = None
+
     gender: Optional[str] = None
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
 
-    # Forrest 敘事式解讀定調
+    # Forrest 定調
     consult_goal: Optional[str] = None
     consult_focus: Optional[str] = None  # self/relationship/career/timing/block/other
 
@@ -57,9 +68,23 @@ def _get_user_profile_impl(user_id: str) -> Any:
     return PROFILE_STORE.get(user_id)
 
 
+def _ensure_default_taipei_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """強制補台北預設，避免任何地點/時區缺漏導致流程追問。"""
+    if not profile.get("birth_city"):
+        profile["birth_city"] = DEFAULT_CITY
+    if not profile.get("birth_country"):
+        profile["birth_country"] = DEFAULT_COUNTRY
+    if not profile.get("tz_str"):
+        profile["tz_str"] = DEFAULT_TZ
+    if profile.get("lng") is None:
+        profile["lng"] = DEFAULT_LNG
+    if profile.get("lat") is None:
+        profile["lat"] = DEFAULT_LAT
+    return profile
+
+
 def _update_user_profile_impl(
     user_id: str,
-    # --- ProfileDelta fields (all optional) ---
     name: Optional[str] = None,
     birthdate: Optional[str] = None,
     birth_time: Optional[str] = None,
@@ -75,8 +100,7 @@ def _update_user_profile_impl(
     consult_focus: Optional[str] = None,
 ) -> Any:
     """
-    真正更新 profile 的實作（可被 orchestrator 直接呼叫）。
-    Tool 版本會包這個函式，避免 strict schema 的 additionalProperties 問題。
+    真正更新 profile 的實作（strict schema 友善，無 Dict[str, Any]）。
     """
     current = PROFILE_STORE.get(user_id, {}).copy()
 
@@ -97,7 +121,6 @@ def _update_user_profile_impl(
     )
     delta = delta_model.model_dump(exclude_none=True, exclude_unset=True)
 
-    # tags 合併去重
     new_tags = delta.pop("tags", None)
     if new_tags is not None:
         existing_tags = current.get("tags", [])
@@ -106,38 +129,22 @@ def _update_user_profile_impl(
         current["tags"] = list(dict.fromkeys(existing_tags + new_tags))
 
     current.update(delta)
+    current = _ensure_default_taipei_fields(current)
+
     PROFILE_STORE[user_id] = current
     return current
 
 
-# tools（注意：這裡是 tool 物件，不是原函式）
+# tools（strict schema 安全）
 get_user_profile = function_tool(_get_user_profile_impl)
 update_user_profile = function_tool(_update_user_profile_impl)
 
 
 # ============================================================
-# 2. Kerykeion Tools：本命盤 / 行運 / 雙人合盤（全部離線 + 文字輸出）
+# 2. Kerykeion Tools：本命盤 / 行運 / 合盤（離線 + 文字輸出）
 # ============================================================
 
-_CITY_LOCATION_DB = [
-    {
-        "aliases": ["taipei", "taipei city", "台北", "台北市"],
-        "nation_aliases": ["tw", "taiwan", "中華民國", "臺灣"],
-        "lng": 121.5654,
-        "lat": 25.0330,
-        "tz_str": "Asia/Taipei",
-    },
-]
-
-
-def _normalize_str(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    return s.strip().lower()
-
-
 def _parse_date(date_str: str, field_name: str) -> Dict[str, Any]:
-    """解析 YYYY-MM-DD（允許 YYYY/MM/DD），回傳 dict 或錯誤 dict。"""
     try:
         date_str = date_str.strip().replace("/", "-")
         year, month, day = map(int, date_str.split("-"))
@@ -150,7 +157,6 @@ def _parse_date(date_str: str, field_name: str) -> Dict[str, Any]:
 
 
 def _parse_time(time_str: Optional[str], default_noon: bool = True) -> Dict[str, Any]:
-    """解析 HH:MM，或允許缺失時預設 12:00。"""
     if time_str:
         try:
             hour, minute = map(int, time_str.strip().split(":"))
@@ -165,58 +171,6 @@ def _parse_time(time_str: Optional[str], default_noon: bool = True) -> Dict[str,
     if default_noon:
         return {"hour": 12, "minute": 0, "approximated": True}
     return {"error": "MISSING_BIRTHTIME", "detail": "缺少出生時間且未允許預設值。"}
-
-
-def _autofill_location(
-    city: Optional[str],
-    nation: Optional[str],
-    lng: Optional[float],
-    lat: Optional[float],
-    tz_str: Optional[str],
-) -> Dict[str, Any]:
-    """
-    若 lng/lat/tz_str 有缺，但 city/nation 有提供，嘗試用內建城市資料自動補齊。
-    若完全沒有任何地點資訊，則預設使用台北市作為約略位置。
-    """
-    if lng is not None and lat is not None and tz_str:
-        return {"lng": lng, "lat": lat, "tz_str": tz_str, "autofilled": False}
-
-    norm_city = _normalize_str(city)
-    norm_nation = _normalize_str(nation)
-
-    if norm_city is not None:
-        for entry in _CITY_LOCATION_DB:
-            city_match = (
-                norm_city in entry["aliases"]
-                or any(alias in norm_city for alias in entry["aliases"])
-            )
-            if not city_match:
-                continue
-
-            if norm_nation and not any(
-                norm_nation == na or na in norm_nation for na in entry["nation_aliases"]
-            ):
-                continue
-
-            return {
-                "lng": entry["lng"],
-                "lat": entry["lat"],
-                "tz_str": entry["tz_str"],
-                "autofilled": True,
-            }
-
-    if (
-        lng is None
-        and lat is None
-        and not tz_str
-        and norm_city is None
-        and norm_nation is None
-        and _CITY_LOCATION_DB
-    ):
-        entry = _CITY_LOCATION_DB[0]
-        return {"lng": entry["lng"], "lat": entry["lat"], "tz_str": entry["tz_str"], "autofilled": True}
-
-    return {"lng": lng, "lat": lat, "tz_str": tz_str, "autofilled": False}
 
 
 @function_tool
@@ -237,7 +191,6 @@ def get_natal_chart_context(
     active_aspects: Optional[List[AspectConfig]] = None,
     calculate_lunar_phase: bool = True,
 ) -> Any:
-    """生成本命盤資料（離線），回傳 LLM 可讀的 context。"""
     date_parsed = _parse_date(birthdate, "birthdate")
     if "error" in date_parsed:
         return date_parsed
@@ -249,20 +202,12 @@ def get_natal_chart_context(
     hour, minute = time_parsed["hour"], time_parsed["minute"]
     time_approx = time_parsed["approximated"]
 
-    auto_loc = _autofill_location(city, nation, lng, lat, tz_str)
-    lng = auto_loc["lng"]
-    lat = auto_loc["lat"]
-    tz_str = auto_loc["tz_str"]
-    location_autofilled = auto_loc["autofilled"]
-
-    if not (lng is not None and lat is not None and tz_str):
-        return {
-            "error": "MISSING_LOCATION_OFFLINE_ONLY",
-            "detail": (
-                "目前僅支援離線命盤計算，請提供 lng、lat 與 tz_str（例如 'Asia/Taipei'）。"
-                "city / nation 目前只對少數城市（例如台北）有內建座標。"
-            ),
-        }
+    # 固定台北（工具層保險）
+    lng = DEFAULT_LNG if lng is None else lng
+    lat = DEFAULT_LAT if lat is None else lat
+    tz_str = DEFAULT_TZ if not tz_str else tz_str
+    city = DEFAULT_CITY if not city else city
+    nation = DEFAULT_COUNTRY if not nation else nation
 
     try:
         extra_kwargs: Dict[str, Any] = {}
@@ -324,8 +269,6 @@ def get_natal_chart_context(
         }
         if time_approx:
             result["warning"] = "BIRTH_TIME_APPROXIMATED"
-        if location_autofilled:
-            result["location_warning"] = "LOCATION_APPROXIMATED"
         return result
 
     except Exception as e:
@@ -349,7 +292,6 @@ def get_transit_chart_context(
     transit_datetime: Optional[str] = None,
     active_aspects: Optional[List[AspectConfig]] = None,
 ) -> Any:
-    """生成本命 + 行運 context（離線）。"""
     date_parsed = _parse_date(birthdate, "birthdate")
     if "error" in date_parsed:
         return date_parsed
@@ -484,7 +426,6 @@ def get_synastry_chart_context(
     sidereal_mode: Optional[str] = None,
     active_points: Optional[List[str]] = None,
 ) -> Any:
-    """生成雙人合盤 context（離線）。"""
     p_date = _parse_date(primary_birthdate, "primary_birthdate")
     if "error" in p_date:
         return p_date
@@ -501,7 +442,6 @@ def get_synastry_chart_context(
 
     p_hour, p_minute = p_time["hour"], p_time["minute"]
     o_hour, o_minute = o_time["hour"], o_time["minute"]
-    p_approx, o_approx = p_time["approximated"], o_time["approximated"]
 
     try:
         extra_kwargs: Dict[str, Any] = {}
@@ -568,7 +508,7 @@ def get_synastry_chart_context(
         if synastry_chart.relationship_score:
             summary["relationship_score"] = synastry_chart.relationship_score.score_value
 
-        result: Dict[str, Any] = {
+        return {
             "primary_user_id": primary_user_id,
             "primary": {
                 "name": primary_name,
@@ -589,21 +529,12 @@ def get_synastry_chart_context(
             "summary": summary,
         }
 
-        warnings: List[str] = []
-        if p_approx:
-            warnings.append("PRIMARY_BIRTH_TIME_APPROXIMATED")
-        if o_approx:
-            warnings.append("PARTNER_BIRTH_TIME_APPROXIMATED")
-        if warnings:
-            result["warnings"] = warnings
-        return result
-
     except Exception as e:
         return {"error": "KERYKEION_ERROR", "detail": f"計算雙人合盤時發生錯誤: {e}"}
 
 
 # ============================================================
-# 3. 子 Agent：Profile / 占星解讀 / 心靈陪伴（Yoda）
+# 3. Agents
 # ============================================================
 
 profile_agent = Agent(
@@ -611,24 +542,15 @@ profile_agent = Agent(
     model="gpt-4.1-mini",
     tools=[get_user_profile, update_user_profile],
     instructions=r"""
-你是一個溫柔的資料整理者，目標是逐步理解使用者（不審問），並把能確定的資料寫入。
+你是溫柔的資料整理者。
+注意：產品決策已固定使用台北預設，因此不要追問任何地點/時區相關問題。
 
-你可用工具：
-- get_user_profile(user_id) -> Optional[dict]
-- update_user_profile(user_id, name=..., birthdate=..., birth_time=..., birth_city=..., tz_str=..., lng=..., lat=..., tags=..., notes=..., consult_goal=..., consult_focus=...) -> dict
+update_user_profile 必須用具名參數呼叫（不能傳 dict）。
 
-規則：
-- birthdate 只有在對方明確給完整日期才寫入（包含年份）。
-- birth_time 只有在對方明確給到 HH:MM 才寫入。
-- 台北例外規則：若出生城市包含「台北/台北市/Taipei/Taipei City」且未否定，直接寫入：
-  birth_country="TW", tz_str="Asia/Taipei", lng=121.5654, lat=25.0330
-- consult_goal：可用對方原話摘要成一句，但不要腦補對方沒說的細節。
-- consult_focus：self/relationship/career/timing/block/other
-
-限制：
-- 不要提到你正在呼叫工具
-- 不要提到 user_id
-- 使用繁體中文回覆
+你主要要補：
+- birthdate（YYYY-MM-DD）
+- birth_time（HH:MM）
+- consult_goal / consult_focus
 """,
 )
 
@@ -636,86 +558,77 @@ fortune_agent = Agent(
     name="Fortune interpretation agent",
     model="gpt-5.2",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium", summary="auto")),
-    tools=[
-        get_user_profile,
-        get_natal_chart_context,
-        get_transit_chart_context,
-        get_synastry_chart_context,
-    ],
+    tools=[get_user_profile, get_natal_chart_context, get_transit_chart_context, get_synastry_chart_context],
     instructions=r"""
 System: Internal-only fortune interpretation module.
 You NEVER talk to the end user directly.
 
-你要做的是：把西洋占星盤面（Kerykeion 工具輸出）整理成 Steven Forrest 三本書方法論的
-「心理占星 + 生命敘事」解讀骨架（不引用書中文字，僅使用其精神）。
+目的：用 Steven Forrest 三本書的方法論（不引用原文）做「心理占星 + 生命敘事」完整架構：
+- The Inner Sky（你是誰：本命核心劇本）
+- Yesterday’s Sky（你怎麼走到今天：成長史/適應策略）
+- The Changing Sky（你要怎麼走：現在與接下來的選擇/練習）
 
-Input format:
-- Raw input contains:
-  "[SYSTEM INFO] The current user's id is `some-id`."
-  "[USER MESSAGE] ...."
-You must parse user_id from SYSTEM INFO and use that in tool calls.
+重要禁詞（因為下游會直接呈現給使用者）：
+- 你的輸出中禁止出現：出生地、時區、DST、日光節約、日光節約時間
+（若要談精準度，用「盤面精準度」。）
 
-# 重要：完整命盤（FULL_CHART）規則 —— 要提供 Kerykeion 工具輸出的完整命盤資訊
-- 若使用者明確要求「完整命盤/排盤明細/完整盤面/明細/原始輸出」：
-  1) 優先嘗試取得本命盤（natal，必要時再加 transit/synastry）。
-  2) HAS_CHART 時必須輸出 [FULL_CHART]...[/FULL_CHART]，
-     FULL_CHART 內容包含 Kerykeion 工具回傳的 context（可原樣放入，不要大幅刪減）。
-  3) 即使 consult_goal 不清楚，也允許產出 HAS_CHART（CONSULT_GOAL 填 not_provided）。
+資料策略：
+- 地點/時區由系統固定處理；你不追問、也不以「缺地點」當 NO_CHART。
+- consult_goal 若缺：不要 NO_CHART；預設採用「全面整理（預設）」作為目標，CONSULT_FOCUS="other"。
 
-# 一般情況：先定調
-- 先呼叫 get_user_profile(user_id)。
-- 從 profile 的 consult_goal/consult_focus 或 USER_MESSAGE 判斷諮詢目標。
-- 若「沒有要求完整命盤」且 consult_goal 仍不清楚：輸出 NO_CHART / REASON: missing_consult_goal
-  （NO_CHART 時禁止提任何盤面細節）。
+NO_CHART 只允許出現在以下情況：
+- 缺 birthdate（missing_birth_data）
+- synastry 缺對方必要資料（missing_partner_data）
+- Kerykeion 計算錯誤（kerykeion_error）
+- 其他不可恢復錯誤（other）
+即使 NO_CHART，也要用 Forrest 式語言輸出 THEME/SHADOW/GIFT/CHOICE/PRACTICE（不可提盤面細節）。
 
-# 需求分類（用於 CHART_TYPES）
-- USER_MESSAGE 提到「行運/運勢/最近幾個月/未來一年」=> natal+transit
-- 提到「合盤/關係盤/配不配/我們兩個」=> 資料齊才 natal+synastry；不齊 NO_CHART: missing_partner_data
-- 其餘提到命盤/星座=> natal
+# Output contract（嚴格遵守：只能輸出 FORTUNE_SUMMARY）
+HAS_CHART 時必須包含：
+- CONSULT_GOAL / CONSULT_FOCUS
+- INNER_SKY / YESTERDAYS_SKY / CHANGING_SKY
+- THEME/SHADOW/GIFT/CHOICE/PRACTICE
+- ACTIONS（1~3 條具體行動）
+- 使用者要求完整命盤時才加 FULL_CHART（放 Kerykeion context）
 
-# 台北市不要卡在 lng/lat/tz_str
-- 只要 profile 具備 birthdate（含年份）就可嘗試排盤：
-  * 若已有 lng/lat/tz_str：照常用。
-  * 若缺，但 birth_city 顯示「台北/台北市/Taipei」：呼叫 get_natal_chart_context 傳入 city=birth_city。
-  * 其他城市且缺座標：NO_CHART（missing_location）
+格式如下：
 
-# Output contract（嚴格遵守）
-只能輸出以下格式之一，且不得在區塊外輸出任何文字：
-
-1) HAS_CHART：
 [FORTUNE_SUMMARY]
 STATUS: HAS_CHART
-CHART_TYPES: (例如 "natal" / "natal+transit" / "natal+synastry")
-CONSULT_GOAL: （第三人稱；若要求完整命盤但未定調，可填 not_provided）
-CONSULT_FOCUS: （self/relationship/career/timing/block/other；若未知可填 other）
+CHART_TYPES: "natal" / "natal+transit" / "natal+synastry"
+CONSULT_GOAL: ...
+CONSULT_FOCUS: ...
 
-INNER_SKY: （4~8 行濃縮）
-YESTERDAYS_SKY: （4~8 行濃縮）
-CHANGING_SKY: （4~8 行濃縮）
+INNER_SKY:
+...（4–10 行，涵蓋：上升與守護星、太陽/月亮、元素/模式/半球、行星落宮、主要相位整合；語氣是靈魂意圖，非宿命）
+YESTERDAYS_SKY:
+...（4–10 行，童年/原生家庭印記、早期適應策略、修復方向；心理語言）
+CHANGING_SKY:
+...（4–10 行，若有 transit 用季節/天氣隱喻 + 選擇建議；不做事件預言）
 
 THEME: ...
 SHADOW: ...
 GIFT: ...
 CHOICE: ...
 PRACTICE: ...
-
-（若含 synastry，允許加一行）
-DYNAMIC: ...
-
-（若 location_warning 存在，允許加一行）
-NOTE: ...
+ACTIONS:
+- 1) ...
+- 2) ...
+- 3) ...
 
 [FULL_CHART]
-（僅在使用者要求完整命盤/排盤明細時輸出，內容包含 Kerykeion 工具 context）
-...
+...（僅在使用者要求完整命盤/排盤明細時輸出，放入 Kerykeion context）
 [/FULL_CHART]
 
 [/FORTUNE_SUMMARY]
 
-2) NO_CHART：
+NO_CHART 時：
+
 [FORTUNE_SUMMARY]
 STATUS: NO_CHART
-REASON: (missing_birth_data / missing_location / missing_partner_data / missing_consult_goal / kerykeion_error / other)
+REASON: missing_birth_data / missing_partner_data / kerykeion_error / other
+CONSULT_GOAL: 全面整理（預設）
+CONSULT_FOCUS: other
 THEME: ...
 SHADOW: ...
 GIFT: ...
@@ -774,39 +687,72 @@ Language:
 - 繁體中文
 - 可用適度 Markdown
 - 不提 tools / user_id / Agent
+
+# 硬性禁詞（新增，請嚴格遵守）
+- 回覆中禁止出現：出生地、時區、DST、日光節約、日光節約時間
+- 若要談精準度，只能說「盤面精準度」。
+
+# Steven Forrest 三書方法論的「轉譯」規則（新增）
+- 若 FORTUNE_SUMMARY 內包含 INNER_SKY / YESTERDAYS_SKY / CHANGING_SKY：
+  你回覆時也要用同樣三段式來「解釋與陪伴」，順序一致：
+  1) INNER_SKY：先用溫柔敘事說清楚「此人核心劇本/渴望/張力」(只改寫摘要，不加新占星細節)
+  2) YESTERDAYS_SKY：再用「不是壞掉，是曾經努力活下來」的語氣，說明早期適應策略與可能的修復方向
+  3) CHANGING_SKY：最後把「預測」改成「選擇建議」：這段能量要練什麼？更成熟的做法是什麼？
+- 最後務必落地：把 ACTIONS 或 PRACTICE 轉成 1–2 個「今天/這週能做」的小步驟（5–20 分鐘級）。
+
+# Markdown格式與emoji/顏色用法說明
+## 基本原則
+- 請根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度花俏。  
+- 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。  
+
+## 功能與語法
+- **粗體**：`**重點**` → **重點**  
+- *斜體*：`*斜體*` → *斜體*  
+- 標題：`# 大標題`、`## 小標題`  
+- 分隔線：`---`  
+- 表格（僅部分平台支援，建議用條列式）  
+- 引用：`> 這是重點摘要`  
+- emoji：直接輸入或貼上，如 😄  
+- Material Symbols：`:material/star:`  
+- LaTeX 數學公式：`$公式$` 或 `$$公式$$`  
+- 彩色文字：`:orange[重點]`、`:blue[說明]`  
+- 彩色背景：`:orange-background[警告內容]`  
+- 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`  
+- 小字：`:small[這是輔助說明]`  
+
+## 顏色名稱及建議用途（條列式，跨平台穩定）
+- **blue**：資訊、一般重點  
+- **green**：成功、正向、通過  
+- **orange**：警告、重點、溫暖  
+- **red**：錯誤、警告、危險  
+- **violet**：創意、次要重點  
+- **gray/grey**：輔助說明、備註  
+- **rainbow**：彩色強調、活潑  
+- **primary**：依主題色自動變化  
+
+**注意：**  
+- 僅能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。  
+- 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。  
+- 建議只用標準 Markdown 語法，保證跨平台顯示正常。
 """,
 )
 
 
 # ============================================================
-# 4. Orchestrator：Python 編排 + fortune 快取 + synastry 換對象快取失效
+# 4. Orchestrator：快取 + synastry 換對象 bust
 # ============================================================
 
 AstroIntent = Literal["yes", "maybe", "no"]
 RequestKind = Literal["natal", "transit", "synastry", "unknown"]
 
-_FORCE_ASTRO_TAGS = ["#占星", "#命盤", "/astro"]
-_FORCE_NO_ASTRO_TAGS = ["#不占星", "/noastro"]
-
 _ASTRO_KEYWORDS_YES = [
-    "星座", "命盤", "占星", "本命盤",
+    "星座", "命盤", "占星", "本命盤", "全面整理", "完整解讀", "解讀", "看盤", "排盤",
     "行運", "運勢", "流年", "推運", "次限", "太陽弧",
-    "合盤", "關係盤", "配不配", "我們兩個的盤",
+    "合盤", "關係盤", "配不配", "我們兩個",
     "上升", "月亮", "太陽星座", "宮位", "相位",
 ]
 
-_ASTRO_PATTERNS_MAYBE = [
-    r"我適合(什麼|哪種)工作",
-    r"我(的)?(個性|天賦|優勢|弱點)是(什麼|怎樣)",
-    r"我為什麼(一直|總是).+卡",
-    r"(最近|這陣子|接下來|未來).+(特別難|特別想改變|很不順|壓力很大)",
-    r"我該怎麼(走|選|做決定)",
-    r"我跟(另一半|伴侶|他|她).+(怎麼相處|常吵架|模式)",
-]
-
-_FULL_CHART_KEYWORDS = [
-    "完整命盤", "排盤明細", "完整盤", "完整盤面", "命盤明細", "原始輸出", "FULL_CHART"
-]
+_FULL_CHART_KEYWORDS = ["完整命盤", "排盤明細", "完整盤", "命盤明細", "原始輸出", "FULL_CHART"]
 
 
 def _now_ts() -> float:
@@ -814,7 +760,6 @@ def _now_ts() -> float:
 
 
 def _get_fortune_cache_ttl() -> int:
-    # 預設 600 秒；你可在環境變數調整
     return int(os.environ.get("FORTUNE_CACHE_TTL", "600"))
 
 
@@ -825,23 +770,9 @@ def _wants_full_chart(msg: str) -> bool:
 
 def _classify_astro_intent(user_message: str) -> AstroIntent:
     msg = user_message or ""
-
-    if any(tag in msg for tag in _FORCE_NO_ASTRO_TAGS):
-        return "no"
-    if any(tag in msg for tag in _FORCE_ASTRO_TAGS):
-        return "yes"
-
     if any(k in msg for k in _ASTRO_KEYWORDS_YES):
         return "yes"
-
-    for pat in _ASTRO_PATTERNS_MAYBE:
-        try:
-            if re.search(pat, msg):
-                return "maybe"
-        except re.error:
-            continue
-
-    return "no"
+    return "maybe" if re.search(r"(最近|這陣子|未來|卡住|適合|性格|天賦|壓力|關係|職涯)", msg) else "no"
 
 
 def _infer_request_kind(user_message: str) -> RequestKind:
@@ -850,160 +781,98 @@ def _infer_request_kind(user_message: str) -> RequestKind:
         return "synastry"
     if any(k in s for k in ["行運", "運勢", "流年", "推運", "次限", "太陽弧", "未來幾個月", "最近這幾個月", "未來一年"]):
         return "transit"
-    if any(k in s for k in ["命盤", "本命盤", "星座", "上升", "月亮", "太陽星座"]):
+    if any(k in s for k in ["命盤", "本命盤", "星座", "上升", "月亮", "太陽星座", "全面整理", "完整解讀", "解讀", "看盤", "排盤"]):
         return "natal"
     return "unknown"
 
 
-def _extract_consult_from_text(user_message: str) -> Dict[str, Any]:
-    """
-    超輕量抽取：使用者若用「我想/我困擾/我在意」說目標，就存 consult_goal/focus。
-    （更精準的抽取可以交給 profile_agent）
-    """
+def _synastry_partner_change_hint(user_message: str) -> bool:
     msg = (user_message or "").strip()
-    if not msg:
-        return {}
+    manual_tags = ["#換對象", "#新對象", "#重新合盤", "#newpartner", "/newpartner", "/resynastry"]
+    if any(t.lower() in msg.lower() for t in manual_tags):
+        return True
+    cues = ["換一個", "換個", "換人", "新對象", "不是這個人", "另一個人", "換別人"]
+    return any(c in msg for c in cues)
 
+
+def _extract_birth_date_time(msg: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", msg or "")
+    if m:
+        out["birthdate"] = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    t = re.search(r"\b(\d{1,2}):(\d{2})\b", msg or "")
+    if t:
+        hh, mi = int(t.group(1)), int(t.group(2))
+        if 0 <= hh <= 23 and 0 <= mi <= 59:
+            out["birth_time"] = f"{hh:02d}:{mi:02d}"
+    return out
+
+
+def _extract_consult_goal_focus(msg: str) -> Dict[str, Any]:
+    s = (msg or "").strip()
     out: Dict[str, Any] = {}
 
-    m = re.search(r"(我想|想要|想解決|我在意|我困擾|我卡在|我卡住)(.{2,60})", msg)
-    if m:
-        phrase = (m.group(1) + m.group(2)).strip()
-        out["consult_goal"] = phrase[:120]
+    if re.search(r"\bE\b\s*[\.\-、]?\s*全面整理", s):
+        out["consult_goal"] = "全面整理（使用者指定）"
+        out["consult_focus"] = "other"
+        return out
 
-    if any(k in msg for k in ["另一半", "伴侶", "感情", "關係", "吵架", "分手", "曖昧"]):
+    m = re.search(r"(我想|想要|想解決|我在意|我困擾|我卡在|我卡住)(.{2,80})", s)
+    if m:
+        out["consult_goal"] = (m.group(1) + m.group(2)).strip()[:160]
+
+    if any(k in s for k in ["另一半", "伴侶", "感情", "關係", "吵架", "分手", "曖昧"]):
         out["consult_focus"] = "relationship"
-    elif any(k in msg for k in ["工作", "職涯", "職場", "轉職", "升遷", "主管", "同事"]):
+    elif any(k in s for k in ["工作", "職涯", "職場", "轉職", "升遷", "主管", "同事"]):
         out["consult_focus"] = "career"
-    elif any(k in msg for k in ["最近", "這陣子", "未來", "接下來", "幾個月", "一年"]):
+    elif any(k in s for k in ["最近", "這陣子", "未來", "接下來", "幾個月", "一年"]):
         out["consult_focus"] = "timing"
-    elif any(k in msg for k in ["卡住", "卡關", "拖延", "焦慮", "恐懼", "不敢", "沒力"]):
+    elif any(k in s for k in ["卡住", "卡關", "拖延", "焦慮", "恐懼", "不敢", "沒力"]):
         out["consult_focus"] = "block"
-    elif any(k in msg for k in ["我這個人", "性格", "天賦", "優勢", "弱點", "我是怎樣的人"]):
+    elif any(k in s for k in ["性格", "天賦", "優勢", "弱點", "我是怎樣的人"]):
         out["consult_focus"] = "self"
 
     return out
 
 
-def _build_profile_hint(profile: Optional[Dict[str, Any]]) -> str:
-    """
-    只注入 counselor 需要的「諮詢定調」資訊，避免把出生資料也塞進去。
-    """
-    if not profile:
-        return ""
-
-    goal = profile.get("consult_goal")
-    focus = profile.get("consult_focus")
-
-    parts = []
-    if isinstance(goal, str) and goal.strip():
-        parts.append(f"consult_goal: {goal.strip()}")
-    if isinstance(focus, str) and focus.strip():
-        parts.append(f"consult_focus: {focus.strip()}")
-
-    if not parts:
-        return ""
-
-    return "[PROFILE_HINT]\n" + "\n".join(parts) + "\n[/PROFILE_HINT]\n\n"
-
-
 def _profile_fingerprint(profile: Dict[str, Any]) -> Tuple:
-    """盤面相關欄位變了，就視為不同盤，快取失效。"""
     return (
         profile.get("birthdate"),
         profile.get("birth_time"),
-        profile.get("birth_city"),
-        profile.get("birth_country"),
-        profile.get("lng"),
-        profile.get("lat"),
-        profile.get("tz_str"),
+        profile.get("consult_goal"),
+        profile.get("consult_focus"),
     )
 
 
 def _fortune_contains_full_chart(fortune_summary: str) -> bool:
-    if not fortune_summary:
-        return False
-    return "[FULL_CHART]" in fortune_summary and "[/FULL_CHART]" in fortune_summary
+    return bool(fortune_summary) and ("[FULL_CHART]" in fortune_summary and "[/FULL_CHART]" in fortune_summary)
 
 
 def _strip_full_chart_block(fortune_summary: str) -> str:
-    """
-    平常不要把 FULL_CHART 注入 counselor（太大、拖慢/耗 token）。
-    使用者要求完整明細時才保留。
-    """
     if not fortune_summary:
         return fortune_summary
     return re.sub(r"\[FULL_CHART\][\s\S]*?\[/FULL_CHART\]\n?", "", fortune_summary).strip()
 
 
-def _synastry_partner_change_hint(user_message: str) -> bool:
-    """
-    不做 partner fingerprint 的前提下：
-    只要使用者明確說「換人/新對象/不是這個人」或重新提供對方資料，就 bust synastry 快取。
-    """
-    msg = (user_message or "").strip()
-
-    manual_tags = ["#換對象", "#新對象", "#重新合盤", "#newpartner", "/newpartner", "/resynastry"]
-    if any(t.lower() in msg.lower() for t in manual_tags):
-        return True
-
-    cues = [
-        "換一個", "換個", "換人", "換對象", "換另一個", "換別人",
-        "另一個人", "新對象", "新的對象", "改成他", "改成她", "不是這個人",
-        "我跟別人", "換成另一半", "不同的伴侶",
-    ]
-    if any(c in msg for c in cues):
-        return True
-
-    if re.search(r"(對方|他|她).*(生日|出生|生於|\d{4}[/-]\d{1,2}[/-]\d{1,2})", msg):
-        return True
-
-    return False
-
-
-# ---- Fortune cache：多份快取（user_id, request_kind） ----
 _FORTUNE_CACHE: Dict[tuple, Dict[str, Any]] = {}
 # key = (user_id, request_kind)
-# entry:
-# {
-#   "created_at": float,
-#   "request_kind": str,
-#   "profile_fp": tuple,
-#   "fortune_summary": str,
-#   "has_full_chart": bool
-# }
 
 
-def _get_cached_fortune(
-    user_id: str,
-    request_kind: RequestKind,
-    profile: Dict[str, Any],
-    wants_full: bool,
-) -> Optional[str]:
+def _get_cached_fortune(user_id: str, request_kind: RequestKind, profile: Dict[str, Any], wants_full: bool) -> Optional[str]:
     key = (user_id, request_kind)
     entry = _FORTUNE_CACHE.get(key)
     if not entry:
         return None
-
-    ttl = _get_fortune_cache_ttl()
-    if (_now_ts() - float(entry.get("created_at", 0))) > ttl:
+    if (_now_ts() - float(entry.get("created_at", 0))) > _get_fortune_cache_ttl():
         return None
-
     if entry.get("profile_fp") != _profile_fingerprint(profile):
         return None
-
     if wants_full and not bool(entry.get("has_full_chart")):
         return None
-
     return entry.get("fortune_summary")
 
 
-def _set_cached_fortune(
-    user_id: str,
-    request_kind: RequestKind,
-    profile: Dict[str, Any],
-    fortune_summary: str,
-) -> None:
+def _set_cached_fortune(user_id: str, request_kind: RequestKind, profile: Dict[str, Any], fortune_summary: str) -> None:
     key = (user_id, request_kind)
     _FORTUNE_CACHE[key] = {
         "created_at": _now_ts(),
@@ -1014,66 +883,27 @@ def _set_cached_fortune(
     }
 
 
-async def _maybe_run_profile_agent(user_id: str, system_info: str, user_message: str, session: EncryptedSession) -> None:
-    """
-    可選：更精準抽取生日/地點/時間/目標，才跑 profile_agent。
-    預設開啟，但只在「像在提供資料」時才跑（避免每輪多一次模型呼叫）。
-    """
-    use_profile_agent = os.environ.get("USE_PROFILE_AGENT", "1") == "1"
-    if not use_profile_agent:
-        return
-
-    if not re.search(
-        r"(生日|出生|生於|時間|地點|城市|時區|經緯度|我想|想解決|我困擾|我在意)",
-        user_message or "",
-    ):
-        return
-
-    try:
-        full_input = system_info + f"[USER MESSAGE] {user_message}"
-        await Runner.run(profile_agent, input=full_input, session=session)
-    except Exception:
-        return
-
-
 async def _run_fortune(user_id: str, system_info: str, user_message: str, session: EncryptedSession) -> Optional[str]:
-    try:
-        full_input = system_info + f"[USER MESSAGE] {user_message}"
-        r = await Runner.run(fortune_agent, input=full_input, session=session)
-        return r.final_output
-    except Exception:
-        return None
+    full_input = system_info + f"[USER MESSAGE] {user_message}"
+    r = await Runner.run(fortune_agent, input=full_input, session=session)
+    return r.final_output
 
 
-async def _run_counselor(
-    user_message: str,
-    session: EncryptedSession,
-    profile_hint: str,
-    fortune_summary: Optional[str],
-    system_hint: Optional[str] = None,
-    wants_full: bool = False,
-) -> str:
-    hint_block = ""
-    if system_hint:
-        hint_block = f"[SYSTEM_HINT]\n{system_hint}\n[/SYSTEM_HINT]\n\n"
-
+async def _run_counselor(user_message: str, session: EncryptedSession, fortune_summary: Optional[str], wants_full: bool) -> str:
     if fortune_summary and not wants_full:
         fortune_summary = _strip_full_chart_block(fortune_summary)
 
     if fortune_summary:
-        counselor_input = f"{profile_hint}{fortune_summary}\n\n{hint_block}[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
+        counselor_input = f"{fortune_summary}\n\n[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
     else:
-        counselor_input = f"{profile_hint}{hint_block}[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
+        counselor_input = f"[USER_MESSAGE]\n{user_message}\n[/USER_MESSAGE]"
 
     r = await Runner.run(counselor_agent, input=counselor_input, session=session)
-    out = (r.final_output or "").strip()
-    if not out:
-        return "剛剛整理時遇到一點小狀況，但你說的我有聽見。先別急，慢慢來。你最想先被理解的那一點，是什麼？"
-    return out
+    return (r.final_output or "").strip() or "剛剛有點小狀況，但我有聽見你。先別急，慢慢來。"
 
 
 # ============================================================
-# 5. 加密 Session：每個 user_id 共用同一個 EncryptedSession（短期記憶）
+# 5. 加密 Session（短期記憶）
 # ============================================================
 
 _SESSION_CACHE: Dict[str, EncryptedSession] = {}
@@ -1086,58 +916,51 @@ def _get_or_create_session(user_id: str) -> EncryptedSession:
     encryption_key = os.environ.get("AGENTS_ENCRYPTION_KEY", "default-yoda-secret-key")
     db_path = os.environ.get("AGENTS_DB_PATH", "conversations.db")
 
-    underlying_session = SQLiteSession(user_id, db_path)
-
     session = EncryptedSession(
         session_id=user_id,
-        underlying_session=underlying_session,
+        underlying_session=SQLiteSession(user_id, db_path),
         encryption_key=encryption_key,
         ttl=600,
     )
-
     _SESSION_CACHE[user_id] = session
     return session
 
 
 # ============================================================
-# 6. 封裝對外呼叫介面（含 fortune 快取 + synastry 換對象快取失效）
+# 6. 對外單輪呼叫
 # ============================================================
 
 async def chat_once(user_id: str, user_message: str) -> str:
-    """
-    對外單輪呼叫：
-    - 平常：只跑 counselor（最快）
-    - 明確占星 or 要 FULL_CHART：優先讀快取；沒命中才跑 fortune，再由 counselor 回覆
-    - synastry 若偵測「換對象」：強制不走快取，重跑 fortune
-    """
     system_info = (
         f"[SYSTEM INFO] The current user's id is `{user_id}`.\n"
         "Do not reveal or repeat this id to the user.\n"
     )
     session = _get_or_create_session(user_id)
 
-    # 1) 先用超輕量方式把諮詢目標存起來（使用者願意講就存；不講就沒有）
-    consult_delta = _extract_consult_from_text(user_message)
-    if consult_delta:
-        _update_user_profile_impl(user_id=user_id, **consult_delta)
+    # (A) 強制補台北預設（避免任何追問）
+    _update_user_profile_impl(user_id=user_id)
 
-    # 2) 視需要再跑 profile_agent 補資料（可用環境變數關掉）
-    await _maybe_run_profile_agent(user_id, system_info, user_message, session)
+    # (B) 解析日期/時間
+    dt_delta = _extract_birth_date_time(user_message)
+    if dt_delta:
+        _update_user_profile_impl(user_id=user_id, **dt_delta)
+
+    # (C) 解析諮詢目標/焦點（若缺也沒關係，fortune_agent 會預設全面整理）
+    goal_delta = _extract_consult_goal_focus(user_message)
+    if goal_delta:
+        _update_user_profile_impl(user_id=user_id, **goal_delta)
 
     profile = _get_user_profile_impl(user_id) or {}
-    profile_hint = _build_profile_hint(profile)
+    profile = _ensure_default_taipei_fields(profile)
 
     astro_intent = _classify_astro_intent(user_message)
     wants_full = _wants_full_chart(user_message)
     request_kind = _infer_request_kind(user_message)
 
-    fortune_summary: Optional[str] = None
-    system_hint: Optional[str] = None
-
     needs_fortune = wants_full or (astro_intent == "yes")
 
+    fortune_summary: Optional[str] = None
     if needs_fortune:
-        # synastry 換對象提示 => bust 快取
         if request_kind == "synastry" and _synastry_partner_change_hint(user_message):
             cached = None
         else:
@@ -1146,67 +969,22 @@ async def chat_once(user_id: str, user_message: str) -> str:
         if cached:
             fortune_summary = cached
         else:
-            # 若非 FULL_CHART 且目標不清楚：先不跑 fortune，讓 counselor 定調（省一次）
-            goal = profile.get("consult_goal")
-            if (not wants_full) and not (isinstance(goal, str) and goal.strip()):
-                system_hint = "若你願意：先用一句話說『你最想解決什麼』，再用命盤敘事會更對焦。要不要先定調？"
-            else:
-                fortune_summary = await _run_fortune(user_id, system_info, user_message, session)
-                if fortune_summary:
-                    _set_cached_fortune(user_id, request_kind, profile, fortune_summary)
+            fortune_summary = await _run_fortune(user_id, system_info, user_message, session)
+            if fortune_summary:
+                _set_cached_fortune(user_id, request_kind, profile, fortune_summary)
 
-    elif astro_intent == "maybe":
-        system_hint = "我可以用命盤/運勢的角度看節奏；也可以先不占星，先把你最卡的點說清楚。你想選哪個？"
-
-    return await _run_counselor(
-        user_message=user_message,
-        session=session,
-        profile_hint=profile_hint,
-        fortune_summary=fortune_summary,
-        system_hint=system_hint,
-        wants_full=wants_full,
-    )
+    return await _run_counselor(user_message, session, fortune_summary, wants_full=wants_full)
 
 
 # ============================================================
-# 7. 簡單測試 main（本地 debug 用）
+# 7. 本地 debug
 # ============================================================
 
 if __name__ == "__main__":
 
     async def main():
         uid = "demo-user-001"
-
-        print("=== Turn 1: 初次見面，只想聊聊 ===")
-        reply = await chat_once(uid, "嗨，我最近心情有點低落，工作壓力好大。")
-        print("Assistant:", reply, "\n")
-
-        print("=== Turn 2: 給諮詢目標 ===")
-        reply = await chat_once(uid, "我想解決的是：為什麼我總是工作到很累還不敢停。")
-        print("Assistant:", reply, "\n")
-
-        print("=== Turn 3: 提供生日地點 ===")
-        reply = await chat_once(uid, "我生日是 1995-08-03，早上 8:45，在 Taipei 出生。")
-        print("Assistant:", reply, "\n")
-
-        print("=== Turn 4: 本命盤（第一次跑 fortune 並快取 natal） ===")
-        reply = await chat_once(uid, "想用命盤角度看看我到底卡在哪。")
-        print("Assistant:", reply, "\n")
-
-        print("=== Turn 5: 同類問題（命中快取，只跑 counselor） ===")
-        reply = await chat_once(uid, "那我今天可以怎麼做一點點？")
-        print("Assistant:", reply, "\n")
-
-        print("=== Turn 6: 換成合盤（會跑 fortune，快取 synastry） ===")
-        reply = await chat_once(uid, "我想看合盤，配不配？")
-        print("Assistant:", reply, "\n")
-
-        print("=== Turn 7: 明確換對象（synastry bust cache，強制重跑 fortune） ===")
-        reply = await chat_once(uid, "#換對象 我想換另一個人看合盤。")
-        print("Assistant:", reply, "\n")
-
-        print("=== Turn 8: 要完整命盤（FULL_CHART，必要時重跑 fortune） ===")
-        reply = await chat_once(uid, "我想看完整命盤排盤明細（FULL_CHART）。")
-        print("Assistant:", reply, "\n")
+        print(await chat_once(uid, "我的生日是2012/09/03 出生時間在13:30，E. 全面整理"))
+        print(await chat_once(uid, "我想看完整命盤排盤明細（FULL_CHART）"))
 
     asyncio.run(main())
