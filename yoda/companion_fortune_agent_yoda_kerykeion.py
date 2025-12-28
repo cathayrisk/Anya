@@ -539,7 +539,7 @@ profile_agent = Agent(
 fortune_agent = Agent(
     name="Fortune interpretation agent",
     model="gpt-5.2",
-    model_settings=ModelSettings(reasoning=Reasoning(effort="medium", verbosity="low")),
+    model_settings=ModelSettings(reasoning=Reasoning(effort="medium"), verbosity="low"),
     tools=[get_user_profile, get_natal_chart_context, get_transit_chart_context, get_synastry_chart_context],
     instructions=r"""
 System: Internal-only fortune interpretation module.
