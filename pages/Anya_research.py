@@ -20,7 +20,6 @@ import numpy as np
 import pandas as pd
 import faiss
 from pypdf import PdfReader
-from pydantic import BaseModel, Field, ValidationError
 
 from openai import OpenAI
 
@@ -30,14 +29,72 @@ try:
 except Exception:
     HAS_PYMUPDF = False
 
-# deepagents (optional)
+# =========================
+# DeepAgents / LangChain imports（可診斷版）
+# =========================
+HAS_DEEPAGENTS = False
+DEEPAGENTS_IMPORT_ERRORS: list[str] = []
+
+create_deep_agent = None
+init_chat_model = None
+ChatOpenAI = None
+
 try:
-    from deepagents import create_deep_agent
-    from langchain.chat_models import init_chat_model
-    from langchain_core.tools import tool
-    HAS_DEEPAGENTS = True
-except Exception:
-    HAS_DEEPAGENTS = False
+    from deepagents import create_deep_agent as _create_deep_agent
+    create_deep_agent = _create_deep_agent
+except Exception as e:
+    DEEPAGENTS_IMPORT_ERRORS.append(f"deepagents import failed: {repr(e)}")
+
+try:
+    # 新版 LangChain 常用
+    from langchain.chat_models import init_chat_model as _init_chat_model
+    init_chat_model = _init_chat_model
+except Exception as e:
+    DEEPAGENTS_IMPORT_ERRORS.append(f"langchain.chat_models.init_chat_model import failed: {repr(e)}")
+
+try:
+    # fallback：用 ChatOpenAI（很多環境是這個最穩）
+    from langchain_openai import ChatOpenAI as _ChatOpenAI
+    ChatOpenAI = _ChatOpenAI
+except Exception as e:
+    DEEPAGENTS_IMPORT_ERRORS.append(f"langchain_openai.ChatOpenAI import failed: {repr(e)}")
+
+HAS_DEEPAGENTS = (create_deep_agent is not None) and ((init_chat_model is not None) or (ChatOpenAI is not None))
+
+
+def _require_deepagents():
+    if HAS_DEEPAGENTS:
+        return
+    st.error("DeepAgent 依賴載入失敗（不一定是沒安裝，可能是版本/依賴不相容）。")
+    if DEEPAGENTS_IMPORT_ERRORS:
+        st.markdown("### 依賴錯誤細節（請把這段貼給我，我就能精準指你該裝哪個版本）")
+        for msg in DEEPAGENTS_IMPORT_ERRORS:
+            st.code(msg)
+    else:
+        st.info("（沒有捕捉到錯誤細節，請確認 app.py 是否已整檔覆蓋為最新版）")
+    st.stop()
+
+
+def _make_langchain_llm(model_name: str, temperature: float = 0.0):
+    """
+    回傳 LangChain 的 chat model instance：
+    - 優先 init_chat_model
+    - fallback ChatOpenAI
+    """
+    if init_chat_model is not None:
+        # init_chat_model 一般接受 "openai:gpt-4o" 這種格式
+        # 你用 gpt-5.2 → "openai:gpt-5.2"
+        if model_name.startswith("openai:"):
+            return init_chat_model(model=model_name, temperature=temperature)
+        return init_chat_model(model=f"openai:{model_name}", temperature=temperature)
+
+    if ChatOpenAI is not None:
+        # ChatOpenAI 直接用 "gpt-5.2"
+        if model_name.startswith("openai:"):
+            model_name = model_name.split("openai:", 1)[1]
+        return ChatOpenAI(model=model_name, temperature=temperature)
+
+    raise RuntimeError("No LangChain LLM factory available.")
 
 
 # =========================
@@ -71,7 +128,7 @@ DA_MAX_WEB_SEARCH_CALLS = 4
 DA_MAX_REWRITE_ROUNDS = 2
 DA_MAX_CLAIMS = 10
 
-# chunk_id leak guard（只擋 chunk_id / _p.._c.. 這類明確樣式，避免誤砍一般文字）
+# chunk_id leak guard（只擋 chunk_id / _p.._c.. 這類明確樣式）
 CHUNK_ID_LEAK_PAT = re.compile(r"(chunk_id\s*=\s*|_p(?:na|\d+)_c\d+)", re.IGNORECASE)
 
 
@@ -112,9 +169,6 @@ def truncate_filename(name: str, max_len: int = 44) -> str:
     base, ext = os.path.splitext(name)
     keep = max(10, max_len - len(ext) - 1)
     return f"{base[:keep]}…{ext}"
-
-def is_web_citation_in_line(line: str) -> bool:
-    return "WebSearch:" in line
 
 
 # =========================
@@ -183,23 +237,6 @@ def call_gpt(
         except Exception:
             sources = None
     return out_text, sources
-
-def call_yesno_grader(client: OpenAI, *, system: str, user: str) -> str:
-    text, _ = call_gpt(
-        client,
-        model=MODEL_GRADER,
-        system=system + "\n\n只回覆 'yes' 或 'no'（小寫），不要加任何其他文字。",
-        user=user,
-        effort="none",
-    )
-    out = (text or "").strip().lower()
-    if "yes" in out and "no" in out:
-        return "yes" if out.find("yes") < out.find("no") else "no"
-    if "yes" in out:
-        return "yes"
-    if "no" in out:
-        return "no"
-    return "no"
 
 
 # =========================
@@ -314,7 +351,7 @@ def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> 
 
 
 # =========================
-# FAISS store（你原本）
+# FAISS store
 # =========================
 @dataclass
 class Chunk:
@@ -346,8 +383,7 @@ class FaissStore:
 
 
 # =========================
-# 引用顯示（badge directive 方式）
-# Citation 格式： [報告名稱 p12] 或 [報告名稱 p-]
+# 引用 badge（只顯示 [title pX]）
 # =========================
 CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
@@ -456,7 +492,7 @@ def build_indices_incremental_no_kg(
     if new_texts:
         vecs_list = []
         for i in range(0, len(new_texts), EMBED_BATCH_SIZE):
-            vecs_list.append(embed_texts(client, new_texts[i:i+EMBED_BATCH_SIZE]))
+            vecs_list.append(embed_texts(client, new_texts[i:i + EMBED_BATCH_SIZE]))
         vecs = np.vstack(vecs_list)
         store.add(vecs, new_chunks)
 
@@ -465,7 +501,7 @@ def build_indices_incremental_no_kg(
 
 
 # =========================
-# Default bundle（一次三份）— 引用改為 [title pX]
+# 預設輸出（一次三份）
 # =========================
 def _split_default_bundle(text: str) -> Dict[str, str]:
     t = (text or "").strip()
@@ -516,11 +552,6 @@ def pick_corpus_chunks_for_default(all_chunks: list[Chunk]) -> list[Chunk]:
     return chosen
 
 def render_chunks_for_model(chunks: list[Chunk], max_chars_each: int = 900) -> str:
-    """
-    給模型看的 context：
-    - citation 標頭只放 [title pX]
-    - 完全不包含 chunk_id（連 evidence 也不露）
-    """
     parts = []
     for c in chunks:
         head = f"[{c.title} p{c.page if c.page is not None else '-'}]"
@@ -557,12 +588,10 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
 
 
 # =========================
-# DeepAgent：chunk_id 內部使用（工具 JSON），evidence/draft 不寫 chunk_id
+# DeepAgent（chunk_id 只在 tool JSON 內部使用）
 # =========================
 def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
-    if not HAS_DEEPAGENTS:
-        st.error("尚未安裝 deepagents / langchain。請先 pip install deepagents langchain langgraph langchain-openai")
-        st.stop()
+    _require_deepagents()
 
     if "deep_agent" not in st.session_state:
         st.session_state.deep_agent = None
@@ -581,12 +610,11 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             if usage[name] > limit:
                 raise RuntimeError(f"Budget exceeded: {name} > {limit}")
 
-    @tool
+    # tools：用「純 function」即可（避免 decorator import 問題）
     def get_usage() -> str:
         with lock:
             return json.dumps(usage, ensure_ascii=False)
 
-    @tool
     def doc_list() -> str:
         by_title: Dict[str, int] = {}
         for c in store.chunks:
@@ -594,11 +622,10 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         lines = [f"- {t} (chunks={n})" for t, n in sorted(by_title.items(), key=lambda x: x[0])]
         return "\n".join(lines) if lines else "（目前沒有任何已索引文件）"
 
-    @tool
     def doc_search(query: str, k: int = 8) -> str:
         """
-        回傳 JSON hits，供 retriever 內部精讀用（chunk_id 只在此存在）。
-        evidence/draft 禁止寫 chunk_id。
+        回傳 JSON hits，chunk_id 只存在這裡（供 retriever 內部精讀用）。
+        evidence/draft 嚴禁寫 chunk_id。
         """
         _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS)
         q = (query or "").strip()
@@ -613,16 +640,13 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             payload["hits"].append({
                 "title": ch.title,
                 "page": str(ch.page) if ch.page is not None else "-",
-                "chunk_id": ch.chunk_id,  # ✅ only internal
+                "chunk_id": ch.chunk_id,  # internal only
                 "text": (ch.text or "")[:1200],
             })
         return json.dumps(payload, ensure_ascii=False)
 
-    @tool
     def doc_get_chunk(chunk_id: str, max_chars: int = 2600) -> str:
-        """
-        精讀用：只回片段文字，不回任何 id。
-        """
+        """精讀用：只回片段文字，不回任何 id。"""
         cid = (chunk_id or "").strip()
         if not cid:
             return ""
@@ -631,10 +655,9 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                 return (c.text or "")[:max_chars]
         return ""
 
-    tools = [get_usage, doc_list, doc_search, doc_get_chunk]
+    tools: list = [get_usage, doc_list, doc_search, doc_get_chunk]
 
     if enable_web:
-        @tool
         def web_search_summary(query: str) -> str:
             _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS)
             q = (query or "").strip()
@@ -665,7 +688,6 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             out_text = (text or "").strip()
             if src_lines:
                 out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
-
             return f"[WebSearch:{q[:30]} p-]\n" + out_text[:2400]
 
         tools.append(web_search_summary)
@@ -673,25 +695,21 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     retriever_prompt = f"""
 你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
 
-你會收到 facet 子任務，格式：
+facet 子任務格式：
 facet_slug: <英文小寫_底線>
 facet_goal: <這個面向要回答什麼>
 hints: <可能的關鍵字/指標/名詞（可空）>
 
-硬規則（非常重要）：
-- 你寫入 /evidence/doc_<facet_slug>.md 的內容只能包含：
+硬規則：
+- 你要寫入 /evidence/doc_<facet_slug>.md
+- evidence 內容只能包含：
   1) 引用標頭：[報告名稱 p頁]（絕對不能出現 chunk_id）
   2) 原文片段（可截斷）
   3) 一行說明「這段支持什麼」
 - 你可以用 doc_search 拿到 chunk_id，然後用 doc_get_chunk(chunk_id=...) 精讀，
   但 chunk_id 絕對不能寫進 evidence。
-- 若遇到 Budget exceeded：立刻停止並在 evidence 明講「證據不足」。
 
-建議流程：
-1) doc_search(facet_goal + hints) → 拿 JSON hits
-2) 挑 2~6 個 hit，對每個 hit.chunk_id 做 doc_get_chunk 精讀確認
-3) 寫 evidence：只寫 [title p頁] + 精讀片段 + 支持說明
-
+若遇到 Budget exceeded：立刻停止並在 evidence 明講「證據不足」。
 最後回覆 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
 """
 
@@ -703,16 +721,15 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - 完整報告/章節 → REPORT
 - 單題回答 → QA
 - 整理知識脈絡 → KNOWLEDGE
-- 使用者貼草稿要除錯/查核（草稿:/draft/```...```）→ VERIFY_DRAFT（最多 {DA_MAX_CLAIMS} 條主張）
+- 使用者貼草稿要查核/除錯 → VERIFY_DRAFT（最多 {DA_MAX_CLAIMS} 條主張）
 
 引用規則（嚴格）：
 - QA：純 bullet（每行 -），每個 bullet 句尾必有引用 [報告名稱 p頁] 或 [WebSearch:* p-]
 - REPORT/KNOWLEDGE/VERIFY：Markdown；每個非標題段落至少 1 個引用
-- enable_web=false：不得出現 WebSearch 字樣
-- 絕對禁止 chunk_id 出現在輸出（draft 也不行）
+- enable_web=false：不得出現 WebSearch
+- draft 絕對不能出現 chunk_id
 
 把結果寫到 /draft.md
-注意：只能根據 /evidence/ 的內容，不可腦補；證據不足就明講缺口。
 """
 
     verifier_prompt = f"""
@@ -723,11 +740,10 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - QA：每個 bullet 句尾必有 [.. p..]
 - 其他：每個非標題段落至少 1 個引用 [.. p..]
 - enable_web=false：不得出現 WebSearch
-- 【強制清理】若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
+- 若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
 
 最多修正 {DA_MAX_REWRITE_ROUNDS} 輪：
-- 每輪：read /draft.md → 找違規處 → edit_file 最少改動修正 → write /review.md 記錄修了什麼與仍缺什麼
-- 若證據不足無法補引用：在 /draft.md 明確寫缺口並停止
+- 每輪：read /draft.md → edit_file 修正 → write /review.md 記錄
 """
 
     subagents = [
@@ -740,14 +756,14 @@ hints: <可能的關鍵字/指標/名詞（可空）>
         },
         {
             "name": "writer",
-            "description": "整合 /evidence/ → 產生 /draft.md（QA/REPORT/KNOWLEDGE/VERIFY）",
+            "description": "整合 /evidence/ → 產生 /draft.md",
             "system_prompt": writer_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
         },
         {
             "name": "verifier",
-            "description": "檢查引用覆蓋並最少改動修正 /draft.md，寫 /review.md",
+            "description": "檢查引用覆蓋並修稿 /draft.md，寫 /review.md",
             "system_prompt": verifier_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
@@ -755,7 +771,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
     ]
 
     if enable_web:
-        web_prompt = f"""
+        web_prompt = """
 你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。
 facet 子任務格式同 retriever。
 
@@ -763,8 +779,6 @@ facet 子任務格式同 retriever。
 - 寫入 /evidence/web_<facet_slug>.md
 - 每段要保留引用標頭 [WebSearch:... p-]
 - 禁止捏造來源；若 Budget exceeded 就停止並寫明缺口
-
-最後回覆 orchestrator：≤150 字摘要
 """
         subagents.insert(
             1,
@@ -772,7 +786,7 @@ facet 子任務格式同 retriever。
                 "name": "web-researcher",
                 "description": "用 OpenAI 內建 web_search 做少量高品質搜尋，寫 /evidence/web_*.md",
                 "system_prompt": web_prompt,
-                "tools": [web_search_summary],  # type: ignore[name-defined]
+                "tools": [web_search_summary],
                 "model": f"openai:{MODEL_MAIN}",
             },
         )
@@ -780,38 +794,28 @@ facet 子任務格式同 retriever。
     orchestrator_prompt = f"""
 你是 Deep Doc Orchestrator（文件優先；enable_web={str(enable_web).lower()}）。
 
-你有內建工具：write_todos/read_todos、ls/read_file/write_file/edit_file/glob/grep、task（叫 subagents）。
-你也有文件工具：doc_list/doc_search/doc_get_chunk/get_usage。
-{("你也有 web_search_summary（網路搜尋摘要）。" if enable_web else "你沒有網路搜尋工具。")}
-
 固定流程（必做）：
-1) write_todos：列 5~9 個步驟（含：拆 facets、平行蒐證、寫作、審稿）
-2) 初始化 /evidence/：用 write_file 建立 /evidence/README.md（寫下本次需求與 enable_web）
-3) 必須拆 2–4 個 facets（面向拆解，不是章節）：
-   - QA/KNOWLEDGE：definitions, metrics, implications, limitations（挑 2–4）
-   - REPORT：scope, key_findings, risks, recommendations（挑 2–4）
-   - VERIFY_DRAFT：claims_support, contradictions, missing_evidence, rewrite_suggestions（挑 2–4）
-4) 平行派工：在同一輪輸出中用多個 task() 同時派工：
+1) write_todos：列 5~9 步（含：拆 facets、平行蒐證、寫作、審稿）
+2) write_file /evidence/README.md 記錄本次需求與 enable_web
+3) 拆 2–4 個 facets（面向，不是章節）：
+   - QA/KNOWLEDGE：definitions, metrics, implications, limitations
+   - REPORT：scope, key_findings, risks, recommendations
+   - VERIFY：claims_support, contradictions, missing_evidence, rewrite_suggestions
+4) 同一輪用多個 task() 平行派工：
    - 每個 facet 至少派 1 個 retriever
-   - enable_web=true 且需要外部背景/時效性時，對同 facet 再派 1 個 web-researcher
-   指派 facet 固定格式（照抄改內容）：
-   facet_slug: definitions
-   facet_goal: 釐清本題的定義/範疇/名詞口徑
-   hints: （可空）
-5) 等子代理完成後：叫 writer 產生 /draft.md，再叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
-6) 最後 read_file /draft.md，把內容直接當作最終回答輸出。
+   - enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
+5) 叫 writer 產生 /draft.md
+6) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
+7) read_file /draft.md 作為最終回答
 
-非常重要（符合你的 UI badge 規則）：
-- /evidence 與 /draft 不能出現 chunk_id。
-- 引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]。
-- chunk_id 可以存在於工具輸出（只用來 doc_get_chunk 精讀），但不可外顯。
-
-成本可預測：
-- doc_search/web_search_summary 超過會 Budget exceeded：看到就停止、改為回報缺口。
-- OCR 由上游索引決定，你不得自行觸發 OCR。
+引用與隱私規則：
+- /evidence 與 /draft 絕對不能出現 chunk_id
+- 引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]
+- chunk_id 只允許存在於 doc_search 的 JSON 裡，用來 doc_get_chunk 精讀
 """
 
-    llm = init_chat_model(model=f"openai:{MODEL_MAIN}", temperature=0)
+    llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0)
+
     agent = create_deep_agent(
         model=llm,
         tools=tools,
@@ -827,9 +831,6 @@ facet 子任務格式同 retriever。
 
 
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
-    """
-    st.status 即時顯示進度（用檔案出現推斷階段）
-    """
     status_lines_added = set()
     last_files = set()
     final_state = None
@@ -842,7 +843,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
     with st.status("DeepAgent 執行中…（可展開查看進度）", expanded=True) as s:
         emit(s, "start", "🚀 啟動 DeepAgent…")
-        emit(s, "plan_hint", "🧭 等待規劃（write_todos）…")
+        emit(s, "plan_hint", "🧭 規劃中（write_todos）…")
 
         try:
             for state in agent.stream(
@@ -872,7 +873,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                     last_files = file_keys
 
         except Exception as e:
-            emit(s, "fallback", f"⚠️ 串流不可用，改用 invoke() 執行（{e}）")
+            emit(s, "fallback", f"⚠️ 串流不可用，改用 invoke()（{e}）")
             final_state = agent.invoke({"messages": [{"role": "user", "content": user_text}]})
 
         files = (final_state or {}).get("files") or {}
@@ -897,7 +898,6 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                 last = msgs[-1]
                 final_text = getattr(last, "content", None) or str(last)
 
-        # UI 出口最後保險 scrub（不影響引用格式）
         if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
             final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
 
@@ -926,7 +926,6 @@ if "default_outputs" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# settings (no sidebar)
 if "enable_web_search_agent" not in st.session_state:
     st.session_state.enable_web_search_agent = False
 
@@ -1090,7 +1089,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
             st.session_state.processed_keys = set()
             st.session_state.default_outputs = None
             st.session_state.chat_history = []
-            # deep agent cache reset
             st.session_state.deep_agent = None
             st.session_state.deep_agent_web_flag = None
             st.rerun()
@@ -1131,7 +1129,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
                 "title": "整體融合（全部上傳報告）",
                 **st.session_state.default_outputs,
             })
-            # deep agent cache reset（索引變了）
             st.session_state.deep_agent = None
             st.session_state.deep_agent_web_flag = None
             st.rerun()
@@ -1145,7 +1142,7 @@ if st.session_state.store is None:
     st.stop()
 
 st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-st.caption("引用 badge 只顯示『報告名稱 + 頁碼』；chunk_id 僅作為系統內部檢索精讀用途。")
+st.caption("引用 badge 只顯示『報告名稱 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
 
 st.divider()
 st.subheader("Chat（DeepAgent + Badges）")
@@ -1168,7 +1165,6 @@ for msg in st.session_state.chat_history:
             else:
                 render_text_with_badges(content, badge_color="gray")
 
-# 使用者提問
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
 if prompt:
     st.session_state.chat_history.append({"role": "user", "kind": "text", "content": prompt})
@@ -1176,18 +1172,11 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        if not HAS_DEEPAGENTS:
-            st.error("尚未安裝 deepagents / langchain。請先 pip install deepagents langchain langgraph langchain-openai")
-            st.stop()
-
-        # 建 agent（依 UI 是否啟用 web 子代理）
         agent = ensure_deep_agent(
             client=client,
             store=st.session_state.store,
             enable_web=bool(st.session_state.enable_web_search_agent),
         )
-
-        # 串流顯示進度
         answer_text, files = deep_agent_run_with_live_status(agent, prompt)
 
         st.markdown("## 最終回答")
@@ -1201,10 +1190,7 @@ if prompt:
                 st.write(list(files.keys())[:200])
                 if "/review.md" in files:
                     st.markdown("### /review.md（審稿紀錄）")
-                    try:
-                        st.text(str(files["/review.md"])[:12000])
-                    except Exception:
-                        pass
+                    st.text(str(files["/review.md"])[:12000])
             else:
                 st.write("（沒有 files）")
 
