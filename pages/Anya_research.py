@@ -612,10 +612,12 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
     # tools：用「純 function」即可（避免 decorator import 問題）
     def get_usage() -> str:
+        """Return current tool usage counters as JSON string (internal for budgeting/debug)."""
         with lock:
             return json.dumps(usage, ensure_ascii=False)
 
     def doc_list() -> str:
+        """List indexed documents and chunk counts (for the agent to know what's available)."""
         by_title: Dict[str, int] = {}
         for c in store.chunks:
             by_title[c.title] = by_title.get(c.title, 0) + 1
@@ -624,8 +626,12 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
     def doc_search(query: str, k: int = 8) -> str:
         """
-        回傳 JSON hits，chunk_id 只存在這裡（供 retriever 內部精讀用）。
-        evidence/draft 嚴禁寫 chunk_id。
+        Search similar chunks by semantic embedding.
+
+        Returns a JSON string:
+          {"hits":[{"title":..., "page":..., "chunk_id":..., "text":...}, ...]}
+
+        Note: chunk_id is INTERNAL ONLY for doc_get_chunk; it must never be written into evidence/draft.
         """
         _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS)
         q = (query or "").strip()
@@ -646,7 +652,11 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         return json.dumps(payload, ensure_ascii=False)
 
     def doc_get_chunk(chunk_id: str, max_chars: int = 2600) -> str:
-        """精讀用：只回片段文字，不回任何 id。"""
+        """
+        Fetch full(er) text for a chunk_id.
+
+        Returns only the text (no ids). Used for close reading after doc_search().
+        """
         cid = (chunk_id or "").strip()
         if not cid:
             return ""
@@ -659,6 +669,12 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
     if enable_web:
         def web_search_summary(query: str) -> str:
+            """
+            Do a lightweight web_search and summarize results.
+
+            Returns a short Traditional Chinese summary and appends sources (title + url).
+            Output is tagged as [WebSearch:... p-] for downstream citation formatting.
+            """
             _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS)
             q = (query or "").strip()
             if not q:
