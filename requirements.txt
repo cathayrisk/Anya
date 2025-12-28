@@ -9,6 +9,7 @@ langchain-core
 langgraph-supervisor
 openai
 openai-agents
+deepagents
 
 # Document processing
 faiss-cpu
