@@ -593,6 +593,10 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
 def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     _require_deepagents()
 
+    # 重要：一定要用 langchain_core 的 BaseTool/StructuredTool
+    # ToolNode 會用 isinstance(tool, BaseTool) 判斷；如果你用到舊路徑產生的 tool，可能會被當成「不是 BaseTool」又去 convert 一次而炸。
+    from langchain_core.tools import BaseTool, StructuredTool
+
     if "deep_agent" not in st.session_state:
         st.session_state.deep_agent = None
     if "deep_agent_web_flag" not in st.session_state:
@@ -600,6 +604,14 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
     if (st.session_state.deep_agent is not None) and (st.session_state.deep_agent_web_flag == bool(enable_web)):
         return st.session_state.deep_agent
+
+    # 如果部署用了 -OO，docstring 會被移除；我們走 StructuredTool+description 就不怕
+    try:
+        import sys
+        if getattr(sys, "flags", None) and getattr(sys.flags, "optimize", 0) >= 2:
+            st.caption("⚠️ 偵測到 Python optimize(-OO) 可能移除 docstring；已改用 StructuredTool(description) 避免此問題。")
+    except Exception:
+        pass
 
     lock = threading.Lock()
     usage = {"doc_search_calls": 0, "web_search_calls": 0}
@@ -610,29 +622,21 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             if usage[name] > limit:
                 raise RuntimeError(f"Budget exceeded: {name} > {limit}")
 
-    # tools：用「純 function」即可（避免 decorator import 問題）
-    def get_usage() -> str:
-        """Return current tool usage counters as JSON string (internal for budgeting/debug)."""
+    # -------------------------
+    # 原始工具函式（維持你原本邏輯）
+    # -------------------------
+    def _get_usage_fn() -> str:
         with lock:
             return json.dumps(usage, ensure_ascii=False)
 
-    def doc_list() -> str:
-        """List indexed documents and chunk counts (for the agent to know what's available)."""
+    def _doc_list_fn() -> str:
         by_title: Dict[str, int] = {}
         for c in store.chunks:
             by_title[c.title] = by_title.get(c.title, 0) + 1
         lines = [f"- {t} (chunks={n})" for t, n in sorted(by_title.items(), key=lambda x: x[0])]
         return "\n".join(lines) if lines else "（目前沒有任何已索引文件）"
 
-    def doc_search(query: str, k: int = 8) -> str:
-        """
-        Search similar chunks by semantic embedding.
-
-        Returns a JSON string:
-          {"hits":[{"title":..., "page":..., "chunk_id":..., "text":...}, ...]}
-
-        Note: chunk_id is INTERNAL ONLY for doc_get_chunk; it must never be written into evidence/draft.
-        """
+    def _doc_search_fn(query: str, k: int = 8) -> str:
         _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS)
         q = (query or "").strip()
         if not q:
@@ -651,12 +655,7 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             })
         return json.dumps(payload, ensure_ascii=False)
 
-    def doc_get_chunk(chunk_id: str, max_chars: int = 2600) -> str:
-        """
-        Fetch full(er) text for a chunk_id.
-
-        Returns only the text (no ids). Used for close reading after doc_search().
-        """
+    def _doc_get_chunk_fn(chunk_id: str, max_chars: int = 2600) -> str:
         cid = (chunk_id or "").strip()
         if not cid:
             return ""
@@ -665,16 +664,39 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                 return (c.text or "")[:max_chars]
         return ""
 
-    tools: list = [get_usage, doc_list, doc_search, doc_get_chunk]
+    # -------------------------
+    # 關鍵修正：全部包成 BaseTool（明確 description）
+    # -------------------------
+    def _mk_tool(fn, name: str, description: str) -> BaseTool:
+        # 一律顯式提供 description，完全不依賴 docstring
+        return StructuredTool.from_function(fn, name=name, description=description)
 
+    tool_get_usage = _mk_tool(
+        _get_usage_fn,
+        "get_usage",
+        "Get current tool usage counters as JSON (budget/debug).",
+    )
+    tool_doc_list = _mk_tool(
+        _doc_list_fn,
+        "doc_list",
+        "List indexed documents and chunk counts.",
+    )
+    tool_doc_search = _mk_tool(
+        _doc_search_fn,
+        "doc_search",
+        "Semantic search over indexed chunks. Returns JSON hits with title/page/chunk_id/text (chunk_id is internal).",
+    )
+    tool_doc_get_chunk = _mk_tool(
+        _doc_get_chunk_fn,
+        "doc_get_chunk",
+        "Fetch full text for a given chunk_id for close reading. Returns text only.",
+    )
+
+    tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk]
+
+    tool_web_search_summary: Optional[BaseTool] = None
     if enable_web:
-        def web_search_summary(query: str) -> str:
-            """
-            Do a lightweight web_search and summarize results.
-
-            Returns a short Traditional Chinese summary and appends sources (title + url).
-            Output is tagged as [WebSearch:... p-] for downstream citation formatting.
-            """
+        def _web_search_summary_fn(query: str) -> str:
             _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS)
             q = (query or "").strip()
             if not q:
@@ -701,13 +723,29 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                     u = s.get("url") or ""
                     if u:
                         src_lines.append(f"- {t} {u}".strip())
+
             out_text = (text or "").strip()
             if src_lines:
                 out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
             return f"[WebSearch:{q[:30]} p-]\n" + out_text[:2400]
 
-        tools.append(web_search_summary)
+        tool_web_search_summary = _mk_tool(
+            _web_search_summary_fn,
+            "web_search_summary",
+            "Run lightweight web_search and return a short Traditional Chinese summary with sources.",
+        )
+        tools.append(tool_web_search_summary)
 
+    # 防呆：如果這裡還混進裸 function，直接在 UI 顯示，而不是讓它在 langchain 內部爆炸還被 redacted
+    bad = [t for t in tools if not isinstance(t, BaseTool)]
+    if bad:
+        st.error("Internal error: tools list contains non-BaseTool items.（避免被 Streamlit redacted，這裡先攔截）")
+        st.code("\n".join([f"- {repr(x)} type={type(x)}" for x in bad])[:8000])
+        st.stop()
+
+    # -------------------------
+    # prompts（沿用你原本內容）
+    # -------------------------
     retriever_prompt = f"""
 你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
 
@@ -767,7 +805,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
             "name": "retriever",
             "description": "從上傳文件向量庫找證據，寫 /evidence/doc_*.md（不含 chunk_id）",
             "system_prompt": retriever_prompt,
-            "tools": [get_usage, doc_list, doc_search, doc_get_chunk],
+            "tools": [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk],  # BaseTool only
             "model": f"openai:{MODEL_MAIN}",
         },
         {
@@ -802,7 +840,7 @@ facet 子任務格式同 retriever。
                 "name": "web-researcher",
                 "description": "用 OpenAI 內建 web_search 做少量高品質搜尋，寫 /evidence/web_*.md",
                 "system_prompt": web_prompt,
-                "tools": [web_search_summary],
+                "tools": [tool_web_search_summary, tool_get_usage] if tool_web_search_summary else [tool_get_usage],
                 "model": f"openai:{MODEL_MAIN}",
             },
         )
@@ -834,7 +872,7 @@ facet 子任務格式同 retriever。
 
     agent = create_deep_agent(
         model=llm,
-        tools=tools,
+        tools=tools,  # ✅ BaseTool instances only
         system_prompt=orchestrator_prompt,
         subagents=subagents,
         debug=False,
@@ -844,7 +882,6 @@ facet 子任務格式同 retriever。
     st.session_state.deep_agent = agent
     st.session_state.deep_agent_web_flag = bool(enable_web)
     return agent
-
 
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
     status_lines_added = set()
