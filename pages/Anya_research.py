@@ -1209,6 +1209,13 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 # Session init
 # =========================
 OPENAI_API_KEY = get_openai_api_key()
+
+# ✅ 關鍵：langchain_openai / deepagents 會依賴這個環境變數
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+# （可選）你原本也用 OPENAI_KEY，順手也補，避免其他地方抓不到
+os.environ.setdefault("OPENAI_KEY", OPENAI_API_KEY)
+
 client = get_client(OPENAI_API_KEY)
 
 if "file_rows" not in st.session_state:
