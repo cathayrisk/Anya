@@ -11,6 +11,7 @@ import time
 import json
 import hashlib
 import threading
+import ast
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -138,10 +139,12 @@ CHUNK_ID_LEAK_PAT = re.compile(r"(chunk_id\s*=\s*|_p(?:na|\d+)_c\d+)", re.IGNORE
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
+
 def estimate_tokens_from_chars(n_chars: int) -> int:
     if n_chars <= 0:
         return 0
     return max(1, int(math.ceil(n_chars / 3.6)))
+
 
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> list[str]:
     text = norm_space(text)
@@ -157,11 +160,14 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> list[str
         i = max(0, j - overlap)
     return out
 
+
 def sha1_bytes(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
+
 def sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:10]
+
 
 def truncate_filename(name: str, max_len: int = 44) -> str:
     if len(name) <= max_len:
@@ -183,8 +189,10 @@ def get_openai_api_key() -> str:
         return os.environ["OPENAI_KEY"]
     raise RuntimeError("Missing OpenAI API key. Set st.secrets['OPENAI_KEY'] or env OPENAI_API_KEY.")
 
+
 def get_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key)
+
 
 def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
     resp = client.embeddings.create(
@@ -197,8 +205,10 @@ def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
     norms = np.where(norms == 0, 1.0, norms)
     return vecs / norms
 
+
 def _to_messages(system: str, user: Any) -> list[Dict[str, Any]]:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
 
 def call_gpt(
     client: OpenAI,
@@ -261,6 +271,7 @@ class FileRow:
     likely_scanned: bool
     use_ocr: bool
 
+
 def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     out = []
@@ -272,6 +283,7 @@ def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
         out.append((i + 1, norm_space(t)))
     return out
 
+
 def extract_pdf_text_pages_pymupdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = []
@@ -281,6 +293,7 @@ def extract_pdf_text_pages_pymupdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
         out.append((i + 1, norm_space(t)))
     return out
 
+
 def extract_pdf_text_pages(pdf_bytes: bytes) -> list[Tuple[int, str]]:
     if HAS_PYMUPDF:
         try:
@@ -288,6 +301,7 @@ def extract_pdf_text_pages(pdf_bytes: bytes) -> list[Tuple[int, str]]:
         except Exception:
             return extract_pdf_text_pages_pypdf(pdf_bytes)
     return extract_pdf_text_pages_pypdf(pdf_bytes)
+
 
 def analyze_pdf_text_quality(
     pdf_pages: list[Tuple[int, str]],
@@ -303,6 +317,7 @@ def analyze_pdf_text_quality(
     text_pages_ratio = text_pages / total_pages
     return sum(lens), blank, blank_ratio, text_pages, text_pages_ratio
 
+
 def should_suggest_ocr(ext: str, pages: Optional[int], extracted_chars: int, blank_ratio: Optional[float]) -> bool:
     if ext != ".pdf":
         return False
@@ -313,6 +328,7 @@ def should_suggest_ocr(ext: str, pages: Optional[int], extracted_chars: int, bla
     avg = extracted_chars / max(1, pages)
     return avg < 120
 
+
 def ocr_image_bytes(client: OpenAI, image_bytes: bytes) -> str:
     system = "你是一個OCR工具。只輸出可見文字與表格內容（若有表格用 Markdown 表格）。中文請用繁體中文。不要加評論。"
     user_content = [
@@ -321,6 +337,7 @@ def ocr_image_bytes(client: OpenAI, image_bytes: bytes) -> str:
     ]
     text, _ = call_gpt(client, model=MODEL_GRADER, system=system, user=user_content, effort="none")
     return text
+
 
 def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> list[Tuple[int, str]]:
     if not HAS_PYMUPDF:
@@ -361,6 +378,7 @@ class Chunk:
     page: Optional[int]
     text: str
 
+
 class FaissStore:
     def __init__(self, dim: int):
         self.index = faiss.IndexFlatIP(dim)
@@ -389,6 +407,7 @@ CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
 CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
 
+
 def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
     parsed = []
     for c in cits:
@@ -397,9 +416,11 @@ def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
             parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip()})
     return parsed
 
+
 def _badge_directive(label: str, color: str) -> str:
     safe = label.replace("[", "(").replace("]", ")")
     return f":{color}-badge[{safe}]"
+
 
 def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
     lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
@@ -412,6 +433,7 @@ def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
         badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
         st.markdown(clean + (" " + " ".join(badges) if badges else ""))
 
+
 def render_text_with_badges(md_text: str, badge_color: str = "gray"):
     cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", md_text or "")]
     clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\]", "", md_text or "").strip()
@@ -420,6 +442,7 @@ def render_text_with_badges(md_text: str, badge_color: str = "gray"):
     if parsed:
         badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
         st.markdown("來源：" + " ".join(badges))
+
 
 def bullets_all_have_citations(md: str) -> bool:
     lines = (md or "").splitlines()
@@ -430,8 +453,226 @@ def bullets_all_have_citations(md: str) -> bool:
             return False
     return True
 
+
 def any_bullets(md: str) -> bool:
     return any(BULLET_RE.match(l) for l in (md or "").splitlines())
+
+
+# =========================
+# QA 顯示：一般 Markdown + 來源膠囊（不顯示 JSON）
+# =========================
+def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
+    t = (text or "").strip()
+    if not t:
+        return None
+
+    # JSON
+    if t.startswith("{") or t.startswith("["):
+        try:
+            return json.loads(t)
+        except Exception:
+            pass
+
+    # Python dict literal（deepagents 有時會出現 {'content': '...'}）
+    if t.startswith("{") and t.endswith("}"):
+        try:
+            return ast.literal_eval(t)
+        except Exception:
+            return None
+
+    return None
+
+
+def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        for k in ("content", "answer", "final", "output", "text", "message"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        # 有些會把 messages 放在 list
+        msgs = payload.get("messages")
+        if isinstance(msgs, list) and msgs:
+            last = msgs[-1]
+            if isinstance(last, dict):
+                c = last.get("content")
+                if isinstance(c, str) and c.strip():
+                    return c
+            return str(last)
+        return None
+
+    if isinstance(payload, list):
+        # 如果是 list[str] 就串起來
+        if all(isinstance(x, str) for x in payload):
+            return "\n".join([x for x in payload if x.strip()])
+        return str(payload)
+
+    return None
+
+
+def _dedup_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _extract_citation_strings(text: str) -> list[str]:
+    if not text:
+        return []
+    return [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", text)]
+
+
+def _strip_citations_from_text(text: str) -> str:
+    if not text:
+        return ""
+    # 移除引用，但保留 Markdown 結構
+    return re.sub(r"\s*\[[^\]]+?\s+p(\d+|-)\s*\]\s*", " ", text).strip()
+
+
+def _group_citations_for_badges(cits: list[str]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for c in cits:
+        m = CIT_PARSE_RE.search(c)
+        if not m:
+            continue
+        title = m.group(1).strip()
+        page = m.group(2).strip()
+        grouped.setdefault(title, []).append(page)
+
+    # 去重、排序（數字頁碼先，'-' 後）
+    for title, pages in grouped.items():
+        pages = _dedup_keep_order(pages)
+
+        def _key(p: str):
+            if p.isdigit():
+                return (0, int(p))
+            if p == "-":
+                return (1, 10**9)
+            return (2, p)
+
+        grouped[title] = sorted(pages, key=_key)
+
+    return grouped
+
+
+def _format_pages_compact(pages: list[str], max_keep: int = 4) -> str:
+    """
+    把 pages 變成短字串，例如：
+      ['1','2','3','6'] -> 'p1,2,3,6'
+      ['1','2','3','4','5','6'] -> 'p1,2,3,+3'
+    """
+    if not pages:
+        return "p-"
+    if len(pages) <= max_keep:
+        return "p" + ",".join(pages)
+    keep_n = max(1, max_keep - 1)  # 保留前 N-1 個，最後用 +n
+    kept = pages[:keep_n]
+    more = len(pages) - keep_n
+    return "p" + ",".join(kept) + f",+{more}"
+
+
+def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str = "green"):
+    """
+    QA 專用：
+    - 把 JSON / Python dict 字串轉成一般 Markdown 顯示
+    - 來源用膠囊 badge（集中在下方）
+    """
+    raw = (answer_text or "").strip()
+
+    # 防 chunk_id 外洩
+    if raw and CHUNK_ID_LEAK_PAT.search(raw):
+        raw = CHUNK_ID_LEAK_PAT.sub("", raw)
+
+    payload = _try_parse_json_or_py_literal(raw)
+    if payload is not None:
+        extracted = _extract_main_text_from_payload(payload)
+        if extracted is not None:
+            raw = extracted.strip()
+
+    cits = _dedup_keep_order(_extract_citation_strings(raw))
+    clean = _strip_citations_from_text(raw)
+
+    # 顯示正文（一般 Markdown）
+    st.markdown(clean if clean else "（無內容）")
+
+    # 顯示來源 badge（合併頁碼）
+    if cits:
+        grouped = _group_citations_for_badges(cits)
+        badges = []
+        for title in sorted(grouped.keys()):
+            pages = grouped[title]
+            label = f"{title} {_format_pages_compact(pages, max_keep=4)}"
+            badges.append(_badge_directive(label, badge_color))
+        if badges:
+            st.markdown("來源：" + " ".join(badges))
+
+
+def render_debug_panel(files: Optional[dict]):
+    """Debug 區塊：tabs + 內容預覽，避免噴一大坨 keys。"""
+    if not files or not isinstance(files, dict):
+        st.write("（沒有 files）")
+        return
+
+    def _file_to_str(file_obj) -> str:
+        if isinstance(file_obj, dict) and "data" in file_obj:
+            v = file_obj["data"]
+            if isinstance(v, (bytes, bytearray)):
+                return v.decode("utf-8", errors="ignore")
+            return str(v)
+        if isinstance(file_obj, (bytes, bytearray)):
+            return file_obj.decode("utf-8", errors="ignore")
+        return str(file_obj)
+
+    def _sanitize_text(t: str) -> str:
+        t = (t or "").strip()
+        if not t:
+            return ""
+        if CHUNK_ID_LEAK_PAT.search(t):
+            t = CHUNK_ID_LEAK_PAT.sub("", t)
+        # 如果內容本身是 dict/JSON 字串，也嘗試抽 content
+        payload = _try_parse_json_or_py_literal(t)
+        if payload is not None:
+            extracted = _extract_main_text_from_payload(payload)
+            if isinstance(extracted, str) and extracted.strip():
+                t = extracted.strip()
+                if CHUNK_ID_LEAK_PAT.search(t):
+                    t = CHUNK_ID_LEAK_PAT.sub("", t)
+        return t
+
+    all_keys = sorted([k for k in files.keys() if isinstance(k, str)])
+    evidence_keys = [k for k in all_keys if k.startswith("/evidence/")]
+
+    draft = _sanitize_text(_file_to_str(files.get("/draft.md", ""))) if "/draft.md" in files else ""
+    review = _sanitize_text(_file_to_str(files.get("/review.md", ""))) if "/review.md" in files else ""
+
+    tab1, tab2, tab3, tab4 = st.tabs(["總覽", "draft.md", "review.md", "evidence"])
+
+    with tab1:
+        st.write(f"files keys：{len(all_keys)}")
+        st.write(f"evidence：{len(evidence_keys)}")
+        st.code("\n".join(all_keys[:400]), language="text")
+
+    with tab2:
+        if draft:
+            st.code(draft[:20000], language="markdown")
+        else:
+            st.write("（沒有 /draft.md）")
+
+    with tab3:
+        if review:
+            st.code(review[:20000], language="markdown")
+        else:
+            st.write("（沒有 /review.md）")
+
+    with tab4:
+        if evidence_keys:
+            st.code("\n".join(evidence_keys[:600]), language="text")
+        else:
+            st.write("（沒有 /evidence/ 檔案）")
 
 
 # =========================
@@ -514,6 +755,7 @@ def _split_default_bundle(text: str) -> Dict[str, str]:
         return {"summary": "", "claims": "", "chain": ""}
     return {"summary": m.group(1).strip(), "claims": m.group(2).strip(), "chain": m.group(3).strip()}
 
+
 def pick_corpus_chunks_for_default(all_chunks: list[Chunk]) -> list[Chunk]:
     by_title: Dict[str, list[Chunk]] = {}
     for c in all_chunks:
@@ -551,12 +793,14 @@ def pick_corpus_chunks_for_default(all_chunks: list[Chunk]) -> list[Chunk]:
     chosen = sorted(chosen, key=score, reverse=True)[:CORPUS_DEFAULT_MAX_CHUNKS]
     return chosen
 
+
 def render_chunks_for_model(chunks: list[Chunk], max_chars_each: int = 900) -> str:
     parts = []
     for c in chunks:
         head = f"[{c.title} p{c.page if c.page is not None else '-'}]"
         parts.append(head + "\n" + c.text[:max_chars_each])
     return "\n\n".join(parts)
+
 
 def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_retries: int = 2) -> Dict[str, str]:
     system = (
@@ -883,6 +1127,7 @@ facet 子任務格式同 retriever。
     st.session_state.deep_agent_web_flag = bool(enable_web)
     return agent
 
+
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
     status_lines_added = set()
     last_files = set()
@@ -1017,6 +1262,7 @@ def file_rows_to_df(rows: list[FileRow]) -> pd.DataFrame:
             "建議": suggest,
         })
     return pd.DataFrame(recs)
+
 
 def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
     id_to_row_idx = {r.file_id: i for i, r in enumerate(rows)}
@@ -1212,11 +1458,9 @@ for msg in st.session_state.chat_history:
             st.markdown("### 3) 推論鏈")
             render_bullets_inline_badges(msg.get("chain", ""), badge_color="orange")
         else:
+            # ✅ QA：用一般 Markdown（不顯示 JSON），來源用膠囊 badge
             content = msg.get("content", "")
-            if any_bullets(content):
-                render_bullets_inline_badges(content, badge_color="green")
-            else:
-                render_text_with_badges(content, badge_color="gray")
+            render_markdown_answer_with_source_badges(content, badge_color="green")
 
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
 if prompt:
@@ -1232,19 +1476,10 @@ if prompt:
         )
         answer_text, files = deep_agent_run_with_live_status(agent, prompt)
 
-        st.markdown("## 最終回答")
-        if any_bullets(answer_text):
-            render_bullets_inline_badges(answer_text, badge_color="green")
-        else:
-            render_text_with_badges(answer_text, badge_color="gray")
+        # ✅ 不要顯示「最終回答」：直接一般 QA 聊天輸出
+        render_markdown_answer_with_source_badges(answer_text, badge_color="green")
 
-        with st.expander("Debug（DeepAgent files）"):
-            if files:
-                st.write(list(files.keys())[:200])
-                if "/review.md" in files:
-                    st.markdown("### /review.md（審稿紀錄）")
-                    st.text(str(files["/review.md"])[:12000])
-            else:
-                st.write("（沒有 files）")
+        with st.expander("Debug", expanded=False):
+            render_debug_panel(files)
 
     st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text})
