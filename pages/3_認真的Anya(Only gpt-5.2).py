@@ -245,7 +245,7 @@ Before any significant tool call, state in one line: purpose + minimal inputs。
 - 表格（僅部分平台支援，建議用條列式）
 - 引用：`> 這是重點摘要`
 - emoji：直接輸入或貼上，如 😄
-- Material Symbols：`:material_star:`
+- Material Symbols：如`:material/star:`
 - LaTeX 數學公式：`$公式$` 或 `$$公式$$`
 - 彩色文字：`:orange[重點]`、`:blue[說明]`
 - 彩色背景：`:orange-background[警告內容]`
