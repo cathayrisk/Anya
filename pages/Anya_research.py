@@ -1142,22 +1142,44 @@ facet 子任務格式同 retriever。
     return agent
 
 
+# =========================
+# 2) 進度顯示：只用 st.status.update()（預設不展開）
+#    ✅ 取代你現在的 deep_agent_run_with_live_status()
+# =========================
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
-    status_lines_added = set()
-    last_files = set()
+    last_phase = None
     final_state = None
+    last_files = set()
 
-    def emit(status_obj, key: str, line: str):
-        if key in status_lines_added:
+    def set_phase(s, phase: str):
+        nonlocal last_phase
+        if phase == last_phase:
             return
-        status_lines_added.add(key)
-        status_obj.write(line)
+        last_phase = phase
 
-    with st.status("DeepAgent 執行中…（可展開查看進度）", expanded=True) as s:
-        emit(s, "start", "🚀 啟動 DeepAgent…")
-        emit(s, "plan_hint", "🧭 規劃中（write_todos）…")
+        # 你可以依喜好改 wording
+        if phase == "start":
+            s.update(label="DeepAgent：啟動中…", state="running", expanded=False)
+        elif phase == "plan":
+            s.update(label="DeepAgent：規劃中…", state="running", expanded=False)
+        elif phase == "evidence":
+            s.update(label="DeepAgent：蒐證中…", state="running", expanded=False)
+        elif phase == "draft":
+            s.update(label="DeepAgent：寫作中…", state="running", expanded=False)
+        elif phase == "review":
+            s.update(label="DeepAgent：審稿/補引用中…", state="running", expanded=False)
+        elif phase == "done":
+            s.update(label="DeepAgent：完成", state="complete", expanded=False)
+        elif phase == "error":
+            s.update(label="DeepAgent：發生錯誤", state="error", expanded=False)
+
+    # ✅ 不用 expander；status 本身會顯示一行可變的狀態文字
+    with st.status("DeepAgent：啟動中…", expanded=False) as s:
+        set_phase(s, "start")
+        set_phase(s, "plan")
 
         try:
+            # 先嘗試 stream（有些環境會失敗）
             for state in agent.stream(
                 {"messages": [{"role": "user", "content": user_text}]},
                 stream_mode="values",
@@ -1166,35 +1188,34 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                 files = state.get("files") or {}
                 file_keys = set(files.keys()) if isinstance(files, dict) else set()
 
+                # 根據 agent 產出的檔案來推進度
                 if any(k.startswith("/evidence/") for k in file_keys):
-                    emit(s, "evidence", "📚 蒐證中（/evidence/ 產生中；retriever/web-researcher 可能在平行跑）…")
+                    set_phase(s, "evidence")
 
                 if "/draft.md" in file_keys:
-                    emit(s, "draft", "✍️ 寫作完成（/draft.md 已生成）")
+                    set_phase(s, "draft")
 
                 if "/review.md" in file_keys:
-                    emit(s, "review", "🧪 審稿/補引用中（/review.md 更新中）")
+                    set_phase(s, "review")
 
-                new_files = file_keys - last_files
-                if new_files:
-                    emit(
-                        s,
-                        f"new_{len(status_lines_added)}",
-                        f"🗂️ 新增檔案：{', '.join(sorted(list(new_files))[:6])}" + ("…" if len(new_files) > 6 else ""),
-                    )
-                    last_files = file_keys
+                # 記錄新檔案（不寫進 status 內容，避免要展開才能看）
+                last_files = file_keys
 
         except Exception as e:
-            # ✅ Budget exceeded：不要再 invoke() 重跑（會再爆一次），改成保留目前 final_state 並回傳提示
             msg = str(e)
-            if "Budget exceeded" in msg:
-                emit(s, "budget", f"⚠️ 已達工具預算上限：{msg}（停止加搜證，改用目前已產出的內容）")
-                # 不做 invoke()，保留目前 final_state（可能已產生部分 /evidence/）
-            else:
-                emit(s, "fallback", f"⚠️ 串流不可用，改用 invoke()（{e}）")
-                final_state = agent.invoke({"messages": [{"role": "user", "content": user_text}]})
 
-        
+            # ✅ Budget exceeded：不要 invoke 重跑；直接停在目前狀態（避免再爆一次）
+            if "Budget exceeded" in msg:
+                set_phase(s, "evidence")
+                s.update(label=f"DeepAgent：已達工具預算上限（停止加搜證）", state="running", expanded=False)
+            else:
+                # 真的 stream 不可用才 fallback invoke
+                try:
+                    final_state = agent.invoke({"messages": [{"role": "user", "content": user_text}]})
+                except Exception:
+                    set_phase(s, "error")
+                    raise
+
         files = (final_state or {}).get("files") or {}
 
         def _file_to_str(file_obj):
@@ -1220,8 +1241,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
         if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
             final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
 
-        emit(s, "done", "✅ DeepAgent 完成")
-        s.update(state="complete", expanded=False)
+        set_phase(s, "done")
 
     return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
 
