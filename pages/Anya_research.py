@@ -860,12 +860,15 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     lock = threading.Lock()
     usage = {"doc_search_calls": 0, "web_search_calls": 0}
 
-    def _inc(name: str, limit: int):
+    def _inc(name: str, limit: int) -> bool:
+        """
+        回傳 True 表示還在 budget 內；
+        回傳 False 表示超出 budget（不 raise，避免整個 agent graph 爆掉）。
+        """
         with lock:
             usage[name] += 1
-            if usage[name] > limit:
-                raise RuntimeError(f"Budget exceeded: {name} > {limit}")
-
+            return usage[name] <= limit
+            
     # -------------------------
     # 原始工具函式（維持你原本邏輯）
     # -------------------------
@@ -882,6 +885,17 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
     def _doc_search_fn(query: str, k: int = 8) -> str:
         _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS)
+
+        if not _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS):
+            # 不 raise，回傳可讀的 error 讓 agent 知道要停
+            return json.dumps(
+                {
+                    "hits": [],
+                    "error": f"Budget exceeded: doc_search_calls > {DA_MAX_DOC_SEARCH_CALLS}",
+                },
+                ensure_ascii=False,
+            )
+        
         q = (query or "").strip()
         if not q:
             return json.dumps({"hits": []}, ensure_ascii=False)
@@ -1171,9 +1185,16 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                     last_files = file_keys
 
         except Exception as e:
-            emit(s, "fallback", f"⚠️ 串流不可用，改用 invoke()（{e}）")
-            final_state = agent.invoke({"messages": [{"role": "user", "content": user_text}]})
+            # ✅ Budget exceeded：不要再 invoke() 重跑（會再爆一次），改成保留目前 final_state 並回傳提示
+            msg = str(e)
+            if "Budget exceeded" in msg:
+                emit(s, "budget", f"⚠️ 已達工具預算上限：{msg}（停止加搜證，改用目前已產出的內容）")
+                # 不做 invoke()，保留目前 final_state（可能已產生部分 /evidence/）
+            else:
+                emit(s, "fallback", f"⚠️ 串流不可用，改用 invoke()（{e}）")
+                final_state = agent.invoke({"messages": [{"role": "user", "content": user_text}]})
 
+        
         files = (final_state or {}).get("files") or {}
 
         def _file_to_str(file_obj):
