@@ -577,9 +577,12 @@ def _format_pages_compact(pages: list[str], max_keep: int = 4) -> str:
 
 def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str = "green"):
     """
-    QA 專用：
-    - 把 JSON / Python dict 字串轉成一般 Markdown 顯示
-    - 來源用膠囊 badge（集中在下方）
+    QA 顯示（分色 badges）：
+    - 只顯示 content（若 answer_text 是 JSON / Python dict 字串）
+    - 正文不顯示引用
+    - 來源用膠囊 badge：只顯示「文章名 + 頁碼」
+      - 文件來源：green（badge_color）
+      - WebSearch：violet（title 以 'WebSearch:' 開頭）
     """
     raw = (answer_text or "").strip()
 
@@ -587,28 +590,59 @@ def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str
     if raw and CHUNK_ID_LEAK_PAT.search(raw):
         raw = CHUNK_ID_LEAK_PAT.sub("", raw)
 
+    # 只取 content
     payload = _try_parse_json_or_py_literal(raw)
     if payload is not None:
         extracted = _extract_main_text_from_payload(payload)
         if extracted is not None:
             raw = extracted.strip()
 
+    # 抽引用
     cits = _dedup_keep_order(_extract_citation_strings(raw))
     clean = _strip_citations_from_text(raw)
 
     # 顯示正文（一般 Markdown）
     st.markdown(clean if clean else "（無內容）")
 
-    # 顯示來源 badge（合併頁碼）
-    if cits:
-        grouped = _group_citations_for_badges(cits)
-        badges = []
-        for title in sorted(grouped.keys()):
-            pages = grouped[title]
-            label = f"{title} {_format_pages_compact(pages, max_keep=4)}"
-            badges.append(_badge_directive(label, badge_color))
-        if badges:
-            st.markdown("來源：" + " ".join(badges))
+    if not cits:
+        return
+
+    grouped = _group_citations_for_badges(cits)
+
+    doc_badges: list[str] = []
+    web_badges: list[str] = []
+
+    def _pages_str(pages: list[str], max_keep: int = 6) -> str:
+        pages = pages or ["-"]
+        if len(pages) <= max_keep:
+            return "p" + ",".join(pages)
+        kept = pages[:max_keep]
+        return "p" + ",".join(kept) + "…"
+
+    for title in sorted(grouped.keys()):
+        pages = grouped[title]
+        pages_part = _pages_str(pages, max_keep=6)
+
+        # ✅ WebSearch 統一格式：[WebSearch:... p-]
+        #    只要 title 以 WebSearch: 開頭就算 web
+        is_web = title.strip().lower().startswith("websearch:")
+
+        label = f"{title} {pages_part}"  # ✅ 只顯示文章名 + 頁碼
+
+        if is_web:
+            web_badges.append(_badge_directive(label, "violet"))
+        else:
+            doc_badges.append(_badge_directive(label, badge_color))
+
+    # ✅ 不印「來源：」文字，只印 badges
+    badges_line = []
+    if doc_badges:
+        badges_line.append(" ".join(doc_badges))
+    if web_badges:
+        badges_line.append(" ".join(web_badges))
+
+    if badges_line:
+        st.markdown(" ".join(badges_line))))
 
 
 def render_debug_panel(files: Optional[dict]):
