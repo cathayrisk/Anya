@@ -430,13 +430,20 @@ def add_web_mem_record_to_index(rec: dict):
 # =========================================================
 # Tools
 # =========================================================
+# =========================================================
+# Tools
+# =========================================================
 @tool
 def kb_available() -> bool:
+    """檢查目前是否已建立/載入知識庫向量庫（st.session_state['vectorstore']）。"""
     return st.session_state.get("vectorstore") is not None
+
 
 @tool
 def web_allowed() -> bool:
+    """回傳目前設定是否允許使用網路搜尋（OpenAI web_search_preview）。"""
     return _web_allowed()
+
 
 @tool
 def web_memory_search(query: str, k: int = 5) -> Dict[str, Any]:
@@ -456,7 +463,6 @@ def web_memory_search(query: str, k: int = 5) -> Dict[str, Any]:
         return {"ok": False, "error": f"web 記憶檢索失敗：{e}", "results": []}
 
     # 用 doc_id 去 jsonl 記憶找原始 metadata（summary/citations/raw_path）
-    # 這裡只從 session_state.memory["web"] 反查（最近幾百筆）
     web_records = st.session_state["memory"]["web"]
 
     def find_rec(doc_id: str) -> Optional[dict]:
@@ -483,8 +489,10 @@ def web_memory_search(query: str, k: int = 5) -> Dict[str, Any]:
 
     return {"ok": True, "results": results, "k": k}
 
+
 @tool
 def vector_search(query: str, k: int = 6) -> Dict[str, Any]:
+    """對使用者上傳的 KB 向量庫做檢索（會消耗 KB budget）。"""
     if not _try_inc_budget("vector"):
         err = f"KB 檢索超過硬性預算（上限 {BUDGET_LIMIT} 次/輪）。"
         persist_failure("budget_exceeded_kb", err)
@@ -516,6 +524,7 @@ def vector_search(query: str, k: int = 6) -> Dict[str, Any]:
     persist_kb_record(query=query, sources=sources, snippets=snippets)
     return {"ok": True, "query": query, "results": results, "budget": dict(st.session_state["budget"])}
 
+
 def _extract_citations_from_content_blocks(content_blocks: List[dict]) -> List[dict]:
     seen = set()
     citations: List[dict] = []
@@ -534,6 +543,7 @@ def _extract_citations_from_content_blocks(content_blocks: List[dict]) -> List[d
             citations.append({"title": title, "url": url})
     return citations
 
+
 def _summarize_5_lines(text: str, focus: str) -> str:
     llm = ChatOpenAI(model=_main_model(), temperature=0)
     system = "你是摘要器。請用繁中，輸出剛好 5 行，每行一個重點，不要多也不要少。"
@@ -549,8 +559,10 @@ def _summarize_5_lines(text: str, focus: str) -> str:
     lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     return "\n".join(lines[:5]) if lines else "（摘要失敗）"
 
+
 @tool
 def openai_web_search(query: str) -> Dict[str, Any]:
+    """使用 OpenAI 的 web_search_preview 做即時網路搜尋（會消耗 Web budget），並把結果存入 web 記憶。"""
     if not web_allowed():
         err = "網路搜尋已被禁用（web_allowed=false）。"
         persist_failure("web_disabled", err)
@@ -618,8 +630,10 @@ def openai_web_search(query: str) -> Dict[str, Any]:
         "budget": dict(st.session_state["budget"]),
     }
 
+
 @tool
 def resummarize_web(raw_path: str, focus: str) -> Dict[str, Any]:
+    """針對既有的 web raw 檔，依新的 focus 重新產生 5 行摘要（不耗 web budget）。"""
     p = Path(raw_path)
     if not p.exists():
         err = f"找不到 raw 檔：{raw_path}"
@@ -629,7 +643,6 @@ def resummarize_web(raw_path: str, focus: str) -> Dict[str, Any]:
     text = p.read_text(encoding="utf-8", errors="ignore")
     summary_5 = _summarize_5_lines(text=text, focus=focus)
     return {"ok": True, "raw_path": raw_path, "summary_5_lines": summary_5}
-
 
 # =========================================================
 # Mode classify
