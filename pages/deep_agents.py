@@ -836,44 +836,51 @@ Todo:
 
     return {"id": tid, "todo": todo, "raw": text, "parsed": parsed, "ok": True}
 
-async def solve_todos_parallel_with_progress(todos: List[Dict[str, Any]], user_question: str, todo_placeholder) -> List[Dict[str, Any]]:
+async def solve_todos_parallel_with_progress(
+    todos: List[Dict[str, Any]],
+    user_question: str,
+    todo_placeholder,
+) -> List[Dict[str, Any]]:
     sem = asyncio.Semaphore(int(st.session_state["settings"].get("max_parallel_todos", 3)))
 
-    async def _wrapped(t):
-        async with sem:
-            return await solve_one_todo(t, user_question)
-
-    st.session_state["last_todos"] = [{**t, "status": "pending", "result": None} for t in todos]
-    todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
-
-    task_map: Dict[asyncio.Task, str] = {}
-    for t in todos:
-        task = asyncio.create_task(_wrapped(t))
-        task_map[task] = t["id"]
-
-    results: List[Dict[str, Any]] = []
-    for done in asyncio.as_completed(task_map.keys()):
-        tid = task_map[done]
+    def _set_status(tid: str, status: str, result: Optional[dict] = None):
         for item in st.session_state["last_todos"]:
-            if item["id"] == tid and item["status"] == "pending":
-                item["status"] = "in_progress"
+            if item.get("id") == tid:
+                item["status"] = status
+                if result is not None:
+                    item["result"] = result
+                break
+
+    async def _wrapped(t: Dict[str, Any]):
+        tid = t["id"]
+        _set_status(tid, "in_progress")
         todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
 
         try:
-            r = await done
-            results.append(r)
-            for item in st.session_state["last_todos"]:
-                if item["id"] == tid:
-                    item["status"] = "completed"
-                    item["result"] = r
+            async with sem:
+                r = await solve_one_todo(t, user_question)
+            return tid, r, None
         except Exception as e:
-            persist_failure("todo_exception", str(e), todo_id=tid)
-            r = {"id": tid, "ok": False, "error": str(e)}
+            return tid, None, e
+
+    # init UI list
+    st.session_state["last_todos"] = [{**t, "status": "pending", "result": None} for t in todos]
+    todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
+
+    tasks: List[asyncio.Task] = [asyncio.create_task(_wrapped(t)) for t in todos]
+
+    results: List[Dict[str, Any]] = []
+    for fut in asyncio.as_completed(tasks):
+        tid, r, err = await fut
+
+        if err is None:
             results.append(r)
-            for item in st.session_state["last_todos"]:
-                if item["id"] == tid:
-                    item["status"] = "failed"
-                    item["result"] = r
+            _set_status(tid, "completed", r)
+        else:
+            persist_failure("todo_exception", str(err), todo_id=tid)
+            fail_rec = {"id": tid, "ok": False, "error": str(err)}
+            results.append(fail_rec)
+            _set_status(tid, "failed", fail_rec)
 
         todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
 
