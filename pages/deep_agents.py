@@ -1,1296 +1,1578 @@
-# pages/deep_agents.py
+# app.py
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import os
 import re
-import json
+import io
 import uuid
-import asyncio
-import tempfile
+import math
+import time
+import json
+import base64
+import hashlib
 import threading
-import logging
-from pathlib import Path
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Literal, Optional
+import ast
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
-from pydantic import BaseModel, Field
+import numpy as np
+import pandas as pd
+import faiss
+from pypdf import PdfReader
 
-from langchain_core.documents import Document
-from langchain_core.tools import tool
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import (
-    PyMuPDFLoader,
-    UnstructuredWordDocumentLoader,
-    UnstructuredPowerPointLoader,
-    UnstructuredExcelLoader,
-    TextLoader,
-)
+from openai import OpenAI
 
-from langgraph.checkpoint.memory import MemorySaver
-from deepagents import create_deep_agent
+try:
+    import fitz  # pymupdf
+    HAS_PYMUPDF = True
+except Exception:
+    HAS_PYMUPDF = False
 
 
-# =========================================================
-# ✅ 壓掉 Streamlit ScriptRunContext 洗版 warning（不影響功能）
-# =========================================================
-logging.getLogger("streamlit").setLevel(logging.ERROR)
-logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
-logging.getLogger("streamlit.runtime.state.session_state_proxy").setLevel(logging.ERROR)
+# =========================
+# DeepAgents / LangChain imports（可診斷版）
+# =========================
+HAS_DEEPAGENTS = False
+DEEPAGENTS_IMPORT_ERRORS: list[str] = []
+
+create_deep_agent = None
+init_chat_model = None
+ChatOpenAI = None
+
+try:
+    from deepagents import create_deep_agent as _create_deep_agent
+    create_deep_agent = _create_deep_agent
+except Exception as e:
+    DEEPAGENTS_IMPORT_ERRORS.append(f"deepagents import failed: {repr(e)}")
+
+try:
+    from langchain.chat_models import init_chat_model as _init_chat_model
+    init_chat_model = _init_chat_model
+except Exception as e:
+    DEEPAGENTS_IMPORT_ERRORS.append(f"langchain.chat_models.init_chat_model import failed: {repr(e)}")
+
+try:
+    from langchain_openai import ChatOpenAI as _ChatOpenAI
+    ChatOpenAI = _ChatOpenAI
+except Exception as e:
+    DEEPAGENTS_IMPORT_ERRORS.append(f"langchain_openai.ChatOpenAI import failed: {repr(e)}")
+
+HAS_DEEPAGENTS = (create_deep_agent is not None) and ((init_chat_model is not None) or (ChatOpenAI is not None))
 
 
-# =========================================================
-# Global constraints
-# =========================================================
-BUDGET_LIMIT = 3            # KB/Web 各 3 次/輪
-MAX_VERIFY_ROUNDS = 1       # 補強 1 輪（保留）
-MAX_REPLAN_ROUNDS = 1       # replan 1 次（replan 會重置預算）
-WEB_MEM_MAX = 500           # ✅ 只保留最近 500 筆 web 記憶做 embeddings 檢索
+def _require_deepagents():
+    if HAS_DEEPAGENTS:
+        return
+    st.error("DeepAgent 依賴載入失敗（不一定是沒安裝，可能是版本/依賴不相容）。")
+    if DEEPAGENTS_IMPORT_ERRORS:
+        st.markdown("### 依賴錯誤細節（請把這段貼給我，我就能精準指你該裝哪個版本）")
+        for msg in DEEPAGENTS_IMPORT_ERRORS:
+            st.code(msg)
+    else:
+        st.info("（沒有捕捉到錯誤細節，請確認 app.py 是否已整檔覆蓋為最新版）")
+    st.stop()
 
 
-# =========================================================
-# Persistence (跨對話短期記憶：jsonl + raw files + FAISS index)
-# =========================================================
-MEM_ROOT = Path(".agent_memory")
-MEM_ROOT.mkdir(parents=True, exist_ok=True)
+def _make_langchain_llm(model_name: str, temperature: float = 0.0, reasoning_effort: Optional[str] = None):
+    """
+    回傳 LangChain 的 chat model instance：
+    - 優先 init_chat_model
+    - fallback ChatOpenAI
+
+    依你需求：
+    - 推理需求高：才加 reasoning={"effort":"medium"}
+    - 其餘：不設定 reasoning
+    """
+    if init_chat_model is not None:
+        if model_name.startswith("openai:"):
+            # init_chat_model: model="openai:gpt-5.2"
+            # 這裡很多版本 init_chat_model 不一定吃 reasoning，所以我們只在 ChatOpenAI 做
+            return init_chat_model(model=model_name, temperature=temperature)
+        return init_chat_model(model=f"openai:{model_name}", temperature=temperature)
+
+    if ChatOpenAI is not None:
+        if model_name.startswith("openai:"):
+            model_name = model_name.split("openai:", 1)[1]
+        kwargs = dict(
+            model=model_name,
+            temperature=temperature,
+            use_responses_api=True,   # ✅ 你希望走 Responses API
+            max_completion_tokens=None,
+        )
+        if reasoning_effort in ("low", "medium", "high"):
+            kwargs["reasoning"] = {"effort": reasoning_effort}
+        return ChatOpenAI(**kwargs)
+
+    raise RuntimeError("No LangChain LLM factory available.")
 
 
-def _now_iso() -> str:
-    # ✅ 修掉 utcnow() deprecation：timezone-aware UTC
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+# =========================
+# Streamlit config（只呼叫一次）
+# =========================
+st.set_page_config(page_title="研究報告助手（DeepAgent + Badges）", layout="wide")
+st.title("研究報告助手（DeepAgent + Badges）")
 
 
-def _jsonl_append(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+# =========================
+# 固定模型設定（依你要求：都用 gpt-5.2）
+# =========================
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+MODEL_MAIN = "gpt-5.2"
+MODEL_GRADER = "gpt-5.2"
+MODEL_WEB = "gpt-5.2"
+
+REASONING_EFFORT = "medium"  # ✅ 推理需求高才使用
 
 
-def _jsonl_tail(path: Path, max_lines: int = 200) -> List[dict]:
-    if not path.exists():
+# =========================
+# 效能參數
+# =========================
+EMBED_BATCH_SIZE = 256
+OCR_MAX_WORKERS = 2
+
+CORPUS_DEFAULT_MAX_CHUNKS = 24
+CORPUS_PER_REPORT_QUOTA = 6
+
+# DeepAgent budgets（可預測成本）
+DA_MAX_DOC_SEARCH_CALLS = 14
+DA_MAX_WEB_SEARCH_CALLS = 4
+DA_MAX_REWRITE_ROUNDS = 2
+DA_MAX_CLAIMS = 10
+
+# chunk_id leak guard（只擋 chunk_id / _p.._c.. 這類明確樣式）
+CHUNK_ID_LEAK_PAT = re.compile(r"(chunk_id\s*=\s*|_p(?:na|\d+)_c\d+)", re.IGNORECASE)
+
+
+# =========================
+# 小工具
+# =========================
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def estimate_tokens_from_chars(n_chars: int) -> int:
+    if n_chars <= 0:
+        return 0
+    return max(1, int(math.ceil(n_chars / 3.6)))
+
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> list[str]:
+    text = norm_space(text)
+    if not text:
         return []
-    with path.open("r", encoding="utf-8") as f:
-        lines = f.readlines()[-max_lines:]
     out = []
-    for ln in lines:
-        ln = ln.strip()
-        if not ln:
-            continue
-        try:
-            out.append(json.loads(ln))
-        except Exception:
-            continue
+    i = 0
+    while i < len(text):
+        j = min(len(text), i + chunk_size)
+        out.append(text[i:j])
+        if j == len(text):
+            break
+        i = max(0, j - overlap)
     return out
 
 
-def _mem_paths(namespace: str) -> Dict[str, Path]:
-    base = MEM_ROOT / namespace
-    return {
-        "base": base,
-        "chat": base / "chat.jsonl",
-        "web": base / "web.jsonl",
-        "kb": base / "kb.jsonl",
-        "failures": base / "failures.jsonl",
-        "web_raw_dir": base / "web_raw",
-        "kb_raw_dir": base / "kb_raw",
-        # ✅ web 記憶 embeddings index
-        "web_index_dir": base / "web_mem_index",
-        "web_index_manifest": base / "web_mem_index" / "manifest.json",
-    }
+def sha1_bytes(data: bytes) -> str:
+    return hashlib.sha1(data).hexdigest()
 
 
-# =========================================================
-# Session init
-# =========================================================
-if "vectorstore" not in st.session_state:
-    st.session_state["vectorstore"] = None
+def sha1_text(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:10]
 
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []  # UI chat only
 
-if "main_thread_id" not in st.session_state:
-    st.session_state["main_thread_id"] = str(uuid.uuid4())
+def truncate_filename(name: str, max_len: int = 44) -> str:
+    if len(name) <= max_len:
+        return name
+    base, ext = os.path.splitext(name)
+    keep = max(10, max_len - len(ext) - 1)
+    return f"{base[:keep]}…{ext}"
 
-# ✅ 依你指定：main/web_tool/reasoning 全部 gpt-5.2
-st.session_state.setdefault(
-    "settings",
-    {
-        "web_allowed": True,
-        "main_model": "gpt-5.2",
-        "web_tool_model": "gpt-5.2",
-        "reasoning_model": "gpt-5.2",
-        "max_parallel_todos": 3,
-        "direct_do_planning": False,
-        "memory_namespace": st.secrets.get("MEMORY_NAMESPACE", "default"),
-    },
-)
 
-# 每次使用者提問 = 一個 run_id（跨對話遞增）
-if "run_seq" not in st.session_state:
-    st.session_state["run_seq"] = 0
-
-# round 只用於同一 run 的 initial/replan
-if "budget" not in st.session_state:
-    st.session_state["budget"] = {"vector_calls": 0, "web_calls": 0, "round": 0, "run_id": 0}
-
-# ✅ lock 用 setdefault，比較不會因為 thread 時序/初始化而缺 key
-st.session_state.setdefault("budget_lock", threading.Lock())
-
-# UI todo list
-if "last_todos" not in st.session_state:
-    st.session_state["last_todos"] = []
-
-# 記憶（會從 jsonl 載入）
-if "memory" not in st.session_state:
-    st.session_state["memory"] = {"web": [], "kb": [], "failures": []}
-
-# tool context：讓 tool 記錄 todo_id、round、run_id、focus
-if "tool_context" not in st.session_state:
-    st.session_state["tool_context"] = {"run_id": 0, "round": 0, "todo_id": None, "focus": ""}
-
-# ✅ web 記憶 embeddings index（FAISS）
-if "web_mem" not in st.session_state:
-    st.session_state["web_mem"] = {
-        "vectorstore": None,     # FAISS vectorstore
-        "doc_ids": [],           # 對應順序（同時也用來判斷是否已索引）
-        "loaded": False,
-    }
-
-st.session_state.setdefault("web_mem_lock", threading.Lock())
-
-# agents cache
-if "agents" not in st.session_state:
-    st.session_state["agents"] = None
-
-if "agents_settings_key" not in st.session_state:
-    st.session_state["agents_settings_key"] = None
-
-# OpenAI key
-if "OPENAI_API_KEY" not in os.environ and "OPENAI_KEY" in st.secrets:
-    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
-
-
-# =========================================================
-# Helpers
-# =========================================================
-def _main_model() -> str:
-    return str(st.session_state["settings"].get("main_model", "gpt-5.2"))
-
-
-def _web_tool_model() -> str:
-    return str(st.session_state["settings"].get("web_tool_model", "gpt-5.2"))
-
-
-def _reasoning_model() -> str:
-    return str(st.session_state["settings"].get("reasoning_model", "gpt-5.2"))
-
-
-def _web_allowed() -> bool:
-    return bool(st.session_state["settings"].get("web_allowed", True))
-
-
-def _direct_do_planning() -> bool:
-    return bool(st.session_state["settings"].get("direct_do_planning", False))
-
-
-def _namespace() -> str:
-    ns = str(st.session_state["settings"].get("memory_namespace", "default")).strip() or "default"
-    return re.sub(r"[^a-zA-Z0-9_\-\.]", "_", ns)
-
-
-def _reset_budget_new_round(round_id: int):
-    st.session_state["budget"]["vector_calls"] = 0
-    st.session_state["budget"]["web_calls"] = 0
-    st.session_state["budget"]["round"] = round_id
-    st.session_state["tool_context"]["round"] = round_id
-
-
-def _start_new_run():
-    st.session_state["run_seq"] += 1
-    st.session_state["budget"]["run_id"] = st.session_state["run_seq"]
-    st.session_state["tool_context"]["run_id"] = st.session_state["run_seq"]
-    _reset_budget_new_round(round_id=0)
-
-
-def _get_budget_lock() -> threading.Lock:
-    # ✅ 就算某些 thread 讀 session_state 出狀況，也不要炸
-    try:
-        lock = st.session_state.get("budget_lock", None)
-    except Exception:
-        lock = None
-    return lock or threading.Lock()
-
-
-def _try_inc_budget(kind: Literal["vector", "web"]) -> bool:
-    with _get_budget_lock():
-        if kind == "vector":
-            if st.session_state["budget"]["vector_calls"] >= BUDGET_LIMIT:
-                return False
-            st.session_state["budget"]["vector_calls"] += 1
-            return True
-        else:
-            if st.session_state["budget"]["web_calls"] >= BUDGET_LIMIT:
-                return False
-            st.session_state["budget"]["web_calls"] += 1
-            return True
-
-
-def render_todos_md(todos: List[Dict[str, Any]]) -> str:
-    lines = ["### Todo 進度\n"]
-    for t in todos:
-        status = t.get("status", "pending")
-        checked = "x" if status == "completed" else " "
-        suffix = ""
-        if status == "failed":
-            suffix = "  **(failed)**"
-        elif status == "in_progress":
-            suffix = "  _(in progress)_"
-        lines.append(f"- [{checked}] {t['id']}: {t['todo']}{suffix}")
-    return "\n".join(lines)
-
-
-def _content_to_text(content: Any) -> str:
-    """
-    ✅ Responses API 可能回傳 content blocks（list[dict]），這裡統一抽成可 parse 的字串。
-    - str: 原樣回傳
-    - list: 抽所有 type=text 的 text 串起來
-    - dict: 取 text 或 json.dumps
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-                continue
-            if isinstance(item, dict):
-                t = item.get("type")
-                if t == "text":
-                    parts.append(str(item.get("text", "")))
-                else:
-                    # 其他 block（reasoning/tool_call/result）通常不含 JSON；但保底
-                    if "text" in item:
-                        parts.append(str(item.get("text", "")))
-            else:
-                parts.append(str(item))
-        return "\n".join([p for p in parts if p.strip()]).strip()
-    if isinstance(content, dict):
-        if "text" in content:
-            return str(content.get("text", ""))
-        try:
-            return json.dumps(content, ensure_ascii=False)
-        except Exception:
-            return str(content)
-    return str(content)
-
-
-def safe_json_from_text(text: Any) -> Optional[dict]:
-    """
-    ✅ 修正你遇到的 TypeError：
-    text 可能是 list（Responses content blocks），先轉字串再 parse。
-    """
-    s = _content_to_text(text)
-    if not s:
-        return None
-    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
-
-
-def memory_digest(max_web: int = 5, max_kb: int = 5, max_fail: int = 10) -> Dict[str, Any]:
-    web = st.session_state["memory"]["web"][-max_web:]
-    kb = st.session_state["memory"]["kb"][-max_kb:]
-    failures = st.session_state["memory"]["failures"][-max_fail:]
-    return {"web_recent": web, "kb_recent": kb, "failures_recent": failures}
-
-
-def load_persistent_memory():
-    paths = _mem_paths(_namespace())
-    st.session_state["memory"]["web"] = _jsonl_tail(paths["web"], 600)       # 多載一些，index 會自己截 500
-    st.session_state["memory"]["kb"] = _jsonl_tail(paths["kb"], 200)
-    st.session_state["memory"]["failures"] = _jsonl_tail(paths["failures"], 400)
-
-
-def persist_chat_message(role: str, content: str):
-    paths = _mem_paths(_namespace())
-    rec = {"ts": _now_iso(), "role": role, "content": content}
-    _jsonl_append(paths["chat"], rec)
-
-
-def persist_failure(kind: str, detail: str, todo_id: Optional[str] = None):
-    paths = _mem_paths(_namespace())
-    rec = {
-        "ts": _now_iso(),
-        "run_id": st.session_state["tool_context"]["run_id"],
-        "round": st.session_state["tool_context"]["round"],
-        "todo_id": todo_id or st.session_state["tool_context"].get("todo_id"),
-        "type": kind,
-        "detail": detail,
-    }
-    _jsonl_append(paths["failures"], rec)
-    st.session_state["memory"]["failures"].append(rec)
-
-
-def persist_kb_record(query: str, sources: List[str], snippets: List[str], todo_id: Optional[str] = None):
-    paths = _mem_paths(_namespace())
-    rec = {
-        "ts": _now_iso(),
-        "run_id": st.session_state["tool_context"]["run_id"],
-        "round": st.session_state["tool_context"]["round"],
-        "todo_id": todo_id or st.session_state["tool_context"].get("todo_id"),
-        "focus": st.session_state["tool_context"].get("focus", "")[:200],
-        "query": query,
-        "sources": list(dict.fromkeys([s for s in sources if s]))[:10],
-        "snippets": snippets[:5],
-    }
-    _jsonl_append(paths["kb"], rec)
-    st.session_state["memory"]["kb"].append(rec)
-
-
-def persist_web_record(rec: dict):
-    """rec 必須包含 doc_id/raw_path/summary_5_lines/citations/query 等。"""
-    paths = _mem_paths(_namespace())
-    _jsonl_append(paths["web"], rec)
-    st.session_state["memory"]["web"].append(rec)
-
-
-# =========================================================
-# LLM factory
-# - ✅ 全部使用 Responses API（use_responses_api=True）
-# - ✅ 只有「推理需求高」才加 reasoning={"effort":"medium"}
-# =========================================================
-def llm_main(temperature: float = 0) -> ChatOpenAI:
-    return ChatOpenAI(
-        model=_main_model(),
-        temperature=temperature,
-        use_responses_api=True,
-        max_completion_tokens=None,
-    )
-
-
-def llm_web_tool(temperature: float = 0) -> ChatOpenAI:
-    return ChatOpenAI(
-        model=_web_tool_model(),
-        temperature=temperature,
-        use_responses_api=True,
-        max_completion_tokens=None,
-    )
-
-
-def llm_reasoning(temperature: float = 0) -> ChatOpenAI:
-    # ✅ 只設定 effort=medium（其餘不設定）
-    reasoning = {"effort": "medium"}
-    return ChatOpenAI(
-        model=_reasoning_model(),
-        temperature=temperature,
-        use_responses_api=True,
-        reasoning=reasoning,
-        max_completion_tokens=None,
-    )
-
-
-# =========================================================
-# ✅ Web 記憶 embeddings index（FAISS）管理
-# =========================================================
-def _web_mem_embeddings() -> OpenAIEmbeddings:
-    return OpenAIEmbeddings(model="text-embedding-3-small")
-
-
-def _web_mem_record_to_text(rec: dict) -> str:
-    """
-    拿來做 embeddings 的「可檢索文字」：
-    - 不 embedding raw 全文（避免太慢、也避免太長）
-    - 用 query + focus + 5 行摘要 + citations title/url
-    """
-    q = (rec.get("query") or "").strip()
-    focus = (rec.get("focus") or "").strip()
-    s5 = (rec.get("summary_5_lines") or "").strip()
-    cites = rec.get("citations") or []
-    cite_text = " | ".join([f"{c.get('title','')} {c.get('url','')}".strip() for c in cites[:5]])
-    return f"query: {q}\nfocus: {focus}\nsummary:\n{s5}\ncitations: {cite_text}".strip()
-
-
-def _web_mem_manifest_load(paths: Dict[str, Path]) -> List[str]:
-    if not paths["web_index_manifest"].exists():
-        return []
-    try:
-        return json.loads(paths["web_index_manifest"].read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-
-def _web_mem_manifest_save(paths: Dict[str, Path], doc_ids: List[str]) -> None:
-    paths["web_index_dir"].mkdir(parents=True, exist_ok=True)
-    paths["web_index_manifest"].write_text(json.dumps(doc_ids, ensure_ascii=False), encoding="utf-8")
-
-
-def web_mem_load_or_build():
-    with st.session_state["web_mem_lock"]:
-        if st.session_state["web_mem"]["loaded"]:
-            return
-
-        paths = _mem_paths(_namespace())
-        emb = _web_mem_embeddings()
-        idx_dir = paths["web_index_dir"]
-
-        if idx_dir.exists():
-            try:
-                vs = FAISS.load_local(
-                    str(idx_dir),
-                    emb,
-                    allow_dangerous_deserialization=True,
-                )
-                doc_ids = _web_mem_manifest_load(paths)
-                st.session_state["web_mem"]["vectorstore"] = vs
-                st.session_state["web_mem"]["doc_ids"] = doc_ids
-                st.session_state["web_mem"]["loaded"] = True
-                return
-            except Exception:
-                pass
-
-        rebuild_web_mem_index()
-
-
-def rebuild_web_mem_index():
-    paths = _mem_paths(_namespace())
-    emb = _web_mem_embeddings()
-
-    records = (st.session_state["memory"]["web"] or [])[-WEB_MEM_MAX:]
-    docs: List[Document] = []
-    doc_ids: List[str] = []
-
-    for rec in records:
-        doc_id = rec.get("doc_id")
-        raw_path = rec.get("raw_path")
-        if not doc_id or not raw_path:
-            continue
-        t = _web_mem_record_to_text(rec)
-        docs.append(Document(page_content=t, metadata={"doc_id": doc_id, "raw_path": raw_path}))
-        doc_ids.append(doc_id)
-
-    if docs:
-        vs = FAISS.from_documents(docs, emb)
-    else:
-        vs = FAISS.from_texts(["(empty)"], emb, metadatas=[{"doc_id": "__empty__", "raw_path": ""}])
-        doc_ids = ["__empty__"]
-
-    paths["web_index_dir"].mkdir(parents=True, exist_ok=True)
-    vs.save_local(str(paths["web_index_dir"]))
-    _web_mem_manifest_save(paths, doc_ids)
-
-    st.session_state["web_mem"]["vectorstore"] = vs
-    st.session_state["web_mem"]["doc_ids"] = doc_ids
-    st.session_state["web_mem"]["loaded"] = True
-
-
-def add_web_mem_record_to_index(rec: dict):
-    with st.session_state["web_mem_lock"]:
-        vs: Optional[FAISS] = st.session_state["web_mem"]["vectorstore"]
-        doc_ids: List[str] = st.session_state["web_mem"]["doc_ids"]
-
-        doc_id = rec.get("doc_id")
-        raw_path = rec.get("raw_path")
-        if not doc_id or not raw_path:
-            return
-
-        if vs is None or not st.session_state["web_mem"]["loaded"]:
-            web_mem_load_or_build()
-            vs = st.session_state["web_mem"]["vectorstore"]
-            doc_ids = st.session_state["web_mem"]["doc_ids"]
-
-        if doc_id in doc_ids:
-            return
-
-        if len([x for x in doc_ids if x != "__empty__"]) >= WEB_MEM_MAX:
-            rebuild_web_mem_index()
-            return
-
-        text = _web_mem_record_to_text(rec)
-        vs.add_documents([Document(page_content=text, metadata={"doc_id": doc_id, "raw_path": raw_path})])
-        doc_ids.append(doc_id)
-
-        st.session_state["web_mem"]["vectorstore"] = vs
-        st.session_state["web_mem"]["doc_ids"] = doc_ids
-
-        paths = _mem_paths(_namespace())
-        paths["web_index_dir"].mkdir(parents=True, exist_ok=True)
-        vs.save_local(str(paths["web_index_dir"]))
-        _web_mem_manifest_save(paths, doc_ids)
-
-
-# =========================================================
-# Tools
-# =========================================================
-@tool
-def kb_available() -> bool:
-    """檢查目前是否已建立/載入知識庫向量庫（st.session_state['vectorstore']）。"""
-    return st.session_state.get("vectorstore") is not None
-
-
-@tool
-def web_allowed() -> bool:
-    """回傳目前設定是否允許使用網路搜尋（OpenAI web_search_preview）。"""
-    return _web_allowed()
-
-
-@tool
-def web_memory_search(query: str, k: int = 5) -> Dict[str, Any]:
-    """
-    ✅ embeddings 記憶檢索：只查「web 記憶 index」，不消耗 web budget。
-    回傳 top-k 的 raw_path + doc_id + summary_5_lines + citations + score。
-    """
-    web_mem_load_or_build()
-    vs: Optional[FAISS] = st.session_state["web_mem"]["vectorstore"]
-    if vs is None:
-        return {"ok": False, "error": "web 記憶 index 尚未建立。", "results": []}
-
-    try:
-        docs_scores = vs.similarity_search_with_score(query, k=k)
-    except Exception as e:
-        return {"ok": False, "error": f"web 記憶檢索失敗：{e}", "results": []}
-
-    web_records = st.session_state["memory"]["web"]
-
-    def find_rec(doc_id: str) -> Optional[dict]:
-        for r in reversed(web_records):
-            if r.get("doc_id") == doc_id:
-                return r
-        return None
-
-    results = []
-    for doc, score in docs_scores:
-        meta = doc.metadata or {}
-        doc_id = meta.get("doc_id", "")
-        raw_path = meta.get("raw_path", "")
-        r = find_rec(doc_id) or {}
-        results.append({
-            "doc_id": doc_id,
-            "raw_path": raw_path or r.get("raw_path", ""),
-            "query": r.get("query", ""),
-            "focus": r.get("focus", ""),
-            "summary_5_lines": r.get("summary_5_lines", ""),
-            "citations": r.get("citations", []),
-            "score": score,
-        })
-
-    return {"ok": True, "results": results, "k": k}
-
-
-@tool
-def vector_search(query: str, k: int = 6) -> Dict[str, Any]:
-    """對使用者上傳的 KB 向量庫做檢索（會消耗 KB budget）。"""
-    if not _try_inc_budget("vector"):
-        err = f"KB 檢索超過硬性預算（上限 {BUDGET_LIMIT} 次/輪）。"
-        persist_failure("budget_exceeded_kb", err)
-        return {"ok": False, "error": err, "results": []}
-
-    vs = st.session_state.get("vectorstore")
-    if vs is None:
-        err = "目前沒有向量庫（尚未上傳文件）。"
-        persist_failure("kb_missing", err)
-        return {"ok": False, "error": err, "results": []}
-
-    retriever = vs.as_retriever(search_kwargs={"k": k})
-    docs: List[Document] = retriever.invoke(query) or []
-
-    results = []
-    sources: List[str] = []
-    snippets: List[str] = []
-
-    for i, d in enumerate(docs, start=1):
-        src = d.metadata.get("source", "")
-        src_short = os.path.basename(str(src).replace("\\", "/")) if src else ""
-        content = (d.page_content or "").strip()
-        results.append({"rank": i, "source": src_short, "content": content, "metadata": d.metadata})
-        if src_short:
-            sources.append(src_short)
-        if content:
-            snippets.append(content[:300])
-
-    persist_kb_record(query=query, sources=sources, snippets=snippets)
-    return {"ok": True, "query": query, "results": results, "budget": dict(st.session_state["budget"])}
-
-
-def _extract_citations_from_content_blocks(content_blocks: List[dict]) -> List[dict]:
+def _dedup_keep_order(items: list[str]) -> list[str]:
     seen = set()
-    citations: List[dict] = []
-    for b in content_blocks or []:
-        if b.get("type") != "text":
+    out = []
+    for x in items:
+        if x in seen:
             continue
-        for a in b.get("annotations", []) or []:
-            if a.get("type") != "citation":
-                continue
-            url = a.get("url") or ""
-            title = a.get("title") or ""
-            key = (title, url)
-            if key in seen:
-                continue
-            seen.add(key)
-            citations.append({"title": title, "url": url})
-    return citations
+        seen.add(x)
+        out.append(x)
+    return out
 
 
-def _summarize_5_lines(text: str, focus: str) -> str:
-    llm = llm_main(temperature=0)
-    system = "你是摘要器。請用繁中，輸出剛好 5 行，每行一個重點，不要多也不要少。"
-    human = f"""焦點（本輪在意的點）：
-{focus}
-
-內容：
-{text[:6000]}
-
-請輸出 5 行重點（每行一點）。"""
-    resp = llm.invoke([("system", system), ("human", human)])
-    out = getattr(resp, "text", None)
-    if not out:
-        out = _content_to_text(getattr(resp, "content", None))
-    lines = [ln.strip() for ln in str(out).splitlines() if ln.strip()]
-    return "\n".join(lines[:5]) if lines else "（摘要失敗）"
+# =========================
+# OpenAI client + wrappers
+# =========================
+def get_openai_api_key() -> str:
+    if "OPENAI_KEY" in st.secrets and st.secrets["OPENAI_KEY"]:
+        return st.secrets["OPENAI_KEY"]
+    if os.environ.get("OPENAI_API_KEY"):
+        return os.environ["OPENAI_API_KEY"]
+    if os.environ.get("OPENAI_KEY"):
+        return os.environ["OPENAI_KEY"]
+    raise RuntimeError("Missing OpenAI API key. Set st.secrets['OPENAI_KEY'] or env OPENAI_API_KEY.")
 
 
-@tool
-def openai_web_search(query: str) -> Dict[str, Any]:
-    """使用 OpenAI 的 web_search_preview 做即時網路搜尋（會消耗 Web budget），並把結果存入 web 記憶。"""
-    if not web_allowed():
-        err = "網路搜尋已被禁用（web_allowed=false）。"
-        persist_failure("web_disabled", err)
-        return {"ok": False, "error": err, "text": "", "citations": []}
+def get_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key)
 
-    if not _try_inc_budget("web"):
-        err = f"Web 搜尋超過硬性預算（上限 {BUDGET_LIMIT} 次/輪）。"
-        persist_failure("budget_exceeded_web", err)
-        return {"ok": False, "error": err, "text": "", "citations": []}
 
-    tool_def = {"type": "web_search_preview"}
-    llm = llm_web_tool(temperature=0).bind_tools([tool_def])
-
-    prompt = (
-        "請使用 web search 搜尋並整理答案。\n"
-        f"Query: {query}\n\n"
-        "輸出要求：\n"
-        "1) 5-10 點重點（條列）\n"
-        "2) 內容要可被 citations 支持（annotations 會附 citation）\n"
-        "3) 不要輸出無根據推測\n"
+def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=texts,
+        encoding_format="float",
     )
-    response = llm.invoke(prompt)
-    content_blocks = getattr(response, "content_blocks", None)
-
-    if content_blocks is None:
-        citations: List[dict] = []
-        text = getattr(response, "text", None) or _content_to_text(getattr(response, "content", None))
-    else:
-        citations = _extract_citations_from_content_blocks(content_blocks)
-        text = getattr(response, "text", None) or ""
-
-    paths = _mem_paths(_namespace())
-    paths["web_raw_dir"].mkdir(parents=True, exist_ok=True)
-    doc_id = f"run{st.session_state['tool_context']['run_id']}_r{st.session_state['tool_context']['round']}_{uuid.uuid4().hex[:8]}"
-    raw_path = paths["web_raw_dir"] / f"{doc_id}.txt"
-    raw_path.write_text(text, encoding="utf-8")
-
-    focus = st.session_state["tool_context"].get("focus", "")
-    summary_5 = _summarize_5_lines(text=text, focus=focus)
-
-    rec = {
-        "ts": _now_iso(),
-        "run_id": st.session_state["tool_context"]["run_id"],
-        "round": st.session_state["tool_context"]["round"],
-        "todo_id": st.session_state["tool_context"].get("todo_id"),
-        "focus": focus[:200],
-        "doc_id": doc_id,
-        "query": query,
-        "summary_5_lines": summary_5,
-        "citations": citations[:10],
-        "raw_path": str(raw_path),
-    }
-    persist_web_record(rec)
-    add_web_mem_record_to_index(rec)
-
-    return {
-        "ok": True,
-        "query": query,
-        "text": text,
-        "citations": citations,
-        "summary_5_lines": summary_5,
-        "raw_path": str(raw_path),
-        "doc_id": doc_id,
-        "budget": dict(st.session_state["budget"]),
-    }
+    vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return vecs / norms
 
 
-@tool
-def resummarize_web(raw_path: str, focus: str) -> Dict[str, Any]:
-    """針對既有的 web raw 檔，依新的 focus 重新產生 5 行摘要（不耗 web budget）。"""
-    p = Path(raw_path)
-    if not p.exists():
-        err = f"找不到 raw 檔：{raw_path}"
-        persist_failure("resummarize_missing_raw", err)
-        return {"ok": False, "error": err, "summary_5_lines": ""}
-
-    text = p.read_text(encoding="utf-8", errors="ignore")
-    summary_5 = _summarize_5_lines(text=text, focus=focus)
-    return {"ok": True, "raw_path": raw_path, "summary_5_lines": summary_5}
+def _to_messages(system: str, user: Any) -> list[Dict[str, Any]]:
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-# =========================================================
-# Mode classify
-# =========================================================
-class NeedModeOut(BaseModel):
-    mode: Literal["direct", "rag"] = Field(...)
-    reason: str = Field(...)
-
-
-async def classify_need_mode(user_question: str) -> NeedModeOut:
-    # ✅ 推理需求高 → reasoning=medium
-    llm = llm_reasoning(temperature=0).with_structured_output(NeedModeOut)
-    system = """你是流程分類器：判斷這題要走 direct 或 rag。
-- direct：純聊天/推理/寫作/格式化/程式建議（不一定需要外部證據）。
-- rag：需要引用文件或外部來源才可靠（規範/數據/最新資訊/需查證）。
-"""
-    return llm.invoke([("system", system), ("human", user_question)])
-
-
-# =========================================================
-# Agents builder (cached)
-# =========================================================
-def build_agents() -> Dict[str, Any]:
-    # ✅ 推理需求高的 agents → gpt-5.2 + reasoning medium
-    reasoning_model = llm_reasoning(temperature=0)
-    # 其餘不設定 reasoning（但仍用 Responses API）
-    base_model = llm_main(temperature=0)
-
-    checkpointer = MemorySaver()
-
-    planner_system = """你是 Planning Agent（繁中）。你有 planning（write_todos）與 filesystem（write_file）。
-請產生 3~7 個 todo，寫入 /workspace/todos.json（JSON 格式：{"todos":[{"id":"T1","todo":"..."}]}），最後回覆：已完成規劃。"""
-    planner_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=planner_system, checkpointer=checkpointer, name="planner", debug=False)
-
-    todo_worker_system = f"""你是 Todo Worker（繁中）。工具：
-- vector_search（KB）
-- web_memory_search（Web 記憶 embeddings 檢索，不耗 web budget）
-- resummarize_web（針對舊 raw 用新 focus 重摘要）
-- openai_web_search（真的上網，耗 web budget）
-- kb_available、web_allowed
-
-策略（強制，按順序）：
-1) 若 kb_available=true：先用 vector_search（1 次；必要時最多 2 次）。
-2) 若 KB 明顯不足：先用 web_memory_search 找「以前查過的網路資料」(top 3~5)。
-   - 若找到合適的 raw_path：用 resummarize_web(raw_path, focus) 針對本次重點重摘要，補齊 todo。
-3) 若仍不足且 web_allowed=true：最後才用 openai_web_search（1 次；最多 2 次不建議）。
-4) 若 todo 不需要查證（整理/改寫/推理/寫作），可以不使用工具直接完成（省預算）。
-
-輸出 JSON（盡量只輸出 JSON）：
-{{
-  "summary": "...",
-  "used_kb": true/false,
-  "used_web_memory": true/false,
-  "used_web_live": true/false,
-  "sources": {{
-    "kb_sources": ["..."],
-    "web_urls": ["https://..."],
-    "web_raw_paths_used": ["..."]
-  }},
-  "notes": "..."
-}}
-
-硬預算提醒：KB/Web live 各最多 {BUDGET_LIMIT} 次/輪（工具會拒絕超額）。
-"""
-
-    todo_worker_agent = create_deep_agent(
-        model=base_model,
-        tools=[kb_available, web_allowed, vector_search, web_memory_search, resummarize_web, openai_web_search],
-        system_prompt=todo_worker_system,
-        checkpointer=checkpointer,
-        name="todo_worker",
-        debug=False,
+def call_gpt(
+    client: OpenAI,
+    *,
+    model: str,
+    system: str,
+    user: Any,
+    reasoning_effort: Optional[str] = None,   # ✅ None 表示「不設定 reasoning」
+    tools: Optional[list] = None,
+    include_sources: bool = False,
+) -> Tuple[str, Optional[list[Dict[str, Any]]]]:
+    """
+    ✅ 依你需求：推理需求高才傳 reasoning={"effort":"medium"}，其他不設定。
+    """
+    messages = _to_messages(system, user)
+    resp = client.responses.create(
+        model=model,
+        input=messages,
+        tools=tools,
+        tool_choice="auto" if tools else "none",
+        parallel_tool_calls=True if tools else None,
+        reasoning={"effort": reasoning_effort} if reasoning_effort in ("low", "medium", "high") else None,
+        include=["web_search_call.action.sources"] if (tools and include_sources) else None,
+        truncation="auto",
     )
-
-    synth_system = """你是統整回答 Agent（繁中）。
-輸入：user_question + todo_results + budget + memory_digest（含過去錯誤與 web/kb 記憶摘要）
-輸出格式：
-A. 回答
-B. 依據/來源（檔名或 URL）
-C. 限制與建議"""
-    synth_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=synth_system, checkpointer=checkpointer, name="synth", debug=False)
-
-    direct_fast_system = """你是 Direct 回應助理（繁中）。
-你可用工具：vector_search、web_memory_search、resummarize_web、openai_web_search、kb_available、web_allowed。
-策略（強制，按順序）：先 KB → 再 web_memory_search → 不足才 web_search（若允許）；不需查證就不要用工具。
-輸出：最終回答 +（若有）來源。"""
-    direct_fast_agent = create_deep_agent(
-        model=reasoning_model,
-        tools=[kb_available, web_allowed, vector_search, web_memory_search, resummarize_web, openai_web_search],
-        system_prompt=direct_fast_system,
-        checkpointer=checkpointer,
-        name="direct_fast",
-        debug=False,
-    )
-
-    verifier_system = """你是 Verifier（繁中），不使用工具。
-輸入：user_question、draft_answer、todo_results、budget、web_allowed、memory_digest。
-輸出 JSON：
-{"needs_fix":true/false,"fix_type":"rewrite_only"|"need_more_research"|"replan","missing_points":[...],"supplemental_todos":[...], "replan_goal":"...", "notes":"..."}"""
-    verifier_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=verifier_system, checkpointer=checkpointer, name="verifier", debug=False)
-
-    replanner_system = """你是 Replanner（繁中），不使用工具。
-輸入：user_question、previous_todos、todo_results、verifier_report、memory_digest（含 failures）。
-輸出 JSON：{"todos":[{"id":"R1","todo":"..."}]}"""
-    replanner_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=replanner_system, checkpointer=checkpointer, name="replanner", debug=False)
-
-    refiner_system = """你是 Refiner（繁中），不使用工具。
-輸入：user_question、draft_answer、todo_results、verifier_report、budget、memory_digest。
-輸出最終答案（非 JSON），格式：
-A. 回答
-B. 依據/來源
-C. 限制與建議"""
-    refiner_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=refiner_system, checkpointer=checkpointer, name="refiner", debug=False)
-
-    return {
-        "planner": planner_agent,
-        "todo_worker": todo_worker_agent,
-        "synth": synth_agent,
-        "direct_fast": direct_fast_agent,
-        "verifier": verifier_agent,
-        "replanner": replanner_agent,
-        "refiner": refiner_agent,
-    }
-
-
-def ensure_agents():
-    settings_key = tuple(sorted(st.session_state["settings"].items()))
-    if st.session_state["agents"] is None or st.session_state["agents_settings_key"] != settings_key:
-        st.session_state["agents"] = build_agents()
-        st.session_state["agents_settings_key"] = settings_key
-
-
-# =========================================================
-# Planning -> todos
-# =========================================================
-async def plan_todos(user_question: str, history_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    ensure_agents()
-    planner = st.session_state["agents"]["planner"]
-    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + ":planner"}}
-    result = await planner.ainvoke({"messages": history_messages + [{"role": "user", "content": user_question}]}, config=config)
-
-    files = result.get("files") or {}
-    raw = files.get("/workspace/todos.json", "")
-    todos: List[Dict[str, str]] = []
-
-    if raw:
+    out_text = resp.output_text
+    sources = None
+    if tools and include_sources:
         try:
-            data = json.loads(raw)
-            for i, t in enumerate(data.get("todos", []), start=1):
-                tid = (t.get("id") or f"T{i}").strip()
-                todo = (t.get("todo") or "").strip()
-                if todo:
-                    todos.append({"id": tid, "todo": todo})
+            sources_list = []
+            if hasattr(resp, "output") and resp.output:
+                for item in resp.output:
+                    d = item if isinstance(item, dict) else getattr(item, "__dict__", {})
+                    if isinstance(d, dict) and d.get("type") == "web_search_call":
+                        action = d.get("action", {}) or {}
+                        if isinstance(action, dict) and action.get("sources"):
+                            sources_list.extend(action["sources"])
+            sources = sources_list if sources_list else None
+        except Exception:
+            sources = None
+    return out_text, sources
+
+
+# =========================
+# 檔案 / OCR
+# =========================
+@dataclass
+class FileRow:
+    file_id: str
+    file_sig: str
+    name: str
+    ext: str
+    bytes_len: int
+    pages: Optional[int]
+    extracted_chars: int
+    token_est: int
+
+    text_pages: Optional[int]
+    text_pages_ratio: Optional[float]
+
+    blank_pages: Optional[int]
+    blank_ratio: Optional[float]
+    likely_scanned: bool
+    use_ocr: bool
+
+
+def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    out = []
+    for i, p in enumerate(reader.pages):
+        try:
+            t = p.extract_text() or ""
+        except Exception:
+            t = ""
+        out.append((i + 1, norm_space(t)))
+    return out
+
+
+def extract_pdf_text_pages_pymupdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out = []
+    for i in range(doc.page_count):
+        page = doc.load_page(i)
+        t = page.get_text("text") or ""
+        out.append((i + 1, norm_space(t)))
+    return out
+
+
+def extract_pdf_text_pages(pdf_bytes: bytes) -> list[Tuple[int, str]]:
+    if HAS_PYMUPDF:
+        try:
+            return extract_pdf_text_pages_pymupdf(pdf_bytes)
+        except Exception:
+            return extract_pdf_text_pages_pypdf(pdf_bytes)
+    return extract_pdf_text_pages_pypdf(pdf_bytes)
+
+
+def analyze_pdf_text_quality(
+    pdf_pages: list[Tuple[int, str]],
+    min_chars_per_page: int = 40,
+) -> Tuple[int, int, float, int, float]:
+    if not pdf_pages:
+        return 0, 0, 1.0, 0, 0.0
+    lens = [len(t) for _, t in pdf_pages]
+    blank = sum(1 for L in lens if L <= min_chars_per_page)
+    total_pages = max(1, len(lens))
+    blank_ratio = blank / total_pages
+    text_pages = total_pages - blank
+    text_pages_ratio = text_pages / total_pages
+    return sum(lens), blank, blank_ratio, text_pages, text_pages_ratio
+
+
+def should_suggest_ocr(ext: str, pages: Optional[int], extracted_chars: int, blank_ratio: Optional[float]) -> bool:
+    if ext != ".pdf":
+        return False
+    if pages is None or pages <= 0:
+        return True
+    if blank_ratio is not None and blank_ratio >= 0.6:
+        return True
+    avg = extracted_chars / max(1, pages)
+    return avg < 120
+
+
+def _img_bytes_to_data_url(img_bytes: bytes, mime: str = "image/png") -> str:
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def ocr_image_bytes(client: OpenAI, image_bytes: bytes, mime: str = "image/png") -> str:
+    system = "你是一個OCR工具。只輸出可見文字與表格內容（若有表格用 Markdown 表格）。中文請用繁體中文。不要加評論。"
+    user_content = [
+        {"type": "input_text", "text": "請擷取圖片中所有可見文字（包含小字/註腳）。若無法辨識請標記[無法辨識]。"},
+        {"type": "input_image", "image_url": _img_bytes_to_data_url(image_bytes, mime=mime)},
+    ]
+    text, _ = call_gpt(client, model=MODEL_GRADER, system=system, user=user_content, reasoning_effort=None)
+    return text
+
+
+def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> list[Tuple[int, str]]:
+    if not HAS_PYMUPDF:
+        raise RuntimeError("未安裝 pymupdf（fitz），無法做 PDF OCR。請 pip install pymupdf")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+
+    def render_page(i: int) -> Tuple[int, bytes]:
+        page = doc.load_page(i)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        return i + 1, pix.tobytes("png")
+
+    page_imgs = [render_page(i) for i in range(doc.page_count)]
+    results: Dict[int, str] = {}
+
+    with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as ex:
+        futs = {ex.submit(ocr_image_bytes, client, img_bytes, "image/png"): page_no for page_no, img_bytes in page_imgs}
+        for fut in as_completed(futs):
+            page_no = futs[fut]
+            try:
+                results[page_no] = norm_space(fut.result())
+            except Exception:
+                results[page_no] = ""
+
+    return [(p, results.get(p, "")) for p, _ in page_imgs]
+
+
+# =========================
+# FAISS store
+# =========================
+@dataclass
+class Chunk:
+    chunk_id: str
+    report_id: str
+    title: str
+    page: Optional[int]
+    text: str
+
+
+class FaissStore:
+    def __init__(self, dim: int):
+        self.index = faiss.IndexFlatIP(dim)
+        self.chunks: list[Chunk] = []
+
+    def add(self, vecs: np.ndarray, chunks: list[Chunk]) -> None:
+        self.index.add(vecs)
+        self.chunks.extend(chunks)
+
+    def search(self, qvec: np.ndarray, k: int = 8) -> list[Tuple[float, Chunk]]:
+        if self.index.ntotal == 0:
+            return []
+        scores, idx = self.index.search(qvec.astype(np.float32), k)
+        out = []
+        for s, i in zip(scores[0], idx[0]):
+            if i < 0 or i >= len(self.chunks):
+                continue
+            out.append((float(s), self.chunks[i]))
+        return out
+
+
+# =========================
+# badges / citations
+# =========================
+CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
+BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
+CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
+
+
+def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
+    parsed = []
+    for c in cits:
+        m = CIT_PARSE_RE.search(c)
+        if m:
+            parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip()})
+    return parsed
+
+
+def _badge_directive(label: str, color: str) -> str:
+    safe = label.replace("[", "(").replace("]", ")")
+    return f":{color}-badge[{safe}]"
+
+
+def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
+    lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
+    for line in lines:
+        if not BULLET_RE.match(line):
+            continue
+        full_cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
+        clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\]", "", line).strip()
+        parsed = _parse_citations(full_cits)
+        badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
+        st.markdown(clean + (" " + " ".join(badges) if badges else ""))
+
+
+def bullets_all_have_citations(md: str) -> bool:
+    lines = (md or "").splitlines()
+    if not any(BULLET_RE.match(l) for l in lines):
+        return False
+    for line in lines:
+        if BULLET_RE.match(line) and not CIT_RE.search(line):
+            return False
+    return True
+
+
+def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.startswith("{") or t.startswith("["):
+        try:
+            return json.loads(t)
         except Exception:
             pass
-
-    if not todos:
-        data = safe_json_from_text(getattr(result["messages"][-1], "content", None)) or {}
-        for i, t in enumerate(data.get("todos", []), start=1):
-            tid = (t.get("id") or f"T{i}").strip()
-            todo = (t.get("todo") or "").strip()
-            if todo:
-                todos.append({"id": tid, "todo": todo})
-
-    if not todos:
-        todos = [{"id": "T1", "todo": user_question.strip()}]
-
-    return todos
-
-
-# =========================================================
-# Todo execution (parallel) + auto tick + focus
-# =========================================================
-async def solve_one_todo(todo_item: Dict[str, Any], user_question: str) -> Dict[str, Any]:
-    ensure_agents()
-    todo_worker = st.session_state["agents"]["todo_worker"]
-    tid = todo_item["id"]
-    todo = todo_item["todo"]
-
-    st.session_state["tool_context"]["todo_id"] = tid
-    st.session_state["tool_context"]["focus"] = f"User question: {user_question}\nTodo: {todo}"
-
-    config = {"configurable": {"thread_id": f"{st.session_state['main_thread_id']}:todo:{tid}:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
-    prompt = f"""User question:
-{user_question}
-
-Todo:
-{todo}
-
-請依策略（先 KB → web_memory_search → 不足才 web_search）輸出 JSON。"""
-
-    res = await todo_worker.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    msg = res["messages"][-1]
-    text = _content_to_text(getattr(msg, "content", None))
-    parsed = safe_json_from_text(text)
-    if parsed is None:
-        persist_failure("todo_output_not_json", text[:400], todo_id=tid)
-
-    return {"id": tid, "todo": todo, "raw": text, "parsed": parsed, "ok": True}
-
-
-async def solve_todos_parallel_with_progress(todos: List[Dict[str, Any]], user_question: str, todo_placeholder) -> List[Dict[str, Any]]:
-    sem = asyncio.Semaphore(int(st.session_state["settings"].get("max_parallel_todos", 3)))
-
-    def _set_status(tid: str, status: str, result: Optional[dict] = None):
-        for item in st.session_state["last_todos"]:
-            if item.get("id") == tid:
-                item["status"] = status
-                if result is not None:
-                    item["result"] = result
-                break
-
-    async def _wrapped(t: Dict[str, Any]):
-        tid = t["id"]
-        _set_status(tid, "in_progress")
-        todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
-
+    if t.startswith("{") and t.endswith("}"):
         try:
-            async with sem:
-                r = await solve_one_todo(t, user_question)
-            return tid, r, None
-        except Exception as e:
-            return tid, None, e
-
-    st.session_state["last_todos"] = [{**t, "status": "pending", "result": None} for t in todos]
-    todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
-
-    tasks: List[asyncio.Task] = [asyncio.create_task(_wrapped(t)) for t in todos]
-
-    results: List[Dict[str, Any]] = []
-    for fut in asyncio.as_completed(tasks):
-        tid, r, err = await fut
-
-        if err is None:
-            results.append(r)
-            _set_status(tid, "completed", r)
-        else:
-            persist_failure("todo_exception", str(err), todo_id=tid)
-            fail_rec = {"id": tid, "ok": False, "error": str(err)}
-            results.append(fail_rec)
-            _set_status(tid, "failed", fail_rec)
-
-        todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
-
-    st.session_state["tool_context"]["todo_id"] = None
-    st.session_state["tool_context"]["focus"] = ""
-    return results
-
-
-# =========================================================
-# Synth / Direct / Verify / Replan / Refine
-# =========================================================
-async def synthesize_answer(user_question: str, todo_results: List[Dict[str, Any]]) -> str:
-    ensure_agents()
-    synth = st.session_state["agents"]["synth"]
-    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":synth:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
-    payload = {
-        "user_question": user_question,
-        "budget": st.session_state["budget"],
-        "todo_results": todo_results,
-        "memory_digest": memory_digest(),
-    }
-    prompt = "請根據以下 JSON 統整最終回答：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-    res = await synth.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    return _content_to_text(getattr(res["messages"][-1], "content", None))
-
-
-async def direct_fast_answer(user_question: str, history_messages: List[Dict[str, str]]) -> str:
-    ensure_agents()
-    agent = st.session_state["agents"]["direct_fast"]
-    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":direct:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
-    res = await agent.ainvoke({"messages": history_messages + [{"role": "user", "content": user_question}]}, config=config)
-    return _content_to_text(getattr(res["messages"][-1], "content", None))
-
-
-class VerifierReport(BaseModel):
-    needs_fix: bool
-    fix_type: Literal["rewrite_only", "need_more_research", "replan"]
-    missing_points: List[str] = Field(default_factory=list)
-    supplemental_todos: List[str] = Field(default_factory=list)
-    replan_goal: str = ""
-    notes: str = ""
-
-
-async def verify_answer(user_question: str, draft_answer: str, todo_results: List[Dict[str, Any]]) -> VerifierReport:
-    ensure_agents()
-    verifier = st.session_state["agents"]["verifier"]
-    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":verifier:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
-    payload = {
-        "user_question": user_question,
-        "draft_answer": draft_answer,
-        "todo_results": todo_results,
-        "budget": st.session_state["budget"],
-        "web_allowed": _web_allowed(),
-        "memory_digest": memory_digest(),
-    }
-    prompt = "請審查並輸出 JSON：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-    res = await verifier.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-
-    # ✅ 修正：content 可能是 list（Responses content blocks）
-    parsed = safe_json_from_text(getattr(res["messages"][-1], "content", None)) or {}
-    try:
-        return VerifierReport(**parsed)
-    except Exception:
-        return VerifierReport(needs_fix=False, fix_type="rewrite_only", notes="Verifier 解析失敗，跳過。")
-
-
-async def replan_todos(user_question: str, previous_todos: List[Dict[str, str]], todo_results: List[Dict[str, Any]], report: VerifierReport) -> List[Dict[str, str]]:
-    ensure_agents()
-    replanner = st.session_state["agents"]["replanner"]
-    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":replanner:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
-    payload = {
-        "user_question": user_question,
-        "previous_todos": previous_todos,
-        "todo_results": todo_results,
-        "verifier_report": report.model_dump(),
-        "memory_digest": memory_digest(),
-    }
-    prompt = "請輸出新的 todos JSON：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-    res = await replanner.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-
-    data = safe_json_from_text(getattr(res["messages"][-1], "content", None)) or {}
-    out = []
-    for i, t in enumerate(data.get("todos", []), start=1):
-        tid = (t.get("id") or f"R{i}").strip()
-        todo = (t.get("todo") or "").strip()
-        if todo:
-            out.append({"id": tid, "todo": todo})
-    return out or [{"id": "R1", "todo": "重新釐清需求與可用資料來源，提出可行解法與限制"}]
-
-
-async def refine_answer(user_question: str, draft_answer: str, todo_results: List[Dict[str, Any]], report: VerifierReport) -> str:
-    ensure_agents()
-    refiner = st.session_state["agents"]["refiner"]
-    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":refiner:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
-    payload = {
-        "user_question": user_question,
-        "draft_answer": draft_answer,
-        "todo_results": todo_results,
-        "verifier_report": report.model_dump(),
-        "budget": st.session_state["budget"],
-        "memory_digest": memory_digest(),
-    }
-    prompt = "請修訂最終答案：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-    res = await refiner.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    return _content_to_text(getattr(res["messages"][-1], "content", None))
-
-
-def _alloc_ids(prefix: str, used_ids: List[str], n: int) -> List[str]:
-    used = set(used_ids)
-    out = []
-    i = 1
-    while len(out) < n:
-        tid = f"{prefix}{i}"
-        if tid not in used:
-            out.append(tid)
-            used.add(tid)
-        i += 1
-    return out
-
-
-async def run_full_pipeline(user_question: str, history_messages: List[Dict[str, str]], todo_placeholder) -> str:
-    mode = await classify_need_mode(user_question)
-
-    previous_todos: List[Dict[str, str]] = []
-    todo_results: List[Dict[str, Any]] = []
-
-    if mode.mode == "direct" and not _direct_do_planning():
-        draft = await direct_fast_answer(user_question, history_messages)
-    else:
-        previous_todos = await plan_todos(user_question, history_messages)
-        todo_results = await solve_todos_parallel_with_progress(previous_todos, user_question, todo_placeholder)
-        draft = await synthesize_answer(user_question, todo_results)
-
-    report = await verify_answer(user_question, draft, todo_results)
-    if not report.needs_fix:
-        return draft
-
-    if report.fix_type == "rewrite_only":
-        return await refine_answer(user_question, draft, todo_results, report)
-
-    if report.fix_type == "need_more_research":
-        supplemental = (report.supplemental_todos or [])[:2]
-        if supplemental:
-            used_ids = [t["id"] for t in st.session_state["last_todos"]]
-            new_ids = _alloc_ids("S", used_ids, len(supplemental))
-            sup_todos = [{"id": tid, "todo": t} for tid, t in zip(new_ids, supplemental)]
-            st.session_state["last_todos"].extend([{**t, "status": "pending", "result": None} for t in sup_todos])
-            todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
-            sup_results = await solve_todos_parallel_with_progress(sup_todos, user_question, todo_placeholder)
-            todo_results.extend(sup_results)
-        return await refine_answer(user_question, draft, todo_results, report)
-
-    if report.fix_type == "replan":
-        for _ in range(MAX_REPLAN_ROUNDS):
-            _reset_budget_new_round(round_id=1)
-            new_todos = await replan_todos(user_question, previous_todos, todo_results, report)
-            st.session_state["last_todos"].append({"id": "—", "todo": "【Replan：重新規劃後的 Todo】", "status": "completed", "result": None})
-            st.session_state["last_todos"].extend([{**t, "status": "pending", "result": None} for t in new_todos])
-            todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
-
-            new_results = await solve_todos_parallel_with_progress(new_todos, user_question, todo_placeholder)
-            todo_results = todo_results + new_results
-            draft2 = await synthesize_answer(user_question, todo_results)
-
-            report2 = await verify_answer(user_question, draft2, todo_results)
-            if report2.needs_fix:
-                return await refine_answer(user_question, draft2, todo_results, report2)
-            return draft2
-
-    return draft
-
-
-def run_async(coro):
-    """
-    Streamlit 有時候環境已經有 event loop（或某些 runtime 包起來），asyncio.run 會噴。
-    這裡做 fallback：nest_asyncio 可用就用它。
-    """
-    try:
-        return asyncio.run(coro)
-    except RuntimeError as e:
-        msg = str(e)
-        if "cannot be called from a running event loop" not in msg:
-            raise
-        try:
-            import nest_asyncio  # type: ignore
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(coro)
+            return ast.literal_eval(t)
         except Exception:
-            raise
+            return None
+    return None
 
 
-# =========================================================
-# UI
-# =========================================================
-st.title("Agentic RAG（Web 記憶 embeddings 檢索 + Replan + GPT-5.2 Responses API）")
+def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        for k in ("content", "answer", "final", "output", "text", "message"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        msgs = payload.get("messages")
+        if isinstance(msgs, list) and msgs:
+            last = msgs[-1]
+            if isinstance(last, dict):
+                c = last.get("content")
+                if isinstance(c, str) and c.strip():
+                    return c
+            return str(last)
+        return None
 
-with st.popover("設定（記憶/模型/網路）", use_container_width=True):
-    st.session_state["settings"]["memory_namespace"] = st.text_input(
-        "記憶ID（同一個ID會載入同一份跨對話記憶）",
-        value=st.session_state["settings"].get("memory_namespace", "default"),
+    if isinstance(payload, list):
+        if all(isinstance(x, str) for x in payload):
+            return "\n".join([x for x in payload if x.strip()])
+        return str(payload)
+
+    return None
+
+
+def _extract_citation_strings(text: str) -> list[str]:
+    if not text:
+        return []
+    return [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", text)]
+
+
+def _strip_citations_from_text(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s*\[[^\]]+?\s+p(\d+|-)\s*\]\s*", " ", text).strip()
+
+
+def _group_citations_for_badges(cits: list[str]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for c in cits:
+        m = CIT_PARSE_RE.search(c)
+        if not m:
+            continue
+        title = m.group(1).strip()
+        page = m.group(2).strip()
+        grouped.setdefault(title, []).append(page)
+
+    for title, pages in grouped.items():
+        pages = _dedup_keep_order(pages)
+
+        def _key(p: str):
+            if p.isdigit():
+                return (0, int(p))
+            if p == "-":
+                return (1, 10**9)
+            return (2, p)
+
+        grouped[title] = sorted(pages, key=_key)
+
+    return grouped
+
+
+def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str = "green"):
+    """
+    QA 顯示（一般 Markdown + badges）：
+    - 正文不顯示引用
+    - 來源用膠囊 badge：只顯示「文章名 + 頁碼」
+      - 文件來源：green
+      - WebSearch：violet（title 以 'WebSearch:' 開頭）
+    """
+    raw = (answer_text or "").strip()
+
+    # 防 chunk_id 外洩
+    if raw and CHUNK_ID_LEAK_PAT.search(raw):
+        raw = CHUNK_ID_LEAK_PAT.sub("", raw)
+
+    payload = _try_parse_json_or_py_literal(raw)
+    if payload is not None:
+        extracted = _extract_main_text_from_payload(payload)
+        if extracted is not None:
+            raw = extracted.strip()
+
+    cits = _dedup_keep_order(_extract_citation_strings(raw))
+    clean = _strip_citations_from_text(raw)
+
+    st.markdown(clean if clean else "（無內容）")
+
+    if not cits:
+        return
+
+    grouped = _group_citations_for_badges(cits)
+
+    doc_badges: list[str] = []
+    web_badges: list[str] = []
+
+    def _pages_str(pages: list[str], max_keep: int = 6) -> str:
+        pages = pages or ["-"]
+        if len(pages) <= max_keep:
+            return "p" + ",".join(pages)
+        kept = pages[:max_keep]
+        return "p" + ",".join(kept) + "…"
+
+    for title in sorted(grouped.keys()):
+        pages = grouped[title]
+        pages_part = _pages_str(pages, max_keep=6)
+
+        is_web = title.strip().lower().startswith("websearch:")
+        label = f"{title} {pages_part}"
+
+        if is_web:
+            web_badges.append(_badge_directive(label, "violet"))
+        else:
+            doc_badges.append(_badge_directive(label, badge_color))
+
+    badges_line = []
+    if doc_badges:
+        badges_line.append(" ".join(doc_badges))
+    if web_badges:
+        badges_line.append(" ".join(web_badges))
+
+    if badges_line:
+        st.markdown(" ".join(badges_line))
+
+
+# =========================
+# Debug panel
+# =========================
+def render_debug_panel(files: Optional[dict]):
+    if not files or not isinstance(files, dict):
+        st.write("（沒有 files）")
+        return
+
+    def _file_to_str(file_obj) -> str:
+        if isinstance(file_obj, dict) and "data" in file_obj:
+            v = file_obj["data"]
+            if isinstance(v, (bytes, bytearray)):
+                return v.decode("utf-8", errors="ignore")
+            return str(v)
+        if isinstance(file_obj, (bytes, bytearray)):
+            return file_obj.decode("utf-8", errors="ignore")
+        return str(file_obj)
+
+    def _sanitize_text(t: str) -> str:
+        t = (t or "").strip()
+        if not t:
+            return ""
+        if CHUNK_ID_LEAK_PAT.search(t):
+            t = CHUNK_ID_LEAK_PAT.sub("", t)
+        payload = _try_parse_json_or_py_literal(t)
+        if payload is not None:
+            extracted = _extract_main_text_from_payload(payload)
+            if isinstance(extracted, str) and extracted.strip():
+                t = extracted.strip()
+                if CHUNK_ID_LEAK_PAT.search(t):
+                    t = CHUNK_ID_LEAK_PAT.sub("", t)
+        return t
+
+    all_keys = sorted([k for k in files.keys() if isinstance(k, str)])
+    evidence_keys = [k for k in all_keys if k.startswith("/evidence/")]
+
+    draft = _sanitize_text(_file_to_str(files.get("/draft.md", ""))) if "/draft.md" in files else ""
+    review = _sanitize_text(_file_to_str(files.get("/review.md", ""))) if "/review.md" in files else ""
+    todos = _sanitize_text(_file_to_str(files.get("/workspace/todos.json", ""))) if "/workspace/todos.json" in files else ""
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["總覽", "todos.json", "draft.md", "review.md", "evidence"])
+
+    with tab1:
+        st.write(f"files keys：{len(all_keys)}")
+        st.write(f"evidence：{len(evidence_keys)}")
+        st.code("\n".join(all_keys[:400]), language="text")
+
+    with tab2:
+        if todos:
+            st.code(todos[:20000], language="json")
+        else:
+            st.write("（沒有 /workspace/todos.json）")
+
+    with tab3:
+        if draft:
+            st.code(draft[:20000], language="markdown")
+        else:
+            st.write("（沒有 /draft.md）")
+
+    with tab4:
+        if review:
+            st.code(review[:20000], language="markdown")
+        else:
+            st.write("（沒有 /review.md）")
+
+    with tab5:
+        if evidence_keys:
+            st.code("\n".join(evidence_keys[:600]), language="text")
+        else:
+            st.write("（沒有 /evidence/ 檔案）")
+
+
+# =========================
+# Indexing（增量：OCR + embeddings）
+# =========================
+def build_indices_incremental_no_kg(
+    client: OpenAI,
+    file_rows: list[FileRow],
+    file_bytes_map: Dict[str, bytes],
+    store: Optional[FaissStore],
+    processed_keys: set,
+    chunk_size: int = 900,
+    overlap: int = 150,
+) -> Tuple[FaissStore, Dict[str, Any], set]:
+    if store is None:
+        dim = embed_texts(client, ["dim_probe"]).shape[1]
+        store = FaissStore(dim)
+
+    stats = {"new_reports": 0, "new_chunks": 0}
+    new_chunks: list[Chunk] = []
+    new_texts: list[str] = []
+
+    to_process = []
+    for r in file_rows:
+        key = (r.file_sig, bool(r.use_ocr))
+        if key not in processed_keys:
+            to_process.append(r)
+
+    for row in to_process:
+        data = file_bytes_map[row.file_id]
+        report_id = row.file_id
+        title = os.path.splitext(row.name)[0]
+        stats["new_reports"] += 1
+
+        if row.ext == ".pdf":
+            if row.use_ocr:
+                pages = ocr_pdf_pages_parallel(client, data)
+            else:
+                pages = extract_pdf_text_pages(data)
+        elif row.ext == ".txt":
+            pages = [(None, norm_space(data.decode("utf-8", errors="ignore")))]
+        elif row.ext in (".png", ".jpg", ".jpeg"):
+            mime = "image/jpeg" if row.ext in (".jpg", ".jpeg") else "image/png"
+            txt = norm_space(ocr_image_bytes(client, data, mime=mime))
+            pages = [(None, txt)]
+        else:
+            pages = [(None, "")]
+
+        for page_no, page_text in pages:
+            if not page_text:
+                continue
+            for i, ch in enumerate(chunk_text(page_text, chunk_size=chunk_size, overlap=overlap)):
+                cid = f"{report_id}_p{page_no if page_no else 'na'}_c{i}"
+                new_chunks.append(Chunk(cid, report_id, title, page_no if isinstance(page_no, int) else None, ch))
+                new_texts.append(ch)
+
+        processed_keys.add((row.file_sig, bool(row.use_ocr)))
+
+    if new_texts:
+        vecs_list = []
+        for i in range(0, len(new_texts), EMBED_BATCH_SIZE):
+            vecs_list.append(embed_texts(client, new_texts[i:i + EMBED_BATCH_SIZE]))
+        vecs = np.vstack(vecs_list)
+        store.add(vecs, new_chunks)
+
+    stats["new_chunks"] = len(new_chunks)
+    return store, stats, processed_keys
+
+
+# =========================
+# 預設輸出（三份 bullets + citations）
+# =========================
+def _split_default_bundle(text: str) -> Dict[str, str]:
+    t = (text or "").strip()
+    pattern = re.compile(
+        r"###\s*SUMMARY\s*(.*?)###\s*CLAIMS\s*(.*?)###\s*CHAIN\s*(.*)$",
+        re.IGNORECASE | re.DOTALL,
     )
-    st.session_state["settings"]["web_allowed"] = st.toggle(
-        "允許使用網路（OpenAI web_search_preview）",
-        value=_web_allowed(),
-    )
-    st.session_state["settings"]["direct_do_planning"] = st.toggle(
-        "Direct 模式也先規劃 Todo",
-        value=_direct_do_planning(),
-    )
-    st.session_state["settings"]["max_parallel_todos"] = st.number_input(
-        "同時並行 Todo 上限",
-        min_value=1, max_value=10,
-        value=int(st.session_state["settings"].get("max_parallel_todos", 3)),
-        step=1,
-    )
-    st.caption(
-        f"每輪預算：KB {BUDGET_LIMIT} 次 + Web live {BUDGET_LIMIT} 次。"
-        f"Web 記憶 embeddings 檢索保留最近 {WEB_MEM_MAX} 筆（不耗 web 預算）。"
+    m = pattern.search(t)
+    if not m:
+        return {"summary": "", "claims": "", "chain": ""}
+    return {"summary": m.group(1).strip(), "claims": m.group(2).strip(), "chain": m.group(3).strip()}
+
+
+def pick_corpus_chunks_for_default(all_chunks: list[Chunk]) -> list[Chunk]:
+    by_title: Dict[str, list[Chunk]] = {}
+    for c in all_chunks:
+        by_title.setdefault(c.title, []).append(c)
+
+    kw = re.compile(
+        r"(outlook|risk|implication|forecast|scenario|inflation|rate|credit|spread|cap rate|vacancy|supply|demand|rental|office|retail|residential|logistics|hotel|reits)",
+        re.I,
     )
 
-with st.popover("上傳知識文件（建立向量庫）", use_container_width=True):
-    uploaded_files = st.file_uploader(
-        "上傳知識文件（PDF, Word, PPT, Excel, TXT）",
-        type=["pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt"],
+    def score(c: Chunk) -> float:
+        s = 0.0
+        if kw.search(c.text or ""):
+            s += 6.0
+        if c.page is not None:
+            s += max(0.0, 2.0 - min(2.0, float(c.page) / 6.0))
+        s += min(2.0, len(c.text) / 1400.0)
+        return s
+
+    chosen: list[Chunk] = []
+    for title, chunks in sorted(by_title.items(), key=lambda x: x[0]):
+        by_page: Dict[int, list[Chunk]] = {}
+        for c in chunks:
+            p = c.page if c.page is not None else 0
+            by_page.setdefault(p, []).append(c)
+
+        page_best = []
+        for p, cs in by_page.items():
+            cs = sorted(cs, key=score, reverse=True)
+            page_best.append(cs[0])
+
+        page_best = sorted(page_best, key=score, reverse=True)
+        chosen.extend(page_best[:CORPUS_PER_REPORT_QUOTA])
+
+    chosen = sorted(chosen, key=score, reverse=True)[:CORPUS_DEFAULT_MAX_CHUNKS]
+    return chosen
+
+
+def render_chunks_for_model(chunks: list[Chunk], max_chars_each: int = 900) -> str:
+    parts = []
+    for c in chunks:
+        head = f"[{c.title} p{c.page if c.page is not None else '-'}]"
+        parts.append(head + "\n" + c.text[:max_chars_each])
+    return "\n\n".join(parts)
+
+
+def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_retries: int = 2) -> Dict[str, str]:
+    system = (
+        "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
+        "硬性規則：\n"
+        "1) 你必須輸出三個區塊，且順序/標題固定：### SUMMARY、### CLAIMS、### CHAIN。\n"
+        "2) 每個區塊都必須是純 bullet（每行以 - 開頭），不要段落。\n"
+        "3) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]\n"
+        "4) 引用中的『報告名稱』必須是資料片段方括號內的那個名稱。\n"
+    )
+    user = (
+        f"請針對《{title}》一次輸出三份內容（融合多份報告）：\n"
+        f"- SUMMARY：8~14 bullets\n"
+        f"- CLAIMS：8~14 bullets\n"
+        f"- CHAIN：6~12 bullets\n\n"
+        f"資料：\n{ctx}\n"
+    )
+
+    last = ""
+    for _ in range(max_retries + 1):
+        out, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=user, reasoning_effort=REASONING_EFFORT)
+        parts = _split_default_bundle(out)
+        ok = bullets_all_have_citations(parts["summary"]) and bullets_all_have_citations(parts["claims"]) and bullets_all_have_citations(parts["chain"])
+        if ok:
+            return parts
+        last = out
+        user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁]。"
+    return _split_default_bundle(last)
+
+
+# =========================
+# DeepAgent（chunk_id 只在 tool JSON 內部使用）
+# =========================
+def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
+    _require_deepagents()
+
+    from langchain_core.tools import BaseTool, StructuredTool
+
+    st.session_state.setdefault("deep_agent", None)
+    st.session_state.setdefault("deep_agent_web_flag", None)
+    st.session_state.setdefault("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})
+
+    if (st.session_state.deep_agent is not None) and (st.session_state.deep_agent_web_flag == bool(enable_web)):
+        return st.session_state.deep_agent
+
+    lock = threading.Lock()
+    usage = {"doc_search_calls": 0, "web_search_calls": 0}
+    st.session_state["da_usage"] = usage
+
+    def _inc(name: str, limit: int) -> bool:
+        with lock:
+            usage[name] += 1
+            st.session_state["da_usage"] = usage
+            return usage[name] <= limit
+
+    def _get_usage_fn() -> str:
+        with lock:
+            return json.dumps(usage, ensure_ascii=False)
+
+    def _doc_list_fn() -> str:
+        by_title: Dict[str, int] = {}
+        for c in store.chunks:
+            by_title[c.title] = by_title.get(c.title, 0) + 1
+        lines = [f"- {t} (chunks={n})" for t, n in sorted(by_title.items(), key=lambda x: x[0])]
+        return "\n".join(lines) if lines else "（目前沒有任何已索引文件）"
+
+    def _doc_search_fn(query: str, k: int = 8) -> str:
+        if not _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS):
+            return json.dumps({"hits": [], "error": f"Budget exceeded: doc_search_calls > {DA_MAX_DOC_SEARCH_CALLS}"}, ensure_ascii=False)
+
+        q = (query or "").strip()
+        if not q:
+            return json.dumps({"hits": []}, ensure_ascii=False)
+
+        qvec = embed_texts(client, [q])
+        hits = store.search(qvec, k=max(1, min(12, int(k))))
+
+        payload = {"hits": []}
+        for score, ch in hits:
+            payload["hits"].append({
+                "title": ch.title,
+                "page": str(ch.page) if ch.page is not None else "-",
+                "chunk_id": ch.chunk_id,  # internal only
+                "text": (ch.text or "")[:1200],
+                "score": float(score),
+            })
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _doc_get_chunk_fn(chunk_id: str, max_chars: int = 2600) -> str:
+        cid = (chunk_id or "").strip()
+        if not cid:
+            return ""
+        for c in store.chunks:
+            if c.chunk_id == cid:
+                return (c.text or "")[:max_chars]
+        return ""
+
+    def _mk_tool(fn, name: str, description: str) -> BaseTool:
+        return StructuredTool.from_function(fn, name=name, description=description)
+
+    tool_get_usage = _mk_tool(_get_usage_fn, "get_usage", "Get current tool usage counters as JSON (budget/debug).")
+    tool_doc_list = _mk_tool(_doc_list_fn, "doc_list", "List indexed documents and chunk counts.")
+    tool_doc_search = _mk_tool(_doc_search_fn, "doc_search", "Semantic search over indexed chunks. Returns JSON hits with title/page/chunk_id/text.")
+    tool_doc_get_chunk = _mk_tool(_doc_get_chunk_fn, "doc_get_chunk", "Fetch full text for a given chunk_id for close reading. Returns text only.")
+
+    tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk]
+
+    tool_web_search_summary: Optional[BaseTool] = None
+    if enable_web:
+        def _web_search_summary_fn(query: str) -> str:
+            if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
+                return f"[WebSearch:{(query or '')[:30]} p-]\nBudget exceeded: web_search_calls > {DA_MAX_WEB_SEARCH_CALLS}"
+
+            q = (query or "").strip()
+            if not q:
+                return "[WebSearch:empty p-]\n（query 為空）"
+
+            system = (
+                "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果成 2-4 段摘要，保留日期/名詞。"
+                "若矛盾要指出。最後用 Sources: 列出 title + url。"
+            )
+            user = f"Search term: {q}"
+            text, sources = call_gpt(
+                client,
+                model=MODEL_WEB,
+                system=system,
+                user=user,
+                reasoning_effort=None,  # ✅ web 不視為高推理（依你規則）
+                tools=[{"type": "web_search"}],
+                include_sources=True,
+            )
+            src_lines = []
+            for s in (sources or [])[:8]:
+                if isinstance(s, dict):
+                    t = s.get("title") or s.get("source") or "source"
+                    u = s.get("url") or ""
+                    if u:
+                        src_lines.append(f"- {t} {u}".strip())
+
+            out_text = (text or "").strip()
+            if src_lines:
+                out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
+
+            # ✅ 讓輸出自帶可被 badge 解析的 citation（WebSearch:* p-）
+            return f"[WebSearch:{q[:30]} p-]\n" + out_text[:2400]
+
+        tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources.")
+        tools.append(tool_web_search_summary)
+
+    # prompts
+    retriever_prompt = f"""
+你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
+
+facet 子任務格式：
+facet_slug: <英文小寫_底線>
+facet_goal: <這個面向要回答什麼>
+hints: <可能的關鍵字/指標/名詞（可空）>
+
+硬規則：
+- 你要寫入 /evidence/doc_<facet_slug>.md
+- evidence 內容只能包含：
+  1) 引用標頭：[報告名稱 p頁]（絕對不能出現 chunk_id）
+  2) 原文片段（可截斷）
+  3) 一行說明「這段支持什麼」
+- 你可以用 doc_search 拿到 chunk_id，然後用 doc_get_chunk(chunk_id=...) 精讀，
+  但 chunk_id 絕對不能寫進 evidence。
+
+若遇到 Budget exceeded：立刻停止並在 evidence 明講「證據不足」。
+最後回覆 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
+"""
+
+    writer_prompt = f"""
+你是寫作/整理專家（用 read_file/glob/grep/write_file/edit_file/ls）。
+你必須整合 /evidence/ 底下所有檔案（doc_*.md 與可選 web_*.md）。
+
+任務類型判斷：
+- 完整報告/章節 → REPORT
+- 單題回答 → QA
+- 整理知識脈絡 → KNOWLEDGE
+- 使用者貼草稿要查核/除錯 → VERIFY_DRAFT（最多 {DA_MAX_CLAIMS} 條主張）
+
+引用規則（嚴格）：
+- QA：純 bullet（每行 -），每個 bullet 句尾必有引用 [報告名稱 p頁] 或 [WebSearch:* p-]
+- REPORT/KNOWLEDGE/VERIFY：Markdown；每個非標題段落至少 1 個引用
+- enable_web=false：不得出現 WebSearch
+- draft 絕對不能出現 chunk_id
+
+把結果寫到 /draft.md
+"""
+
+    verifier_prompt = f"""
+你是審稿查核專家（用 read_file/edit_file/grep）。
+任務：檢查 /draft.md 是否符合引用覆蓋，並做『最少改動』修正。
+
+規則：
+- QA：每個 bullet 句尾必有 [.. p..]
+- 其他：每個非標題段落至少 1 個引用 [.. p..]
+- enable_web=false：不得出現 WebSearch
+- 若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
+
+最多修正 {DA_MAX_REWRITE_ROUNDS} 輪：
+- 每輪：read /draft.md → edit_file 修正 → write /review.md 記錄
+"""
+
+    subagents = [
+        {
+            "name": "retriever",
+            "description": "從上傳文件向量庫找證據，寫 /evidence/doc_*.md（不含 chunk_id）",
+            "system_prompt": retriever_prompt,
+            "tools": [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+        {
+            "name": "writer",
+            "description": "整合 /evidence/ → 產生 /draft.md",
+            "system_prompt": writer_prompt,
+            "tools": [],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+        {
+            "name": "verifier",
+            "description": "檢查引用覆蓋並修稿 /draft.md，寫 /review.md",
+            "system_prompt": verifier_prompt,
+            "tools": [],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+    ]
+
+    if enable_web:
+        web_prompt = """
+你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。
+facet 子任務格式同 retriever。
+
+硬規則：
+- 寫入 /evidence/web_<facet_slug>.md
+- 每段要保留引用標頭 [WebSearch:... p-]
+- 禁止捏造來源；若 Budget exceeded 就停止並寫明缺口
+"""
+        subagents.insert(
+            1,
+            {
+                "name": "web-researcher",
+                "description": "用 OpenAI 內建 web_search 做少量高品質搜尋，寫 /evidence/web_*.md",
+                "system_prompt": web_prompt,
+                "tools": [tool_web_search_summary, tool_get_usage] if tool_web_search_summary else [tool_get_usage],
+                "model": f"openai:{MODEL_MAIN}",
+            },
+        )
+
+    orchestrator_prompt = f"""
+你是 Deep Doc Orchestrator（文件優先；enable_web={str(enable_web).lower()}）。
+
+固定流程（必做）：
+1) write_todos：列 5~9 步（含：拆 facets、平行蒐證、寫作、審稿）
+2) write_file /evidence/README.md 記錄本次需求與 enable_web
+3) 拆 2–4 個 facets（面向，不是章節）
+4) 平行派工：
+   - 每個 facet 至少派 1 個 retriever
+   - enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
+5) 叫 writer 產生 /draft.md
+6) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
+7) read_file /draft.md 作為最終回答
+
+引用與隱私規則：
+- /evidence 與 /draft 絕對不能出現 chunk_id
+- 引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]
+"""
+
+    # ✅ 推理需求高：Orchestrator 用 reasoning=medium（透過 ChatOpenAI）
+    llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
+
+    agent = create_deep_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=orchestrator_prompt,
+        subagents=subagents,
+        debug=False,
+        name="deep-doc-agent",
+    ).with_config({"recursion_limit": 90})
+
+    st.session_state.deep_agent = agent
+    st.session_state.deep_agent_web_flag = bool(enable_web)
+    return agent
+
+
+# =========================
+# DeepAgent run（status 不展開）
+# =========================
+def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
+    final_state = None
+
+    def set_phase(s, phase: str):
+        mapping = {
+            "start": ("DeepAgent：啟動中…", "running"),
+            "plan": ("DeepAgent：規劃中…", "running"),
+            "evidence": ("DeepAgent：蒐證中…", "running"),
+            "draft": ("DeepAgent：寫作中…", "running"),
+            "review": ("DeepAgent：審稿/補引用中…", "running"),
+            "done": ("DeepAgent：完成", "complete"),
+            "error": ("DeepAgent：發生錯誤", "error"),
+        }
+        label, state = mapping.get(phase, ("DeepAgent：執行中…", "running"))
+        s.update(label=label, state=state, expanded=False)
+
+    with st.status("DeepAgent：啟動中…", expanded=False) as s:
+        set_phase(s, "start")
+        set_phase(s, "plan")
+
+        try:
+            for state in agent.stream(
+                {"messages": [{"role": "user", "content": user_text}]},
+                stream_mode="values",
+            ):
+                final_state = state
+                files = state.get("files") or {}
+                file_keys = set(files.keys()) if isinstance(files, dict) else set()
+
+                if any(k.startswith("/evidence/") for k in file_keys):
+                    set_phase(s, "evidence")
+                if "/draft.md" in file_keys:
+                    set_phase(s, "draft")
+                if "/review.md" in file_keys:
+                    set_phase(s, "review")
+
+        except Exception as e:
+            msg = str(e)
+            if "Budget exceeded" in msg:
+                set_phase(s, "evidence")
+                s.update(label="DeepAgent：已達工具預算上限（停止加搜證）", state="running", expanded=False)
+            else:
+                try:
+                    final_state = agent.invoke({"messages": [{"role": "user", "content": user_text}]})
+                except Exception:
+                    set_phase(s, "error")
+                    raise
+
+        files = (final_state or {}).get("files") or {}
+
+        def _file_to_str(file_obj):
+            if isinstance(file_obj, dict) and "data" in file_obj:
+                v = file_obj["data"]
+                if isinstance(v, (bytes, bytearray)):
+                    return v.decode("utf-8", errors="ignore")
+                return str(v)
+            if isinstance(file_obj, (bytes, bytearray)):
+                return file_obj.decode("utf-8", errors="ignore")
+            return str(file_obj)
+
+        final_text = ""
+        if isinstance(files, dict) and "/draft.md" in files:
+            final_text = (_file_to_str(files["/draft.md"]) or "").strip()
+
+        if not final_text:
+            msgs = (final_state or {}).get("messages") or []
+            if msgs:
+                last = msgs[-1]
+                final_text = getattr(last, "content", None) or str(last)
+
+        if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
+            final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
+
+        set_phase(s, "done")
+
+    return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
+
+
+# =========================
+# ✅ need_todo 判斷（就算不需要 todo，也要顯示原因）
+# =========================
+def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
+    system = (
+        "你是路由器。請判斷這個問題是否需要做『Todo + 文件/網路檢索』。\n"
+        "規則：\n"
+        "- 需要：涉及具體事實、數據、政策、版本、引用、研究、比較、出處；或需要引用上傳文件。\n"
+        "- 不需要：純意見/寫作/改寫/腦力激盪/不要求引用的泛泛解釋。\n"
+        "請輸出 JSON：{\"need_todo\": true/false, \"reason\": \"...\"}（只輸出 JSON）"
+    )
+    out, _ = call_gpt(
+        client,
+        model=MODEL_MAIN,
+        system=system,
+        user=question,
+        reasoning_effort=REASONING_EFFORT,  # ✅ 推理需求高
+        tools=None,
+        include_sources=False,
+    )
+    data = _try_parse_json_or_py_literal(out) or {}
+    need = bool(data.get("need_todo", False))
+    reason = str(data.get("reason", "")).strip() or "（未提供原因）"
+    return need, reason
+
+
+def render_run_badges(*, mode: str, need_todo: bool, reason: str, usage: dict, enable_web: bool):
+    # mode badges
+    badges: List[str] = []
+    badges.append(_badge_directive(f"Mode:{mode}", "gray"))
+
+    if need_todo:
+        badges.append(_badge_directive("Todo:需要", "blue"))
+    else:
+        badges.append(_badge_directive("Todo:不需要", "blue"))
+        # 原因也做 badge（短一點）
+        short_reason = reason if len(reason) <= 40 else reason[:40] + "…"
+        badges.append(_badge_directive(f"理由:{short_reason}", "gray"))
+
+    # tool usage badges
+    doc_calls = int((usage or {}).get("doc_search_calls", 0) or 0)
+    web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
+    if doc_calls > 0:
+        badges.append(_badge_directive(f"DB:used({doc_calls})", "green"))
+    else:
+        badges.append(_badge_directive("DB:unused", "gray"))
+
+    if enable_web:
+        if web_calls > 0:
+            badges.append(_badge_directive(f"Web:used({web_calls})", "violet"))
+        else:
+            badges.append(_badge_directive("Web:unused", "gray"))
+    else:
+        badges.append(_badge_directive("Web:disabled", "gray"))
+
+    st.markdown(" ".join(badges))
+
+
+# =========================
+# Session init
+# =========================
+OPENAI_API_KEY = get_openai_api_key()
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+os.environ.setdefault("OPENAI_KEY", OPENAI_API_KEY)
+
+client = get_client(OPENAI_API_KEY)
+
+st.session_state.setdefault("file_rows", [])
+st.session_state.setdefault("file_bytes", {})
+st.session_state.setdefault("store", None)
+st.session_state.setdefault("processed_keys", set())
+st.session_state.setdefault("default_outputs", None)
+st.session_state.setdefault("chat_history", [])
+st.session_state.setdefault("enable_web_search_agent", False)
+
+
+# =========================
+# File table helpers
+# =========================
+def file_rows_to_df(rows: list[FileRow]) -> pd.DataFrame:
+    recs = []
+    for r in rows:
+        if r.ext == ".pdf":
+            pages_str = "-" if r.pages is None else str(r.pages)
+            text_pages_str = "-" if r.text_pages is None else str(r.text_pages)
+            text_ratio_str = "-" if r.text_pages_ratio is None else f"{r.text_pages_ratio:.0%}"
+        else:
+            pages_str = "-" if r.pages is None else str(r.pages)
+            text_pages_str = "-"
+            text_ratio_str = "-"
+
+        if r.ext == ".pdf" and r.likely_scanned:
+            suggest = "建議 OCR"
+        elif r.ext in (".png", ".jpg", ".jpeg"):
+            suggest = "必 OCR"
+        else:
+            suggest = ""
+
+        recs.append({
+            "_file_id": r.file_id,
+            "使用OCR": bool(r.use_ocr),
+            "檔名": truncate_filename(r.name, 52),
+            "格式": r.ext.replace(".", ""),
+            "頁數": pages_str,
+            "文字頁": text_pages_str,
+            "文字%": text_ratio_str,
+            "token估算": int(r.token_est),
+            "建議": suggest,
+        })
+    return pd.DataFrame(recs)
+
+
+def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
+    id_to_row_idx = {r.file_id: i for i, r in enumerate(rows)}
+    for _, rec in df.iterrows():
+        fid = rec.get("_file_id")
+        if fid not in id_to_row_idx:
+            continue
+        i = id_to_row_idx[fid]
+
+        ext = rows[i].ext
+        if ext in (".png", ".jpg", ".jpeg"):
+            rows[i].use_ocr = True
+        elif ext == ".txt":
+            rows[i].use_ocr = False
+        else:
+            rows[i].use_ocr = bool(rec.get("使用OCR", rows[i].use_ocr))
+
+
+# =========================
+# Popover：文件管理 + DeepAgent 設定
+# =========================
+with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）", use_container_width=True):
+    st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
+
+    st.session_state.enable_web_search_agent = st.checkbox(
+        "啟用網路搜尋 Agent（可與文件檢索平行；會增加成本）",
+        value=bool(st.session_state.enable_web_search_agent),
+    )
+
+    uploaded = st.file_uploader(
+        "上傳文件",
+        type=["pdf", "txt", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
-                tmp.write(uploaded_file.read())
-                tmp_path = tmp.name
 
-            if file_ext == ".pdf":
-                loader = PyMuPDFLoader(tmp_path)
-            elif file_ext in [".docx", ".doc"]:
-                loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
-            elif file_ext == ".pptx":
-                loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
-            elif file_ext in [".xlsx", ".xls"]:
-                loader = UnstructuredExcelLoader(tmp_path, mode="single")
-            elif file_ext == ".txt":
-                loader = TextLoader(tmp_path)
-            else:
-                st.warning(f"不支援的檔案格式：{uploaded_file.name}")
+    if uploaded:
+        existing = {(r.name, r.bytes_len) for r in st.session_state.file_rows}
+        for f in uploaded:
+            data = f.read()
+            if (f.name, len(data)) in existing:
                 continue
 
-            docs = loader.load()
-            if not docs:
-                st.warning(f"檔案 {uploaded_file.name} 沒有可讀內容，請換個檔案！")
-                continue
+            ext = os.path.splitext(f.name)[1].lower()
+            fid = str(uuid.uuid4())[:10]
+            sig = sha1_bytes(data)
+            st.session_state.file_bytes[fid] = data
 
-            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=30)
-            splits = splitter.split_documents(docs)
+            pages = None
+            extracted_chars = 0
+            blank_pages = None
+            blank_ratio = None
+            text_pages = None
+            text_pages_ratio = None
 
-            embd = OpenAIEmbeddings(model="text-embedding-3-small")
-            if st.session_state["vectorstore"] is None:
-                st.session_state["vectorstore"] = FAISS.from_documents(splits, embd)
+            if ext == ".pdf":
+                pdf_pages = extract_pdf_text_pages(data)
+                pages = len(pdf_pages)
+                extracted_chars, blank_pages, blank_ratio, text_pages, text_pages_ratio = analyze_pdf_text_quality(pdf_pages)
+            elif ext == ".txt":
+                extracted_chars = len(norm_space(data.decode("utf-8", errors="ignore")))
+
+            token_est = estimate_tokens_from_chars(extracted_chars)
+            likely_scanned = should_suggest_ocr(ext, pages, extracted_chars, blank_ratio)
+
+            if ext in (".png", ".jpg", ".jpeg"):
+                use_ocr = True
+            elif ext == ".txt":
+                use_ocr = False
             else:
-                st.session_state["vectorstore"].add_documents(splits)
+                use_ocr = bool(likely_scanned)
 
-            st.success(f"已建立/更新向量庫：{uploaded_file.name}")
+            st.session_state.file_rows.append(
+                FileRow(
+                    file_id=fid,
+                    file_sig=sig,
+                    name=f.name,
+                    ext=ext,
+                    bytes_len=len(data),
+                    pages=pages,
+                    extracted_chars=extracted_chars,
+                    token_est=token_est,
+                    text_pages=text_pages,
+                    text_pages_ratio=text_pages_ratio,
+                    blank_pages=blank_pages,
+                    blank_ratio=blank_ratio,
+                    likely_scanned=likely_scanned,
+                    use_ocr=use_ocr,
+                )
+            )
 
-# 載入跨對話記憶（依 memory_namespace）
-load_persistent_memory()
-# ✅ 載入/建立 web 記憶 index（最多 500）
-web_mem_load_or_build()
+    st.markdown("### 文件清單（可逐檔勾選 OCR）")
 
-# 顯示歷史對話（UI）
-for entry in st.session_state["chat_history"]:
-    with st.chat_message(entry["role"]):
-        st.markdown(entry["content"])
+    if not st.session_state.file_rows:
+        st.info("尚未上傳文件。")
+    else:
+        df = file_rows_to_df(st.session_state.file_rows)
 
-prompt = st.chat_input("請輸入需求 / 問題")
+        edited = st.data_editor(
+            df.drop(columns=["_file_id"]),
+            key="file_table_editor",
+            use_container_width=True,
+            hide_index=True,
+            disabled=["檔名", "格式", "頁數", "文字頁", "文字%", "token估算", "建議"],
+            column_config={
+                "使用OCR": st.column_config.CheckboxColumn("使用OCR", help="逐檔選擇是否啟用 OCR（PDF 可選；圖檔固定OCR；TXT固定不OCR）"),
+            },
+        )
+
+        df_for_sync = df.copy()
+        df_for_sync["使用OCR"] = edited["使用OCR"].values
+        sync_df_to_file_rows(df_for_sync, st.session_state.file_rows)
+
+        st.divider()
+        col1, col2 = st.columns([1, 1])
+        build_btn = col1.button("🚀 建立索引 + 預設輸出", type="primary", use_container_width=True)
+        clear_btn = col2.button("🧹 清空全部", use_container_width=True)
+
+        if clear_btn:
+            st.session_state.file_rows = []
+            st.session_state.file_bytes = {}
+            st.session_state.store = None
+            st.session_state.processed_keys = set()
+            st.session_state.default_outputs = None
+            st.session_state.chat_history = []
+            st.session_state.deep_agent = None
+            st.session_state.deep_agent_web_flag = None
+            st.session_state.da_usage = {"doc_search_calls": 0, "web_search_calls": 0}
+            st.rerun()
+
+        if build_btn:
+            need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
+            if need_ocr and not HAS_PYMUPDF:
+                st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf。")
+                st.stop()
+
+            with st.status("建索引中（OCR + embeddings）...", expanded=True) as s:
+                t0 = time.perf_counter()
+                store, stats, processed_keys = build_indices_incremental_no_kg(
+                    client,
+                    st.session_state.file_rows,
+                    st.session_state.file_bytes,
+                    st.session_state.store,
+                    st.session_state.processed_keys,
+                )
+                st.session_state.store = store
+                st.session_state.processed_keys = processed_keys
+                s.write(f"新增報告數：{stats['new_reports']}")
+                s.write(f"新增 chunks：{stats['new_chunks']}")
+                s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
+                s.update(state="complete")
+
+            with st.status("產生預設輸出（摘要/主張/推論鏈）...", expanded=True) as s2:
+                chosen = pick_corpus_chunks_for_default(st.session_state.store.chunks)
+                ctx = render_chunks_for_model(chosen)
+                bundle = generate_default_outputs_bundle(client, "整體融合（全部上傳報告）", ctx, max_retries=2)
+                st.session_state.default_outputs = bundle
+                s2.update(state="complete")
+
+            st.session_state.chat_history = []
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "kind": "default",
+                "title": "整體融合（全部上傳報告）",
+                **st.session_state.default_outputs,
+            })
+            st.session_state.deep_agent = None
+            st.session_state.deep_agent_web_flag = None
+            st.rerun()
+
+
+# =========================
+# 主畫面：狀態 + Chat
+# =========================
+if st.session_state.store is None:
+    st.info("尚未建立索引。請先在 popover 上傳並建立索引。")
+    st.stop()
+
+st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
+st.caption("引用 badge 只顯示『報告名稱 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
+
+st.divider()
+st.subheader("Chat（DeepAgent + Badges + Todo decision）")
+
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg.get("role", "assistant")):
+        if msg.get("kind") == "default":
+            st.markdown(f"## 預設輸出：{msg.get('title','')}")
+            st.markdown("### 1) 報告摘要")
+            render_bullets_inline_badges(msg.get("summary", ""), badge_color="green")
+            st.markdown("### 2) 核心主張")
+            render_bullets_inline_badges(msg.get("claims", ""), badge_color="violet")
+            st.markdown("### 3) 推論鏈")
+            render_bullets_inline_badges(msg.get("chain", ""), badge_color="orange")
+        else:
+            meta = msg.get("meta", {}) or {}
+            mode = meta.get("mode", "unknown")
+            need_todo = bool(meta.get("need_todo", False))
+            reason = str(meta.get("reason", "") or "")
+            usage = meta.get("usage", {}) or {}
+            enable_web = bool(meta.get("enable_web", False))
+
+            render_run_badges(mode=mode, need_todo=need_todo, reason=reason, usage=usage, enable_web=enable_web)
+            render_markdown_answer_with_source_badges(msg.get("content", ""), badge_color="green")
+
+            # 額外：顯示 todos 狀態（就算沒有也要顯示）
+            todo_status = meta.get("todo_status", None)
+            if todo_status:
+                st.markdown(todo_status)
+
+prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
 if prompt:
-    ensure_agents()
-    _start_new_run()
-
-    st.session_state["chat_history"].append({"role": "user", "content": prompt})
-    persist_chat_message("user", prompt)
+    st.session_state.chat_history.append({"role": "user", "kind": "text", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    todo_placeholder = st.empty()
-
-    with st.status("執行中：initial → verifier →（補強或 replan）→ 最終答案", expanded=True) as status:
-        history_messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state["chat_history"]]
-        final_answer = run_async(run_full_pipeline(prompt, history_messages, todo_placeholder))
-        status.write({"run_id": st.session_state["budget"]["run_id"], "budget": st.session_state["budget"]})
-        status.update(label="完成！", state="complete")
-
-    st.session_state["chat_history"].append({"role": "assistant", "content": final_answer})
-    persist_chat_message("assistant", final_answer)
     with st.chat_message("assistant"):
-        st.markdown(final_answer)
+        enable_web = bool(st.session_state.enable_web_search_agent)
+        usage_before = dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0}))
 
-    with st.expander("Web 記憶 embeddings index 狀態", expanded=False):
-        st.write({
-            "indexed_docs": len([x for x in st.session_state["web_mem"]["doc_ids"] if x != "__empty__"]),
-            "max": WEB_MEM_MAX,
-            "index_dir": str(_mem_paths(_namespace())["web_index_dir"]),
-        })
+        # ✅ 先判斷需不需要 todo
+        need_todo, reason = decide_need_todo(client, prompt)
 
-    with st.expander("短期記憶（分開存）", expanded=False):
-        st.markdown("#### Web memory（最近 5 筆）")
-        st.json(st.session_state["memory"]["web"][-5:])
-        st.markdown("#### KB memory（最近 5 筆）")
-        st.json(st.session_state["memory"]["kb"][-5:])
-        st.markdown("#### Failures（最近 10 筆）")
-        st.json(st.session_state["memory"]["failures"][-10:])
+        if not need_todo:
+            # direct 回覆（不跑 deepagent）
+            system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
+            answer_text, _ = call_gpt(
+                client,
+                model=MODEL_MAIN,
+                system=system,
+                user=prompt,
+                reasoning_effort=None,  # ✅ 不走 reasoning（依你規則）
+                tools=None,
+            )
 
-    with st.expander("本輪 Todo 詳細（debug）", expanded=False):
-        st.json(st.session_state.get("last_todos", []))
+            meta = {
+                "mode": "direct",
+                "need_todo": False,
+                "reason": reason,
+                "usage": usage_before,
+                "enable_web": enable_web,
+                "todo_status": _badge_directive("本次判斷不需要 Todo", "gray"),
+            }
+
+            render_run_badges(mode=meta["mode"], need_todo=False, reason=reason, usage=usage_before, enable_web=enable_web)
+            render_markdown_answer_with_source_badges(answer_text, badge_color="green")
+
+            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+            st.stop()
+
+        # ✅ 需要 todo → 用 DeepAgent
+        agent = ensure_deep_agent(
+            client=client,
+            store=st.session_state.store,
+            enable_web=enable_web,
+        )
+        answer_text, files = deep_agent_run_with_live_status(agent, prompt)
+
+        # todo 顯示：若沒有 todos.json 也顯示「沒有 todo（流程未產生 / 或不需要）」
+        todo_md = ""
+        if isinstance(files, dict) and "/workspace/todos.json" in files:
+            todo_md = _badge_directive("Todo:已產生 /workspace/todos.json", "blue")
+        else:
+            todo_md = _badge_directive("Todo:未產生（可能不需要或流程未寫出）", "gray")
+
+        usage_after = dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0}))
+
+        meta = {
+            "mode": "deepagent",
+            "need_todo": True,
+            "reason": reason,
+            "usage": usage_after,
+            "enable_web": enable_web,
+            "todo_status": todo_md,
+        }
+
+        render_run_badges(mode=meta["mode"], need_todo=True, reason=reason, usage=usage_after, enable_web=enable_web)
+        render_markdown_answer_with_source_badges(answer_text, badge_color="green")
+        st.markdown(todo_md)
+
+        with st.expander("Debug", expanded=False):
+            render_debug_panel(files)
+
+    st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
