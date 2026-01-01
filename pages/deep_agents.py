@@ -1142,8 +1142,8 @@ with st.popover("設定（記憶/模型/網路）", use_container_width=True):
     )
     st.session_state["settings"]["main_model"] = st.selectbox(
         "主/worker/摘要模型",
-        options=["gpt-5.2", "gpt-4o-mini", "gpt-4o"],
-        index=["gpt-5.2", "gpt-4o-mini", "gpt-4o"].index(_main_model()),
+        options=["gpt-5.2", "gpt-4.1-mini", "gpt-4o"],
+        index=["gpt-5.2", "gpt-4.1-mini", "gpt-4o"].index(_main_model()),
     )
     st.session_state["settings"]["web_tool_model"] = st.selectbox(
         "Web tool 模型（建議 gpt-4o-mini）",
