@@ -1,538 +1,1160 @@
-# Anya/pages/main.py
-from __future__ import annotations
-
+# app.py
+# -*- coding: utf-8 -*-
 import os
-os.environ.setdefault("AGENTS_TRACE_EXPORT", "disabled")
-
-import json
 import re
-import time
+import json
+import uuid
 import asyncio
-import random
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
+import tempfile
+import threading
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Literal, Optional
 
 import streamlit as st
+from pydantic import BaseModel, Field
 
-st.set_page_config(page_title="Anya DeepAgents Orchestrator", page_icon="🧠")
-st.title("🧠 Anya DeepAgents Orchestrator")
-st.caption("A+ 版｜單狀態列 + 過程紀錄 + 假連結防呆 + 自動修訂直到通過（最多2回）")
+from langchain.schema import Document
+from langchain_core.tools import tool
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import (
+    PyMuPDFLoader,
+    UnstructuredWordDocumentLoader,
+    UnstructuredPowerPointLoader,
+    UnstructuredExcelLoader,
+    TextLoader,
+)
 
-# === API Key ===
-_openai_key = os.getenv("OPENAI_API_KEY")
-_openai_key = st.secrets.get("OPENAI_API_KEY") or st.secrets["OPENAI_KEY"] or _openai_key
-if not _openai_key:
-    st.error("找不到 OpenAI API Key，請在 .streamlit/secrets.toml 設定 OPENAI_API_KEY 或 OPENAI_KEY。")
-    st.stop()
-os.environ["OPENAI_API_KEY"] = _openai_key
+from langgraph.checkpoint.memory import MemorySaver
+from deepagents import create_deep_agent
 
-# 基礎套件
-try:
-    from agents import Agent, Runner
-except Exception as e:
-    st.error(f"無法載入基礎 agents 套件：{e}")
-    st.stop()
 
-# 自訂 Agents
-try:
-    from deepagents import (
-        Step,
-        Plan,
-        TriageDecision,
-        VerificationResult,
-        triage_agent,
-        planner_agent,
-        research_agent,
-        code_agent,
-        data_agent,
-        verifier_agent,
-        writer_agent,
-    )
-except Exception as e:
-    st.error("無法從 deepagents 載入自訂代理與型別，請確認路徑 Anya/deepagents 是否正確。錯誤：{}".format(e))
-    st.stop()
+# =========================================================
+# Global constraints
+# =========================================================
+BUDGET_LIMIT = 3            # KB/Web 各 3 次/輪
+MAX_VERIFY_ROUNDS = 1       # 補強 1 輪
+MAX_REPLAN_ROUNDS = 1       # replan 1 次（replan 會重置預算）
+WEB_MEM_MAX = 500           # ✅ 只保留最近 500 筆 web 記憶做 embeddings 檢索
 
-# 小工具
-def _ensure_dict(obj) -> Dict:
-    if obj is None:
-        return {}
-    if isinstance(obj, dict):
-        return obj
-    if isinstance(obj, str):
+
+# =========================================================
+# Persistence (跨對話短期記憶：jsonl + raw files + FAISS index)
+# =========================================================
+MEM_ROOT = Path(".agent_memory")
+MEM_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _jsonl_append(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _jsonl_tail(path: Path, max_lines: int = 200) -> List[dict]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as f:
+        lines = f.readlines()[-max_lines:]
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
         try:
-            return json.loads(obj)
+            out.append(json.loads(ln))
         except Exception:
-            return {}
-    return {}
+            continue
+    return out
 
-_URL_RE = re.compile(r"https?://[^\s)>\]}]+", re.IGNORECASE)
 
-def _extract_urls(text: str) -> List[str]:
-    return _URL_RE.findall(text or "")
+def _mem_paths(namespace: str) -> Dict[str, Path]:
+    base = MEM_ROOT / namespace
+    return {
+        "base": base,
+        "chat": base / "chat.jsonl",
+        "web": base / "web.jsonl",
+        "kb": base / "kb.jsonl",
+        "failures": base / "failures.jsonl",
+        "web_raw_dir": base / "web_raw",
+        "kb_raw_dir": base / "kb_raw",
+        # ✅ web 記憶 embeddings index
+        "web_index_dir": base / "web_mem_index",
+        "web_index_manifest": base / "web_mem_index" / "manifest.json",
+    }
 
-def _looks_like_fake_url(u: str) -> bool:
-    bad = ("example.com", "localhost", "127.0.0.1")
-    return any(b in u.lower() for b in bad)
 
-def _has_fake_url(text: str) -> bool:
-    return any(_looks_like_fake_url(u) for u in _extract_urls(text))
+# =========================================================
+# Session init
+# =========================================================
+if "vectorstore" not in st.session_state:
+    st.session_state["vectorstore"] = None
 
-# 預設最佳參數
-DEFAULT_MAX_PARALLEL = 5
-DEFAULT_BASE_BACKOFF = 0.6
-DEFAULT_STRICT_VERIFY = False  # 步驟未過先警告放行；最終階段有自動修訂循環
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []  # UI chat only
 
-class APlusOrchestrator:
-    def __init__(
-        self,
-        max_parallel: int = DEFAULT_MAX_PARALLEL,
-        base_backoff: float = DEFAULT_BASE_BACKOFF,
-        strict_verify: bool = DEFAULT_STRICT_VERIFY,
-        progress: Optional[Callable[[str, Dict], None]] = None,
-    ):
-        self.max_parallel = max_parallel
-        self.base_backoff = base_backoff
-        self.strict_verify = strict_verify
-        self._progress = progress or (lambda *a, **k: None)
-        self._step_order: Dict[str, int] = {}
-        self._agent_usage: List[Dict[str, object]] = []
-        self._agents_used: Set[str] = set()
+if "main_thread_id" not in st.session_state:
+    st.session_state["main_thread_id"] = str(uuid.uuid4())
 
-    def _notify(self, event: str, **payload):
+if "settings" not in st.session_state:
+    st.session_state["settings"] = {
+        "web_allowed": True,
+        "main_model": "gpt-4.1-mini",
+        "web_tool_model": "gpt-4o-mini",
+        "max_parallel_todos": 3,
+        "direct_do_planning": False,
+        "memory_namespace": st.secrets.get("MEMORY_NAMESPACE", "default"),
+    }
+
+# 每次使用者提問 = 一個 run_id（跨對話遞增）
+if "run_seq" not in st.session_state:
+    st.session_state["run_seq"] = 0
+
+# round 只用於同一 run 的 initial/replan
+if "budget" not in st.session_state:
+    st.session_state["budget"] = {"vector_calls": 0, "web_calls": 0, "round": 0, "run_id": 0}
+
+if "budget_lock" not in st.session_state:
+    st.session_state["budget_lock"] = threading.Lock()
+
+# UI todo list
+if "last_todos" not in st.session_state:
+    st.session_state["last_todos"] = []
+
+# 記憶（會從 jsonl 載入）
+if "memory" not in st.session_state:
+    st.session_state["memory"] = {"web": [], "kb": [], "failures": []}
+
+# tool context：讓 tool 記錄 todo_id、round、run_id、focus
+if "tool_context" not in st.session_state:
+    st.session_state["tool_context"] = {"run_id": 0, "round": 0, "todo_id": None, "focus": ""}
+
+# ✅ web 記憶 embeddings index（FAISS）
+if "web_mem" not in st.session_state:
+    st.session_state["web_mem"] = {
+        "vectorstore": None,     # FAISS vectorstore
+        "doc_ids": [],           # 對應順序（同時也用來判斷是否已索引）
+        "loaded": False,
+    }
+
+if "web_mem_lock" not in st.session_state:
+    st.session_state["web_mem_lock"] = threading.Lock()
+
+# agents cache
+if "agents" not in st.session_state:
+    st.session_state["agents"] = None
+
+if "agents_settings_key" not in st.session_state:
+    st.session_state["agents_settings_key"] = None
+
+# OpenAI key
+if "OPENAI_API_KEY" not in os.environ and "OPENAI_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_KEY"]
+
+
+# =========================================================
+# Helpers
+# =========================================================
+def _main_model() -> str:
+    return str(st.session_state["settings"].get("main_model", "gpt-4.1-mini"))
+
+def _web_tool_model() -> str:
+    return str(st.session_state["settings"].get("web_tool_model", "gpt-4o-mini"))
+
+def _web_allowed() -> bool:
+    return bool(st.session_state["settings"].get("web_allowed", True))
+
+def _direct_do_planning() -> bool:
+    return bool(st.session_state["settings"].get("direct_do_planning", False))
+
+def _namespace() -> str:
+    ns = str(st.session_state["settings"].get("memory_namespace", "default")).strip() or "default"
+    return re.sub(r"[^a-zA-Z0-9_\-\.]", "_", ns)
+
+def _reset_budget_new_round(round_id: int):
+    st.session_state["budget"]["vector_calls"] = 0
+    st.session_state["budget"]["web_calls"] = 0
+    st.session_state["budget"]["round"] = round_id
+    st.session_state["tool_context"]["round"] = round_id
+
+def _start_new_run():
+    st.session_state["run_seq"] += 1
+    st.session_state["budget"]["run_id"] = st.session_state["run_seq"]
+    st.session_state["tool_context"]["run_id"] = st.session_state["run_seq"]
+    _reset_budget_new_round(round_id=0)
+
+def _try_inc_budget(kind: Literal["vector", "web"]) -> bool:
+    with st.session_state["budget_lock"]:
+        if kind == "vector":
+            if st.session_state["budget"]["vector_calls"] >= BUDGET_LIMIT:
+                return False
+            st.session_state["budget"]["vector_calls"] += 1
+            return True
+        else:
+            if st.session_state["budget"]["web_calls"] >= BUDGET_LIMIT:
+                return False
+            st.session_state["budget"]["web_calls"] += 1
+            return True
+
+def render_todos_md(todos: List[Dict[str, Any]]) -> str:
+    lines = ["### Todo 進度\n"]
+    for t in todos:
+        status = t.get("status", "pending")
+        checked = "x" if status == "completed" else " "
+        suffix = ""
+        if status == "failed":
+            suffix = "  **(failed)**"
+        elif status == "in_progress":
+            suffix = "  _(in progress)_"
+        lines.append(f"- [{checked}] {t['id']}: {t['todo']}{suffix}")
+    return "\n".join(lines)
+
+def safe_json_from_text(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+def memory_digest(max_web: int = 5, max_kb: int = 5, max_fail: int = 10) -> Dict[str, Any]:
+    web = st.session_state["memory"]["web"][-max_web:]
+    kb = st.session_state["memory"]["kb"][-max_kb:]
+    failures = st.session_state["memory"]["failures"][-max_fail:]
+    return {"web_recent": web, "kb_recent": kb, "failures_recent": failures}
+
+def load_persistent_memory():
+    paths = _mem_paths(_namespace())
+    st.session_state["memory"]["web"] = _jsonl_tail(paths["web"], 600)       # 多載一些，index 會自己截 500
+    st.session_state["memory"]["kb"] = _jsonl_tail(paths["kb"], 200)
+    st.session_state["memory"]["failures"] = _jsonl_tail(paths["failures"], 400)
+
+def persist_chat_message(role: str, content: str):
+    paths = _mem_paths(_namespace())
+    rec = {"ts": _now_iso(), "role": role, "content": content}
+    _jsonl_append(paths["chat"], rec)
+
+def persist_failure(kind: str, detail: str, todo_id: Optional[str] = None):
+    paths = _mem_paths(_namespace())
+    rec = {
+        "ts": _now_iso(),
+        "run_id": st.session_state["tool_context"]["run_id"],
+        "round": st.session_state["tool_context"]["round"],
+        "todo_id": todo_id or st.session_state["tool_context"].get("todo_id"),
+        "type": kind,
+        "detail": detail,
+    }
+    _jsonl_append(paths["failures"], rec)
+    st.session_state["memory"]["failures"].append(rec)
+
+def persist_kb_record(query: str, sources: List[str], snippets: List[str], todo_id: Optional[str] = None):
+    paths = _mem_paths(_namespace())
+    rec = {
+        "ts": _now_iso(),
+        "run_id": st.session_state["tool_context"]["run_id"],
+        "round": st.session_state["tool_context"]["round"],
+        "todo_id": todo_id or st.session_state["tool_context"].get("todo_id"),
+        "focus": st.session_state["tool_context"].get("focus", "")[:200],
+        "query": query,
+        "sources": list(dict.fromkeys([s for s in sources if s]))[:10],
+        "snippets": snippets[:5],
+    }
+    _jsonl_append(paths["kb"], rec)
+    st.session_state["memory"]["kb"].append(rec)
+
+def persist_web_record(rec: dict):
+    """rec 必須包含 doc_id/raw_path/summary_5_lines/citations/query 等。"""
+    paths = _mem_paths(_namespace())
+    _jsonl_append(paths["web"], rec)
+    st.session_state["memory"]["web"].append(rec)
+
+
+# =========================================================
+# ✅ Web 記憶 embeddings index（FAISS）管理
+# =========================================================
+def _web_mem_embeddings() -> OpenAIEmbeddings:
+    return OpenAIEmbeddings(model="text-embedding-3-small")
+
+def _web_mem_record_to_text(rec: dict) -> str:
+    """
+    拿來做 embeddings 的「可檢索文字」：
+    - 不 embedding raw 全文（避免太慢、也避免太長）
+    - 用 query + focus + 5 行摘要 + citations title/url（可選）
+    """
+    q = (rec.get("query") or "").strip()
+    focus = (rec.get("focus") or "").strip()
+    s5 = (rec.get("summary_5_lines") or "").strip()
+    cites = rec.get("citations") or []
+    cite_text = " | ".join([f"{c.get('title','')} {c.get('url','')}".strip() for c in cites[:5]])
+    return f"query: {q}\nfocus: {focus}\nsummary:\n{s5}\ncitations: {cite_text}".strip()
+
+def _web_mem_manifest_load(paths: Dict[str, Path]) -> List[str]:
+    if not paths["web_index_manifest"].exists():
+        return []
+    try:
+        return json.loads(paths["web_index_manifest"].read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+def _web_mem_manifest_save(paths: Dict[str, Path], doc_ids: List[str]) -> None:
+    paths["web_index_dir"].mkdir(parents=True, exist_ok=True)
+    paths["web_index_manifest"].write_text(json.dumps(doc_ids, ensure_ascii=False), encoding="utf-8")
+
+def web_mem_load_or_build():
+    """
+    啟動時呼叫：
+    - 先嘗試 load 既有 index
+    - 若沒有或壞掉 → 用最近 500 筆 web 記憶重建
+    """
+    with st.session_state["web_mem_lock"]:
+        if st.session_state["web_mem"]["loaded"]:
+            return
+
+        paths = _mem_paths(_namespace())
+        emb = _web_mem_embeddings()
+        idx_dir = paths["web_index_dir"]
+
+        # 1) Try load
+        if idx_dir.exists():
+            try:
+                vs = FAISS.load_local(
+                    str(idx_dir),
+                    emb,
+                    allow_dangerous_deserialization=True,
+                )
+                doc_ids = _web_mem_manifest_load(paths)
+                st.session_state["web_mem"]["vectorstore"] = vs
+                st.session_state["web_mem"]["doc_ids"] = doc_ids
+                st.session_state["web_mem"]["loaded"] = True
+                return
+            except Exception:
+                # 壞掉就重建
+                pass
+
+        # 2) Build from last 500 web records
+        rebuild_web_mem_index()
+
+def rebuild_web_mem_index():
+    """
+    用最近 WEB_MEM_MAX 筆 web.jsonl 內容重建 FAISS index。
+    （只有在首次沒有 index 或超過 500 需要砍掉舊資料時才做）
+    """
+    paths = _mem_paths(_namespace())
+    emb = _web_mem_embeddings()
+
+    # 取最近 500 筆（用 session_state.memory 比較快）
+    records = (st.session_state["memory"]["web"] or [])[-WEB_MEM_MAX:]
+    texts: List[str] = []
+    docs: List[Document] = []
+    doc_ids: List[str] = []
+
+    for rec in records:
+        doc_id = rec.get("doc_id")
+        raw_path = rec.get("raw_path")
+        if not doc_id or not raw_path:
+            continue
+        t = _web_mem_record_to_text(rec)
+        docs.append(Document(page_content=t, metadata={"doc_id": doc_id, "raw_path": raw_path}))
+        doc_ids.append(doc_id)
+
+    if docs:
+        vs = FAISS.from_documents(docs, emb)
+    else:
+        # 空 index
+        vs = FAISS.from_texts(["(empty)"], emb, metadatas=[{"doc_id": "__empty__", "raw_path": ""}])
+        doc_ids = ["__empty__"]
+
+    # save
+    paths["web_index_dir"].mkdir(parents=True, exist_ok=True)
+    vs.save_local(str(paths["web_index_dir"]))
+    _web_mem_manifest_save(paths, doc_ids)
+
+    st.session_state["web_mem"]["vectorstore"] = vs
+    st.session_state["web_mem"]["doc_ids"] = doc_ids
+    st.session_state["web_mem"]["loaded"] = True
+
+def add_web_mem_record_to_index(rec: dict):
+    """
+    增量更新：只對新 doc_id 做 embedding + add_documents
+    超過 500 則重建一次（砍掉最舊的）
+    """
+    with st.session_state["web_mem_lock"]:
+        vs: Optional[FAISS] = st.session_state["web_mem"]["vectorstore"]
+        doc_ids: List[str] = st.session_state["web_mem"]["doc_ids"]
+
+        doc_id = rec.get("doc_id")
+        raw_path = rec.get("raw_path")
+        if not doc_id or not raw_path:
+            return
+
+        # 若尚未 load，先 load/build
+        if vs is None or not st.session_state["web_mem"]["loaded"]:
+            web_mem_load_or_build()
+            vs = st.session_state["web_mem"]["vectorstore"]
+            doc_ids = st.session_state["web_mem"]["doc_ids"]
+
+        # 避免重複
+        if doc_id in doc_ids:
+            return
+
+        # 超過上限：重建（簡單可靠）
+        if len([x for x in doc_ids if x != "__empty__"]) >= WEB_MEM_MAX:
+            rebuild_web_mem_index()
+            return
+
+        # 增量加入
+        text = _web_mem_record_to_text(rec)
+        vs.add_documents([Document(page_content=text, metadata={"doc_id": doc_id, "raw_path": raw_path})])
+        doc_ids.append(doc_id)
+
+        # 存回
+        st.session_state["web_mem"]["vectorstore"] = vs
+        st.session_state["web_mem"]["doc_ids"] = doc_ids
+
+        # persist index + manifest
+        paths = _mem_paths(_namespace())
+        paths["web_index_dir"].mkdir(parents=True, exist_ok=True)
+        vs.save_local(str(paths["web_index_dir"]))
+        _web_mem_manifest_save(paths, doc_ids)
+
+
+# =========================================================
+# Tools
+# =========================================================
+@tool
+def kb_available() -> bool:
+    return st.session_state.get("vectorstore") is not None
+
+@tool
+def web_allowed() -> bool:
+    return _web_allowed()
+
+@tool
+def web_memory_search(query: str, k: int = 5) -> Dict[str, Any]:
+    """
+    ✅ embeddings 記憶檢索：只查「web 記憶 index」，不消耗 web budget。
+    回傳 top-k 的 raw_path + doc_id + summary_5_lines + citations + score。
+    """
+    web_mem_load_or_build()
+    vs: Optional[FAISS] = st.session_state["web_mem"]["vectorstore"]
+    if vs is None:
+        return {"ok": False, "error": "web 記憶 index 尚未建立。", "results": []}
+
+    # similarity_search_with_score：分數越小越像（依版本而異，但可用來排序）
+    try:
+        docs_scores = vs.similarity_search_with_score(query, k=k)
+    except Exception as e:
+        return {"ok": False, "error": f"web 記憶檢索失敗：{e}", "results": []}
+
+    # 用 doc_id 去 jsonl 記憶找原始 metadata（summary/citations/raw_path）
+    # 這裡只從 session_state.memory["web"] 反查（最近幾百筆）
+    web_records = st.session_state["memory"]["web"]
+
+    def find_rec(doc_id: str) -> Optional[dict]:
+        for r in reversed(web_records):
+            if r.get("doc_id") == doc_id:
+                return r
+        return None
+
+    results = []
+    for doc, score in docs_scores:
+        meta = doc.metadata or {}
+        doc_id = meta.get("doc_id", "")
+        raw_path = meta.get("raw_path", "")
+        r = find_rec(doc_id) or {}
+        results.append({
+            "doc_id": doc_id,
+            "raw_path": raw_path or r.get("raw_path", ""),
+            "query": r.get("query", ""),
+            "focus": r.get("focus", ""),
+            "summary_5_lines": r.get("summary_5_lines", ""),
+            "citations": r.get("citations", []),
+            "score": score,
+        })
+
+    return {"ok": True, "results": results, "k": k}
+
+@tool
+def vector_search(query: str, k: int = 6) -> Dict[str, Any]:
+    if not _try_inc_budget("vector"):
+        err = f"KB 檢索超過硬性預算（上限 {BUDGET_LIMIT} 次/輪）。"
+        persist_failure("budget_exceeded_kb", err)
+        return {"ok": False, "error": err, "results": []}
+
+    vs = st.session_state.get("vectorstore")
+    if vs is None:
+        err = "目前沒有向量庫（尚未上傳文件）。"
+        persist_failure("kb_missing", err)
+        return {"ok": False, "error": err, "results": []}
+
+    retriever = vs.as_retriever(search_kwargs={"k": k})
+    docs: List[Document] = retriever.invoke(query) or []
+
+    results = []
+    sources: List[str] = []
+    snippets: List[str] = []
+
+    for i, d in enumerate(docs, start=1):
+        src = d.metadata.get("source", "")
+        src_short = os.path.basename(str(src).replace("\\", "/")) if src else ""
+        content = (d.page_content or "").strip()
+        results.append({"rank": i, "source": src_short, "content": content, "metadata": d.metadata})
+        if src_short:
+            sources.append(src_short)
+        if content:
+            snippets.append(content[:300])
+
+    persist_kb_record(query=query, sources=sources, snippets=snippets)
+    return {"ok": True, "query": query, "results": results, "budget": dict(st.session_state["budget"])}
+
+def _extract_citations_from_content_blocks(content_blocks: List[dict]) -> List[dict]:
+    seen = set()
+    citations: List[dict] = []
+    for b in content_blocks or []:
+        if b.get("type") != "text":
+            continue
+        for a in b.get("annotations", []) or []:
+            if a.get("type") != "citation":
+                continue
+            url = a.get("url") or ""
+            title = a.get("title") or ""
+            key = (title, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            citations.append({"title": title, "url": url})
+    return citations
+
+def _summarize_5_lines(text: str, focus: str) -> str:
+    llm = ChatOpenAI(model=_main_model(), temperature=0)
+    system = "你是摘要器。請用繁中，輸出剛好 5 行，每行一個重點，不要多也不要少。"
+    human = f"""焦點（本輪在意的點）：
+{focus}
+
+內容：
+{text[:6000]}
+
+請輸出 5 行重點（每行一點）。"""
+    resp = llm.invoke([("system", system), ("human", human)])
+    out = getattr(resp, "text", None) or (resp.content if isinstance(resp.content, str) else str(resp.content))
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return "\n".join(lines[:5]) if lines else "（摘要失敗）"
+
+@tool
+def openai_web_search(query: str) -> Dict[str, Any]:
+    if not web_allowed():
+        err = "網路搜尋已被禁用（web_allowed=false）。"
+        persist_failure("web_disabled", err)
+        return {"ok": False, "error": err, "text": "", "citations": []}
+
+    if not _try_inc_budget("web"):
+        err = f"Web 搜尋超過硬性預算（上限 {BUDGET_LIMIT} 次/輪）。"
+        persist_failure("budget_exceeded_web", err)
+        return {"ok": False, "error": err, "text": "", "citations": []}
+
+    tool_def = {"type": "web_search_preview"}
+    llm = ChatOpenAI(model=_web_tool_model(), temperature=0).bind_tools([tool_def])
+
+    prompt = (
+        "請使用 web search 搜尋並整理答案。\n"
+        f"Query: {query}\n\n"
+        "輸出要求：\n"
+        "1) 5-10 點重點（條列）\n"
+        "2) 內容要可被 citations 支持（annotations 會附 citation）\n"
+        "3) 不要輸出無根據推測\n"
+    )
+    response = llm.invoke(prompt)
+    content_blocks = getattr(response, "content_blocks", None)
+
+    if content_blocks is None:
+        citations: List[dict] = []
+        text = getattr(response, "text", None) or (response.content if isinstance(response.content, str) else str(response.content))
+    else:
+        citations = _extract_citations_from_content_blocks(content_blocks)
+        text = getattr(response, "text", None) or ""
+
+    # raw 存檔
+    paths = _mem_paths(_namespace())
+    paths["web_raw_dir"].mkdir(parents=True, exist_ok=True)
+    doc_id = f"run{st.session_state['tool_context']['run_id']}_r{st.session_state['tool_context']['round']}_{uuid.uuid4().hex[:8]}"
+    raw_path = paths["web_raw_dir"] / f"{doc_id}.txt"
+    raw_path.write_text(text, encoding="utf-8")
+
+    focus = st.session_state["tool_context"].get("focus", "")
+    summary_5 = _summarize_5_lines(text=text, focus=focus)
+
+    rec = {
+        "ts": _now_iso(),
+        "run_id": st.session_state["tool_context"]["run_id"],
+        "round": st.session_state["tool_context"]["round"],
+        "todo_id": st.session_state["tool_context"].get("todo_id"),
+        "focus": focus[:200],
+        "doc_id": doc_id,
+        "query": query,
+        "summary_5_lines": summary_5,
+        "citations": citations[:10],
+        "raw_path": str(raw_path),
+    }
+    persist_web_record(rec)
+    add_web_mem_record_to_index(rec)  # ✅ 增量更新 embeddings index
+
+    return {
+        "ok": True,
+        "query": query,
+        "text": text,
+        "citations": citations,
+        "summary_5_lines": summary_5,
+        "raw_path": str(raw_path),
+        "doc_id": doc_id,
+        "budget": dict(st.session_state["budget"]),
+    }
+
+@tool
+def resummarize_web(raw_path: str, focus: str) -> Dict[str, Any]:
+    p = Path(raw_path)
+    if not p.exists():
+        err = f"找不到 raw 檔：{raw_path}"
+        persist_failure("resummarize_missing_raw", err)
+        return {"ok": False, "error": err, "summary_5_lines": ""}
+
+    text = p.read_text(encoding="utf-8", errors="ignore")
+    summary_5 = _summarize_5_lines(text=text, focus=focus)
+    return {"ok": True, "raw_path": raw_path, "summary_5_lines": summary_5}
+
+
+# =========================================================
+# Mode classify
+# =========================================================
+class NeedModeOut(BaseModel):
+    mode: Literal["direct", "rag"] = Field(...)
+    reason: str = Field(...)
+
+async def classify_need_mode(user_question: str) -> NeedModeOut:
+    llm = ChatOpenAI(model=_main_model(), temperature=0).with_structured_output(NeedModeOut)
+    system = """你是流程分類器：判斷這題要走 direct 或 rag。
+- direct：純聊天/推理/寫作/格式化/程式建議（不一定需要外部證據）。
+- rag：需要引用文件或外部來源才可靠（規範/數據/最新資訊/需查證）。
+"""
+    return llm.invoke([("system", system), ("human", user_question)])
+
+
+# =========================================================
+# Agents builder (cached)
+# =========================================================
+def build_agents() -> Dict[str, Any]:
+    model = ChatOpenAI(model=_main_model(), temperature=0)
+    checkpointer = MemorySaver()
+
+    planner_system = """你是 Planning Agent（繁中）。你有 planning（write_todos）與 filesystem（write_file）。
+請產生 3~7 個 todo，寫入 /workspace/todos.json（JSON 格式：{"todos":[{"id":"T1","todo":"..."}]}），最後回覆：已完成規劃。"""
+    planner_agent = create_deep_agent(model=model, tools=[], system_prompt=planner_system, checkpointer=checkpointer, name="planner", debug=False)
+
+    # ✅ Todo worker：先 KB → 再查 web_memory_search（embedding）→ 不足才 web_search
+    todo_worker_system = f"""你是 Todo Worker（繁中）。工具：
+- vector_search（KB）
+- web_memory_search（Web 記憶 embeddings 檢索，不耗 web budget）
+- resummarize_web（針對舊 raw 用新 focus 重摘要）
+- openai_web_search（真的上網，耗 web budget）
+- kb_available、web_allowed
+
+策略（強制，按順序）：
+1) 若 kb_available=true：先用 vector_search（1 次；必要時最多 2 次）。
+2) 若 KB 明顯不足：先用 web_memory_search 找「以前查過的網路資料」(top 3~5)。
+   - 若找到合適的 raw_path：用 resummarize_web(raw_path, focus) 針對本次重點重摘要，補齊 todo。
+3) 若仍不足且 web_allowed=true：最後才用 openai_web_search（1 次；最多 2 次不建議）。
+4) 若 todo 不需要查證（整理/改寫/推理/寫作），可以不使用工具直接完成（省預算）。
+
+輸出 JSON（盡量只輸出 JSON）：
+{{
+  "summary": "...",
+  "used_kb": true/false,
+  "used_web_memory": true/false,
+  "used_web_live": true/false,
+  "sources": {{
+    "kb_sources": ["..."],
+    "web_urls": ["https://..."],
+    "web_raw_paths_used": ["..."]
+  }},
+  "notes": "..."
+}}
+
+硬預算提醒：KB/Web live 各最多 {BUDGET_LIMIT} 次/輪（工具會拒絕超額）。
+"""
+
+    todo_worker_agent = create_deep_agent(
+        model=model,
+        tools=[kb_available, web_allowed, vector_search, web_memory_search, resummarize_web, openai_web_search],
+        system_prompt=todo_worker_system,
+        checkpointer=checkpointer,
+        name="todo_worker",
+        debug=False,
+    )
+
+    synth_system = """你是統整回答 Agent（繁中）。
+輸入：user_question + todo_results + budget + memory_digest（含過去錯誤與 web/kb 記憶摘要）
+輸出格式：
+A. 回答
+B. 依據/來源（檔名或 URL）
+C. 限制與建議"""
+    synth_agent = create_deep_agent(model=model, tools=[], system_prompt=synth_system, checkpointer=checkpointer, name="synth", debug=False)
+
+    direct_fast_system = f"""你是 Direct 回應助理（繁中）。
+你可用工具：vector_search、web_memory_search、resummarize_web、openai_web_search、kb_available、web_allowed。
+策略（強制，按順序）：先 KB → 再 web_memory_search → 不足才 web_search（若允許）；不需查證就不要用工具。
+輸出：最終回答 +（若有）來源。"""
+    direct_fast_agent = create_deep_agent(
+        model=model,
+        tools=[kb_available, web_allowed, vector_search, web_memory_search, resummarize_web, openai_web_search],
+        system_prompt=direct_fast_system,
+        checkpointer=checkpointer,
+        name="direct_fast",
+        debug=False,
+    )
+
+    verifier_system = """你是 Verifier（繁中），不使用工具。
+輸入：user_question、draft_answer、todo_results、budget、web_allowed、memory_digest。
+輸出 JSON：
+{"needs_fix":true/false,"fix_type":"rewrite_only"|"need_more_research"|"replan","missing_points":[...],"supplemental_todos":[...], "replan_goal":"...", "notes":"..."}"""
+    verifier_agent = create_deep_agent(model=model, tools=[], system_prompt=verifier_system, checkpointer=checkpointer, name="verifier", debug=False)
+
+    replanner_system = """你是 Replanner（繁中），不使用工具。
+輸入：user_question、previous_todos、todo_results、verifier_report、memory_digest（含 failures）。
+輸出 JSON：{"todos":[{"id":"R1","todo":"..."}]}"""
+    replanner_agent = create_deep_agent(model=model, tools=[], system_prompt=replanner_system, checkpointer=checkpointer, name="replanner", debug=False)
+
+    refiner_system = """你是 Refiner（繁中），不使用工具。
+輸入：user_question、draft_answer、todo_results、verifier_report、budget、memory_digest。
+輸出最終答案（非 JSON），格式：
+A. 回答
+B. 依據/來源
+C. 限制與建議"""
+    refiner_agent = create_deep_agent(model=model, tools=[], system_prompt=refiner_system, checkpointer=checkpointer, name="refiner", debug=False)
+
+    return {
+        "planner": planner_agent,
+        "todo_worker": todo_worker_agent,
+        "synth": synth_agent,
+        "direct_fast": direct_fast_agent,
+        "verifier": verifier_agent,
+        "replanner": replanner_agent,
+        "refiner": refiner_agent,
+    }
+
+def ensure_agents():
+    settings_key = tuple(sorted(st.session_state["settings"].items()))
+    if st.session_state["agents"] is None or st.session_state["agents_settings_key"] != settings_key:
+        st.session_state["agents"] = build_agents()
+        st.session_state["agents_settings_key"] = settings_key
+
+
+# =========================================================
+# Planning -> todos
+# =========================================================
+async def plan_todos(user_question: str, history_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    ensure_agents()
+    planner = st.session_state["agents"]["planner"]
+    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + ":planner"}}
+    result = await planner.ainvoke({"messages": history_messages + [{"role": "user", "content": user_question}]}, config=config)
+
+    files = result.get("files") or {}
+    raw = files.get("/workspace/todos.json", "")
+    todos: List[Dict[str, str]] = []
+
+    if raw:
         try:
-            self._progress(event, payload)
+            data = json.loads(raw)
+            for i, t in enumerate(data.get("todos", []), start=1):
+                tid = (t.get("id") or f"T{i}").strip()
+                todo = (t.get("todo") or "").strip()
+                if todo:
+                    todos.append({"id": tid, "todo": todo})
         except Exception:
             pass
 
-    async def run(self, goal: str) -> Dict[str, object]:
-        # 1) Triage
-        self._notify("triage.start", goal=goal)
-        triage_res = await Runner.run(triage_agent, goal)
-        triage = triage_res.final_output_as(TriageDecision)
-        self._notify("triage.done", triage=triage)
+    if not todos:
+        data = safe_json_from_text(result["messages"][-1].content) or {}
+        for i, t in enumerate(data.get("todos", []), start=1):
+            tid = (t.get("id") or f"T{i}").strip()
+            todo = (t.get("todo") or "").strip()
+            if todo:
+                todos.append({"id": tid, "todo": todo})
 
-        # 2) Plan
-        self._notify("plan.start")
-        planner_input = f"Goal: {goal}\nTriage: {triage.model_dump_json()}"
-        plan_res = await Runner.run(planner_agent, planner_input)
-        plan = plan_res.final_output_as(Plan)
-        # 步驟編號表
-        self._step_order = {s.id: i + 1 for i, s in enumerate(plan.steps)}
-        self._notify("plan.done", total_steps=len(plan.steps))
+    if not todos:
+        todos = [{"id": "T1", "todo": user_question.strip()}]
 
-        # 3) Execute
-        self._notify("execute.start")
-        outputs: Dict[str, str] = {}
+    return todos
 
-        # 並行批次
-        for group_key, steps in self._group_parallel_steps(plan.steps).items():
-            self._notify("execute.batch_start", batch=group_key, count=len(steps))
-            await self._execute_parallel_batch(steps, outputs)
-            self._notify("execute.batch_done", batch=group_key)
 
-        # 序列步驟
-        serial_steps = [s for s in plan.steps if not s.is_parallel]
-        for step in serial_steps:
-            self._notify("execute.step_start", step_id=step.id, step_num=self._step_order.get(step.id), desc=step.description, tool=step.tool_name)
-            sid, out = await self._execute_with_retry(step)
-            outputs[sid] = out
-            evt = "execute.step_ok"
-            if out and "[ERROR]" in out:
-                evt = "execute.step_error"
-            elif out and "[WARN]" in out:
-                evt = "execute.step_warn"
-            self._notify(evt, step_id=sid, step_num=self._step_order.get(sid), desc=step.description, output=out)
-        self._notify("execute.done")
+# =========================================================
+# Todo execution (parallel) + auto tick + focus
+# =========================================================
+async def solve_one_todo(todo_item: Dict[str, Any], user_question: str) -> Dict[str, Any]:
+    ensure_agents()
+    todo_worker = st.session_state["agents"]["todo_worker"]
+    tid = todo_item["id"]
+    todo = todo_item["todo"]
 
-        # 4) Writer
-        self._notify("write.start")
-        writer_input = f"Goal: {plan.metadata.goal}\nArtifacts: {outputs}"
-        final_res = await Runner.run(writer_agent, writer_input)
-        final_output = str(final_res.final_output)
-        self._notify("write.done", output=final_output)
+    st.session_state["tool_context"]["todo_id"] = tid
+    st.session_state["tool_context"]["focus"] = f"User question: {user_question}\nTodo: {todo}"
 
-        # 5) Final verify + 修訂循環（最多 2 回）
-        self._notify("final_verify.start")
-        final_criteria = _ensure_dict(getattr(plan.metadata, "acceptance_criteria_final", None))
-        if not final_criteria:
-            final_criteria = {
-                "type": "research",
-                "min_sources": 8,
-                "must_have_sections": ["政策公告彙整", "主流媒體交叉", "學者/產業觀點", "社會影響", "事件時間線"],
-                "per_source_fields": ["title", "url", "published_date"],
-                "date_window_max_months": 18,
-                "forbid_domains": ["example.com", "localhost", "127.0.0.1"],
-            }
+    config = {"configurable": {"thread_id": f"{st.session_state['main_thread_id']}:todo:{tid}:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
+    prompt = f"""User question:
+{user_question}
 
-        verification = await self._verify(final_output, final_criteria)
-        rounds = 0
-        while not verification.passed and rounds < 2:
-            rounds += 1
-            self._notify("revise.start", round=rounds, issues=verification.issues)
-            # 把問題回饋給 writer 要求修正：補區塊、改連結、補日期等
-            repair_prompt = (
-                "請針對以下驗證意見修正輸出：\n"
-                f"{verification.issues}\n\n"
-                "重點要求：\n"
-                "- 若有假連結或 example.com/localhost/127.0.0.1，請以真實、可點擊的原始來源替換（官方或原刊）。\n"
-                "- 每則來源都要有 title/url/published_date（YYYY-MM-DD）並與文本對應。\n"
-                "- 需包含且清楚標示以下段落標題：政策公告彙整｜主流媒體交叉｜學者/產業觀點｜社會影響｜事件時間線。\n"
-                "- 若來源不足請主動補足至標準，並避免重複同一網址或同一網域首頁。\n"
-                "以下為前一版輸出，請直接回傳修正後全文：\n"
-            )
-            repair_res = await Runner.run(writer_agent, repair_prompt + final_output)
-            final_output = str(repair_res.final_output)
-            verification = await self._verify(final_output, final_criteria)
-            self._notify("revise.done", round=rounds, passed=verification.passed)
-        self._notify("final_verify.done", passed=verification.passed, issues=verification.issues)
+Todo:
+{todo}
 
-        return {
-            "ok": True,
-            "triage": triage,
-            "plan": plan,
-            "step_outputs": outputs,
-            "final_output": final_output,
-            "verification": verification,
-            "agents_used": sorted(self._agents_used),
-            "agent_usage": self._agent_usage,
-        }
+請依策略（先 KB → web_memory_search → 不足才 web_search）輸出 JSON。"""
 
-    async def _verify(self, output: str, criteria: Dict) -> VerificationResult:
-        v_in = {"output": output, "criteria": criteria}
-        ver = await Runner.run(verifier_agent, json.dumps(v_in, ensure_ascii=False))
-        return ver.final_output_as(VerificationResult)
+    res = await todo_worker.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
+    text = res["messages"][-1].content
+    parsed = safe_json_from_text(text)
+    if parsed is None:
+        persist_failure("todo_output_not_json", text[:400], todo_id=tid)
 
-    def _group_parallel_steps(self, steps: Sequence[Step]) -> Dict[str, List[Step]]:
-        groups: Dict[str, List[Step]] = {}
-        for s in steps:
-            if s.is_parallel:
-                key = s.parallel_group or "default_parallel"
-                groups.setdefault(key, []).append(s)
-        return groups
+    return {"id": tid, "todo": todo, "raw": text, "parsed": parsed, "ok": True}
 
-    async def _execute_parallel_batch(self, steps: Sequence[Step], outputs: Dict[str, str]) -> None:
-        sem = asyncio.Semaphore(self.max_parallel)
+async def solve_todos_parallel_with_progress(todos: List[Dict[str, Any]], user_question: str, todo_placeholder) -> List[Dict[str, Any]]:
+    sem = asyncio.Semaphore(int(st.session_state["settings"].get("max_parallel_todos", 3)))
 
-        async def run_one(step: Step) -> Tuple[str, str]:
-            async with sem:
-                try:
-                    self._notify("execute.step_start", step_id=step.id, step_num=self._step_order.get(step.id), desc=step.description, tool=step.tool_name)
-                    sid, out = await self._execute_with_retry(step)
-                    evt = "execute.step_ok"
-                    if out and "[ERROR]" in out:
-                        evt = "execute.step_error"
-                    elif out and "[WARN]" in out:
-                        evt = "execute.step_warn"
-                    self._notify(evt, step_id=sid, step_num=self._step_order.get(sid), desc=step.description, output=out)
-                    return sid, out
-                except Exception as e:
-                    self._notify("execute.step_error", step_id=step.id, step_num=self._step_order.get(step.id), desc=step.description, output=str(e))
-                    return step.id, f"[ERROR] {e}"
+    async def _wrapped(t):
+        async with sem:
+            return await solve_one_todo(t, user_question)
 
-        tasks = [asyncio.create_task(run_one(s)) for s in steps]
-        for coro in asyncio.as_completed(tasks):
-            try:
-                sid, out = await coro
-            except Exception as e:
-                sid, out = "unknown_step", f"[ERROR] {e}"
-            outputs[sid] = out
+    st.session_state["last_todos"] = [{**t, "status": "pending", "result": None} for t in todos]
+    todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
 
-    async def _execute_with_retry(self, step: Step) -> Tuple[str, str]:
-        attempts = step.max_retries + 1 if getattr(step, "max_retries", None) is not None else 2
-        for i in range(attempts):
-            try:
-                output = await self._execute_step(step, attempt=i, total_attempts=attempts)
-                # 假網址防呆（在正式驗收前先擋掉）
-                if _has_fake_url(output):
-                    if i < attempts - 1:
-                        await asyncio.sleep(self._backoff(i))
-                        continue
-                    if not self.strict_verify:
-                        return step.id, f"{output}\n\n[WARN] 偵測到疑似假連結或占位連結，請更換為真實來源。"
-                    raise RuntimeError("輸出含疑似假連結（example.com/localhost/127.0.0.1）")
+    task_map: Dict[asyncio.Task, str] = {}
+    for t in todos:
+        task = asyncio.create_task(_wrapped(t))
+        task_map[task] = t["id"]
 
-                # 正式驗收
-                criteria = self._merged_criteria(step)
-                v_in = {"output": output, "criteria": criteria}
-                ver_res = await Runner.run(verifier_agent, json.dumps(v_in, ensure_ascii=False))
-                ver = ver_res.final_output_as(VerificationResult)
-                if ver.passed:
-                    return step.id, output
-                else:
-                    if i < attempts - 1:
-                        await asyncio.sleep(self._backoff(i))
-                        continue
-                    if not self.strict_verify:
-                        return step.id, f"{output}\n\n[WARN] verify failed: {ver.issues}"
-                    raise RuntimeError(f"Step {step.id} failed verification: {ver.issues}")
-            except Exception as e:
-                if i < attempts - 1:
-                    await asyncio.sleep(self._backoff(i))
-                    continue
-                return step.id, f"[ERROR] Step {step.id} error after retries: {e}"
+    results: List[Dict[str, Any]] = []
+    for done in asyncio.as_completed(task_map.keys()):
+        tid = task_map[done]
+        for item in st.session_state["last_todos"]:
+            if item["id"] == tid and item["status"] == "pending":
+                item["status"] = "in_progress"
+        todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
 
-    def _backoff(self, attempt: int) -> float:
-        return (2 ** attempt) * self.base_backoff + random.uniform(0, 0.3)
+        try:
+            r = await done
+            results.append(r)
+            for item in st.session_state["last_todos"]:
+                if item["id"] == tid:
+                    item["status"] = "completed"
+                    item["result"] = r
+        except Exception as e:
+            persist_failure("todo_exception", str(e), todo_id=tid)
+            r = {"id": tid, "ok": False, "error": str(e)}
+            results.append(r)
+            for item in st.session_state["last_todos"]:
+                if item["id"] == tid:
+                    item["status"] = "failed"
+                    item["result"] = r
 
-    def _cap_timeout(self, step: Step) -> float:
-        typ = _ensure_dict(step.acceptance_criteria).get("type", "")
-        if typ == "research":
-            cap = 90.0
-        elif typ in ("data", "code"):
-            cap = 120.0
-        else:
-            cap = 240.0
-        t = getattr(step, "timeout", None)
-        if t is None or t <= 0:
-            return cap
-        return min(float(t), cap)
+        todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
 
-    def _agent_label(self, step: Step) -> str:
-        if step.requires_tool and step.tool_name == "web_search":
-            return "research_agent"
-        if step.requires_tool and step.tool_name == "data_transform":
-            return "data_agent"
-        if step.requires_tool and step.tool_name == "code_run":
-            return "code_agent"
-        return "research_agent"
+    st.session_state["tool_context"]["todo_id"] = None
+    st.session_state["tool_context"]["focus"] = ""
+    return results
 
-    async def _execute_step(self, step: Step, attempt: int = 0, total_attempts: int = 1) -> str:
-        agent = self._route_agent(step)
-        agent_label = self._agent_label(step)
-        self._agents_used.add(agent_label)
 
-        criteria = self._merged_criteria(step)
-        guidance = (
-            "CitationPolicy:\n"
-            "- 嚴禁使用 example.com/localhost/127.0.0.1 或占位連結。\n"
-            "- 每則來源需提供 title/url/published_date（YYYY-MM-DD），url 必須可點且為原始來源（優先官網/原刊）。\n"
-            "- 若為研究步驟，當達到 min_sources 且欄位齊全即可停止擴充（早停）。\n"
-        )
-        if attempt > 0:
-            guidance += "- 前次未通過，請改用不同關鍵字/來源，並補齊缺欄位與有效連結。\n"
+# =========================================================
+# Synth / Direct / Verify / Replan / Refine
+# =========================================================
+async def synthesize_answer(user_question: str, todo_results: List[Dict[str, Any]]) -> str:
+    ensure_agents()
+    synth = st.session_state["agents"]["synth"]
+    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":synth:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
+    payload = {
+        "user_question": user_question,
+        "budget": st.session_state["budget"],
+        "todo_results": todo_results,
+        "memory_digest": memory_digest(),
+    }
+    prompt = "請根據以下 JSON 統整最終回答：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    res = await synth.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
+    return res["messages"][-1].content
 
-        input_payload = (
-            f"Step: {step.description}\n"
-            f"Params: {step.parameters}\n"
-            f"AcceptanceCriteria: {json.dumps(criteria, ensure_ascii=False)}\n"
-            f"{guidance}"
-            f"Retry: {attempt + 1}/{total_attempts}"
-        )
+async def direct_fast_answer(user_question: str, history_messages: List[Dict[str, str]]) -> str:
+    ensure_agents()
+    agent = st.session_state["agents"]["direct_fast"]
+    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":direct:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
+    res = await agent.ainvoke({"messages": history_messages + [{"role": "user", "content": user_question}]}, config=config)
+    return res["messages"][-1].content
 
-        task = Runner.run(agent, input_payload)
-        timeout = self._cap_timeout(step)
+class VerifierReport(BaseModel):
+    needs_fix: bool
+    fix_type: Literal["rewrite_only", "need_more_research", "replan"]
+    missing_points: List[str] = Field(default_factory=list)
+    supplemental_todos: List[str] = Field(default_factory=list)
+    replan_goal: str = ""
+    notes: str = ""
 
-        t0 = time.perf_counter()
-        res = await asyncio.wait_for(task, timeout=timeout)
-        dt = time.perf_counter() - t0
+async def verify_answer(user_question: str, draft_answer: str, todo_results: List[Dict[str, Any]]) -> VerifierReport:
+    ensure_agents()
+    verifier = st.session_state["agents"]["verifier"]
+    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":verifier:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
+    payload = {
+        "user_question": user_question,
+        "draft_answer": draft_answer,
+        "todo_results": todo_results,
+        "budget": st.session_state["budget"],
+        "web_allowed": _web_allowed(),
+        "memory_digest": memory_digest(),
+    }
+    prompt = "請審查並輸出 JSON：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    res = await verifier.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
+    parsed = safe_json_from_text(res["messages"][-1].content) or {}
+    try:
+        return VerifierReport(**parsed)
+    except Exception:
+        return VerifierReport(needs_fix=False, fix_type="rewrite_only", notes="Verifier 解析失敗，跳過。")
 
-        self._agent_usage.append({
-            "step_id": step.id,
-            "step_num": self._step_order.get(step.id),
-            "agent": agent_label,
-            "seconds": round(dt, 2),
-        })
-        return str(res.final_output)
+async def replan_todos(user_question: str, previous_todos: List[Dict[str, str]], todo_results: List[Dict[str, Any]], report: VerifierReport) -> List[Dict[str, str]]:
+    ensure_agents()
+    replanner = st.session_state["agents"]["replanner"]
+    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":replanner:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
+    payload = {
+        "user_question": user_question,
+        "previous_todos": previous_todos,
+        "todo_results": todo_results,
+        "verifier_report": report.model_dump(),
+        "memory_digest": memory_digest(),
+    }
+    prompt = "請輸出新的 todos JSON：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    res = await replanner.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
+    data = safe_json_from_text(res["messages"][-1].content) or {}
+    out = []
+    for i, t in enumerate(data.get("todos", []), start=1):
+        tid = (t.get("id") or f"R{i}").strip()
+        todo = (t.get("todo") or "").strip()
+        if todo:
+            out.append({"id": tid, "todo": todo})
+    return out or [{"id": "R1", "todo": "重新釐清需求與可用資料來源，提出可行解法與限制"}]
 
-    def _route_agent(self, step: Step) -> Agent:
-        if step.requires_tool and step.tool_name == "web_search":
-            return research_agent
-        if step.requires_tool and step.tool_name == "data_transform":
-            return data_agent
-        if step.requires_tool and step.tool_name == "code_run":
-            return code_agent
-        return research_agent
+async def refine_answer(user_question: str, draft_answer: str, todo_results: List[Dict[str, Any]], report: VerifierReport) -> str:
+    ensure_agents()
+    refiner = st.session_state["agents"]["refiner"]
+    config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":refiner:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
+    payload = {
+        "user_question": user_question,
+        "draft_answer": draft_answer,
+        "todo_results": todo_results,
+        "verifier_report": report.model_dump(),
+        "budget": st.session_state["budget"],
+        "memory_digest": memory_digest(),
+    }
+    prompt = "請修訂最終答案：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    res = await refiner.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
+    return res["messages"][-1].content
 
-    def _merged_criteria(self, step: Step) -> Dict:
-        base = _ensure_dict(step.acceptance_criteria)
-        typ = base.get("type")
-        # 統一補上防呆規則：研究類加欄位與禁用域名
-        if typ == "research":
-            base.setdefault("per_source_fields", ["title", "url", "published_date", "summary"])
-            base.setdefault("forbid_domains", ["example.com", "localhost", "127.0.0.1"])
-            # 若 planner 沒給 min_sources，給個合理下限
-            base.setdefault("min_sources", 4)
-        return base
+def _alloc_ids(prefix: str, used_ids: List[str], n: int) -> List[str]:
+    used = set(used_ids)
+    out = []
+    i = 1
+    while len(out) < n:
+        tid = f"{prefix}{i}"
+        if tid not in used:
+            out.append(tid)
+            used.add(tid)
+        i += 1
+    return out
 
-# Chat 狀態
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "嗨嗨～請描述你的目標或要解的問題，安妮亞會規劃→並行研究→彙整交付！🥜"}
-    ]
+async def run_full_pipeline(user_question: str, history_messages: List[Dict[str, str]], todo_placeholder) -> str:
+    mode = await classify_need_mode(user_question)
 
-def transcript_from_messages(msgs: List[Dict[str, str]]) -> str:
-    lines = []
-    for m in msgs:
-        who = "User" if m["role"] == "user" else "Assistant"
-        lines.append(f"{who}: {m['content']}")
-    return "\n".join(lines)
+    previous_todos: List[Dict[str, str]] = []
+    todo_results: List[Dict[str, Any]] = []
 
-# 歷史訊息
-for m in st.session_state.messages:
-    with st.chat_message(m["role"], avatar="🤩" if m["role"] == "user" else "🧠"):
-        st.markdown(m["content"])
+    # 先產出 draft
+    if mode.mode == "direct" and not _direct_do_planning():
+        draft = await direct_fast_answer(user_question, history_messages)
+    else:
+        previous_todos = await plan_todos(user_question, history_messages)
+        todo_results = await solve_todos_parallel_with_progress(previous_todos, user_question, todo_placeholder)
+        draft = await synthesize_answer(user_question, todo_results)
 
-prompt = st.chat_input("請輸入你的目標或要解的問題（可持續補充）", max_chars=2000, key="chat_input_main")
+    # verifier
+    report = await verify_answer(user_question, draft, todo_results)
+    if not report.needs_fix:
+        return draft
 
+    if report.fix_type == "rewrite_only":
+        return await refine_answer(user_question, draft, todo_results, report)
+
+    if report.fix_type == "need_more_research":
+        supplemental = (report.supplemental_todos or [])[:2]
+        if supplemental:
+            used_ids = [t["id"] for t in st.session_state["last_todos"]]
+            new_ids = _alloc_ids("S", used_ids, len(supplemental))
+            sup_todos = [{"id": tid, "todo": t} for tid, t in zip(new_ids, supplemental)]
+            st.session_state["last_todos"].extend([{**t, "status": "pending", "result": None} for t in sup_todos])
+            todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
+            sup_results = await solve_todos_parallel_with_progress(sup_todos, user_question, todo_placeholder)
+            todo_results.extend(sup_results)
+        return await refine_answer(user_question, draft, todo_results, report)
+
+    # replan（B：重置預算、保留 memory）
+    if report.fix_type == "replan":
+        for _ in range(MAX_REPLAN_ROUNDS):
+            _reset_budget_new_round(round_id=1)  # ✅ 重置一輪預算
+            new_todos = await replan_todos(user_question, previous_todos, todo_results, report)
+            st.session_state["last_todos"].append({"id": "—", "todo": "【Replan：重新規劃後的 Todo】", "status": "completed", "result": None})
+            st.session_state["last_todos"].extend([{**t, "status": "pending", "result": None} for t in new_todos])
+            todo_placeholder.markdown(render_todos_md(st.session_state["last_todos"]))
+
+            new_results = await solve_todos_parallel_with_progress(new_todos, user_question, todo_placeholder)
+            todo_results = todo_results + new_results
+            draft2 = await synthesize_answer(user_question, todo_results)
+
+            report2 = await verify_answer(user_question, draft2, todo_results)
+            if report2.needs_fix:
+                return await refine_answer(user_question, draft2, todo_results, report2)
+            return draft2
+
+    return draft
+
+
+# =========================================================
+# UI
+# =========================================================
+st.title("Agentic RAG（Web 記憶 embeddings 檢索 + Replan）")
+
+with st.popover("設定（記憶/模型/網路）", use_container_width=True):
+    st.session_state["settings"]["memory_namespace"] = st.text_input(
+        "記憶ID（同一個ID會載入同一份跨對話記憶）",
+        value=st.session_state["settings"].get("memory_namespace", "default"),
+    )
+    st.session_state["settings"]["web_allowed"] = st.toggle(
+        "允許使用網路（OpenAI web_search_preview）",
+        value=_web_allowed(),
+    )
+    st.session_state["settings"]["direct_do_planning"] = st.toggle(
+        "Direct 模式也先規劃 Todo",
+        value=_direct_do_planning(),
+    )
+    st.session_state["settings"]["main_model"] = st.selectbox(
+        "主/規劃/統整模型",
+        options=["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o"],
+        index=["gpt-4.1-mini", "gpt-4o-mini", "gpt-4o"].index(_main_model()),
+    )
+    st.session_state["settings"]["web_tool_model"] = st.selectbox(
+        "Web tool 模型（建議 gpt-4o-mini）",
+        options=["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+        index=["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"].index(_web_tool_model()),
+    )
+    st.session_state["settings"]["max_parallel_todos"] = st.number_input(
+        "同時並行 Todo 上限",
+        min_value=1, max_value=10,
+        value=int(st.session_state["settings"].get("max_parallel_todos", 3)),
+        step=1,
+    )
+    st.caption(
+        f"每輪預算：KB {BUDGET_LIMIT} 次 + Web live {BUDGET_LIMIT} 次。"
+        f"Web 記憶 embeddings 檢索保留最近 {WEB_MEM_MAX} 筆（不耗 web 預算）。"
+    )
+
+with st.popover("上傳知識文件（建立向量庫）", use_container_width=True):
+    uploaded_files = st.file_uploader(
+        "上傳知識文件（PDF, Word, PPT, Excel, TXT）",
+        type=["pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt"],
+        accept_multiple_files=True,
+    )
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+                tmp.write(uploaded_file.read())
+                tmp_path = tmp.name
+
+            if file_ext == ".pdf":
+                loader = PyMuPDFLoader(tmp_path)
+            elif file_ext in [".docx", ".doc"]:
+                loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
+            elif file_ext == ".pptx":
+                loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
+            elif file_ext in [".xlsx", ".xls"]:
+                loader = UnstructuredExcelLoader(tmp_path, mode="single")
+            elif file_ext == ".txt":
+                loader = TextLoader(tmp_path)
+            else:
+                st.warning(f"不支援的檔案格式：{uploaded_file.name}")
+                continue
+
+            docs = loader.load()
+            if not docs:
+                st.warning(f"檔案 {uploaded_file.name} 沒有可讀內容，請換個檔案！")
+                continue
+
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=30)
+            splits = splitter.split_documents(docs)
+
+            embd = OpenAIEmbeddings(model="text-embedding-3-small")
+            if st.session_state["vectorstore"] is None:
+                st.session_state["vectorstore"] = FAISS.from_documents(splits, embd)
+            else:
+                st.session_state["vectorstore"].add_documents(splits)
+
+            st.success(f"已建立/更新向量庫：{uploaded_file.name}")
+
+# 載入跨對話記憶（依 memory_namespace）
+load_persistent_memory()
+# ✅ 載入/建立 web 記憶 index（最多 500）
+web_mem_load_or_build()
+
+# 顯示歷史對話（UI）
+for entry in st.session_state["chat_history"]:
+    with st.chat_message(entry["role"]):
+        st.markdown(entry["content"])
+
+prompt = st.chat_input("請輸入需求 / 問題")
 if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user", avatar="🤩"):
+    ensure_agents()
+    _start_new_run()
+
+    st.session_state["chat_history"].append({"role": "user", "content": prompt})
+    persist_chat_message("user", prompt)
+    with st.chat_message("user"):
         st.markdown(prompt)
 
-    full_text = transcript_from_messages(st.session_state.messages)
+    todo_placeholder = st.empty()
 
-    with st.chat_message("assistant", avatar="🧠"):
-        with st.status("準備中…", state="running") as status:
-            # 一個「過程紀錄」總 expander
-            proc = st.expander("過程紀錄（即時更新）", expanded=True)
-            triage_box = proc.container()
-            plan_box = proc.container()
-            steps_box = proc.container()
-            writer_box = proc.container()
-            verify_box = proc.container()
-            agents_box = proc.container()
+    with st.status("執行中：initial → verifier →（補強或 replan）→ 最終答案", expanded=True) as status:
+        history_messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state["chat_history"]]
+        final_answer = asyncio.run(run_full_pipeline(prompt, history_messages, todo_placeholder))
+        status.write({"run_id": st.session_state["budget"]["run_id"], "budget": st.session_state["budget"]})
+        status.update(label="完成！", state="complete")
 
-            def _progress_cb(event: str, info: Dict):
-                # 狀態列
-                if event == "triage.start":
-                    status.update(label="分類中（Triage）", state="running")
-                elif event == "triage.done":
-                    status.update(label="分類完成（Triage）", state="running")
-                    tri = info.get("triage")
-                    if tri:
-                        with triage_box:
-                            st.markdown("• Triage 摘要")
-                            st.markdown(f"- category: {tri.category}")
-                            st.markdown(f"- complexity: {tri.complexity}")
-                            st.markdown(f"- approach: {tri.approach}")
-                            if tri.recommended_tools:
-                                st.markdown(f"- recommended_tools: {', '.join(tri.recommended_tools)}")
-                            if tri.notes:
-                                st.markdown(f"- notes: {tri.notes}")
+    st.session_state["chat_history"].append({"role": "assistant", "content": final_answer})
+    persist_chat_message("assistant", final_answer)
+    with st.chat_message("assistant"):
+        st.markdown(final_answer)
 
-                elif event == "plan.start":
-                    status.update(label="規劃中（Plan）", state="running")
-                elif event == "plan.done":
-                    total = info.get("total_steps", 0)
-                    status.update(label=f"規劃完成（{total} 步）", state="running")
-                    with plan_box:
-                        st.markdown(f"• 規劃完成（共 {total} 步）")
+    with st.expander("Web 記憶 embeddings index 狀態", expanded=False):
+        st.write({
+            "indexed_docs": len([x for x in st.session_state["web_mem"]["doc_ids"] if x != "__empty__"]),
+            "max": WEB_MEM_MAX,
+            "index_dir": str(_mem_paths(_namespace())["web_index_dir"]),
+        })
 
-                elif event == "execute.start":
-                    status.update(label="執行中（Execute）", state="running")
-                elif event == "execute.batch_start":
-                    batch = info.get("batch")
-                    count = info.get("count")
-                    with steps_box:
-                        st.markdown(f"• 開始並行批次：{batch}（{count} 步）")
-                elif event == "execute.step_start":
-                    pass
-                elif event in ("execute.step_ok", "execute.step_warn", "execute.step_error"):
-                    step_num = info.get("step_num")
-                    desc = info.get("desc")
-                    out = info.get("output") or ""
-                    tag = {"execute.step_ok": "✅ 完成", "execute.step_warn": "⚠️ 完成（警告）", "execute.step_error": "❌ 失敗"}[event]
-                    with steps_box:
-                        st.markdown(f"• 步驟 {step_num} {tag}：{desc}")
-                        if out:
-                            st.code(out[:1600] + ("..." if len(out) > 1600 else ""), language="markdown")
-                elif event == "execute.done":
-                    status.update(label="執行完成（Execute）", state="running")
-                elif event == "write.start":
-                    status.update(label="撰寫中（Write）", state="running")
-                elif event == "write.done":
-                    status.update(label="撰寫完成（Write）", state="running")
-                    with writer_box:
-                        st.markdown("• 撰寫完成（略顯示全文）")
+    with st.expander("短期記憶（分開存）", expanded=False):
+        st.markdown("#### Web memory（最近 5 筆）")
+        st.json(st.session_state["memory"]["web"][-5:])
+        st.markdown("#### KB memory（最近 5 筆）")
+        st.json(st.session_state["memory"]["kb"][-5:])
+        st.markdown("#### Failures（最近 10 筆）")
+        st.json(st.session_state["memory"]["failures"][-10:])
 
-                elif event == "final_verify.start":
-                    status.update(label="驗證中（Final Verify）", state="running")
-                elif event == "revise.start":
-                    r = info.get("round")
-                    issues = info.get("issues")
-                    status.update(label=f"驗證未過，修訂第 {r} 回…", state="running")
-                    with verify_box:
-                        st.markdown(f"• 修訂第 {r} 回：根據以下問題修正")
-                        st.code((issues or "")[:1600], language="markdown")
-                elif event == "revise.done":
-                    r = info.get("round")
-                    passed = info.get("passed")
-                    with verify_box:
-                        st.markdown(f"• 修訂第 {r} 回完成 → {'✅ 通過' if passed else '仍未通過'}")
-                elif event == "final_verify.done":
-                    passed = info.get("passed")
-                    if passed:
-                        status.update(label="驗證完成（✅ 通過）", state="complete")
-                    else:
-                        issues = info.get("issues")
-                        status.update(label="驗證完成（⚠️ 未通過）", state="error")
-                        with verify_box:
-                            st.markdown("• 驗證問題")
-                            st.code((issues or "")[:2000], language="markdown")
-
-            async def _run_once() -> Dict[str, object]:
-                orchestrator = APlusOrchestrator(
-                    max_parallel=DEFAULT_MAX_PARALLEL,
-                    base_backoff=DEFAULT_BASE_BACKOFF,
-                    strict_verify=DEFAULT_STRICT_VERIFY,
-                    progress=_progress_cb,
-                )
-                return await orchestrator.run(full_text)
-
-            try:
-                out = asyncio.run(_run_once())
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                try:
-                    asyncio.set_event_loop(loop)
-                    out = loop.run_until_complete(_run_once())
-                except Exception as e:
-                    status.update(label=f"流程失敗：{e}", state="error")
-                    st.error(f"流程失敗：{e}")
-                    st.stop()
-                finally:
-                    loop.close()
-            except Exception as e:
-                status.update(label=f"流程失敗：{e}", state="error")
-                st.error(f"流程失敗：{e}")
-                st.stop()
-
-        # Plan（以友善步驟編號，不顯示 S1/S2…）
-        plan = out.get("plan")
-        if plan:
-            with st.expander("Plan 步驟（含並行標註）", expanded=False):
-                for i, s in enumerate(plan.steps, start=1):
-                    tag = "並行" if s.is_parallel else "序列"
-                    tool = f"{s.tool_name}" if s.tool_name else "-"
-                    st.markdown(f"**步驟 {i}** · {tag} · tool={tool}")
-                    st.markdown(f"- {s.description}")
-
-        # 最終輸出
-        final_output = out.get("final_output") or ""
-        st.markdown("### 最終結果")
-        st.write(final_output)
-
-        # 最終驗證
-        ver = out.get("verification")
-        if ver:
-            ok_emoji = "✅" if ver.passed else "⚠️"
-            with st.expander(f"最終驗證 {ok_emoji}", expanded=not ver.passed):
-                st.markdown(f"- passed: {ver.passed}")
-                if ver.issues:
-                    st.markdown(f"- issues: {ver.issues}")
-
-        # Agents 使用與提速觀察
-        agents_used = out.get("agents_used") or []
-        usage = out.get("agent_usage") or []
-        if agents_used:
-            with st.expander("Agents 使用與耗時觀察", expanded=False):
-                st.markdown(f"- 使用的 Agents：{', '.join(agents_used)}")
-                if usage:
-                    by_agent: Dict[str, float] = {}
-                    for rec in usage:
-                        by_agent[rec["agent"]] = by_agent.get(rec["agent"], 0.0) + float(rec["seconds"])
-                    st.markdown("- 耗時（秒）彙總：")
-                    for k, v in by_agent.items():
-                        st.markdown(f"  - {k}: {round(v, 2)}s")
-                    st.caption("提速建議：提高 research 並行數到 5、每步 timeout 自動封頂（research≤90s），且重試僅 1 次；已啟用連結防呆與早停。")
-
-        st.session_state.messages.append({"role": "assistant", "content": final_output or "(流程完成)（無最終輸出）"})
+    with st.expander("本輪 Todo 詳細（debug）", expanded=False):
+        st.json(st.session_state.get("last_todos", []))
