@@ -14,7 +14,7 @@ from typing import List, Dict, Any, Literal, Optional
 import streamlit as st
 from pydantic import BaseModel, Field
 
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
