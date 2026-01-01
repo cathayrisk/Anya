@@ -505,6 +505,60 @@ CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
 CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
 
+# ====== 【新增】放在「badges / citations」區塊附近（CIT_RE/BULLET_RE 下方即可） ======
+
+def file_to_text(file_obj: Any) -> str:
+    """
+    把 deepagents/langgraph 的檔案物件轉成乾淨文字：
+    - {"data": ...} → 遞迴解包
+    - {"content": [...]} / {"content": "..."} → 取 content
+    - list[str] → join（避免印出 ['#..', '', '##..']）
+    - bytes → decode
+    """
+    if file_obj is None:
+        return ""
+
+    if isinstance(file_obj, dict):
+        # 最常見包裝：{"data": ...}
+        if "data" in file_obj:
+            return file_to_text(file_obj.get("data"))
+
+        # 你這次遇到的型態：{"content": [ ... ], "created_at": ..., ...}
+        if "content" in file_obj:
+            return file_to_text(file_obj.get("content"))
+
+        # 其他常見欄位（保險）
+        for k in ("text", "answer", "final", "output", "message"):
+            if k in file_obj:
+                return file_to_text(file_obj.get(k))
+
+        # 最後才退回整包（但這種通常不該進主畫面）
+        try:
+            return json.dumps(file_obj, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(file_obj)
+
+    if isinstance(file_obj, (bytes, bytearray)):
+        return file_obj.decode("utf-8", errors="ignore")
+
+    if isinstance(file_obj, str):
+        return file_obj
+
+    if isinstance(file_obj, (list, tuple)):
+        parts: list[str] = []
+        for x in file_obj:
+            t = file_to_text(x).strip()
+            if t:
+                parts.append(t)
+        return "\n".join(parts)
+
+    return str(file_obj)
+
+
+def get_files_text(files: Optional[dict], key: str) -> str:
+    if not isinstance(files, dict) or key not in files:
+        return ""
+    return file_to_text(files.get(key)).strip()
 
 def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
     parsed = []
@@ -686,10 +740,13 @@ def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str
 # =========================
 # Debug panel
 # =========================
-def render_debug_panel(files: Optional[dict]):
-    if not files or not isinstance(files, dict):
-        st.write("（沒有 files）")
-        return
+# ====== 【覆蓋】render_debug_panel() 裡的 _file_to_str 改成用 file_to_text ======
+# 你找到 render_debug_panel 內部：
+# def _file_to_str(file_obj) -> str:
+# 整段替換成：
+
+    def _file_to_str(file_obj) -> str:
+        return file_to_text(file_obj)
 
     def _file_to_str(file_obj) -> str:
         # ✅ 修 C：list/tuple 不要 str(list)，要 join
@@ -1176,6 +1233,11 @@ facet 子任務格式同 retriever。
 # =========================
 # DeepAgent run（status 不展開）
 # =========================
+# ====== 【覆蓋】用這個版本覆蓋你的 deep_agent_run_with_live_status() ======
+# 重點：
+# 1) 最終答案一定取 /draft.md 的「content 文字」
+# 2) 不再把 dict/list repr 噴到內文
+
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
     final_state = None
 
@@ -1191,25 +1253,6 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
         }
         label, state = mapping.get(phase, ("DeepAgent：執行中…", "running"))
         s.update(label=label, state=state, expanded=False)
-
-    def _file_to_str(file_obj) -> str:
-        # ✅ 修 B/C：list/tuple 不要 str(list)，要 join；dict(data) 也要遞迴解
-        if file_obj is None:
-            return ""
-        if isinstance(file_obj, dict) and "data" in file_obj:
-            return _file_to_str(file_obj.get("data"))
-        if isinstance(file_obj, (bytes, bytearray)):
-            return file_obj.decode("utf-8", errors="ignore")
-        if isinstance(file_obj, str):
-            return file_obj
-        if isinstance(file_obj, (list, tuple)):
-            parts = []
-            for x in file_obj:
-                t = _file_to_str(x)
-                if t:
-                    parts.append(t)
-            return "\n".join(parts)
-        return str(file_obj)
 
     with st.status("DeepAgent：啟動中…", expanded=False) as s:
         set_phase(s, "start")
@@ -1245,21 +1288,16 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
         files = (final_state or {}).get("files") or {}
 
-        # ✅ 優先取 review，再取 draft（避免拿到中間產物/怪格式）
-        final_text = ""
-        if isinstance(files, dict):
-            for k in ("/review.md", "/draft.md"):
-                if k in files:
-                    final_text = (_file_to_str(files[k]) or "").strip()
-                    if final_text:
-                        break
+        # ✅ 只取 draft 內容（你說的「要取 context 裡面的文字」就是 content 那份）
+        final_text = get_files_text(files, "/draft.md")
 
+        # fallback：真的沒 draft 才退回 messages
         if not final_text:
             msgs = (final_state or {}).get("messages") or []
             if msgs:
                 last = msgs[-1]
                 content = getattr(last, "content", None)
-                final_text = (_file_to_str(content) or _file_to_str(last)).strip()
+                final_text = (file_to_text(content) or file_to_text(last)).strip()
 
         if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
             final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
@@ -1654,9 +1692,9 @@ if prompt:
 
         todo_md = ""
         if isinstance(files, dict) and "/workspace/todos.json" in files:
-            todo_md = _badge_directive("Todo:已產生 /workspace/todos.json", "blue")
+            todo_md = _badge_directive("Todo:需要（已產生 todos.json）", "blue")
         else:
-            todo_md = _badge_directive("Todo:未產生（可能不需要或流程未寫出）", "gray")
+            todo_md = _badge_directive("Todo:需要（未產生 todos.json，流程未寫出/異常）", "orange")"gray")
 
         usage_after = dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0}))
 
