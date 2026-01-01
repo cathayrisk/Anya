@@ -1694,7 +1694,7 @@ if prompt:
         if isinstance(files, dict) and "/workspace/todos.json" in files:
             todo_md = _badge_directive("Todo:需要（已產生 todos.json）", "blue")
         else:
-            todo_md = _badge_directive("Todo:需要（未產生 todos.json，流程未寫出/異常）", "orange")"gray")
+            todo_md = _badge_directive("Todo:需要（未產生 todos.json，流程未寫出/異常）", "orange")
 
         usage_after = dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0}))
 
