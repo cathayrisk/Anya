@@ -34,7 +34,6 @@ from deepagents import create_deep_agent
 
 # =========================================================
 # ✅ 壓掉 Streamlit ScriptRunContext 洗版 warning（不影響功能）
-# - 這類 warning 常見於背景 thread 觸碰到 st.*（Streamlit issue 已確認）
 # =========================================================
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -45,14 +44,9 @@ logging.getLogger("streamlit.runtime.state.session_state_proxy").setLevel(loggin
 # Global constraints
 # =========================================================
 BUDGET_LIMIT = 3            # KB/Web 各 3 次/輪
-MAX_VERIFY_ROUNDS = 1       # 補強 1 輪（目前 pipeline 沒顯式 loop 用它，但保留）
+MAX_VERIFY_ROUNDS = 1       # 補強 1 輪（保留）
 MAX_REPLAN_ROUNDS = 1       # replan 1 次（replan 會重置預算）
 WEB_MEM_MAX = 500           # ✅ 只保留最近 500 筆 web 記憶做 embeddings 檢索
-
-# ✅ 你指定的 reasoning 設定（Responses API）
-REASONING: Dict[str, Any] = {
-    "effort": "medium",  # 'low', 'medium', or 'high'
-}
 
 
 # =========================================================
@@ -63,7 +57,7 @@ MEM_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _now_iso() -> str:
-    # ✅ 修掉 utcnow() deprecation：使用 timezone-aware UTC
+    # ✅ 修掉 utcnow() deprecation：timezone-aware UTC
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -109,17 +103,22 @@ def _mem_paths(namespace: str) -> Dict[str, Path]:
 # =========================================================
 # Session init
 # =========================================================
-st.session_state.setdefault("vectorstore", None)
-st.session_state.setdefault("chat_history", [])
-st.session_state.setdefault("main_thread_id", str(uuid.uuid4()))
+if "vectorstore" not in st.session_state:
+    st.session_state["vectorstore"] = None
 
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []  # UI chat only
+
+if "main_thread_id" not in st.session_state:
+    st.session_state["main_thread_id"] = str(uuid.uuid4())
+
+# ✅ 依你指定：main/web_tool/reasoning 全部 gpt-5.2
 st.session_state.setdefault(
     "settings",
     {
         "web_allowed": True,
         "main_model": "gpt-5.2",
         "web_tool_model": "gpt-5.2",
-        # ✅ 推理需求高：改用 gpt-5.2（你指定）
         "reasoning_model": "gpt-5.2",
         "max_parallel_todos": 3,
         "direct_do_planning": False,
@@ -127,31 +126,45 @@ st.session_state.setdefault(
     },
 )
 
-st.session_state.setdefault("run_seq", 0)
-st.session_state.setdefault("budget", {"vector_calls": 0, "web_calls": 0, "round": 0, "run_id": 0})
+# 每次使用者提問 = 一個 run_id（跨對話遞增）
+if "run_seq" not in st.session_state:
+    st.session_state["run_seq"] = 0
 
-# ✅ budget_lock：不再用 if "budget_lock" not in ... 以免 thread 時讀不到
+# round 只用於同一 run 的 initial/replan
+if "budget" not in st.session_state:
+    st.session_state["budget"] = {"vector_calls": 0, "web_calls": 0, "round": 0, "run_id": 0}
+
+# ✅ lock 用 setdefault，比較不會因為 thread 時序/初始化而缺 key
 st.session_state.setdefault("budget_lock", threading.Lock())
 
-st.session_state.setdefault("last_todos", [])
-st.session_state.setdefault("memory", {"web": [], "kb": [], "failures": []})
+# UI todo list
+if "last_todos" not in st.session_state:
+    st.session_state["last_todos"] = []
 
-# tool context：給 UI / 記憶紀錄用（注意：並行 todo 會覆蓋；但至少不會缺 key）
-st.session_state.setdefault("tool_context", {"run_id": 0, "round": 0, "todo_id": None, "focus": ""})
+# 記憶（會從 jsonl 載入）
+if "memory" not in st.session_state:
+    st.session_state["memory"] = {"web": [], "kb": [], "failures": []}
+
+# tool context：讓 tool 記錄 todo_id、round、run_id、focus
+if "tool_context" not in st.session_state:
+    st.session_state["tool_context"] = {"run_id": 0, "round": 0, "todo_id": None, "focus": ""}
 
 # ✅ web 記憶 embeddings index（FAISS）
-st.session_state.setdefault(
-    "web_mem",
-    {
-        "vectorstore": None,
-        "doc_ids": [],
+if "web_mem" not in st.session_state:
+    st.session_state["web_mem"] = {
+        "vectorstore": None,     # FAISS vectorstore
+        "doc_ids": [],           # 對應順序（同時也用來判斷是否已索引）
         "loaded": False,
-    },
-)
+    }
+
 st.session_state.setdefault("web_mem_lock", threading.Lock())
 
-st.session_state.setdefault("agents", None)
-st.session_state.setdefault("agents_settings_key", None)
+# agents cache
+if "agents" not in st.session_state:
+    st.session_state["agents"] = None
+
+if "agents_settings_key" not in st.session_state:
+    st.session_state["agents_settings_key"] = None
 
 # OpenAI key
 if "OPENAI_API_KEY" not in os.environ and "OPENAI_KEY" in st.secrets:
@@ -201,7 +214,7 @@ def _start_new_run():
 
 
 def _get_budget_lock() -> threading.Lock:
-    # ✅ 即使 thread 看到 session_state 缺 key，也不要炸
+    # ✅ 就算某些 thread 讀 session_state 出狀況，也不要炸
     try:
         lock = st.session_state.get("budget_lock", None)
     except Exception:
@@ -237,10 +250,53 @@ def render_todos_md(todos: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def safe_json_from_text(text: str) -> Optional[dict]:
-    if not text:
+def _content_to_text(content: Any) -> str:
+    """
+    ✅ Responses API 可能回傳 content blocks（list[dict]），這裡統一抽成可 parse 的字串。
+    - str: 原樣回傳
+    - list: 抽所有 type=text 的 text 串起來
+    - dict: 取 text 或 json.dumps
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                t = item.get("type")
+                if t == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    # 其他 block（reasoning/tool_call/result）通常不含 JSON；但保底
+                    if "text" in item:
+                        parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
+        return "\n".join([p for p in parts if p.strip()]).strip()
+    if isinstance(content, dict):
+        if "text" in content:
+            return str(content.get("text", ""))
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+    return str(content)
+
+
+def safe_json_from_text(text: Any) -> Optional[dict]:
+    """
+    ✅ 修正你遇到的 TypeError：
+    text 可能是 list（Responses content blocks），先轉字串再 parse。
+    """
+    s = _content_to_text(text)
+    if not s:
         return None
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
     if not m:
         return None
     try:
@@ -258,7 +314,7 @@ def memory_digest(max_web: int = 5, max_kb: int = 5, max_fail: int = 10) -> Dict
 
 def load_persistent_memory():
     paths = _mem_paths(_namespace())
-    st.session_state["memory"]["web"] = _jsonl_tail(paths["web"], 600)
+    st.session_state["memory"]["web"] = _jsonl_tail(paths["web"], 600)       # 多載一些，index 會自己截 500
     st.session_state["memory"]["kb"] = _jsonl_tail(paths["kb"], 200)
     st.session_state["memory"]["failures"] = _jsonl_tail(paths["failures"], 400)
 
@@ -307,23 +363,20 @@ def persist_web_record(rec: dict):
 
 
 # =========================================================
-# ✅ LLM factory
-# - reasoning agents：gpt-5.2 + Responses API + reasoning
-# - web tool：Responses API + web_search_preview
-# - main：一般 ChatOpenAI
+# LLM factory
+# - ✅ 全部使用 Responses API（use_responses_api=True）
+# - ✅ 只有「推理需求高」才加 reasoning={"effort":"medium"}
 # =========================================================
-def make_reasoning_llm(temperature: float = 0) -> ChatOpenAI:
-    # langchain-openai 1.1.6 支援 use_responses_api + reasoning
+def llm_main(temperature: float = 0) -> ChatOpenAI:
     return ChatOpenAI(
-        model=_reasoning_model(),
+        model=_main_model(),
         temperature=temperature,
         use_responses_api=True,
-        reasoning=dict(REASONING),
         max_completion_tokens=None,
     )
 
 
-def make_web_tool_llm(temperature: float = 0) -> ChatOpenAI:
+def llm_web_tool(temperature: float = 0) -> ChatOpenAI:
     return ChatOpenAI(
         model=_web_tool_model(),
         temperature=temperature,
@@ -332,10 +385,14 @@ def make_web_tool_llm(temperature: float = 0) -> ChatOpenAI:
     )
 
 
-def make_main_llm(temperature: float = 0) -> ChatOpenAI:
+def llm_reasoning(temperature: float = 0) -> ChatOpenAI:
+    # ✅ 只設定 effort=medium（其餘不設定）
+    reasoning = {"effort": "medium"}
     return ChatOpenAI(
-        model=_main_model(),
+        model=_reasoning_model(),
         temperature=temperature,
+        use_responses_api=True,
+        reasoning=reasoning,
         max_completion_tokens=None,
     )
 
@@ -348,6 +405,11 @@ def _web_mem_embeddings() -> OpenAIEmbeddings:
 
 
 def _web_mem_record_to_text(rec: dict) -> str:
+    """
+    拿來做 embeddings 的「可檢索文字」：
+    - 不 embedding raw 全文（避免太慢、也避免太長）
+    - 用 query + focus + 5 行摘要 + citations title/url
+    """
     q = (rec.get("query") or "").strip()
     focus = (rec.get("focus") or "").strip()
     s5 = (rec.get("summary_5_lines") or "").strip()
@@ -577,7 +639,7 @@ def _extract_citations_from_content_blocks(content_blocks: List[dict]) -> List[d
 
 
 def _summarize_5_lines(text: str, focus: str) -> str:
-    llm = make_main_llm(temperature=0)
+    llm = llm_main(temperature=0)
     system = "你是摘要器。請用繁中，輸出剛好 5 行，每行一個重點，不要多也不要少。"
     human = f"""焦點（本輪在意的點）：
 {focus}
@@ -587,8 +649,10 @@ def _summarize_5_lines(text: str, focus: str) -> str:
 
 請輸出 5 行重點（每行一點）。"""
     resp = llm.invoke([("system", system), ("human", human)])
-    out = getattr(resp, "text", None) or (resp.content if isinstance(resp.content, str) else str(resp.content))
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    out = getattr(resp, "text", None)
+    if not out:
+        out = _content_to_text(getattr(resp, "content", None))
+    lines = [ln.strip() for ln in str(out).splitlines() if ln.strip()]
     return "\n".join(lines[:5]) if lines else "（摘要失敗）"
 
 
@@ -606,7 +670,7 @@ def openai_web_search(query: str) -> Dict[str, Any]:
         return {"ok": False, "error": err, "text": "", "citations": []}
 
     tool_def = {"type": "web_search_preview"}
-    llm = make_web_tool_llm(temperature=0).bind_tools([tool_def])
+    llm = llm_web_tool(temperature=0).bind_tools([tool_def])
 
     prompt = (
         "請使用 web search 搜尋並整理答案。\n"
@@ -621,7 +685,7 @@ def openai_web_search(query: str) -> Dict[str, Any]:
 
     if content_blocks is None:
         citations: List[dict] = []
-        text = getattr(response, "text", None) or (response.content if isinstance(response.content, str) else str(response.content))
+        text = getattr(response, "text", None) or _content_to_text(getattr(response, "content", None))
     else:
         citations = _extract_citations_from_content_blocks(content_blocks)
         text = getattr(response, "text", None) or ""
@@ -685,7 +749,8 @@ class NeedModeOut(BaseModel):
 
 
 async def classify_need_mode(user_question: str) -> NeedModeOut:
-    llm = make_reasoning_llm(temperature=0).with_structured_output(NeedModeOut)
+    # ✅ 推理需求高 → reasoning=medium
+    llm = llm_reasoning(temperature=0).with_structured_output(NeedModeOut)
     system = """你是流程分類器：判斷這題要走 direct 或 rag。
 - direct：純聊天/推理/寫作/格式化/程式建議（不一定需要外部證據）。
 - rag：需要引用文件或外部來源才可靠（規範/數據/最新資訊/需查證）。
@@ -697,23 +762,16 @@ async def classify_need_mode(user_question: str) -> NeedModeOut:
 # Agents builder (cached)
 # =========================================================
 def build_agents() -> Dict[str, Any]:
-    # ✅ 高推理 agents 用 gpt-5.2 + Responses API + reasoning
-    reasoning_model = make_reasoning_llm(temperature=0)
-    # worker 用主模型即可（省錢且比較穩 JSON）
-    worker_model = make_main_llm(temperature=0)
+    # ✅ 推理需求高的 agents → gpt-5.2 + reasoning medium
+    reasoning_model = llm_reasoning(temperature=0)
+    # 其餘不設定 reasoning（但仍用 Responses API）
+    base_model = llm_main(temperature=0)
 
     checkpointer = MemorySaver()
 
     planner_system = """你是 Planning Agent（繁中）。你有 planning（write_todos）與 filesystem（write_file）。
 請產生 3~7 個 todo，寫入 /workspace/todos.json（JSON 格式：{"todos":[{"id":"T1","todo":"..."}]}），最後回覆：已完成規劃。"""
-    planner_agent = create_deep_agent(
-        model=reasoning_model,
-        tools=[],
-        system_prompt=planner_system,
-        checkpointer=checkpointer,
-        name="planner",
-        debug=False,
-    )
+    planner_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=planner_system, checkpointer=checkpointer, name="planner", debug=False)
 
     todo_worker_system = f"""你是 Todo Worker（繁中）。工具：
 - vector_search（KB）
@@ -747,7 +805,7 @@ def build_agents() -> Dict[str, Any]:
 """
 
     todo_worker_agent = create_deep_agent(
-        model=worker_model,
+        model=base_model,
         tools=[kb_available, web_allowed, vector_search, web_memory_search, resummarize_web, openai_web_search],
         system_prompt=todo_worker_system,
         checkpointer=checkpointer,
@@ -761,16 +819,9 @@ def build_agents() -> Dict[str, Any]:
 A. 回答
 B. 依據/來源（檔名或 URL）
 C. 限制與建議"""
-    synth_agent = create_deep_agent(
-        model=reasoning_model,
-        tools=[],
-        system_prompt=synth_system,
-        checkpointer=checkpointer,
-        name="synth",
-        debug=False,
-    )
+    synth_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=synth_system, checkpointer=checkpointer, name="synth", debug=False)
 
-    direct_fast_system = f"""你是 Direct 回應助理（繁中）。
+    direct_fast_system = """你是 Direct 回應助理（繁中）。
 你可用工具：vector_search、web_memory_search、resummarize_web、openai_web_search、kb_available、web_allowed。
 策略（強制，按順序）：先 KB → 再 web_memory_search → 不足才 web_search（若允許）；不需查證就不要用工具。
 輸出：最終回答 +（若有）來源。"""
@@ -787,26 +838,12 @@ C. 限制與建議"""
 輸入：user_question、draft_answer、todo_results、budget、web_allowed、memory_digest。
 輸出 JSON：
 {"needs_fix":true/false,"fix_type":"rewrite_only"|"need_more_research"|"replan","missing_points":[...],"supplemental_todos":[...], "replan_goal":"...", "notes":"..."}"""
-    verifier_agent = create_deep_agent(
-        model=reasoning_model,
-        tools=[],
-        system_prompt=verifier_system,
-        checkpointer=checkpointer,
-        name="verifier",
-        debug=False,
-    )
+    verifier_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=verifier_system, checkpointer=checkpointer, name="verifier", debug=False)
 
     replanner_system = """你是 Replanner（繁中），不使用工具。
 輸入：user_question、previous_todos、todo_results、verifier_report、memory_digest（含 failures）。
 輸出 JSON：{"todos":[{"id":"R1","todo":"..."}]}"""
-    replanner_agent = create_deep_agent(
-        model=reasoning_model,
-        tools=[],
-        system_prompt=replanner_system,
-        checkpointer=checkpointer,
-        name="replanner",
-        debug=False,
-    )
+    replanner_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=replanner_system, checkpointer=checkpointer, name="replanner", debug=False)
 
     refiner_system = """你是 Refiner（繁中），不使用工具。
 輸入：user_question、draft_answer、todo_results、verifier_report、budget、memory_digest。
@@ -814,14 +851,7 @@ C. 限制與建議"""
 A. 回答
 B. 依據/來源
 C. 限制與建議"""
-    refiner_agent = create_deep_agent(
-        model=reasoning_model,
-        tools=[],
-        system_prompt=refiner_system,
-        checkpointer=checkpointer,
-        name="refiner",
-        debug=False,
-    )
+    refiner_agent = create_deep_agent(model=reasoning_model, tools=[], system_prompt=refiner_system, checkpointer=checkpointer, name="refiner", debug=False)
 
     return {
         "planner": planner_agent,
@@ -866,7 +896,7 @@ async def plan_todos(user_question: str, history_messages: List[Dict[str, str]])
             pass
 
     if not todos:
-        data = safe_json_from_text(result["messages"][-1].content) or {}
+        data = safe_json_from_text(getattr(result["messages"][-1], "content", None)) or {}
         for i, t in enumerate(data.get("todos", []), start=1):
             tid = (t.get("id") or f"T{i}").strip()
             todo = (t.get("todo") or "").strip()
@@ -891,11 +921,7 @@ async def solve_one_todo(todo_item: Dict[str, Any], user_question: str) -> Dict[
     st.session_state["tool_context"]["todo_id"] = tid
     st.session_state["tool_context"]["focus"] = f"User question: {user_question}\nTodo: {todo}"
 
-    config = {
-        "configurable": {
-            "thread_id": f"{st.session_state['main_thread_id']}:todo:{tid}:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"
-        }
-    }
+    config = {"configurable": {"thread_id": f"{st.session_state['main_thread_id']}:todo:{tid}:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
     prompt = f"""User question:
 {user_question}
 
@@ -905,7 +931,8 @@ Todo:
 請依策略（先 KB → web_memory_search → 不足才 web_search）輸出 JSON。"""
 
     res = await todo_worker.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    text = res["messages"][-1].content
+    msg = res["messages"][-1]
+    text = _content_to_text(getattr(msg, "content", None))
     parsed = safe_json_from_text(text)
     if parsed is None:
         persist_failure("todo_output_not_json", text[:400], todo_id=tid)
@@ -976,7 +1003,7 @@ async def synthesize_answer(user_question: str, todo_results: List[Dict[str, Any
     }
     prompt = "請根據以下 JSON 統整最終回答：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     res = await synth.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    return res["messages"][-1].content
+    return _content_to_text(getattr(res["messages"][-1], "content", None))
 
 
 async def direct_fast_answer(user_question: str, history_messages: List[Dict[str, str]]) -> str:
@@ -984,7 +1011,7 @@ async def direct_fast_answer(user_question: str, history_messages: List[Dict[str
     agent = st.session_state["agents"]["direct_fast"]
     config = {"configurable": {"thread_id": st.session_state["main_thread_id"] + f":direct:run{st.session_state['budget']['run_id']}:r{st.session_state['budget']['round']}"}}
     res = await agent.ainvoke({"messages": history_messages + [{"role": "user", "content": user_question}]}, config=config)
-    return res["messages"][-1].content
+    return _content_to_text(getattr(res["messages"][-1], "content", None))
 
 
 class VerifierReport(BaseModel):
@@ -1010,7 +1037,9 @@ async def verify_answer(user_question: str, draft_answer: str, todo_results: Lis
     }
     prompt = "請審查並輸出 JSON：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     res = await verifier.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    parsed = safe_json_from_text(res["messages"][-1].content) or {}
+
+    # ✅ 修正：content 可能是 list（Responses content blocks）
+    parsed = safe_json_from_text(getattr(res["messages"][-1], "content", None)) or {}
     try:
         return VerifierReport(**parsed)
     except Exception:
@@ -1030,7 +1059,8 @@ async def replan_todos(user_question: str, previous_todos: List[Dict[str, str]],
     }
     prompt = "請輸出新的 todos JSON：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     res = await replanner.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    data = safe_json_from_text(res["messages"][-1].content) or {}
+
+    data = safe_json_from_text(getattr(res["messages"][-1], "content", None)) or {}
     out = []
     for i, t in enumerate(data.get("todos", []), start=1):
         tid = (t.get("id") or f"R{i}").strip()
@@ -1054,7 +1084,7 @@ async def refine_answer(user_question: str, draft_answer: str, todo_results: Lis
     }
     prompt = "請修訂最終答案：\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
     res = await refiner.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
-    return res["messages"][-1].content
+    return _content_to_text(getattr(res["messages"][-1], "content", None))
 
 
 def _alloc_ids(prefix: str, used_ids: List[str], n: int) -> List[str]:
@@ -1122,10 +1152,30 @@ async def run_full_pipeline(user_question: str, history_messages: List[Dict[str,
     return draft
 
 
+def run_async(coro):
+    """
+    Streamlit 有時候環境已經有 event loop（或某些 runtime 包起來），asyncio.run 會噴。
+    這裡做 fallback：nest_asyncio 可用就用它。
+    """
+    try:
+        return asyncio.run(coro)
+    except RuntimeError as e:
+        msg = str(e)
+        if "cannot be called from a running event loop" not in msg:
+            raise
+        try:
+            import nest_asyncio  # type: ignore
+            nest_asyncio.apply()
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(coro)
+        except Exception:
+            raise
+
+
 # =========================================================
 # UI
 # =========================================================
-st.title("Agentic RAG（Web 記憶 embeddings 檢索 + Replan + GPT-5.2 reasoning）")
+st.title("Agentic RAG（Web 記憶 embeddings 檢索 + Replan + GPT-5.2 Responses API）")
 
 with st.popover("設定（記憶/模型/網路）", use_container_width=True):
     st.session_state["settings"]["memory_namespace"] = st.text_input(
@@ -1139,22 +1189,6 @@ with st.popover("設定（記憶/模型/網路）", use_container_width=True):
     st.session_state["settings"]["direct_do_planning"] = st.toggle(
         "Direct 模式也先規劃 Todo",
         value=_direct_do_planning(),
-    )
-    st.session_state["settings"]["main_model"] = st.selectbox(
-        "主/worker/摘要模型",
-        options=["gpt-5.2", "gpt-4.1-mini", "gpt-4o"],
-        index=["gpt-5.2", "gpt-4.1-mini", "gpt-4o"].index(_main_model()),
-    )
-    st.session_state["settings"]["web_tool_model"] = st.selectbox(
-        "Web tool 模型（建議 gpt-4o-mini）",
-        options=["gpt-5.2", "gpt-4o", "gpt-4.1-mini"],
-        index=["gpt-5.2", "gpt-4o", "gpt-4.1-mini"].index(_web_tool_model()),
-    )
-    st.session_state["settings"]["reasoning_model"] = st.selectbox(
-        "推理模型（Planner/Synth/Verifier/Refiner 等）",
-        options=["gpt-5.2", "gpt-5", "gpt-4o"],
-        index=["gpt-5.2", "gpt-5", "gpt-4o"].index(_reasoning_model())
-        if _reasoning_model() in ["gpt-5.2", "gpt-5", "gpt-4o"] else 0,
     )
     st.session_state["settings"]["max_parallel_todos"] = st.number_input(
         "同時並行 Todo 上限",
@@ -1210,9 +1244,12 @@ with st.popover("上傳知識文件（建立向量庫）", use_container_width=T
 
             st.success(f"已建立/更新向量庫：{uploaded_file.name}")
 
+# 載入跨對話記憶（依 memory_namespace）
 load_persistent_memory()
+# ✅ 載入/建立 web 記憶 index（最多 500）
 web_mem_load_or_build()
 
+# 顯示歷史對話（UI）
 for entry in st.session_state["chat_history"]:
     with st.chat_message(entry["role"]):
         st.markdown(entry["content"])
@@ -1231,7 +1268,7 @@ if prompt:
 
     with st.status("執行中：initial → verifier →（補強或 replan）→ 最終答案", expanded=True) as status:
         history_messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state["chat_history"]]
-        final_answer = asyncio.run(run_full_pipeline(prompt, history_messages, todo_placeholder))
+        final_answer = run_async(run_full_pipeline(prompt, history_messages, todo_placeholder))
         status.write({"run_id": st.session_state["budget"]["run_id"], "budget": st.session_state["budget"]})
         status.update(label="完成！", state="complete")
 
