@@ -1515,7 +1515,7 @@ def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
 # =========================
 # Popover：文件管理 + DeepAgent 設定
 # =========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）", use_container_width=True):
+with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）", width="stretch"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
     st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
 
@@ -1637,6 +1637,23 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
         build_btn = col1.button("🚀 建立索引", type="primary", use_container_width=True)
         default_btn = col2.button("🧾 產生預設輸出", use_container_width=True)
         clear_btn = col3.button("🧹 清空全部", use_container_width=True)
+
+    # ✅ 索引狀態（搬到 popover 內）
+    has_index = (
+        st.session_state.store is not None
+        and getattr(st.session_state.store, "index", None) is not None
+        and st.session_state.store.index.ntotal > 0
+    )
+    if has_index:
+        st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
+        st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
+    else:
+        st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
+
+    st.session_state.enable_web_search_agent = st.checkbox(
+        "啟用網路搜尋（會增加成本）",
+        value=bool(st.session_state.enable_web_search_agent),
+    )     
 
         if clear_btn:
             st.session_state.file_rows = []
@@ -1766,6 +1783,7 @@ if prompt:
                 "usage": {"doc_search_calls": 0, "web_search_calls": 0},
                 "enable_web": enable_web,
                 "todo_file_present": None,
+                "forced_end": None,
             }
             render_run_badges(
                 mode=meta["mode"],
@@ -1774,6 +1792,7 @@ if prompt:
                 usage=meta["usage"],
                 enable_web=enable_web,
                 todo_file_present=None,
+                forced_end=meta.get("forced_end"),  # ✅ 新增
             )
             render_markdown_answer_with_source_badges(answer_text, badge_color="green")
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
