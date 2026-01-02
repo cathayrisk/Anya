@@ -30,7 +30,8 @@ try:
     HAS_PYMUPDF = True
 except Exception:
     HAS_PYMUPDF = False
-
+# ===== [1] import 區：補上（若已經有就跳過）=====
+from langgraph.errors import GraphRecursionError
 
 # =========================
 # Streamlit config（只呼叫一次）
@@ -169,6 +170,24 @@ EVIDENCE_PATH_IN_CIT_RE = re.compile(r"\[(?:/)?evidence/[^ \]]+?\s+p(\d+|-)\s*\]
 # =========================
 # 小工具
 # =========================
+# ===== [2] 放在「badges / citations / file-to-text」區（EVIDENCE_PATH_IN_CIT_RE / CIT_RE 附近）新增 =====
+def has_visible_citations(text: str) -> bool:
+    """
+    是否含「有效引用」：
+    - 形式：[xxx p12] 或 [WebSearch:... p-]
+    - 忽略 /evidence/*.md 這種內部路徑引用
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", raw)]
+    cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
+    return bool(cits)
+
+def _hash_norm_text(s: str) -> str:
+    """用來判斷 draft 是否『內容完全沒變』（去空白後 hash）。"""
+    return sha1_bytes(norm_space(s).encode("utf-8"))
+
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -1163,9 +1182,70 @@ facet 子任務格式同 retriever。
 # =========================
 # DeepAgent run（status 不展開 + planning 後顯示 todos）
 # =========================
+# ===== [3] 放在 deep_agent_run_with_live_status() 前面新增：卡住時的 fallback（向量庫 RAG）=====
+def fallback_answer_from_store(
+    client: OpenAI,
+    store: Optional[FaissStore],
+    question: str,
+    *,
+    k: int = 10,
+) -> str:
+    """
+    DeepAgent 卡住/超步數時的降級方案：
+    - 向量搜尋 top-k chunks
+    - 直接叫模型用 chunks 回答，並強制每個 bullet 句尾都有引用 [報告名稱 p頁]
+    """
+    q = (question or "").strip()
+    if not q:
+        return "（系統：問題為空，無法產生回答）"
+
+    if store is None or getattr(store, "index", None) is None or store.index.ntotal == 0:
+        system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
+        ans, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=q, reasoning_effort=None, tools=None)
+        return ans or "（系統：無索引且模型未產出內容）"
+
+    qvec = embed_texts(client, [q])
+    hits = store.search(qvec, k=max(4, min(12, int(k))))
+    chunks = [ch for _, ch in hits]
+    ctx = render_chunks_for_model(chunks, max_chars_each=900)
+
+    system = (
+        "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
+        "輸出要求：\n"
+        "1) 純 bullet，每行以 - 開頭。\n"
+        "2) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]。\n"
+        "3) 引用中的報告名稱必須來自我提供的資料片段標頭（例如 [XXX p12]）。\n"
+        "4) 不可使用 /evidence/*.md 當作報告名稱。\n"
+        "5) 若資料不足，請用 bullet 明確說明缺口，並引用最接近的來源。\n"
+    )
+    user = f"問題：{q}\n\n資料：\n{ctx}\n"
+
+    out, _ = call_gpt(
+        client,
+        model=MODEL_MAIN,
+        system=system,
+        user=user,
+        reasoning_effort=REASONING_EFFORT,
+        tools=None,
+        include_sources=False,
+    )
+    return (out or "").strip() or "（系統：fallback RAG 未產出內容）"
+    
+# ===== [7] 用「整段替換」更新 deep_agent_run_with_live_status()：更準卡住判定 + 設 last_run_forced_end =====
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
     final_state = None
     todos_preview_written = False
+
+    # 每次新 run 先清掉強制結束狀態
+    st.session_state["last_run_forced_end"] = None
+
+    recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
+    stall_steps = int(st.session_state.get("citation_stall_steps", 12))
+    stall_min_chars = int(st.session_state.get("citation_stall_min_chars", 450))
+
+    draft_unchanged_streak = 0
+    draft_no_citation_streak = 0
+    last_draft_hash: Optional[str] = None
 
     def set_phase(s, phase: str):
         mapping = {
@@ -1188,12 +1268,12 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
             for state in agent.stream(
                 {"messages": [{"role": "user", "content": user_text}]},
                 stream_mode="values",
+                config={"recursion_limit": recursion_limit},
             ):
                 final_state = state
                 files = state.get("files") or {}
                 file_keys = set(files.keys()) if isinstance(files, dict) else set()
 
-                # ✅ 規劃後如果 todos.json 出現，立刻顯示預覽在 status 裡
                 if (not todos_preview_written) and isinstance(files, dict) and "/workspace/todos.json" in files:
                     todos_txt = get_files_text(files, "/workspace/todos.json")
                     if todos_txt:
@@ -1208,23 +1288,60 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                 if "/review.md" in file_keys:
                     set_phase(s, "review")
 
+                # ✅ 更準卡住判定：draft 夠長後才開始
+                if isinstance(files, dict) and "/draft.md" in files:
+                    draft_txt = get_files_text(files, "/draft.md")
+                    draft_norm = norm_space(draft_txt)
+                    if len(draft_norm) >= stall_min_chars:
+                        h = _hash_norm_text(draft_norm)
+                        if last_draft_hash == h:
+                            draft_unchanged_streak += 1
+                        else:
+                            draft_unchanged_streak = 0
+                            last_draft_hash = h
+
+                        if has_visible_citations(draft_norm):
+                            draft_no_citation_streak = 0
+                        else:
+                            draft_no_citation_streak += 1
+
+                        # ✅ 兩條件都達標才算真的卡住（降低誤殺）
+                        if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
+                            set_phase(s, "error")
+                            st.session_state["last_run_forced_end"] = "citation_stall"
+                            s.warning(
+                                f"判定卡住：/draft.md 內容連續 {draft_unchanged_streak} 步未變、且連續 {draft_no_citation_streak} 步無引用。"
+                                "已強制結束 DeepAgent，改用 fallback（向量搜尋 + 強制引用）產出答案。"
+                            )
+                            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
+                            return answer, files if isinstance(files, dict) and files else None
+
+        except GraphRecursionError:
+            set_phase(s, "error")
+            st.session_state["last_run_forced_end"] = "recursion_limit"
+
+            files = (final_state or {}).get("files") or {}
+            draft = get_files_text(files, "/draft.md") if isinstance(files, dict) else ""
+            if draft.strip():
+                s.warning(f"已達步數上限（recursion_limit={recursion_limit}），回傳目前 /draft.md。")
+                return draft.strip(), (files if isinstance(files, dict) and files else None)
+
+            s.warning(f"已達步數上限（recursion_limit={recursion_limit}），改用 fallback 產生回答。")
+            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
+            return answer, (files if isinstance(files, dict) and files else None)
+
         except Exception as e:
             msg = str(e)
             if "Budget exceeded" in msg:
                 set_phase(s, "evidence")
                 s.update(label="DeepAgent：已達工具預算上限（停止加搜證）", state="running", expanded=False)
             else:
-                try:
-                    final_state = agent.invoke({"messages": [{"role": "user", "content": user_text}]})
-                except Exception:
-                    set_phase(s, "error")
-                    raise
+                set_phase(s, "error")
+                raise
 
         files = (final_state or {}).get("files") or {}
 
-        # ✅ 最終答案：一律取 /draft.md 的 content
         final_text = get_files_text(files, "/draft.md")
-
         if not final_text:
             msgs = (final_state or {}).get("messages") or []
             if msgs:
@@ -1238,7 +1355,6 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
         set_phase(s, "done")
 
     return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
-
 
 # =========================
 # need_todo 判斷
@@ -1266,7 +1382,17 @@ def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
     return need, reason
 
 
-def render_run_badges(*, mode: str, need_todo: bool, reason: str, usage: dict, enable_web: bool, todo_file_present: Optional[bool] = None):
+# ===== [6] 修改 render_run_badges：新增 forced_end 參數 + 顯示 Badge =====
+def render_run_badges(
+    *,
+    mode: str,
+    need_todo: bool,
+    reason: str,
+    usage: dict,
+    enable_web: bool,
+    todo_file_present: Optional[bool] = None,
+    forced_end: Optional[str] = None,   # ✅ 新增
+):
     badges: List[str] = []
     badges.append(_badge_directive(f"Mode:{mode}", "gray"))
 
@@ -1281,6 +1407,16 @@ def render_run_badges(*, mode: str, need_todo: bool, reason: str, usage: dict, e
         badges.append(_badge_directive("Todos.json:有", "blue"))
     elif todo_file_present is False and need_todo:
         badges.append(_badge_directive("Todos.json:無(流程異常)", "orange"))
+
+    # ✅ 新增：強制結束提醒（用 badge）
+    if forced_end:
+        mapping = {
+            "citation_stall": "ForcedStop:卡住(引用未生成)",
+            "recursion_limit": "ForcedStop:步數上限",
+        }
+        label = mapping.get(forced_end, f"ForcedStop:{forced_end}")
+        badges.append(_badge_directive(label, "orange"))
+        badges.append(_badge_directive("Fallback:RAG", "orange"))
 
     doc_calls = int((usage or {}).get("doc_search_calls", 0) or 0)
     web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
@@ -1300,7 +1436,6 @@ def render_run_badges(*, mode: str, need_todo: bool, reason: str, usage: dict, e
 
     st.markdown(" ".join(badges))
 
-
 # =========================
 # Session init
 # =========================
@@ -1318,6 +1453,11 @@ st.session_state.setdefault("default_outputs", None)
 st.session_state.setdefault("chat_history", [])
 st.session_state.setdefault("enable_web_search_agent", False)
 
+# ===== [4] Session init 區：加三個設定 + 本次是否強制結束的旗標 =====
+st.session_state.setdefault("langgraph_recursion_limit", 200)
+st.session_state.setdefault("citation_stall_steps", 12)      # draft 不動+無引用 連續幾步才算卡住
+st.session_state.setdefault("citation_stall_min_chars", 450) # draft 至少到這個長度才開始判定（避免誤殺）
+st.session_state.setdefault("last_run_forced_end", None)     # None / "citation_stall" / "recursion_limit" / ...
 
 # =========================
 # File table helpers
@@ -1384,6 +1524,31 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
         value=bool(st.session_state.enable_web_search_agent),
     )
 
+# ===== [5] Popover「DeepAgent設定」區（enable_web checkbox 後面）加 UI 控制（可選但建議）=====
+    st.session_state.langgraph_recursion_limit = st.number_input(
+        "LangGraph recursion_limit（步數上限）",
+        min_value=50,
+        max_value=3000,
+        value=int(st.session_state.get("langgraph_recursion_limit", 200)),
+        step=50,
+    )
+
+    st.session_state.citation_stall_steps = st.number_input(
+        "卡住判定：draft『不變 + 無引用』連續幾步就強制結束",
+        min_value=5,
+        max_value=80,
+        value=int(st.session_state.get("citation_stall_steps", 12)),
+        step=1,
+    )
+
+    st.session_state.citation_stall_min_chars = st.number_input(
+        "卡住判定：draft 最少字元數（太短不判定，避免誤殺）",
+        min_value=150,
+        max_value=5000,
+        value=int(st.session_state.get("citation_stall_min_chars", 450)),
+        step=50,
+    )
+    
     uploaded = st.file_uploader(
         "上傳文件",
         type=["pdf", "txt", "png", "jpg", "jpeg"],
@@ -1568,7 +1733,10 @@ for msg in st.session_state.chat_history:
                 usage=meta.get("usage", {}) or {},
                 enable_web=bool(meta.get("enable_web", False)),
                 todo_file_present=meta.get("todo_file_present", None),
+                forced_end=meta.get("forced_end", None),
             )
+            # (b) deepagent 跑完後：把 forced_end 放進 meta，並傳進 render_run_badges
+            forced_end = st.session_state.get("last_run_forced_end", None)
             render_markdown_answer_with_source_badges(msg.get("content", ""), badge_color="green")
 
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
@@ -1623,6 +1791,7 @@ if prompt:
             "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
             "enable_web": enable_web,
             "todo_file_present": bool(todo_file_present),
+            "forced_end": forced_end,
         }
 
         render_run_badges(
@@ -1632,6 +1801,7 @@ if prompt:
             usage=meta["usage"],
             enable_web=enable_web,
             todo_file_present=meta["todo_file_present"],
+            forced_end=meta.get("forced_end"),
         )
         render_markdown_answer_with_source_badges(answer_text, badge_color="green")
 
