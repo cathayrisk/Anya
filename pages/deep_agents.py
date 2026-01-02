@@ -1515,7 +1515,7 @@ def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
 # =========================
 # Popover：文件管理 + DeepAgent 設定
 # =========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）", width="stretch"):
+with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
     st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
 
