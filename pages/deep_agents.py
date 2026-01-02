@@ -1,4 +1,4 @@
-# app.py
+# pages/deep_agents.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -30,6 +30,32 @@ try:
     HAS_PYMUPDF = True
 except Exception:
     HAS_PYMUPDF = False
+
+
+# =========================
+# Streamlit config（只呼叫一次）
+# =========================
+st.set_page_config(page_title="研究報告助手（DeepAgent + Badges）", layout="wide")
+st.title("研究報告助手（DeepAgent + Badges）")
+
+# ✅ Markdown 顯示微調：字體/行距/標題大小/列表間距
+st.markdown(
+    """
+<style>
+/* 讓文章可讀性更好（你覺得內容 OK，但呈現需要調整） */
+.block-container { padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1200px; }
+.stMarkdown { line-height: 1.7; }
+.stMarkdown h1 { font-size: 1.8rem; margin: 0.8rem 0 0.7rem; }
+.stMarkdown h2 { font-size: 1.35rem; margin: 0.9rem 0 0.55rem; }
+.stMarkdown h3 { font-size: 1.15rem; margin: 0.8rem 0 0.45rem; }
+.stMarkdown p { margin: 0.35rem 0 0.6rem; }
+.stMarkdown ul, .stMarkdown ol { margin: 0.35rem 0 0.75rem 1.2rem; }
+.stMarkdown li { margin: 0.15rem 0; }
+.stMarkdown blockquote { padding: 0.4rem 0.8rem; border-left: 0.25rem solid rgba(60, 60, 60, 0.25); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 
 # =========================
@@ -72,7 +98,7 @@ def _require_deepagents():
         for msg in DEEPAGENTS_IMPORT_ERRORS:
             st.code(msg)
     else:
-        st.info("（沒有捕捉到錯誤細節，請確認 app.py 是否已整檔覆蓋為最新版）")
+        st.info("（沒有捕捉到錯誤細節，請確認 deep_agents.py 是否已整檔覆蓋為最新版）")
     st.stop()
 
 
@@ -97,7 +123,7 @@ def _make_langchain_llm(model_name: str, temperature: float = 0.0, reasoning_eff
         kwargs = dict(
             model=model_name,
             temperature=temperature,
-            use_responses_api=True,   # ✅ 你希望走 Responses API
+            use_responses_api=True,
             max_completion_tokens=None,
         )
         if reasoning_effort in ("low", "medium", "high"):
@@ -105,13 +131,6 @@ def _make_langchain_llm(model_name: str, temperature: float = 0.0, reasoning_eff
         return ChatOpenAI(**kwargs)
 
     raise RuntimeError("No LangChain LLM factory available.")
-
-
-# =========================
-# Streamlit config（只呼叫一次）
-# =========================
-st.set_page_config(page_title="研究報告助手（DeepAgent + Badges）", layout="wide")
-st.title("研究報告助手（DeepAgent + Badges）")
 
 
 # =========================
@@ -135,17 +154,16 @@ OCR_MAX_WORKERS = 2
 CORPUS_DEFAULT_MAX_CHUNKS = 24
 CORPUS_PER_REPORT_QUOTA = 6
 
-# DeepAgent budgets（可預測成本）
+# DeepAgent budgets
 DA_MAX_DOC_SEARCH_CALLS = 14
 DA_MAX_WEB_SEARCH_CALLS = 4
 DA_MAX_REWRITE_ROUNDS = 2
 DA_MAX_CLAIMS = 10
 
-# chunk_id leak guard（只擋 chunk_id / _p.._c.. 這類明確樣式）
 CHUNK_ID_LEAK_PAT = re.compile(r"(chunk_id\s*=\s*|_p(?:na|\d+)_c\d+)", re.IGNORECASE)
 
-# ✅ 預設輸出（摘要/主張/推論鏈）是否要自動跑：一律關掉（只在你按按鈕才跑）
-AUTO_DEFAULT_OUTPUTS = False
+# ✅ 重要：你的內部 evidence 檔名不應出現在引用 badge
+EVIDENCE_PATH_IN_CIT_RE = re.compile(r"\[(?:/)?evidence/[^ \]]+?\s+p(\d+|-)\s*\]", re.IGNORECASE)
 
 
 # =========================
@@ -180,10 +198,6 @@ def sha1_bytes(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
 
-def sha1_text(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:10]
-
-
 def truncate_filename(name: str, max_len: int = 44) -> str:
     if len(name) <= max_len:
         return name
@@ -201,14 +215,6 @@ def _dedup_keep_order(items: list[str]) -> list[str]:
         seen.add(x)
         out.append(x)
     return out
-
-
-def _safe_badge_text(s: str, max_len: int = 60) -> str:
-    t = (s or "").strip().replace("[", "(").replace("]", ")")
-    t = re.sub(r"\s+", " ", t)
-    if len(t) > max_len:
-        t = t[:max_len] + "…"
-    return t
 
 
 # =========================
@@ -250,13 +256,10 @@ def call_gpt(
     model: str,
     system: str,
     user: Any,
-    reasoning_effort: Optional[str] = None,   # ✅ None 表示「不設定 reasoning」
+    reasoning_effort: Optional[str] = None,
     tools: Optional[list] = None,
     include_sources: bool = False,
 ) -> Tuple[str, Optional[list[Dict[str, Any]]]]:
-    """
-    ✅ 依你需求：推理需求高才傳 reasoning={"effort":"medium"}，其他不設定。
-    """
     messages = _to_messages(system, user)
     resp = client.responses.create(
         model=model,
@@ -284,62 +287,6 @@ def call_gpt(
         except Exception:
             sources = None
     return out_text, sources
-
-
-def _web_sources_to_badge_citations(sources: Optional[list[Dict[str, Any]]], max_keep: int = 6) -> str:
-    """
-    讓 render_markdown_answer_with_source_badges 能吃到：
-    [WebSearch:xxx p-]
-    """
-    if not sources:
-        return ""
-    cits: list[str] = []
-    for s in sources[:max_keep]:
-        if not isinstance(s, dict):
-            continue
-        title = s.get("title") or s.get("source") or s.get("url") or "source"
-        title = _safe_badge_text(str(title), max_len=55)
-        cits.append(f"[WebSearch:{title} p-]")
-    return "\n".join(cits).strip()
-
-
-def answer_direct_llm(client: OpenAI, prompt: str) -> Tuple[str, dict]:
-    system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
-    answer_text, _ = call_gpt(
-        client,
-        model=MODEL_MAIN,
-        system=system,
-        user=prompt,
-        reasoning_effort=None,  # ✅ direct 預設不走 reasoning（依你規則）
-        tools=None,
-    )
-    meta_usage = {"doc_search_calls": 0, "web_search_calls": 0}
-    return answer_text, meta_usage
-
-
-def answer_direct_with_websearch(client: OpenAI, prompt: str) -> Tuple[str, dict]:
-    """
-    ✅ 沒文件也能用 web_search。
-    回答正文不強迫模型產引用；我們用 sources 自己加 [WebSearch:* p-] 讓 badges 乾淨呈現。
-    """
-    system = (
-        "你是助理。用繁體中文（台灣用語）回答，結構清楚。\n"
-        "你可以使用 web_search 工具查資料，但請不要在文內塞一堆連結；我會在回答後面加上來源標記。"
-    )
-    answer_text, sources = call_gpt(
-        client,
-        model=MODEL_WEB,
-        system=system,
-        user=prompt,
-        reasoning_effort=None,
-        tools=[{"type": "web_search"}],
-        include_sources=True,
-    )
-    cits = _web_sources_to_badge_citations(sources, max_keep=6)
-    if cits:
-        answer_text = (answer_text or "").rstrip() + "\n\n" + cits
-    meta_usage = {"doc_search_calls": 0, "web_search_calls": 1}
-    return answer_text, meta_usage
 
 
 # =========================
@@ -499,40 +446,28 @@ class FaissStore:
 
 
 # =========================
-# badges / citations
+# badges / citations / file-to-text
 # =========================
 CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
 CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
 
-# ====== 【新增】放在「badges / citations」區塊附近（CIT_RE/BULLET_RE 下方即可） ======
 
 def file_to_text(file_obj: Any) -> str:
     """
-    把 deepagents/langgraph 的檔案物件轉成乾淨文字：
-    - {"data": ...} → 遞迴解包
-    - {"content": [...]} / {"content": "..."} → 取 content
-    - list[str] → join（避免印出 ['#..', '', '##..']）
-    - bytes → decode
+    ✅ 修你最關鍵的點：從 dict(content=[...]) 取出真正 markdown 文字
     """
     if file_obj is None:
         return ""
 
     if isinstance(file_obj, dict):
-        # 最常見包裝：{"data": ...}
         if "data" in file_obj:
             return file_to_text(file_obj.get("data"))
-
-        # 你這次遇到的型態：{"content": [ ... ], "created_at": ..., ...}
         if "content" in file_obj:
             return file_to_text(file_obj.get("content"))
-
-        # 其他常見欄位（保險）
         for k in ("text", "answer", "final", "output", "message"):
             if k in file_obj:
                 return file_to_text(file_obj.get(k))
-
-        # 最後才退回整包（但這種通常不該進主畫面）
         try:
             return json.dumps(file_obj, ensure_ascii=False, indent=2)
         except Exception:
@@ -560,6 +495,7 @@ def get_files_text(files: Optional[dict], key: str) -> str:
         return ""
     return file_to_text(files.get(key)).strip()
 
+
 def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
     parsed = []
     for c in cits:
@@ -574,26 +510,15 @@ def _badge_directive(label: str, color: str) -> str:
     return f":{color}-badge[{safe}]"
 
 
-def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
-    lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
-    for line in lines:
-        if not BULLET_RE.match(line):
+def _dedup_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in items:
+        if x in seen:
             continue
-        full_cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
-        clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\]", "", line).strip()
-        parsed = _parse_citations(full_cits)
-        badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
-        st.markdown(clean + (" " + " ".join(badges) if badges else ""))
-
-
-def bullets_all_have_citations(md: str) -> bool:
-    lines = (md or "").splitlines()
-    if not any(BULLET_RE.match(l) for l in lines):
-        return False
-    for line in lines:
-        if BULLET_RE.match(line) and not CIT_RE.search(line):
-            return False
-    return True
+        seen.add(x)
+        out.append(x)
+    return out
 
 
 def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
@@ -616,24 +541,33 @@ def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
 def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
     if isinstance(payload, dict):
         for k in ("content", "answer", "final", "output", "text", "message"):
+            if k not in payload:
+                continue
             v = payload.get(k)
             if isinstance(v, str) and v.strip():
                 return v
+            if isinstance(v, (list, tuple)):
+                joined = file_to_text(v).strip()
+                if joined:
+                    return joined
+
         msgs = payload.get("messages")
         if isinstance(msgs, list) and msgs:
             last = msgs[-1]
             if isinstance(last, dict):
                 c = last.get("content")
-                if isinstance(c, str) and c.strip():
-                    return c
-            return str(last)
+                if isinstance(c, (str, list, tuple, dict)):
+                    out = file_to_text(c).strip()
+                    if out:
+                        return out
+            out = file_to_text(last).strip()
+            return out or None
+
         return None
 
     if isinstance(payload, list):
-        # ✅ list[str] 的話，直接 join；避免印出 ['a','b'] 這種 repr
-        if all(isinstance(x, str) for x in payload):
-            return "\n".join([x for x in payload if x.strip()])
-        return str(payload)
+        out = file_to_text(payload).strip()
+        return out or None
 
     return None
 
@@ -677,15 +611,12 @@ def _group_citations_for_badges(cits: list[str]) -> dict[str, list[str]]:
 
 def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str = "green"):
     """
-    QA 顯示（一般 Markdown + badges）：
     - 正文不顯示引用
-    - 來源用膠囊 badge：只顯示「文章名 + 頁碼」
-      - 文件來源：green
-      - WebSearch：violet（title 以 'WebSearch:' 開頭）
+    - 來源用 badge 顯示「資料檔名 + 頁碼」
+    - ✅ 自動忽略 /evidence/*.md 這種內部路徑引用（你說不該顯示）
     """
     raw = (answer_text or "").strip()
 
-    # 防 chunk_id 外洩
     if raw and CHUNK_ID_LEAK_PAT.search(raw):
         raw = CHUNK_ID_LEAK_PAT.sub("", raw)
 
@@ -696,8 +627,10 @@ def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str
             raw = extracted.strip()
 
     cits = _dedup_keep_order(_extract_citation_strings(raw))
-    clean = _strip_citations_from_text(raw)
+    # ✅ 濾掉 evidence 路徑引用
+    cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
 
+    clean = _strip_citations_from_text(raw)
     st.markdown(clean if clean else "（無內容）")
 
     if not cits:
@@ -737,64 +670,57 @@ def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str
         st.markdown(" ".join(badges_line))
 
 
+def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
+    lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
+    for line in lines:
+        if not BULLET_RE.match(line):
+            continue
+        full_cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
+        full_cits = [c for c in full_cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
+        clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\]", "", line).strip()
+        parsed = _parse_citations(full_cits)
+        badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
+        st.markdown(clean + (" " + " ".join(badges) if badges else ""))
+
+
+def bullets_all_have_citations(md: str) -> bool:
+    lines = (md or "").splitlines()
+    if not any(BULLET_RE.match(l) for l in lines):
+        return False
+    for line in lines:
+        if BULLET_RE.match(line):
+            # ✅ 一樣忽略 /evidence/*.md 這種不算有效引用
+            cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
+            cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
+            if not cits:
+                return False
+    return True
+
+
 # =========================
-# Debug panel
+# Debug panel（一定要先定義，避免 NameError）
 # =========================
-# ====== 【覆蓋】render_debug_panel() 裡的 _file_to_str 改成用 file_to_text ======
-# 你找到 render_debug_panel 內部：
-# def _file_to_str(file_obj) -> str:
-# 整段替換成：
-
-    def _file_to_str(file_obj) -> str:
-        return file_to_text(file_obj)
-
-    def _file_to_str(file_obj) -> str:
-        # ✅ 修 C：list/tuple 不要 str(list)，要 join
-        if file_obj is None:
-            return ""
-        if isinstance(file_obj, dict) and "data" in file_obj:
-            return _file_to_str(file_obj.get("data"))
-        if isinstance(file_obj, (bytes, bytearray)):
-            return file_obj.decode("utf-8", errors="ignore")
-        if isinstance(file_obj, str):
-            return file_obj
-        if isinstance(file_obj, (list, tuple)):
-            parts = []
-            for x in file_obj:
-                t = _file_to_str(x)
-                if t:
-                    parts.append(t)
-            return "\n".join(parts)
-        return str(file_obj)
-
-    def _sanitize_text(t: str) -> str:
-        t = (t or "").strip()
-        if not t:
-            return ""
-        if CHUNK_ID_LEAK_PAT.search(t):
-            t = CHUNK_ID_LEAK_PAT.sub("", t)
-        payload = _try_parse_json_or_py_literal(t)
-        if payload is not None:
-            extracted = _extract_main_text_from_payload(payload)
-            if isinstance(extracted, str) and extracted.strip():
-                t = extracted.strip()
-                if CHUNK_ID_LEAK_PAT.search(t):
-                    t = CHUNK_ID_LEAK_PAT.sub("", t)
-        return t
+def render_debug_panel(files: Optional[dict]):
+    """
+    ✅ Tabs 全包在這裡，並且只會在主程式的 Debug expander 內呼叫
+    """
+    if not files or not isinstance(files, dict):
+        st.write("（沒有 files）")
+        return
 
     all_keys = sorted([k for k in files.keys() if isinstance(k, str)])
     evidence_keys = [k for k in all_keys if k.startswith("/evidence/")]
 
-    draft = _sanitize_text(_file_to_str(files.get("/draft.md", ""))) if "/draft.md" in files else ""
-    review = _sanitize_text(_file_to_str(files.get("/review.md", ""))) if "/review.md" in files else ""
-    todos = _sanitize_text(_file_to_str(files.get("/workspace/todos.json", ""))) if "/workspace/todos.json" in files else ""
+    draft = get_files_text(files, "/draft.md") if "/draft.md" in files else ""
+    review = get_files_text(files, "/review.md") if "/review.md" in files else ""
+    todos = get_files_text(files, "/workspace/todos.json") if "/workspace/todos.json" in files else ""
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["總覽", "todos.json", "draft.md", "review.md", "evidence"])
 
     with tab1:
         st.write(f"files keys：{len(all_keys)}")
         st.write(f"evidence：{len(evidence_keys)}")
-        st.code("\n".join(all_keys[:400]), language="text")
+        st.code("\n".join(all_keys[:500]), language="text")
 
     with tab2:
         if todos:
@@ -816,7 +742,8 @@ def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str
 
     with tab5:
         if evidence_keys:
-            st.code("\n".join(evidence_keys[:600]), language="text")
+            # 顯示 evidence 檔名清單（不把內容全塞爆）
+            st.code("\n".join(evidence_keys[:800]), language="text")
         else:
             st.write("（沒有 /evidence/ 檔案）")
 
@@ -850,14 +777,11 @@ def build_indices_incremental_no_kg(
     for row in to_process:
         data = file_bytes_map[row.file_id]
         report_id = row.file_id
-        title = os.path.splitext(row.name)[0]
+        title = os.path.splitext(row.name)[0]  # ✅ 來源顯示用「檔名（不含副檔名）」很合理
         stats["new_reports"] += 1
 
         if row.ext == ".pdf":
-            if row.use_ocr:
-                pages = ocr_pdf_pages_parallel(client, data)
-            else:
-                pages = extract_pdf_text_pages(data)
+            pages = ocr_pdf_pages_parallel(client, data) if row.use_ocr else extract_pdf_text_pages(data)
         elif row.ext == ".txt":
             pages = [(None, norm_space(data.decode("utf-8", errors="ignore")))]
         elif row.ext in (".png", ".jpg", ".jpeg"):
@@ -957,6 +881,7 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
         "2) 每個區塊都必須是純 bullet（每行以 - 開頭），不要段落。\n"
         "3) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]\n"
         "4) 引用中的『報告名稱』必須是資料片段方括號內的那個名稱。\n"
+        "5) 不可使用 /evidence/*.md 當作報告名稱。\n"
     )
     user = (
         f"請針對《{title}》一次輸出三份內容（融合多份報告）：\n"
@@ -974,16 +899,15 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
         if ok:
             return parts
         last = out
-        user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁]。"
+        user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁]；不得出現 /evidence/*.md。"
     return _split_default_bundle(last)
 
 
 # =========================
-# DeepAgent（chunk_id 只在 tool JSON 內部使用）
+# DeepAgent
 # =========================
 def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     _require_deepagents()
-
     from langchain_core.tools import BaseTool, StructuredTool
 
     st.session_state.setdefault("deep_agent", None)
@@ -1028,7 +952,7 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         payload = {"hits": []}
         for score, ch in hits:
             payload["hits"].append({
-                "title": ch.title,
+                "title": ch.title,  # ✅ 這個 title 就是你要顯示在 badge 的「資料檔名」
                 "page": str(ch.page) if ch.page is not None else "-",
                 "chunk_id": ch.chunk_id,  # internal only
                 "text": (ch.text or "")[:1200],
@@ -1075,7 +999,7 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                 model=MODEL_WEB,
                 system=system,
                 user=user,
-                reasoning_effort=None,  # ✅ web 不視為高推理（依你規則）
+                reasoning_effort=None,
                 tools=[{"type": "web_search"}],
                 include_sources=True,
             )
@@ -1096,6 +1020,7 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources.")
         tools.append(tool_web_search_summary)
 
+    # prompts
     retriever_prompt = f"""
 你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
 
@@ -1107,7 +1032,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 硬規則：
 - 你要寫入 /evidence/doc_<facet_slug>.md
 - evidence 內容只能包含：
-  1) 引用標頭：[報告名稱 p頁]（絕對不能出現 chunk_id）
+  1) 引用標頭：[報告名稱 p頁]（不得包含 /evidence/ 路徑；不得用 doc_*.md 當報告名稱）
   2) 原文片段（可截斷）
   3) 一行說明「這段支持什麼」
 - 你可以用 doc_search 拿到 chunk_id，然後用 doc_get_chunk(chunk_id=...) 精讀，
@@ -1132,6 +1057,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - REPORT/KNOWLEDGE/VERIFY：Markdown；每個非標題段落至少 1 個引用
 - enable_web=false：不得出現 WebSearch
 - draft 絕對不能出現 chunk_id
+- 報告名稱不得是 /evidence/*.md
 
 把結果寫到 /draft.md
 """
@@ -1145,6 +1071,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - 其他：每個非標題段落至少 1 個引用 [.. p..]
 - enable_web=false：不得出現 WebSearch
 - 若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
+- 引用標頭不得使用 /evidence/*.md
 
 最多修正 {DA_MAX_REWRITE_ROUNDS} 輪：
 - 每輪：read /draft.md → edit_file 修正 → write /review.md 記錄
@@ -1195,23 +1122,26 @@ facet 子任務格式同 retriever。
             },
         )
 
+    # ✅ 這裡改最重要：不要用「write_todos」這種不存在的詞；
+    #    明確要求用 write_file 寫 /workspace/todos.json
     orchestrator_prompt = f"""
 你是 Deep Doc Orchestrator（文件優先；enable_web={str(enable_web).lower()}）。
 
 固定流程（必做）：
-1) write_todos：列 5~9 步（含：拆 facets、平行蒐證、寫作、審稿）
-2) write_file /evidence/README.md 記錄本次需求與 enable_web
-3) 拆 2–4 個 facets（面向，不是章節）
-4) 平行派工：
+0) 立刻用 write_file 建立 /workspace/todos.json（JSON array of strings；5~9 步），並在第一步說明 enable_web 與目標。
+1) write_file /evidence/README.md 記錄本次需求與 enable_web
+2) 拆 2–4 個 facets（面向，不是章節）
+3) 平行派工：
    - 每個 facet 至少派 1 個 retriever
    - enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
-5) 叫 writer 產生 /draft.md
-6) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
-7) read_file /draft.md 作為最終回答
+4) 叫 writer 產生 /draft.md
+5) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
+6) read_file /draft.md 作為最終回答
 
 引用與隱私規則：
 - /evidence 與 /draft 絕對不能出現 chunk_id
 - 引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]
+- 報告名稱不得使用 /evidence/*.md 當作來源名稱
 """
 
     llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
@@ -1231,15 +1161,11 @@ facet 子任務格式同 retriever。
 
 
 # =========================
-# DeepAgent run（status 不展開）
+# DeepAgent run（status 不展開 + planning 後顯示 todos）
 # =========================
-# ====== 【覆蓋】用這個版本覆蓋你的 deep_agent_run_with_live_status() ======
-# 重點：
-# 1) 最終答案一定取 /draft.md 的「content 文字」
-# 2) 不再把 dict/list repr 噴到內文
-
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
     final_state = None
+    todos_preview_written = False
 
     def set_phase(s, phase: str):
         mapping = {
@@ -1267,6 +1193,14 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                 files = state.get("files") or {}
                 file_keys = set(files.keys()) if isinstance(files, dict) else set()
 
+                # ✅ 規劃後如果 todos.json 出現，立刻顯示預覽在 status 裡
+                if (not todos_preview_written) and isinstance(files, dict) and "/workspace/todos.json" in files:
+                    todos_txt = get_files_text(files, "/workspace/todos.json")
+                    if todos_txt:
+                        s.write("### 本次 Todo（規劃結果預覽）")
+                        s.code(todos_txt[:4000], language="json")
+                        todos_preview_written = True
+
                 if any(k.startswith("/evidence/") for k in file_keys):
                     set_phase(s, "evidence")
                 if "/draft.md" in file_keys:
@@ -1288,10 +1222,9 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
         files = (final_state or {}).get("files") or {}
 
-        # ✅ 只取 draft 內容（你說的「要取 context 裡面的文字」就是 content 那份）
+        # ✅ 最終答案：一律取 /draft.md 的 content
         final_text = get_files_text(files, "/draft.md")
 
-        # fallback：真的沒 draft 才退回 messages
         if not final_text:
             msgs = (final_state or {}).get("messages") or []
             if msgs:
@@ -1308,7 +1241,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
 
 # =========================
-# ✅ need_todo 判斷（就算不需要 todo，也要顯示原因）
+# need_todo 判斷
 # =========================
 def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
     system = (
@@ -1323,7 +1256,7 @@ def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
         model=MODEL_MAIN,
         system=system,
         user=question,
-        reasoning_effort=REASONING_EFFORT,  # ✅ 推理需求高
+        reasoning_effort=REASONING_EFFORT,
         tools=None,
         include_sources=False,
     )
@@ -1333,7 +1266,7 @@ def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
     return need, reason
 
 
-def render_run_badges(*, mode: str, need_todo: bool, reason: str, usage: dict, enable_web: bool):
+def render_run_badges(*, mode: str, need_todo: bool, reason: str, usage: dict, enable_web: bool, todo_file_present: Optional[bool] = None):
     badges: List[str] = []
     badges.append(_badge_directive(f"Mode:{mode}", "gray"))
 
@@ -1343,6 +1276,11 @@ def render_run_badges(*, mode: str, need_todo: bool, reason: str, usage: dict, e
         badges.append(_badge_directive("Todo:不需要", "blue"))
         short_reason = reason if len(reason) <= 40 else reason[:40] + "…"
         badges.append(_badge_directive(f"理由:{short_reason}", "gray"))
+
+    if todo_file_present is True:
+        badges.append(_badge_directive("Todos.json:有", "blue"))
+    elif todo_file_present is False and need_todo:
+        badges.append(_badge_directive("Todos.json:無(流程異常)", "orange"))
 
     doc_calls = int((usage or {}).get("doc_search_calls", 0) or 0)
     web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
@@ -1442,7 +1380,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
     st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
 
     st.session_state.enable_web_search_agent = st.checkbox(
-        "啟用網路搜尋（direct / DeepAgent 都會用到；會增加成本）",
+        "啟用網路搜尋（會增加成本）",
         value=bool(st.session_state.enable_web_search_agent),
     )
 
@@ -1531,8 +1469,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
 
         st.divider()
         col1, col2, col3 = st.columns([1, 1, 1])
-
-        # ✅ 拆開：建立索引 vs 產生預設輸出（不再自動）
         build_btn = col1.button("🚀 建立索引", type="primary", use_container_width=True)
         default_btn = col2.button("🧾 產生預設輸出", use_container_width=True)
         clear_btn = col3.button("🧹 清空全部", use_container_width=True)
@@ -1571,7 +1507,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
                 s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
                 s.update(state="complete")
 
-            # ✅ 不再自動產生預設輸出、不再自動塞聊天
             st.session_state.deep_agent = None
             st.session_state.deep_agent_web_flag = None
             st.rerun()
@@ -1587,7 +1522,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
                     st.session_state.default_outputs = bundle
                     s2.update(state="complete")
 
-                # ✅ 只有你按了「產生預設輸出」才插入聊天（符合你要的「等待提問」）
                 st.session_state.chat_history.append({
                     "role": "assistant",
                     "kind": "default",
@@ -1600,13 +1534,17 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
 # =========================
 # 主畫面：狀態 + Chat
 # =========================
-has_index = st.session_state.store is not None and getattr(st.session_state.store, "index", None) is not None and st.session_state.store.index.ntotal > 0
+has_index = (
+    st.session_state.store is not None
+    and getattr(st.session_state.store, "index", None) is not None
+    and st.session_state.store.index.ntotal > 0
+)
 
 if has_index:
     st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-    st.caption("引用 badge 只顯示『報告名稱 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
+    st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
 else:
-    st.info("目前沒有索引（也沒關係）：你可以直接聊天（純 LLM / 可選 web_search）。若要引用文件，再去「文件管理」建立索引。")
+    st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再去「文件管理」建立索引。")
 
 st.divider()
 st.subheader("Chat（DeepAgent + Badges + Todo decision）")
@@ -1623,18 +1561,15 @@ for msg in st.session_state.chat_history:
             render_bullets_inline_badges(msg.get("chain", ""), badge_color="orange")
         else:
             meta = msg.get("meta", {}) or {}
-            mode = meta.get("mode", "unknown")
-            need_todo = bool(meta.get("need_todo", False))
-            reason = str(meta.get("reason", "") or "")
-            usage = meta.get("usage", {}) or {}
-            enable_web = bool(meta.get("enable_web", False))
-
-            render_run_badges(mode=mode, need_todo=need_todo, reason=reason, usage=usage, enable_web=enable_web)
+            render_run_badges(
+                mode=meta.get("mode", "unknown"),
+                need_todo=bool(meta.get("need_todo", False)),
+                reason=str(meta.get("reason", "") or ""),
+                usage=meta.get("usage", {}) or {},
+                enable_web=bool(meta.get("enable_web", False)),
+                todo_file_present=meta.get("todo_file_present", None),
+            )
             render_markdown_answer_with_source_badges(msg.get("content", ""), badge_color="green")
-
-            todo_status = meta.get("todo_status", None)
-            if todo_status:
-                st.markdown(todo_status)
 
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
 if prompt:
@@ -1644,74 +1579,71 @@ if prompt:
 
     with st.chat_message("assistant"):
         enable_web = bool(st.session_state.enable_web_search_agent)
-
-        # ✅ 先判斷需不需要 todo
         need_todo, reason = decide_need_todo(client, prompt)
 
-        # ✅ 沒索引時：永遠不要跑 deepagent（因為 doc tools 沒意義）
-        #    但仍可：純 LLM / web_search（符合你要的「沒文件也能聊」）
         if (not has_index) or (not need_todo):
-            if enable_web:
-                answer_text, usage_direct = answer_direct_with_websearch(client, prompt)
-                mode = "direct+web"
-            else:
-                answer_text, usage_direct = answer_direct_llm(client, prompt)
-                mode = "direct"
-
-            # todo 狀態提示：如果 need_todo=True 但沒索引，就說明「已降級」
-            if need_todo and not has_index:
-                todo_md = _badge_directive("Todo:需要（但未建索引，改用 direct/web）", "gray")
-            elif not need_todo:
-                todo_md = _badge_directive("本次判斷不需要 Todo", "gray")
-            else:
-                todo_md = _badge_directive("Todo:需要（direct/web 已處理）", "blue")
-
+            system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
+            answer_text, _ = call_gpt(
+                client,
+                model=MODEL_MAIN,
+                system=system,
+                user=prompt,
+                reasoning_effort=None,
+                tools=None,
+            )
             meta = {
-                "mode": mode,
+                "mode": "direct",
                 "need_todo": bool(need_todo),
                 "reason": reason,
-                "usage": usage_direct,           # ✅ 不再誤用 deepagent 舊 usage
+                "usage": {"doc_search_calls": 0, "web_search_calls": 0},
                 "enable_web": enable_web,
-                "todo_status": todo_md,
+                "todo_file_present": None,
             }
-
-            render_run_badges(mode=meta["mode"], need_todo=bool(need_todo), reason=reason, usage=usage_direct, enable_web=enable_web)
+            render_run_badges(
+                mode=meta["mode"],
+                need_todo=bool(need_todo),
+                reason=reason,
+                usage=meta["usage"],
+                enable_web=enable_web,
+                todo_file_present=None,
+            )
             render_markdown_answer_with_source_badges(answer_text, badge_color="green")
-            st.markdown(todo_md)
-
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
 
-        # ✅ 有索引 + 需要 todo → 用 DeepAgent
-        agent = ensure_deep_agent(
-            client=client,
-            store=st.session_state.store,
-            enable_web=enable_web,
-        )
+        agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
         answer_text, files = deep_agent_run_with_live_status(agent, prompt)
 
-        todo_md = ""
-        if isinstance(files, dict) and "/workspace/todos.json" in files:
-            todo_md = _badge_directive("Todo:需要（已產生 todos.json）", "blue")
-        else:
-            todo_md = _badge_directive("Todo:需要（未產生 todos.json，流程未寫出/異常）", "orange")
-
-        usage_after = dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0}))
+        todo_file_present = isinstance(files, dict) and ("/workspace/todos.json" in files)
 
         meta = {
             "mode": "deepagent",
             "need_todo": True,
             "reason": reason,
-            "usage": usage_after,
+            "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
             "enable_web": enable_web,
-            "todo_status": todo_md,
+            "todo_file_present": bool(todo_file_present),
         }
 
-        render_run_badges(mode=meta["mode"], need_todo=True, reason=reason, usage=usage_after, enable_web=enable_web)
+        render_run_badges(
+            mode=meta["mode"],
+            need_todo=True,
+            reason=reason,
+            usage=meta["usage"],
+            enable_web=enable_web,
+            todo_file_present=meta["todo_file_present"],
+        )
         render_markdown_answer_with_source_badges(answer_text, badge_color="green")
-        st.markdown(todo_md)
 
+        # ✅ Debug：Tabs 全包在 Debug expander 內
         with st.expander("Debug", expanded=False):
+            # 額外：在 Debug 最上方先顯示 todos 預覽（你想要「點開可看到 todos」）
+            todos_txt = get_files_text(files, "/workspace/todos.json") if isinstance(files, dict) else ""
+            if todos_txt:
+                st.markdown("### 本次 Todo（完整）")
+                st.code(todos_txt[:20000], language="json")
+                st.divider()
+
             render_debug_panel(files)
 
     st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
