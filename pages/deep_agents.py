@@ -1620,7 +1620,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
         edited = st.data_editor(
             df.drop(columns=["_file_id"]),
             key="file_table_editor",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             disabled=["檔名", "格式", "頁數", "文字頁", "文字%", "token估算", "建議"],
             column_config={
