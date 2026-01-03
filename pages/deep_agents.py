@@ -1462,6 +1462,13 @@ st.session_state.setdefault("last_run_forced_end", None)     # None / "citation_
 # =========================
 # File table helpers
 # =========================
+def get_forced_end() -> Optional[str]:
+    """
+    統一取得「本次是否因卡住/步數上限而強制結束」的狀態。
+    來源一律是 st.session_state['last_run_forced_end']，避免 NameError。
+    """
+    return st.session_state.get("last_run_forced_end", None)
+
 def file_rows_to_df(rows: list[FileRow]) -> pd.DataFrame:
     recs = []
     for r in rows:
@@ -1719,20 +1726,20 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
 # =========================
 # 主畫面：狀態 + Chat
 # =========================
-has_index = (
-    st.session_state.store is not None
-    and getattr(st.session_state.store, "index", None) is not None
-    and st.session_state.store.index.ntotal > 0
-)
+#has_index #ha
+#    st.#    st.session_state.store is 
+#    #    and getattr(st.session_state.store, "index", None) is not
+#    #    and st.session_state.store.index.ntota
+#)
 
-if has_index:
-    st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-    st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
-else:
-    st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再去「文件管理」建立索引。")
+#if#if has_ind
+#    st.#    st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.ch
+#    st.#    st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來
+#else#
+#    st.#    st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再去「文件管理
 
-st.divider()
-st.subheader("Chat（DeepAgent + Badges + Todo decision）")
+#st.#st.divid
+#st.#st.subheader("Chat（DeepAgent + Badges + Todo decisio
 
 for msg in st.session_state.chat_history:
     with st.chat_message(msg.get("role", "assistant")):
@@ -1755,8 +1762,6 @@ for msg in st.session_state.chat_history:
                 todo_file_present=meta.get("todo_file_present", None),
                 forced_end=meta.get("forced_end", None),
             )
-            # (b) deepagent 跑完後：把 forced_end 放進 meta，並傳進 render_run_badges
-            forced_end = st.session_state.get("last_run_forced_end", None)
             render_markdown_answer_with_source_badges(msg.get("content", ""), badge_color="green")
 
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
@@ -1813,7 +1818,7 @@ if prompt:
             "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
             "enable_web": enable_web,
             "todo_file_present": bool(todo_file_present),
-            "forced_end": forced_end,
+            "forced_end": get_forced_end(),
         }
 
         render_run_badges(
