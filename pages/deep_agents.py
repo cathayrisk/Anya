@@ -24,14 +24,14 @@ import faiss
 from pypdf import PdfReader
 
 from openai import OpenAI
+from langgraph.errors import GraphRecursionError
 
 try:
     import fitz  # pymupdf
     HAS_PYMUPDF = True
 except Exception:
     HAS_PYMUPDF = False
-# ===== [1] import 區：補上（若已經有就跳過）=====
-from langgraph.errors import GraphRecursionError
+
 
 # =========================
 # Streamlit config（只呼叫一次）
@@ -39,24 +39,7 @@ from langgraph.errors import GraphRecursionError
 st.set_page_config(page_title="研究報告助手（DeepAgent + Badges）", layout="wide")
 st.title("研究報告助手（DeepAgent + Badges）")
 
-# ✅ Markdown 顯示微調：字體/行距/標題大小/列表間距
-st.markdown(
-    """
-<style>
-/* 讓文章可讀性更好（你覺得內容 OK，但呈現需要調整） */
-.block-container { padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1200px; }
-.stMarkdown { line-height: 1.7; }
-.stMarkdown h1 { font-size: 1.8rem; margin: 0.8rem 0 0.7rem; }
-.stMarkdown h2 { font-size: 1.35rem; margin: 0.9rem 0 0.55rem; }
-.stMarkdown h3 { font-size: 1.15rem; margin: 0.8rem 0 0.45rem; }
-.stMarkdown p { margin: 0.35rem 0 0.6rem; }
-.stMarkdown ul, .stMarkdown ol { margin: 0.35rem 0 0.75rem 1.2rem; }
-.stMarkdown li { margin: 0.15rem 0; }
-.stMarkdown blockquote { padding: 0.4rem 0.8rem; border-left: 0.25rem solid rgba(60, 60, 60, 0.25); }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+# ✅ 依你的要求：不再注入任何 CSS（回到 Streamlit 原生排版）
 
 
 # =========================
@@ -163,31 +146,18 @@ DA_MAX_CLAIMS = 10
 
 CHUNK_ID_LEAK_PAT = re.compile(r"(chunk_id\s*=\s*|_p(?:na|\d+)_c\d+)", re.IGNORECASE)
 
-# ✅ 重要：你的內部 evidence 檔名不應出現在引用 badge
+# ✅ 重要：你的內部 evidence 檔名不應出現在引用
 EVIDENCE_PATH_IN_CIT_RE = re.compile(r"\[(?:/)?evidence/[^ \]]+?\s+p(\d+|-)\s*\]", re.IGNORECASE)
+
+# citations regex (單筆引用 token)
+CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
+BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
+CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
 
 
 # =========================
 # 小工具
 # =========================
-# ===== [2] 放在「badges / citations / file-to-text」區（EVIDENCE_PATH_IN_CIT_RE / CIT_RE 附近）新增 =====
-def has_visible_citations(text: str) -> bool:
-    """
-    是否含「有效引用」：
-    - 形式：[xxx p12] 或 [WebSearch:... p-]
-    - 忽略 /evidence/*.md 這種內部路徑引用
-    """
-    raw = (text or "").strip()
-    if not raw:
-        return False
-    cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", raw)]
-    cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
-    return bool(cits)
-
-def _hash_norm_text(s: str) -> str:
-    """用來判斷 draft 是否『內容完全沒變』（去空白後 hash）。"""
-    return sha1_bytes(norm_space(s).encode("utf-8"))
-
 def norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -236,6 +206,212 @@ def _dedup_keep_order(items: list[str]) -> list[str]:
     return out
 
 
+def has_visible_citations(text: str) -> bool:
+    """
+    是否含「有效引用」：
+    - 形式：[xxx p12] 或 [WebSearch:... p-]
+    - 忽略 /evidence/*.md 這種內部路徑引用
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", raw)]
+    cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
+    return bool(cits)
+
+
+def _hash_norm_text(s: str) -> str:
+    """用來判斷 draft 是否『內容完全沒變』（去空白後 hash）。"""
+    return sha1_bytes(norm_space(s).encode("utf-8"))
+
+
+def _to_messages(system: str, user: Any) -> list[Dict[str, Any]]:
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.startswith("{") or t.startswith("["):
+        try:
+            return json.loads(t)
+        except Exception:
+            pass
+    if t.startswith("{") and t.endswith("}"):
+        try:
+            return ast.literal_eval(t)
+        except Exception:
+            return None
+    return None
+
+
+def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        for k in ("content", "answer", "final", "output", "text", "message"):
+            if k not in payload:
+                continue
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+            if isinstance(v, (list, tuple)):
+                joined = file_to_text(v).strip()
+                if joined:
+                    return joined
+
+        msgs = payload.get("messages")
+        if isinstance(msgs, list) and msgs:
+            last = msgs[-1]
+            if isinstance(last, dict):
+                c = last.get("content")
+                if isinstance(c, (str, list, tuple, dict)):
+                    out = file_to_text(c).strip()
+                    if out:
+                        return out
+            out = file_to_text(last).strip()
+            return out or None
+
+        return None
+
+    if isinstance(payload, list):
+        out = file_to_text(payload).strip()
+        return out or None
+
+    return None
+
+
+def _strip_citations_from_text(text: str) -> str:
+    """
+    ✅ 移除引用，但保留原本的換行與段落（避免 Markdown 黏成一坨）
+    - 逐行處理：只清掉同一行中的 citation token
+    - 不用 \\s*，避免把 \\n 吃掉
+    """
+    if not text:
+        return ""
+
+    # 清掉「像引用的 bracket」：含 p.. 的 bracket
+    pat = re.compile(r"[ \t]*\[[^\]]*?\s+p(\d+|-)(?:-\d+)?[^\]]*?\][ \t]*")
+
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        newline = pat.sub("", line).rstrip()
+        out_lines.append(newline)
+
+    return "\n".join(out_lines).strip()
+
+
+def _badge_directive(label: str, color: str) -> str:
+    safe = label.replace("[", "(").replace("]", ")")
+    return f":{color}-badge[{safe}]"
+
+
+def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
+    parsed = []
+    for c in cits:
+        m = CIT_PARSE_RE.search(c)
+        if m:
+            parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip()})
+    return parsed
+
+
+def _extract_citation_items(text: str) -> list[tuple[str, str]]:
+    """
+    從全文抽出引用項目 (title, page)。
+    支援：
+    - [Title p12]
+    - [Title p2-3; Another Title p8]  （同一對 [] 內多筆引用）
+    """
+    if not text:
+        return []
+
+    items: list[tuple[str, str]] = []
+    for m in re.finditer(r"\[([^\]]+)\]", text):
+        inner = (m.group(1) or "").strip()
+        if not inner:
+            continue
+
+        parts = [p.strip() for p in re.split(r"[;；]", inner) if p.strip()]
+        for p in parts:
+            mm = re.search(r"^(.*)\s+p(\d+(?:-\d+)?|-)\s*$", p)
+            if not mm:
+                continue
+            title = norm_space(mm.group(1))
+            page = mm.group(2).strip()
+
+            if EVIDENCE_PATH_IN_CIT_RE.search(f"[{title} p{page}]"):
+                continue
+
+            items.append((title, page))
+
+    return items
+
+
+def render_markdown_answer_with_sources_list(
+    answer_text: str,
+    *,
+    max_titles_inline: int = 4,
+):
+    """
+    ✅ 依你要求：來源改成「清單風格」
+    - 正文：把引用 token 移除，但保留原本 Markdown 換行/段落
+    - 來源：以清單顯示（Title：p...）
+    """
+    raw = (answer_text or "").strip()
+
+    if raw and CHUNK_ID_LEAK_PAT.search(raw):
+        raw = CHUNK_ID_LEAK_PAT.sub("", raw)
+
+    payload = _try_parse_json_or_py_literal(raw)
+    if payload is not None:
+        extracted = _extract_main_text_from_payload(payload)
+        if extracted is not None:
+            raw = extracted.strip()
+
+    cit_items = _extract_citation_items(raw)
+
+    clean = _strip_citations_from_text(raw)
+    st.markdown(clean if clean else "（無內容）")
+
+    if not cit_items:
+        return
+
+    grouped: dict[str, list[str]] = {}
+    for title, page in cit_items:
+        grouped.setdefault(title, []).append(page)
+
+    # dedup + sort page strings
+    def _key(p: str):
+        if p.isdigit():
+            return (0, int(p))
+        if re.fullmatch(r"\d+-\d+", p):
+            a, b = p.split("-", 1)
+            return (1, int(a), int(b))
+        if p == "-":
+            return (9, 10**9)
+        return (10, p)
+
+    for t in list(grouped.keys()):
+        pages = _dedup_keep_order([p.strip() for p in grouped[t] if p.strip()])
+        grouped[t] = sorted(pages, key=_key)
+
+    titles_sorted = sorted(grouped.keys(), key=lambda x: (x.strip().lower().startswith("websearch:"), x.lower()))
+    inline_titles = titles_sorted[:max_titles_inline]
+    extra_titles = titles_sorted[max_titles_inline:]
+
+    def _render_sources(titles: list[str]):
+        for t in titles:
+            pages = grouped.get(t, []) or ["-"]
+            pages_str = ", ".join([f"p{p}" if not str(p).startswith("p") else str(p) for p in pages])
+            st.markdown(f"- **{t}**：{pages_str}")
+
+    st.markdown("### 來源")
+    _render_sources(inline_titles)
+
+    if extra_titles:
+        with st.expander(f"更多來源（{len(extra_titles)}）", expanded=False):
+            _render_sources(extra_titles)
+
+
 # =========================
 # OpenAI client + wrappers
 # =========================
@@ -263,10 +439,6 @@ def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     return vecs / norms
-
-
-def _to_messages(system: str, user: Any) -> list[Dict[str, Any]]:
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def call_gpt(
@@ -465,16 +637,11 @@ class FaissStore:
 
 
 # =========================
-# badges / citations / file-to-text
+# file-to-text
 # =========================
-CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
-BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
-CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
-
-
 def file_to_text(file_obj: Any) -> str:
     """
-    ✅ 修你最關鍵的點：從 dict(content=[...]) 取出真正 markdown 文字
+    從 dict(content=[...]) 取出真正 markdown 文字
     """
     if file_obj is None:
         return ""
@@ -515,213 +682,12 @@ def get_files_text(files: Optional[dict], key: str) -> str:
     return file_to_text(files.get(key)).strip()
 
 
-def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
-    parsed = []
-    for c in cits:
-        m = CIT_PARSE_RE.search(c)
-        if m:
-            parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip()})
-    return parsed
-
-
-def _badge_directive(label: str, color: str) -> str:
-    safe = label.replace("[", "(").replace("]", ")")
-    return f":{color}-badge[{safe}]"
-
-
-def _dedup_keep_order(items: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-
-def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
-    t = (text or "").strip()
-    if not t:
-        return None
-    if t.startswith("{") or t.startswith("["):
-        try:
-            return json.loads(t)
-        except Exception:
-            pass
-    if t.startswith("{") and t.endswith("}"):
-        try:
-            return ast.literal_eval(t)
-        except Exception:
-            return None
-    return None
-
-
-def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
-    if isinstance(payload, dict):
-        for k in ("content", "answer", "final", "output", "text", "message"):
-            if k not in payload:
-                continue
-            v = payload.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-            if isinstance(v, (list, tuple)):
-                joined = file_to_text(v).strip()
-                if joined:
-                    return joined
-
-        msgs = payload.get("messages")
-        if isinstance(msgs, list) and msgs:
-            last = msgs[-1]
-            if isinstance(last, dict):
-                c = last.get("content")
-                if isinstance(c, (str, list, tuple, dict)):
-                    out = file_to_text(c).strip()
-                    if out:
-                        return out
-            out = file_to_text(last).strip()
-            return out or None
-
-        return None
-
-    if isinstance(payload, list):
-        out = file_to_text(payload).strip()
-        return out or None
-
-    return None
-
-
-def _extract_citation_strings(text: str) -> list[str]:
-    if not text:
-        return []
-    return [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", text)]
-
-
-def _strip_citations_from_text(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r"\s*\[[^\]]+?\s+p(\d+|-)\s*\]\s*", " ", text).strip()
-
-
-def _group_citations_for_badges(cits: list[str]) -> dict[str, list[str]]:
-    grouped: dict[str, list[str]] = {}
-    for c in cits:
-        m = CIT_PARSE_RE.search(c)
-        if not m:
-            continue
-        title = m.group(1).strip()
-        page = m.group(2).strip()
-        grouped.setdefault(title, []).append(page)
-
-    for title, pages in grouped.items():
-        pages = _dedup_keep_order(pages)
-
-        def _key(p: str):
-            if p.isdigit():
-                return (0, int(p))
-            if p == "-":
-                return (1, 10**9)
-            return (2, p)
-
-        grouped[title] = sorted(pages, key=_key)
-
-    return grouped
-
-
-def render_markdown_answer_with_source_badges(answer_text: str, badge_color: str = "green"):
-    """
-    - 正文不顯示引用
-    - 來源用 badge 顯示「資料檔名 + 頁碼」
-    - ✅ 自動忽略 /evidence/*.md 這種內部路徑引用（你說不該顯示）
-    """
-    raw = (answer_text or "").strip()
-
-    if raw and CHUNK_ID_LEAK_PAT.search(raw):
-        raw = CHUNK_ID_LEAK_PAT.sub("", raw)
-
-    payload = _try_parse_json_or_py_literal(raw)
-    if payload is not None:
-        extracted = _extract_main_text_from_payload(payload)
-        if extracted is not None:
-            raw = extracted.strip()
-
-    cits = _dedup_keep_order(_extract_citation_strings(raw))
-    # ✅ 濾掉 evidence 路徑引用
-    cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
-
-    clean = _strip_citations_from_text(raw)
-    st.markdown(clean if clean else "（無內容）")
-
-    if not cits:
-        return
-
-    grouped = _group_citations_for_badges(cits)
-
-    doc_badges: list[str] = []
-    web_badges: list[str] = []
-
-    def _pages_str(pages: list[str], max_keep: int = 6) -> str:
-        pages = pages or ["-"]
-        if len(pages) <= max_keep:
-            return "p" + ",".join(pages)
-        kept = pages[:max_keep]
-        return "p" + ",".join(kept) + "…"
-
-    for title in sorted(grouped.keys()):
-        pages = grouped[title]
-        pages_part = _pages_str(pages, max_keep=6)
-
-        is_web = title.strip().lower().startswith("websearch:")
-        label = f"{title} {pages_part}"
-
-        if is_web:
-            web_badges.append(_badge_directive(label, "violet"))
-        else:
-            doc_badges.append(_badge_directive(label, badge_color))
-
-    badges_line = []
-    if doc_badges:
-        badges_line.append(" ".join(doc_badges))
-    if web_badges:
-        badges_line.append(" ".join(web_badges))
-
-    if badges_line:
-        st.markdown(" ".join(badges_line))
-
-
-def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
-    lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
-    for line in lines:
-        if not BULLET_RE.match(line):
-            continue
-        full_cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
-        full_cits = [c for c in full_cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
-        clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\]", "", line).strip()
-        parsed = _parse_citations(full_cits)
-        badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
-        st.markdown(clean + (" " + " ".join(badges) if badges else ""))
-
-
-def bullets_all_have_citations(md: str) -> bool:
-    lines = (md or "").splitlines()
-    if not any(BULLET_RE.match(l) for l in lines):
-        return False
-    for line in lines:
-        if BULLET_RE.match(line):
-            # ✅ 一樣忽略 /evidence/*.md 這種不算有效引用
-            cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
-            cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
-            if not cits:
-                return False
-    return True
-
-
 # =========================
-# Debug panel（一定要先定義，避免 NameError）
+# Debug panel（evidence 可點選看內容）
 # =========================
 def render_debug_panel(files: Optional[dict]):
     """
-    ✅ Tabs 全包在這裡，並且只會在主程式的 Debug expander 內呼叫
+    Tabs 全包在這裡，並且只會在主程式的 Debug expander 內呼叫
     """
     if not files or not isinstance(files, dict):
         st.write("（沒有 files）")
@@ -734,7 +700,7 @@ def render_debug_panel(files: Optional[dict]):
     review = get_files_text(files, "/review.md") if "/review.md" in files else ""
     todos = get_files_text(files, "/workspace/todos.json") if "/workspace/todos.json" in files else ""
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["總覽", "todos.json", "draft.md", "review.md", "evidence"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["總覽", "todos.json", "draft.md", "review.md", "evidence（可看內容）"])
 
     with tab1:
         st.write(f"files keys：{len(all_keys)}")
@@ -760,11 +726,14 @@ def render_debug_panel(files: Optional[dict]):
             st.write("（沒有 /review.md）")
 
     with tab5:
-        if evidence_keys:
-            # 顯示 evidence 檔名清單（不把內容全塞爆）
-            st.code("\n".join(evidence_keys[:800]), language="text")
-        else:
+        if not evidence_keys:
             st.write("（沒有 /evidence/ 檔案）")
+        else:
+            # ✅ 點 evidence 檔名就看內容
+            pick = st.selectbox("選擇 evidence 檔案", evidence_keys, index=0)
+            content = get_files_text(files, pick)
+            st.markdown(f"**{pick}**")
+            st.code((content or "")[:50000], language="markdown")
 
 
 # =========================
@@ -796,7 +765,7 @@ def build_indices_incremental_no_kg(
     for row in to_process:
         data = file_bytes_map[row.file_id]
         report_id = row.file_id
-        title = os.path.splitext(row.name)[0]  # ✅ 來源顯示用「檔名（不含副檔名）」很合理
+        title = os.path.splitext(row.name)[0]
         stats["new_reports"] += 1
 
         if row.ext == ".pdf":
@@ -892,6 +861,33 @@ def render_chunks_for_model(chunks: list[Chunk], max_chars_each: int = 900) -> s
     return "\n\n".join(parts)
 
 
+def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
+    # 這塊保持原樣（預設輸出用 badge 很好讀）
+    lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
+    for line in lines:
+        if not BULLET_RE.match(line):
+            continue
+        full_cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
+        full_cits = [c for c in full_cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
+        clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\]", "", line).strip()
+        parsed = _parse_citations(full_cits)
+        badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
+        st.markdown(clean + (" " + " ".join(badges) if badges else ""))
+
+
+def bullets_all_have_citations(md: str) -> bool:
+    lines = (md or "").splitlines()
+    if not any(BULLET_RE.match(l) for l in lines):
+        return False
+    for line in lines:
+        if BULLET_RE.match(line):
+            cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
+            cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
+            if not cits:
+                return False
+    return True
+
+
 def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_retries: int = 2) -> Dict[str, str]:
     system = (
         "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
@@ -901,6 +897,7 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
         "3) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]\n"
         "4) 引用中的『報告名稱』必須是資料片段方括號內的那個名稱。\n"
         "5) 不可使用 /evidence/*.md 當作報告名稱。\n"
+        "6) 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。\n"
     )
     user = (
         f"請針對《{title}》一次輸出三份內容（融合多份報告）：\n"
@@ -918,7 +915,7 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
         if ok:
             return parts
         last = out
-        user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁]；不得出現 /evidence/*.md。"
+        user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁]；不得出現 /evidence/*.md。多引用用 [A p2][B p8]。"
     return _split_default_bundle(last)
 
 
@@ -971,9 +968,9 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         payload = {"hits": []}
         for score, ch in hits:
             payload["hits"].append({
-                "title": ch.title,  # ✅ 這個 title 就是你要顯示在 badge 的「資料檔名」
+                "title": ch.title,
                 "page": str(ch.page) if ch.page is not None else "-",
-                "chunk_id": ch.chunk_id,  # internal only
+                "chunk_id": ch.chunk_id,
                 "text": (ch.text or "")[:1200],
                 "score": float(score),
             })
@@ -1039,7 +1036,6 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources.")
         tools.append(tool_web_search_summary)
 
-    # prompts
     retriever_prompt = f"""
 你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
 
@@ -1077,6 +1073,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - enable_web=false：不得出現 WebSearch
 - draft 絕對不能出現 chunk_id
 - 報告名稱不得是 /evidence/*.md
+- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
 
 把結果寫到 /draft.md
 """
@@ -1091,6 +1088,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - enable_web=false：不得出現 WebSearch
 - 若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
 - 引用標頭不得使用 /evidence/*.md
+- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
 
 最多修正 {DA_MAX_REWRITE_ROUNDS} 輪：
 - 每輪：read /draft.md → edit_file 修正 → write /review.md 記錄
@@ -1141,8 +1139,6 @@ facet 子任務格式同 retriever。
             },
         )
 
-    # ✅ 這裡改最重要：不要用「write_todos」這種不存在的詞；
-    #    明確要求用 write_file 寫 /workspace/todos.json
     orchestrator_prompt = f"""
 你是 Deep Doc Orchestrator（文件優先；enable_web={str(enable_web).lower()}）。
 
@@ -1161,9 +1157,13 @@ facet 子任務格式同 retriever。
 - /evidence 與 /draft 絕對不能出現 chunk_id
 - 引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]
 - 報告名稱不得使用 /evidence/*.md 當作來源名稱
+- 多引用請用 [A p2][B p8]，不要在同一對 [] 內塞多筆
 """
 
     llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
+
+    # ✅ recursion_limit 由 UI session 控制（避免固定 90 太小）
+    recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
 
     agent = create_deep_agent(
         model=llm,
@@ -1172,7 +1172,7 @@ facet 子任務格式同 retriever。
         subagents=subagents,
         debug=False,
         name="deep-doc-agent",
-    ).with_config({"recursion_limit": 90})
+    ).with_config({"recursion_limit": recursion_limit})
 
     st.session_state.deep_agent = agent
     st.session_state.deep_agent_web_flag = bool(enable_web)
@@ -1182,7 +1182,6 @@ facet 子任務格式同 retriever。
 # =========================
 # DeepAgent run（status 不展開 + planning 後顯示 todos）
 # =========================
-# ===== [3] 放在 deep_agent_run_with_live_status() 前面新增：卡住時的 fallback（向量庫 RAG）=====
 def fallback_answer_from_store(
     client: OpenAI,
     store: Optional[FaissStore],
@@ -1216,7 +1215,8 @@ def fallback_answer_from_store(
         "2) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]。\n"
         "3) 引用中的報告名稱必須來自我提供的資料片段標頭（例如 [XXX p12]）。\n"
         "4) 不可使用 /evidence/*.md 當作報告名稱。\n"
-        "5) 若資料不足，請用 bullet 明確說明缺口，並引用最接近的來源。\n"
+        "5) 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]。\n"
+        "6) 若資料不足，請用 bullet 明確說明缺口，並引用最接近的來源。\n"
     )
     user = f"問題：{q}\n\n資料：\n{ctx}\n"
 
@@ -1230,8 +1230,8 @@ def fallback_answer_from_store(
         include_sources=False,
     )
     return (out or "").strip() or "（系統：fallback RAG 未產出內容）"
-    
-# ===== [7] 用「整段替換」更新 deep_agent_run_with_live_status()：更準卡住判定 + 設 last_run_forced_end =====
+
+
 def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
     final_state = None
     todos_preview_written = False
@@ -1288,7 +1288,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                 if "/review.md" in file_keys:
                     set_phase(s, "review")
 
-                # ✅ 更準卡住判定：draft 夠長後才開始
+                # ✅ 更準卡住判定：draft 夠長後才開始（不變 + 無引用）連續 N 步
                 if isinstance(files, dict) and "/draft.md" in files:
                     draft_txt = get_files_text(files, "/draft.md")
                     draft_norm = norm_space(draft_txt)
@@ -1305,7 +1305,6 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                         else:
                             draft_no_citation_streak += 1
 
-                        # ✅ 兩條件都達標才算真的卡住（降低誤殺）
                         if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
                             set_phase(s, "error")
                             st.session_state["last_run_forced_end"] = "citation_stall"
@@ -1356,6 +1355,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
     return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
 
+
 # =========================
 # need_todo 判斷
 # =========================
@@ -1382,7 +1382,6 @@ def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
     return need, reason
 
 
-# ===== [6] 修改 render_run_badges：新增 forced_end 參數 + 顯示 Badge =====
 def render_run_badges(
     *,
     mode: str,
@@ -1391,7 +1390,7 @@ def render_run_badges(
     usage: dict,
     enable_web: bool,
     todo_file_present: Optional[bool] = None,
-    forced_end: Optional[str] = None,   # ✅ 新增
+    forced_end: Optional[str] = None,
 ):
     badges: List[str] = []
     badges.append(_badge_directive(f"Mode:{mode}", "gray"))
@@ -1408,7 +1407,6 @@ def render_run_badges(
     elif todo_file_present is False and need_todo:
         badges.append(_badge_directive("Todos.json:無(流程異常)", "orange"))
 
-    # ✅ 新增：強制結束提醒（用 badge）
     if forced_end:
         mapping = {
             "citation_stall": "ForcedStop:卡住(引用未生成)",
@@ -1436,6 +1434,11 @@ def render_run_badges(
 
     st.markdown(" ".join(badges))
 
+
+def get_forced_end() -> Optional[str]:
+    return st.session_state.get("last_run_forced_end", None)
+
+
 # =========================
 # Session init
 # =========================
@@ -1453,22 +1456,16 @@ st.session_state.setdefault("default_outputs", None)
 st.session_state.setdefault("chat_history", [])
 st.session_state.setdefault("enable_web_search_agent", False)
 
-# ===== [4] Session init 區：加三個設定 + 本次是否強制結束的旗標 =====
+# DeepAgent tuning
 st.session_state.setdefault("langgraph_recursion_limit", 200)
-st.session_state.setdefault("citation_stall_steps", 12)      # draft 不動+無引用 連續幾步才算卡住
-st.session_state.setdefault("citation_stall_min_chars", 450) # draft 至少到這個長度才開始判定（避免誤殺）
-st.session_state.setdefault("last_run_forced_end", None)     # None / "citation_stall" / "recursion_limit" / ...
+st.session_state.setdefault("citation_stall_steps", 12)
+st.session_state.setdefault("citation_stall_min_chars", 450)
+st.session_state.setdefault("last_run_forced_end", None)
+
 
 # =========================
 # File table helpers
 # =========================
-def get_forced_end() -> Optional[str]:
-    """
-    統一取得「本次是否因卡住/步數上限而強制結束」的狀態。
-    來源一律是 st.session_state['last_run_forced_end']，避免 NameError。
-    """
-    return st.session_state.get("last_run_forced_end", None)
-
 def file_rows_to_df(rows: list[FileRow]) -> pd.DataFrame:
     recs = []
     for r in rows:
@@ -1520,13 +1517,12 @@ def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
 
 
 # =========================
-# Popover：文件管理 + DeepAgent 設定
+# Popover：文件管理 + DeepAgent 設定（保留索引狀態在 popover）
 # =========================
 with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）", width="stretch"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
     st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
 
-    # ✅ 索引狀態（放在 popover 內最上面，讓使用者一打開就看到）
     has_index = (
         st.session_state.store is not None
         and getattr(st.session_state.store, "index", None) is not None
@@ -1534,13 +1530,12 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
     )
     if has_index:
         st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-        st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
+        st.caption("引用會以「來源清單」顯示（資料檔名 + 頁碼）；chunk_id 只在系統內部用來精讀與校對。")
     else:
         st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
 
     st.divider()
 
-    # ✅ DeepAgent / Web 設定（checkbox 只放一次！）
     st.session_state.enable_web_search_agent = st.checkbox(
         "啟用網路搜尋（會增加成本）",
         value=bool(st.session_state.enable_web_search_agent),
@@ -1723,23 +1718,18 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
             })
             st.rerun()
 
-# =========================
-# 主畫面：狀態 + Chat
-# =========================
-#has_index #ha
-#    st.#    st.session_state.store is 
-#    #    and getattr(st.session_state.store, "index", None) is not
-#    #    and st.session_state.store.index.ntota
-#)
 
-#if#if has_ind
-#    st.#    st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.ch
-#    st.#    st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來
-#else#
-#    st.#    st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再去「文件管理
+# =========================
+# 主畫面：Chat
+# =========================
+has_index = (
+    st.session_state.store is not None
+    and getattr(st.session_state.store, "index", None) is not None
+    and st.session_state.store.index.ntotal > 0
+)
 
-#st.#st.divid
-#st.#st.subheader("Chat（DeepAgent + Badges + Todo decisio
+st.divider()
+st.subheader("Chat（DeepAgent + 來源清單 + Todo decision）")
 
 for msg in st.session_state.chat_history:
     with st.chat_message(msg.get("role", "assistant")):
@@ -1762,7 +1752,7 @@ for msg in st.session_state.chat_history:
                 todo_file_present=meta.get("todo_file_present", None),
                 forced_end=meta.get("forced_end", None),
             )
-            render_markdown_answer_with_source_badges(msg.get("content", ""), badge_color="green")
+            render_markdown_answer_with_sources_list(msg.get("content", ""), max_titles_inline=4)
 
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
 if prompt:
@@ -1800,9 +1790,9 @@ if prompt:
                 usage=meta["usage"],
                 enable_web=enable_web,
                 todo_file_present=None,
-                forced_end=meta.get("forced_end"),  # ✅ 新增
+                forced_end=meta.get("forced_end"),
             )
-            render_markdown_answer_with_source_badges(answer_text, badge_color="green")
+            render_markdown_answer_with_sources_list(answer_text, max_titles_inline=4)
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
 
@@ -1830,11 +1820,9 @@ if prompt:
             todo_file_present=meta["todo_file_present"],
             forced_end=meta.get("forced_end"),
         )
-        render_markdown_answer_with_source_badges(answer_text, badge_color="green")
+        render_markdown_answer_with_sources_list(answer_text, max_titles_inline=4)
 
-        # ✅ Debug：Tabs 全包在 Debug expander 內
         with st.expander("Debug", expanded=False):
-            # 額外：在 Debug 最上方先顯示 todos 預覽（你想要「點開可看到 todos」）
             todos_txt = get_files_text(files, "/workspace/todos.json") if isinstance(files, dict) else ""
             if todos_txt:
                 st.markdown("### 本次 Todo（完整）")
