@@ -1515,16 +1515,30 @@ def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
 # =========================
 # Popover：文件管理 + DeepAgent 設定
 # =========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）"):
+with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）", width="stretch"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
     st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
 
+    # ✅ 索引狀態（放在 popover 內最上面，讓使用者一打開就看到）
+    has_index = (
+        st.session_state.store is not None
+        and getattr(st.session_state.store, "index", None) is not None
+        and st.session_state.store.index.ntotal > 0
+    )
+    if has_index:
+        st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
+        st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
+    else:
+        st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
+
+    st.divider()
+
+    # ✅ DeepAgent / Web 設定（checkbox 只放一次！）
     st.session_state.enable_web_search_agent = st.checkbox(
         "啟用網路搜尋（會增加成本）",
         value=bool(st.session_state.enable_web_search_agent),
     )
 
-# ===== [5] Popover「DeepAgent設定」區（enable_web checkbox 後面）加 UI 控制（可選但建議）=====
     st.session_state.langgraph_recursion_limit = st.number_input(
         "LangGraph recursion_limit（步數上限）",
         min_value=50,
@@ -1548,7 +1562,9 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
         value=int(st.session_state.get("citation_stall_min_chars", 450)),
         step=50,
     )
-    
+
+    st.divider()
+
     uploaded = st.file_uploader(
         "上傳文件",
         type=["pdf", "txt", "png", "jpg", "jpeg"],
@@ -1624,7 +1640,10 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
             hide_index=True,
             disabled=["檔名", "格式", "頁數", "文字頁", "文字%", "token估算", "建議"],
             column_config={
-                "使用OCR": st.column_config.CheckboxColumn("使用OCR", help="逐檔選擇是否啟用 OCR（PDF 可選；圖檔固定OCR；TXT固定不OCR）"),
+                "使用OCR": st.column_config.CheckboxColumn(
+                    "使用OCR",
+                    help="逐檔選擇是否啟用 OCR（PDF 可選；圖檔固定OCR；TXT固定不OCR）",
+                ),
             },
         )
 
@@ -1632,86 +1651,70 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
         df_for_sync["使用OCR"] = edited["使用OCR"].values
         sync_df_to_file_rows(df_for_sync, st.session_state.file_rows)
 
-        st.divider()
-        col1, col2, col3 = st.columns([1, 1, 1])
-        build_btn = col1.button("🚀 建立索引", type="primary", use_container_width=True)
-        default_btn = col2.button("🧾 產生預設輸出", use_container_width=True)
-        clear_btn = col3.button("🧹 清空全部", use_container_width=True)
+    st.divider()
+    col1, col2, col3 = st.columns([1, 1, 1])
 
-    # ✅ 索引狀態（搬到 popover 內）
-    has_index = (
-        st.session_state.store is not None
-        and getattr(st.session_state.store, "index", None) is not None
-        and st.session_state.store.index.ntotal > 0
-    )
-    if has_index:
-        st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-        st.caption("引用 badge 顯示『資料檔名 + 頁碼』；chunk_id 只在系統內部用來精讀與校對。")
-    else:
-        st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
+    build_btn = col1.button("🚀 建立索引", type="primary", width="stretch")
+    default_btn = col2.button("🧾 產生預設輸出", width="stretch")
+    clear_btn = col3.button("🧹 清空全部", width="stretch")
 
-    st.session_state.enable_web_search_agent = st.checkbox(
-        "啟用網路搜尋（會增加成本）",
-        value=bool(st.session_state.enable_web_search_agent),
-    )     
+    if clear_btn:
+        st.session_state.file_rows = []
+        st.session_state.file_bytes = {}
+        st.session_state.store = None
+        st.session_state.processed_keys = set()
+        st.session_state.default_outputs = None
+        st.session_state.chat_history = []
+        st.session_state.deep_agent = None
+        st.session_state.deep_agent_web_flag = None
+        st.session_state.da_usage = {"doc_search_calls": 0, "web_search_calls": 0}
+        st.session_state["last_run_forced_end"] = None
+        st.rerun()
 
-        if clear_btn:
-            st.session_state.file_rows = []
-            st.session_state.file_bytes = {}
-            st.session_state.store = None
-            st.session_state.processed_keys = set()
-            st.session_state.default_outputs = None
-            st.session_state.chat_history = []
-            st.session_state.deep_agent = None
-            st.session_state.deep_agent_web_flag = None
-            st.session_state.da_usage = {"doc_search_calls": 0, "web_search_calls": 0}
+    if build_btn:
+        need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
+        if need_ocr and not HAS_PYMUPDF:
+            st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf。")
+            st.stop()
+
+        with st.status("建索引中（OCR + embeddings）...", expanded=True) as s:
+            t0 = time.perf_counter()
+            store, stats, processed_keys = build_indices_incremental_no_kg(
+                client,
+                st.session_state.file_rows,
+                st.session_state.file_bytes,
+                st.session_state.store,
+                st.session_state.processed_keys,
+            )
+            st.session_state.store = store
+            st.session_state.processed_keys = processed_keys
+            s.write(f"新增報告數：{stats['new_reports']}")
+            s.write(f"新增 chunks：{stats['new_chunks']}")
+            s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
+            s.update(state="complete")
+
+        st.session_state.deep_agent = None
+        st.session_state.deep_agent_web_flag = None
+        st.rerun()
+
+    if default_btn:
+        if st.session_state.store is None or st.session_state.store.index.ntotal == 0:
+            st.warning("尚未建立索引或沒有 chunks，請先按「建立索引」。")
+        else:
+            with st.status("產生預設輸出（摘要/主張/推論鏈）...", expanded=True) as s2:
+                chosen = pick_corpus_chunks_for_default(st.session_state.store.chunks)
+                ctx = render_chunks_for_model(chosen)
+                bundle = generate_default_outputs_bundle(client, "整體融合（全部上傳報告）", ctx, max_retries=2)
+                st.session_state.default_outputs = bundle
+                s2.update(state="complete")
+
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "kind": "default",
+                "title": "整體融合（全部上傳報告）",
+                **(st.session_state.default_outputs or {}),
+            })
             st.rerun()
-
-        if build_btn:
-            need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
-            if need_ocr and not HAS_PYMUPDF:
-                st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf。")
-                st.stop()
-
-            with st.status("建索引中（OCR + embeddings）...", expanded=True) as s:
-                t0 = time.perf_counter()
-                store, stats, processed_keys = build_indices_incremental_no_kg(
-                    client,
-                    st.session_state.file_rows,
-                    st.session_state.file_bytes,
-                    st.session_state.store,
-                    st.session_state.processed_keys,
-                )
-                st.session_state.store = store
-                st.session_state.processed_keys = processed_keys
-                s.write(f"新增報告數：{stats['new_reports']}")
-                s.write(f"新增 chunks：{stats['new_chunks']}")
-                s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
-                s.update(state="complete")
-
-            st.session_state.deep_agent = None
-            st.session_state.deep_agent_web_flag = None
-            st.rerun()
-
-        if default_btn:
-            if st.session_state.store is None or st.session_state.store.index.ntotal == 0:
-                st.warning("尚未建立索引或沒有 chunks，請先按「建立索引」。")
-            else:
-                with st.status("產生預設輸出（摘要/主張/推論鏈）...", expanded=True) as s2:
-                    chosen = pick_corpus_chunks_for_default(st.session_state.store.chunks)
-                    ctx = render_chunks_for_model(chosen)
-                    bundle = generate_default_outputs_bundle(client, "整體融合（全部上傳報告）", ctx, max_retries=2)
-                    st.session_state.default_outputs = bundle
-                    s2.update(state="complete")
-
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "kind": "default",
-                    "title": "整體融合（全部上傳報告）",
-                    **(st.session_state.default_outputs or {}),
-                })
-                st.rerun()
-
 
 # =========================
 # 主畫面：狀態 + Chat
