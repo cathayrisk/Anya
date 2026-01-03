@@ -16,6 +16,7 @@ import ast
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 import streamlit as st
 import numpy as np
@@ -125,7 +126,7 @@ REASONING_EFFORT = "medium"
 
 
 # =========================
-# 效能參數
+# 效能參數（固定預設；不提供 UI 調整）
 # =========================
 EMBED_BATCH_SIZE = 256
 OCR_MAX_WORKERS = 2
@@ -137,6 +138,14 @@ DA_MAX_DOC_SEARCH_CALLS = 14
 DA_MAX_WEB_SEARCH_CALLS = 4
 DA_MAX_REWRITE_ROUNDS = 2
 DA_MAX_CLAIMS = 10
+
+# 固定預設（不提供 UI）
+DEFAULT_RECURSION_LIMIT = 200
+DEFAULT_CITATION_STALL_STEPS = 12
+DEFAULT_CITATION_STALL_MIN_CHARS = 450
+
+DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE = 4
+DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE = 10
 
 
 # =========================
@@ -150,6 +159,12 @@ EVIDENCE_PATH_IN_CIT_RE = re.compile(r"\[(?:/)?evidence/[^ \]]+?\s+p(\d+|-)\s*\]
 CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
 CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
+
+# 移除內部流程/檔名洩漏（只留「查得到的」內容）
+INTERNAL_LEAK_PAT = re.compile(
+    r"(Budget exceeded|/evidence|doc_[\w\-]+\.md|web_[\w\-]+\.md|額度不足|占位|向量庫|內部文件|工作流|流程|工具預算)",
+    re.IGNORECASE,
+)
 
 
 # =========================
@@ -231,6 +246,31 @@ def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
         except Exception:
             return None
     return None
+
+
+def _domain_from_url(u: str) -> str:
+    try:
+        host = urlparse(u).netloc or ""
+        host = host.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host or "web"
+    except Exception:
+        return "web"
+
+
+def strip_internal_process_lines(md: str) -> str:
+    """
+    你指定「只寫有查到的」，所以：
+    - 任何主要在講額度不足/內部檔名/流程的行，直接移除
+    """
+    lines = (md or "").splitlines()
+    kept = []
+    for line in lines:
+        if INTERNAL_LEAK_PAT.search(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 # =========================
@@ -571,15 +611,6 @@ def _badge_directive(label: str, color: str) -> str:
     return f":{color}-badge[{safe}]"
 
 
-def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
-    parsed = []
-    for c in cits:
-        m = CIT_PARSE_RE.search(c)
-        if m:
-            parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip()})
-    return parsed
-
-
 def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
     if isinstance(payload, dict):
         for k in ("content", "answer", "final", "output", "text", "message"):
@@ -655,6 +686,20 @@ def _extract_citation_items(text: str) -> list[tuple[str, str]]:
     return items
 
 
+def _title_to_display_domain(title: str) -> str:
+    """
+    B 方案：badge 只顯示 domain
+    - doc: 그대로用 title
+    - web: [WebSearch:domain p-] -> 顯示 domain
+    """
+    t = (title or "").strip()
+    low = t.lower()
+    if low.startswith("websearch:"):
+        dom = t.split(":", 1)[1].strip() if ":" in t else "web"
+        return dom or "web"
+    return t
+
+
 def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
     raw = (answer_text or "").strip()
 
@@ -666,6 +711,9 @@ def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
         extracted = _extract_main_text_from_payload(payload)
         if extracted is not None:
             raw = extracted.strip()
+
+    # ✅ 最終輸出前再保險：去內部流程/檔名
+    raw = strip_internal_process_lines(raw)
 
     cit_items = _extract_citation_items(raw)
 
@@ -694,8 +742,8 @@ def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
         grouped[t] = sorted(pages, key=_key)
 
     titles_sorted = sorted(grouped.keys(), key=lambda x: (x.strip().lower().startswith("websearch:"), x.lower()))
-    max_inline = int(st.session_state.get("sources_badge_max_titles_inline", 4))
-    max_pages = int(st.session_state.get("sources_badge_max_pages_per_title", 10))
+    max_inline = int(st.session_state.get("sources_badge_max_titles_inline", DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE))
+    max_pages = int(st.session_state.get("sources_badge_max_pages_per_title", DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE))
 
     inline_titles = titles_sorted[:max_inline]
     extra_titles = titles_sorted[max_inline:]
@@ -711,7 +759,8 @@ def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
         doc_badges: list[str] = []
         web_badges: list[str] = []
         for title in titles:
-            label = f"{title} {_pages_str(grouped.get(title, []))}"
+            show_title = _title_to_display_domain(title)
+            label = f"{show_title} {_pages_str(grouped.get(title, []))}"
             if title.strip().lower().startswith("websearch:"):
                 web_badges.append(_badge_directive(label, "violet"))
             else:
@@ -733,12 +782,7 @@ def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
 # =========================
 FORMATTER_SYSTEM_PROMPT = r"""
 你是安妮亞（Anya Forger，《SPY×FAMILY》）風格的「可靠小幫手」，但你的本職是：Markdown 輸出排版美化（formatter）。
-風格目標：:orange-badge[可愛但克制]、:blue-badge[重點先行]、:green-badge[不出錯]
-
-最高優先順序：
-1) 正確性與可追溯性 ＞ 可愛
-2) 清楚好讀 ＞ 長篇敘事
-3) 人設點到為止
+風格目標：可愛但克制、重點先行、不出錯。
 
 任務（只做版面，不改內容）：
 - 調整標題層級（# / ## / ###）、補空行、分段
@@ -754,13 +798,51 @@ FORMATTER_SYSTEM_PROMPT = r"""
 - 形如 [報告名稱 p頁]、[WebSearch:... p-]、[A p2][B p8] 的 token 不可改寫、不可刪除、不可合併
 - 若你把段落改成 bullet，引用 token 要放回對應 bullet 句尾
 
-Markdown 規則：
-- 只用 Streamlit 支援的 Markdown（禁止 HTML）
-- 顏色只用 blue/green/orange/red/violet/gray/grey/rainbow/primary，禁止 yellow
-- 公式預設不用 LaTeX；行內公式用 inline code，多行用 ```text```
+另外：
+- 不得提及內部流程、檔名、額度不足、Budget exceeded 等字樣。
+- 若遇到「缺口/不足」描述，請直接省略該段落（使用者只想看有查到的內容）。
 
 輸出：
 - 只輸出排版後的 Markdown，不要解釋、不加前言
+
+# 格式化規則
+- 根據內容選擇最合適的 Markdown 格式及彩色徽章（colored badges）元素表達。
+- 可愛語氣與彩色元素是輔助閱讀的裝飾，而不是主要結構；**不可取代清楚的標題、條列與段落組織**。
+
+# Markdown 格式與 emoji／顏色用法說明
+## 基本原則
+- 根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度使用彩色文字與 emoji 造成視覺負擔。
+- 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。
+
+## 功能與語法
+- **粗體**：`**重點**` → **重點**
+- *斜體*：`*斜體*` → *斜體*
+- 標題：`# 大標題`、`## 小標題`
+- 分隔線：`---`
+- 表格（僅部分平台支援，建議用條列式）
+- 引用：`> 這是重點摘要`
+- emoji：直接輸入或貼上，如 😄
+- Material Symbols：`:material/star:`
+- LaTeX 數學公式：`$公式$` 或 `$$公式$$`
+- 彩色文字：`:orange[重點]`、`:blue[說明]`
+- 彩色背景：`:orange-background[警告內容]`
+- 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
+- 小字：`:small[這是輔助說明]`
+
+## 顏色名稱及建議用途（條列式，跨平台穩定）
+- **blue**：資訊、一般重點
+- **green**：成功、正向、通過
+- **orange**：警告、重點、溫暖
+- **red**：錯誤、警告、危險
+- **violet**：創意、次要重點
+- **gray/grey**：輔助說明、備註
+- **rainbow**：彩色強調、活潑
+- **primary**：依主題色自動變化
+
+**注意：**
+- 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
+- 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。
+- 建議只用標準 Markdown 語法，保證跨平台顯示正常。
 """
 
 
@@ -781,7 +863,7 @@ def format_markdown_output_preserve_citations(client: OpenAI, md: str) -> str:
 
 
 # =========================
-# Default outputs (summary/claims/chain)
+# Default outputs (summary/claims/chain)（保留原樣）
 # =========================
 def _split_default_bundle(text: str) -> Dict[str, str]:
     t = (text or "").strip()
@@ -887,6 +969,44 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
 
 
 # =========================
+# Direct mode todos.json（你要求 direct 也要產）
+# =========================
+def build_todos_json_for_question(client: OpenAI, question: str, *, enable_web: bool, has_index: bool, planned_mode: str) -> str:
+    system = (
+        "你是任務規劃器。請輸出 todos.json（JSON array of strings）。\n"
+        "目的：用來規劃『如何回答使用者問題』。\n"
+        "硬規則：\n"
+        "1) 只輸出 JSON array（不要 markdown、不要解釋）。\n"
+        "2) 5~9 個 steps。\n"
+        "3) 第 1 步要說明 enable_web/has_index/planned_mode 與本題目標。\n"
+    )
+    user = f"enable_web={str(enable_web).lower()}\nhas_index={str(has_index).lower()}\nplanned_mode={planned_mode}\n\n問題：{question}"
+    out, _ = call_gpt(
+        client,
+        model=MODEL_MAIN,
+        system=system,
+        user=user,
+        reasoning_effort=None,
+        tools=None,
+        include_sources=False,
+    )
+    data = _try_parse_json_or_py_literal(out)
+    if isinstance(data, list):
+        steps = [str(x) for x in data if str(x).strip()]
+        return json.dumps(steps[:12], ensure_ascii=False, indent=2)
+
+    steps = [
+        f"說明 enable_web={str(enable_web).lower()}、has_index={str(has_index).lower()}、planned_mode={planned_mode} 與本題目標",
+        "釐清問題範圍與關鍵名詞，避免誤解",
+        "列出需要引用/查證的資訊點",
+        "若可用文件索引，規劃如何檢索與引用；若啟用網搜，規劃要查的主題與來源類型",
+        "整理可用證據後，產出結構化回覆（結論先行 + 分點）",
+        "最終檢查：不提內部流程與檔名，只保留有來源支撐的內容",
+    ]
+    return json.dumps(steps, ensure_ascii=False, indent=2)
+
+
+# =========================
 # DeepAgent
 # =========================
 def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
@@ -966,15 +1086,22 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     if enable_web:
         def _web_search_summary_fn(query: str) -> str:
             if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
-                return f"[WebSearch:{(query or '')[:30]} p-]\nBudget exceeded: web_search_calls > {DA_MAX_WEB_SEARCH_CALLS}"
+                # 仍回傳引用標頭，但不要把 Budget exceeded 寫進成品內容（writer 會省略無來源段落）
+                return "[WebSearch:web p-]\nSources:\n- web | (budget exceeded) |"
 
             q = (query or "").strip()
             if not q:
-                return "[WebSearch:empty p-]\n（query 為空）"
+                return "[WebSearch:web p-]\nSources:\n- web | (empty query) |"
 
             system = (
-                "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果成 2-4 段摘要，保留日期/名詞。"
-                "若矛盾要指出。最後用 Sources: 列出 title + url。"
+                "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果。\n"
+                "輸出格式必須固定：\n"
+                "1) 先用 3~8 個 bullets 摘要（每點一句，清楚、帶日期/數字則保留）。\n"
+                "2) 最後一定要有一段 Sources:，用條列列出來源。\n"
+                "   每列格式：- <domain> | <title> | <url>\n"
+                "規則：\n"
+                "- 不要提到工具流程/額度/Budget exceeded。\n"
+                "- 若找不到可靠來源：摘要可為空，但仍要輸出 Sources:（可能為空）。\n"
             )
             user = f"Search term: {q}"
             text, sources = call_gpt(
@@ -986,21 +1113,31 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                 tools=[{"type": "web_search"}],
                 include_sources=True,
             )
+
             src_lines = []
-            for s in (sources or [])[:8]:
+            domains = []
+            for s in (sources or [])[:10]:
                 if isinstance(s, dict):
-                    t = s.get("title") or s.get("source") or "source"
-                    u = s.get("url") or ""
+                    t = (s.get("title") or s.get("source") or "source").strip()
+                    u = (s.get("url") or "").strip()
+                    dom = _domain_from_url(u) if u else "web"
+                    domains.append(dom)
                     if u:
-                        src_lines.append(f"- {t} {u}".strip())
+                        src_lines.append(f"- {dom} | {t} | {u}")
 
             out_text = (text or "").strip()
+            # ✅ 用第一個來源 domain 當 citation title（badge 就只會顯示 domain）
+            primary_domain = domains[0] if domains else "web"
+
+            # 保證有 Sources 段
             if src_lines:
                 out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
+            else:
+                out_text = (out_text + "\n\nSources:").strip()
 
-            return f"[WebSearch:{q[:30]} p-]\n" + out_text[:2400]
+            return f"[WebSearch:{primary_domain} p-]\n" + out_text[:2400]
 
-        tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources.")
+        tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources + domain.")
         tools.append(tool_web_search_summary)
 
     retriever_prompt = f"""
@@ -1020,7 +1157,7 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - 你可以用 doc_search 拿到 chunk_id，然後用 doc_get_chunk(chunk_id=...) 精讀，
   但 chunk_id 絕對不能寫進 evidence。
 
-若遇到 Budget exceeded：立刻停止並在 evidence 明講「證據不足」。
+若遇到 Budget exceeded：停止，且不要把錯誤字串抄進 evidence（只要停止即可）。
 最後回覆 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
 """
 
@@ -1040,7 +1177,12 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - enable_web=false：不得出現 WebSearch
 - draft 絕對不能出現 chunk_id
 - 報告名稱不得是 /evidence/*.md
-- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
+- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]
+
+輸出禁則（非常重要）：
+- 成品 /draft.md 不得提及內部流程或檔名：不得出現「/evidence」、「doc_*.md」、「web_*.md」、「Budget exceeded」、「額度不足」、「占位」、「向量庫」等字樣。
+- 若某面向找不到可引用來源：在 /draft.md 直接省略該面向，不要寫「證據不足/額度不足/未能取得」等段落。
+- 只寫你有引用支撐、能說清楚的內容。
 
 把結果寫到 /draft.md
 """
@@ -1055,7 +1197,10 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - enable_web=false：不得出現 WebSearch
 - 若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
 - 引用標頭不得使用 /evidence/*.md
-- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
+
+額外規則：
+- /draft.md 若出現「/evidence、doc_、web_、Budget exceeded、額度不足、占位、向量庫」等內部字樣，必須移除。
+- 若整段主要在講「找不到資料/額度不足」，請刪除該段落（使用者只想看有查到的內容）。
 
 最多修正 {DA_MAX_REWRITE_ROUNDS} 輪：
 - 每輪：read /draft.md → edit_file 修正 → write /review.md 記錄
@@ -1092,8 +1237,9 @@ facet 子任務格式同 retriever。
 
 硬規則：
 - 寫入 /evidence/web_<facet_slug>.md
-- 每段要保留引用標頭 [WebSearch:... p-]
-- 禁止捏造來源；若 Budget exceeded 就停止並寫明缺口
+- 每段要保留引用標頭 [WebSearch:<domain> p-]
+- 禁止捏造來源
+- 不要寫「Budget exceeded/額度不足/占位」到 evidence；若沒有來源就不要寫那段
 """
         subagents.insert(
             1,
@@ -1122,13 +1268,13 @@ facet 子任務格式同 retriever。
 
 引用與隱私規則：
 - /evidence 與 /draft 絕對不能出現 chunk_id
-- 引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]
+- 引用只能用 [報告名稱 p頁] 或 [WebSearch:<domain> p-]
 - 報告名稱不得使用 /evidence/*.md 當作來源名稱
 - 多引用請用 [A p2][B p8]，不要在同一對 [] 內塞多筆
+- 成品不得提及內部流程/檔名/額度不足；只保留有引用支撐的內容
 """
 
     llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
-    recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
 
     agent = create_deep_agent(
         model=llm,
@@ -1137,7 +1283,7 @@ facet 子任務格式同 retriever。
         subagents=subagents,
         debug=False,
         name="deep-doc-agent",
-    ).with_config({"recursion_limit": recursion_limit})
+    ).with_config({"recursion_limit": int(st.session_state.get("langgraph_recursion_limit", DEFAULT_RECURSION_LIMIT))})
 
     st.session_state.deep_agent = agent
     st.session_state.deep_agent_web_flag = bool(enable_web)
@@ -1176,7 +1322,6 @@ def fallback_answer_from_store(
         "3) 引用中的報告名稱必須來自我提供的資料片段標頭（例如 [XXX p12]）。\n"
         "4) 不可使用 /evidence/*.md 當作報告名稱。\n"
         "5) 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]。\n"
-        "6) 若資料不足，請用 bullet 明確說明缺口，並引用最接近的來源。\n"
     )
     user = f"問題：{q}\n\n資料：\n{ctx}\n"
 
@@ -1189,7 +1334,9 @@ def fallback_answer_from_store(
         tools=None,
         include_sources=False,
     )
-    return (out or "").strip() or "（系統：fallback RAG 未產出內容）"
+    out = (out or "").strip()
+    out = strip_internal_process_lines(out)
+    return out or "（系統：fallback RAG 未產出內容）"
 
 
 # =========================
@@ -1201,9 +1348,9 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
     st.session_state["last_run_forced_end"] = None
 
-    recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
-    stall_steps = int(st.session_state.get("citation_stall_steps", 12))
-    stall_min_chars = int(st.session_state.get("citation_stall_min_chars", 450))
+    recursion_limit = int(st.session_state.get("langgraph_recursion_limit", DEFAULT_RECURSION_LIMIT))
+    stall_steps = int(st.session_state.get("citation_stall_steps", DEFAULT_CITATION_STALL_STEPS))
+    stall_min_chars = int(st.session_state.get("citation_stall_min_chars", DEFAULT_CITATION_STALL_MIN_CHARS))
 
     draft_unchanged_streak = 0
     draft_no_citation_streak = 0
@@ -1272,7 +1419,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
                             st.session_state["last_run_forced_end"] = "citation_stall"
                             s.warning(
                                 f"判定卡住：/draft.md 內容連續 {draft_unchanged_streak} 步未變、且連續 {draft_no_citation_streak} 步無引用。"
-                                "已強制結束 DeepAgent，改用 fallback（向量搜尋 + 強制引用）產出答案。"
+                                "已強制結束 DeepAgent，改用 fallback 產出答案。"
                             )
                             answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
                             return answer, files if isinstance(files, dict) and files else None
@@ -1283,6 +1430,7 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
             files = (final_state or {}).get("files") or {}
             draft = get_files_text(files, "/draft.md") if isinstance(files, dict) else ""
+            draft = strip_internal_process_lines(draft)
             if draft.strip():
                 s.warning(f"已達步數上限（recursion_limit={recursion_limit}），回傳目前 /draft.md。")
                 return draft.strip(), (files if isinstance(files, dict) and files else None)
@@ -1312,6 +1460,8 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
 
         if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
             final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
+
+        final_text = strip_internal_process_lines(final_text)
 
         set_phase(s, "done")
 
@@ -1360,16 +1510,12 @@ def render_run_badges(
     badges: List[str] = []
     badges.append(_badge_directive(f"Mode:{mode}", "gray"))
 
-    if need_todo:
-        badges.append(_badge_directive("Todo:需要", "blue"))
-    else:
-        badges.append(_badge_directive("Todo:不需要", "blue"))
-        short_reason = reason if len(reason) <= 40 else reason[:40] + "…"
-        badges.append(_badge_directive(f"理由:{short_reason}", "gray"))
+    # ✅ 你要求：不管模式都要 Todo 分析（所以這裡永遠顯示 Todo:需要）
+    badges.append(_badge_directive("Todo:需要", "blue"))
 
     if todo_file_present is True:
         badges.append(_badge_directive("Todos.json:有", "blue"))
-    elif todo_file_present is False and need_todo:
+    elif todo_file_present is False:
         badges.append(_badge_directive("Todos.json:無(流程異常)", "orange"))
 
     if forced_end:
@@ -1385,9 +1531,8 @@ def render_run_badges(
     web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
 
     badges.append(_badge_directive(f"DB:{'used' if doc_calls else 'unused'}({doc_calls})" if doc_calls else "DB:unused", "green" if doc_calls else "gray"))
-
     if enable_web:
-        badges.append(_badge_directive(f"Web:{'used' if web_calls else 'unused'}({web_calls})" if web_calls else "Web:unused", "violet" if web_calls else "gray"))
+        badges.append(_badge_directive(f"Web:used({web_calls})" if web_calls else "Web:unused", "violet" if web_calls else "gray"))
     else:
         badges.append(_badge_directive("Web:disabled", "gray"))
 
@@ -1476,16 +1621,18 @@ st.session_state.setdefault("processed_keys", set())
 st.session_state.setdefault("default_outputs", None)
 st.session_state.setdefault("chat_history", [])
 
+# Popover 只留 web 開關
 st.session_state.setdefault("enable_web_search_agent", False)
 
-st.session_state.setdefault("langgraph_recursion_limit", 200)
-st.session_state.setdefault("citation_stall_steps", 12)
-st.session_state.setdefault("citation_stall_min_chars", 450)
+# 其餘固定預設（不提供 UI）
+st.session_state.setdefault("langgraph_recursion_limit", DEFAULT_RECURSION_LIMIT)
+st.session_state.setdefault("citation_stall_steps", DEFAULT_CITATION_STALL_STEPS)
+st.session_state.setdefault("citation_stall_min_chars", DEFAULT_CITATION_STALL_MIN_CHARS)
 st.session_state.setdefault("last_run_forced_end", None)
 
 st.session_state.setdefault("enable_output_formatter", True)
-st.session_state.setdefault("sources_badge_max_titles_inline", 4)
-st.session_state.setdefault("sources_badge_max_pages_per_title", 10)
+st.session_state.setdefault("sources_badge_max_titles_inline", DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE)
+st.session_state.setdefault("sources_badge_max_pages_per_title", DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE)
 
 
 # =========================
@@ -1542,7 +1689,7 @@ def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
 
 
 # =========================
-# Popover：文件管理 + DeepAgent 設定（索引狀態保留在 popover）
+# Popover：文件管理（只留網搜開關；其餘 UI 不顯示）
 # =========================
 with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）"):
     st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
@@ -1555,56 +1702,16 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
     )
     if has_index:
         st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-        st.caption("來源以 badge 顯示（檔名 + 頁碼彙總）；chunk_id 僅供內部精讀與校對。")
+        st.caption("來源以 badge 顯示（文件：檔名 + 頁碼；網路：domain + p-）。")
     else:
         st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
 
     st.divider()
 
+    # ✅ 只留這個
     st.session_state.enable_web_search_agent = st.checkbox(
         "啟用網路搜尋（會增加成本）",
         value=bool(st.session_state.enable_web_search_agent),
-    )
-    st.session_state.enable_output_formatter = st.checkbox(
-        "輸出排版美化（formatter；會多一次模型呼叫）",
-        value=bool(st.session_state.get("enable_output_formatter", True)),
-    )
-
-    st.session_state.langgraph_recursion_limit = st.number_input(
-        "LangGraph recursion_limit（步數上限）",
-        min_value=50,
-        max_value=3000,
-        value=int(st.session_state.get("langgraph_recursion_limit", 200)),
-        step=50,
-    )
-    st.session_state.citation_stall_steps = st.number_input(
-        "卡住判定：draft『不變 + 無引用』連續幾步就強制結束",
-        min_value=5,
-        max_value=80,
-        value=int(st.session_state.get("citation_stall_steps", 12)),
-        step=1,
-    )
-    st.session_state.citation_stall_min_chars = st.number_input(
-        "卡住判定：draft 最少字元數（太短不判定，避免誤殺）",
-        min_value=150,
-        max_value=5000,
-        value=int(st.session_state.get("citation_stall_min_chars", 450)),
-        step=50,
-    )
-
-    st.session_state.sources_badge_max_titles_inline = st.number_input(
-        "來源 badge：前台最多顯示幾個來源（其餘收合）",
-        min_value=1,
-        max_value=20,
-        value=int(st.session_state.get("sources_badge_max_titles_inline", 4)),
-        step=1,
-    )
-    st.session_state.sources_badge_max_pages_per_title = st.number_input(
-        "來源 badge：每個來源最多顯示幾個頁碼",
-        min_value=3,
-        max_value=40,
-        value=int(st.session_state.get("sources_badge_max_pages_per_title", 10)),
-        step=1,
     )
 
     st.divider()
@@ -1676,7 +1783,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
         st.info("尚未上傳文件。")
     else:
         df = file_rows_to_df(st.session_state.file_rows)
-
         edited = st.data_editor(
             df.drop(columns=["_file_id"]),
             key="file_table_editor",
@@ -1772,13 +1878,18 @@ has_index = (
 st.divider()
 st.subheader("Chat（DeepAgent + Sources Badges + Todo decision）")
 
-# 顯示歷史
+
+# 顯示歷史（✅ user 不顯示 badge）
 for msg in st.session_state.chat_history:
-    with st.chat_message(msg.get("role", "assistant")):
+    role = msg.get("role", "assistant")
+    with st.chat_message(role):
+        if role == "user":
+            st.markdown(msg.get("content", ""))
+            continue
+
         if msg.get("kind") == "default":
             st.markdown(f"## 預設輸出：{msg.get('title','')}")
             st.markdown("### 1) 報告摘要")
-            # 這裡保持簡單，避免又刷一堆 badge（你要我也可改成來源清單/收合）
             st.code((msg.get("summary", "") or "")[:20000], language="markdown")
             st.markdown("### 2) 核心主張")
             st.code((msg.get("claims", "") or "")[:20000], language="markdown")
@@ -1788,7 +1899,7 @@ for msg in st.session_state.chat_history:
             meta = msg.get("meta", {}) or {}
             render_run_badges(
                 mode=meta.get("mode", "unknown"),
-                need_todo=bool(meta.get("need_todo", False)),
+                need_todo=True,
                 reason=str(meta.get("reason", "") or ""),
                 usage=meta.get("usage", {}) or {},
                 enable_web=bool(meta.get("enable_web", False)),
@@ -1796,6 +1907,7 @@ for msg in st.session_state.chat_history:
                 forced_end=meta.get("forced_end", None),
             )
             render_markdown_answer_with_sources_badges(msg.get("content", ""))
+
 
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
 if prompt:
@@ -1805,10 +1917,21 @@ if prompt:
 
     with st.chat_message("assistant"):
         enable_web = bool(st.session_state.enable_web_search_agent)
+
+        # ✅ 不管 direct/deepagent，都做 todo 判斷（你要求）
         need_todo, reason = decide_need_todo(client, prompt)
 
+        planned_mode = "deepagent" if (has_index and need_todo) else "direct"
+        todos_json_text = build_todos_json_for_question(
+            client,
+            prompt,
+            enable_web=enable_web,
+            has_index=has_index,
+            planned_mode=planned_mode,
+        )
+
         # direct
-        if (not has_index) or (not need_todo):
+        if planned_mode == "direct":
             system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
             answer_text, _ = call_gpt(
                 client,
@@ -1819,29 +1942,38 @@ if prompt:
                 tools=None,
             )
 
+            # formatter + 去內部流程
             if st.session_state.get("enable_output_formatter", True):
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
+            answer_text = strip_internal_process_lines(answer_text)
+
+            # ✅ direct 也造出 files（供 debug / badges）
+            files = {"/workspace/todos.json": todos_json_text}
 
             meta = {
                 "mode": "direct",
-                "need_todo": bool(need_todo),
+                "need_todo": True,
                 "reason": reason,
                 "usage": {"doc_search_calls": 0, "web_search_calls": 0},
                 "enable_web": enable_web,
-                "todo_file_present": None,
+                "todo_file_present": True,
                 "forced_end": None,
             }
 
             render_run_badges(
                 mode=meta["mode"],
-                need_todo=bool(need_todo),
+                need_todo=True,
                 reason=reason,
                 usage=meta["usage"],
                 enable_web=enable_web,
-                todo_file_present=None,
-                forced_end=meta.get("forced_end"),
+                todo_file_present=True,
+                forced_end=None,
             )
             render_markdown_answer_with_sources_badges(answer_text)
+
+            with st.expander("Debug", expanded=False):
+                st.markdown("### 本次 Todo（direct 產生）")
+                st.code(todos_json_text[:20000], language="json")
 
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
@@ -1852,6 +1984,13 @@ if prompt:
 
         if st.session_state.get("enable_output_formatter", True):
             answer_text = format_markdown_output_preserve_citations(client, answer_text)
+        answer_text = strip_internal_process_lines(answer_text)
+
+        # deepagent：若沒產 todos.json，用 direct 計畫補上（保證有）
+        if not isinstance(files, dict):
+            files = {}
+        if "/workspace/todos.json" not in files:
+            files["/workspace/todos.json"] = todos_json_text
 
         todo_file_present = isinstance(files, dict) and ("/workspace/todos.json" in files)
 
