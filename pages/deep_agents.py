@@ -1140,6 +1140,78 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources + domain.")
         tools.append(tool_web_search_summary)
 
+    if enable_web:
+        def _web_search_summary_fn(query: str) -> str:
+            if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
+                # ✅ 不要把 Budget exceeded 的文字塞進 evidence/草稿，避免污染最終輸出
+                return "[WebSearch:web p-]\nSources:"
+
+            q = (query or "").strip()
+            if not q:
+                return "[WebSearch:web p-]\nSources:"
+
+            system = (
+                "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果。\n"
+                "輸出格式必須固定：\n"
+                "1) 先用 3~8 個 bullets 摘要（每點一句，清楚、帶日期/數字則保留）。\n"
+                "2) 最後一定要有一段 Sources:，用條列列出來源。\n"
+                "   每列格式：- <domain> | <title> | <url>\n"
+                "規則：\n"
+                "- 不要提到工具流程/額度/Budget exceeded。\n"
+                "- 若找不到可靠來源：摘要可為空，但仍要輸出 Sources:。\n"
+            )
+            user = f"Search term: {q}"
+            text, sources = call_gpt(
+                client,
+                model=MODEL_WEB,
+                system=system,
+                user=user,
+                reasoning_effort=None,
+                tools=[{"type": "web_search"}],
+                include_sources=True,
+            )
+
+            def _domain(u: str) -> str:
+                try:
+                    host = urlparse(u).netloc.lower()
+                    if host.startswith("www."):
+                        host = host[4:]
+                    return host or "web"
+                except Exception:
+                    return "web"
+
+        # ✅ 用第一個來源的 domain 當 citation header： [WebSearch:<domain> p-]
+            primary_domain = "web"
+            if isinstance(sources, list) and sources:
+                first = sources[0] if isinstance(sources[0], dict) else {}
+                u0 = (first.get("url") or "").strip()
+                if u0:
+                    primary_domain = _domain(u0)
+
+            src_lines = []
+            for s in (sources or [])[:10]:
+                if isinstance(s, dict):
+                    t = (s.get("title") or s.get("source") or "source").strip()
+                    u = (s.get("url") or "").strip()
+                    if u:
+                        src_lines.append(f"- {_domain(u)} | {t} | {u}")
+
+            out_text = (text or "").strip()
+            if src_lines:
+                out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
+            else:
+                # 仍保留 Sources: 標頭，讓 downstream 好解析
+                out_text = (out_text + "\n\nSources:").strip()
+
+            return f"[WebSearch:{primary_domain} p-]\n" + out_text[:2400]
+
+        tool_web_search_summary = _mk_tool(
+            _web_search_summary_fn,
+            "web_search_summary",
+            "Run web_search and return a short Traditional Chinese summary with sources (domain|title|url).",
+        )
+        tools.append(tool_web_search_summary)
+    
     retriever_prompt = f"""
 你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
 
