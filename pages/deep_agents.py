@@ -1256,7 +1256,46 @@ hints: <可能的關鍵字/指標/名詞（可空）>
 - 若某面向找不到可引用來源：在 /draft.md 直接省略該面向，不要寫「證據不足/額度不足/未能取得」等段落。
 - 只寫你有引用支撐、能說清楚的內容。
 
-把結果寫到 /draft.md
+# 格式化規則
+- 根據內容選擇最合適的 Markdown 格式及彩色徽章（colored badges）元素表達。
+- 可愛語氣與彩色元素是輔助閱讀的裝飾，而不是主要結構；**不可取代清楚的標題、條列與段落組織**。
+
+# Markdown 格式與 emoji／顏色用法說明
+## 基本原則
+- 根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度使用彩色文字與 emoji 造成視覺負擔。
+- 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。
+
+## 功能與語法
+- **粗體**：`**重點**` → **重點**
+- *斜體*：`*斜體*` → *斜體*
+- 標題：`# 大標題`、`## 小標題`
+- 分隔線：`---`
+- 表格（僅部分平台支援，建議用條列式）
+- 引用：`> 這是重點摘要`
+- emoji：直接輸入或貼上，如 😄
+- Material Symbols：`:material/star:`
+- LaTeX 數學公式：`$公式$` 或 `$$公式$$`
+- 彩色文字：`:orange[重點]`、`:blue[說明]`
+- 彩色背景：`:orange-background[警告內容]`
+- 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
+- 小字：`:small[這是輔助說明]`
+
+## 顏色名稱及建議用途（條列式，跨平台穩定）
+- **blue**：資訊、一般重點
+- **green**：成功、正向、通過
+- **orange**：警告、重點、溫暖
+- **red**：錯誤、警告、危險
+- **violet**：創意、次要重點
+- **gray/grey**：輔助說明、備註
+- **rainbow**：彩色強調、活潑
+- **primary**：依主題色自動變化
+
+**注意：**
+- 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
+- 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。
+- 建議只用標準 Markdown 語法，保證跨平台顯示正常。
+
+## 最終把結果寫到 /draft.md
 """
 
     verifier_prompt = f"""
@@ -1706,6 +1745,8 @@ st.session_state.setdefault("enable_output_formatter", True)
 st.session_state.setdefault("sources_badge_max_titles_inline", DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE)
 st.session_state.setdefault("sources_badge_max_pages_per_title", DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE)
 
+ENABLE_FORMATTER_FOR_DIRECT = True
+ENABLE_FORMATTER_FOR_DEEPAGENT = False
 
 # =========================
 # File table helpers
@@ -1778,15 +1819,11 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
     else:
         st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
 
-    st.divider()
-
     # ✅ 只留這個
     st.session_state.enable_web_search_agent = st.checkbox(
         "啟用網路搜尋（會增加成本）",
         value=bool(st.session_state.enable_web_search_agent),
     )
-
-    st.divider()
 
     uploaded = st.file_uploader(
         "上傳文件",
@@ -2015,7 +2052,7 @@ if prompt:
             )
 
             # formatter + 去內部流程
-            if st.session_state.get("enable_output_formatter", True):
+            if ENABLE_FORMATTER_FOR_DIRECT and st.session_state.get("enable_output_formatter", True):
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
             answer_text = strip_internal_process_lines(answer_text)
 
@@ -2054,7 +2091,7 @@ if prompt:
         agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
         answer_text, files = deep_agent_run_with_live_status(agent, prompt)
 
-        if st.session_state.get("enable_output_formatter", True):
+        if ENABLE_FORMATTER_FOR_DEEPAGENT and st.session_state.get("enable_output_formatter", True):
             answer_text = format_markdown_output_preserve_citations(client, answer_text)
         answer_text = strip_internal_process_lines(answer_text)
 
