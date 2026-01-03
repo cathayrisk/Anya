@@ -34,11 +34,10 @@ except Exception:
 
 
 # =========================
-# Streamlit config（只呼叫一次）
+# Streamlit config
 # =========================
 st.set_page_config(page_title="研究報告助手（DeepAgent + Badges）", layout="wide")
 st.title("研究報告助手（DeepAgent + Badges）")
-
 # ✅ 依你要求：不注入任何 CSS（回到 Streamlit 預設排版）
 
 
@@ -73,7 +72,7 @@ except Exception as e:
 HAS_DEEPAGENTS = (create_deep_agent is not None) and ((init_chat_model is not None) or (ChatOpenAI is not None))
 
 
-def _require_deepagents():
+def _require_deepagents() -> None:
     if HAS_DEEPAGENTS:
         return
     st.error("DeepAgent 依賴載入失敗（不一定是沒安裝，可能是版本/依賴不相容）。")
@@ -82,7 +81,7 @@ def _require_deepagents():
         for msg in DEEPAGENTS_IMPORT_ERRORS:
             st.code(msg)
     else:
-        st.info("（沒有捕捉到錯誤細節，請確認 deep_agents.py 是否已整檔覆蓋為最新版）")
+        st.info("（沒有捕捉到錯誤細節）")
     st.stop()
 
 
@@ -114,7 +113,7 @@ def _make_langchain_llm(model_name: str, temperature: float = 0.0, reasoning_eff
 
 
 # =========================
-# 固定模型設定（依你要求：都用 gpt-5.2）
+# 模型設定（依你要求：gpt-5.2）
 # =========================
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -122,7 +121,7 @@ MODEL_MAIN = "gpt-5.2"
 MODEL_GRADER = "gpt-5.2"
 MODEL_WEB = "gpt-5.2"
 
-REASONING_EFFORT = "medium"  # ✅ 推理需求高才使用
+REASONING_EFFORT = "medium"
 
 
 # =========================
@@ -134,18 +133,20 @@ OCR_MAX_WORKERS = 2
 CORPUS_DEFAULT_MAX_CHUNKS = 24
 CORPUS_PER_REPORT_QUOTA = 6
 
-# DeepAgent budgets
 DA_MAX_DOC_SEARCH_CALLS = 14
 DA_MAX_WEB_SEARCH_CALLS = 4
 DA_MAX_REWRITE_ROUNDS = 2
 DA_MAX_CLAIMS = 10
 
+
+# =========================
+# Regex / citations
+# =========================
 CHUNK_ID_LEAK_PAT = re.compile(r"(chunk_id\s*=\s*|_p(?:na|\d+)_c\d+)", re.IGNORECASE)
 
-# ✅ 重要：你的內部 evidence 檔名不應出現在引用 badge
+# 重要：內部 evidence 不該出現在有效引用
 EVIDENCE_PATH_IN_CIT_RE = re.compile(r"\[(?:/)?evidence/[^ \]]+?\s+p(\d+|-)\s*\]", re.IGNORECASE)
 
-# citations
 CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
 CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
@@ -203,16 +204,10 @@ def _dedup_keep_order(items: list[str]) -> list[str]:
 
 
 def _hash_norm_text(s: str) -> str:
-    """用來判斷 draft 是否『內容完全沒變』（去空白後 hash）。"""
     return sha1_bytes(norm_space(s).encode("utf-8"))
 
 
 def has_visible_citations(text: str) -> bool:
-    """
-    是否含「有效引用」：
-    - 形式：[xxx p12] 或 [WebSearch:... p-]
-    - 忽略 /evidence/*.md 這種內部路徑引用
-    """
     raw = (text or "").strip()
     if not raw:
         return False
@@ -239,259 +234,7 @@ def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
 
 
 # =========================
-# file-to-text
-# =========================
-def file_to_text(file_obj: Any) -> str:
-    """
-    從 dict(content=[...]) 取出真正 markdown 文字
-    """
-    if file_obj is None:
-        return ""
-
-    if isinstance(file_obj, dict):
-        if "data" in file_obj:
-            return file_to_text(file_obj.get("data"))
-        if "content" in file_obj:
-            return file_to_text(file_obj.get("content"))
-        for k in ("text", "answer", "final", "output", "message"):
-            if k in file_obj:
-                return file_to_text(file_obj.get(k))
-        try:
-            return json.dumps(file_obj, ensure_ascii=False, indent=2)
-        except Exception:
-            return str(file_obj)
-
-    if isinstance(file_obj, (bytes, bytearray)):
-        return file_obj.decode("utf-8", errors="ignore")
-
-    if isinstance(file_obj, str):
-        return file_obj
-
-    if isinstance(file_obj, (list, tuple)):
-        parts: list[str] = []
-        for x in file_obj:
-            t = file_to_text(x).strip()
-            if t:
-                parts.append(t)
-        return "\n".join(parts)
-
-    return str(file_obj)
-
-
-def get_files_text(files: Optional[dict], key: str) -> str:
-    if not isinstance(files, dict) or key not in files:
-        return ""
-    return file_to_text(files.get(key)).strip()
-
-
-def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
-    if isinstance(payload, dict):
-        for k in ("content", "answer", "final", "output", "text", "message"):
-            if k not in payload:
-                continue
-            v = payload.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-            if isinstance(v, (list, tuple)):
-                joined = file_to_text(v).strip()
-                if joined:
-                    return joined
-
-        msgs = payload.get("messages")
-        if isinstance(msgs, list) and msgs:
-            last = msgs[-1]
-            if isinstance(last, dict):
-                c = last.get("content")
-                if isinstance(c, (str, list, tuple, dict)):
-                    out = file_to_text(c).strip()
-                    if out:
-                        return out
-            out = file_to_text(last).strip()
-            return out or None
-
-        return None
-
-    if isinstance(payload, list):
-        out = file_to_text(payload).strip()
-        return out or None
-
-    return None
-
-
-# =========================
-# citations parsing + rendering
-# =========================
-def _badge_directive(label: str, color: str) -> str:
-    safe = label.replace("[", "(").replace("]", ")")
-    return f":{color}-badge[{safe}]"
-
-
-def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
-    parsed = []
-    for c in cits:
-        m = CIT_PARSE_RE.search(c)
-        if m:
-            parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip()})
-    return parsed
-
-
-def _strip_citations_from_text(text: str) -> str:
-    """
-    ✅ 移除引用，但保留原本的換行與段落（避免 Markdown 黏成一坨）
-    """
-    if not text:
-        return ""
-
-    pat = re.compile(r"[ \t]*\[[^\]]*?\s+p(\d+|-)(?:-\d+)?[^\]]*?\][ \t]*")
-    out_lines: list[str] = []
-    for line in text.splitlines():
-        newline = pat.sub("", line).rstrip()
-        out_lines.append(newline)
-    return "\n".join(out_lines).strip()
-
-
-def _extract_citation_items(text: str) -> list[tuple[str, str]]:
-    """
-    從全文抽出引用項目 (title, page)。
-    支援：
-    - [Title p12]
-    - [Title p2-3; Another Title p8]
-    - [A p2][B p8]
-    """
-    if not text:
-        return []
-
-    items: list[tuple[str, str]] = []
-    for m in re.finditer(r"\[([^\]]+)\]", text):
-        inner = (m.group(1) or "").strip()
-        if not inner:
-            continue
-
-        parts = [p.strip() for p in re.split(r"[;；]", inner) if p.strip()]
-        for p in parts:
-            mm = re.search(r"^(.*)\s+p(\d+(?:-\d+)?|-)\s*$", p)
-            if not mm:
-                continue
-            title = norm_space(mm.group(1))
-            page = mm.group(2).strip()
-
-            # 濾掉 evidence 路徑引用
-            if EVIDENCE_PATH_IN_CIT_RE.search(f"[{title} p{page}]"):
-                continue
-
-            items.append((title, page))
-
-    return items
-
-
-def render_markdown_answer_with_sources_badges(answer_text: str):
-    """
-    - 正文：去除引用 token，但保留換行
-    - 來源：以 badge 顯示（每個 title 一個 badge + pages 彙總）；過多則收合
-    """
-    raw = (answer_text or "").strip()
-
-    if raw and CHUNK_ID_LEAK_PAT.search(raw):
-        raw = CHUNK_ID_LEAK_PAT.sub("", raw)
-
-    payload = _try_parse_json_or_py_literal(raw)
-    if payload is not None:
-        extracted = _extract_main_text_from_payload(payload)
-        if extracted is not None:
-            raw = extracted.strip()
-
-    cit_items = _extract_citation_items(raw)
-
-    clean = _strip_citations_from_text(raw)
-    st.markdown(clean if clean else "（無內容）")
-
-    if not cit_items:
-        return
-
-    grouped: dict[str, list[str]] = {}
-    for title, page in cit_items:
-        grouped.setdefault(title, []).append(page)
-
-    def _key(p: str):
-        if p.isdigit():
-            return (0, int(p))
-        if re.fullmatch(r"\d+-\d+", p):
-            a, b = p.split("-", 1)
-            return (1, int(a), int(b))
-        if p == "-":
-            return (9, 10**9)
-        return (10, p)
-
-    for t in list(grouped.keys()):
-        pages = _dedup_keep_order([p.strip() for p in grouped[t] if p.strip()])
-        grouped[t] = sorted(pages, key=_key)
-
-    titles_sorted = sorted(grouped.keys(), key=lambda x: (x.strip().lower().startswith("websearch:"), x.lower()))
-
-    max_inline = int(st.session_state.get("sources_badge_max_titles_inline", 4))
-    max_pages = int(st.session_state.get("sources_badge_max_pages_per_title", 10))
-
-    inline_titles = titles_sorted[:max_inline]
-    extra_titles = titles_sorted[max_inline:]
-
-    def _pages_str(pages: list[str]) -> str:
-        if not pages:
-            return "p-"
-        if len(pages) <= max_pages:
-            return "p" + ",".join(pages)
-        return "p" + ",".join(pages[:max_pages]) + "…"
-
-    def _render_badges(titles: list[str]):
-        doc_badges: list[str] = []
-        web_badges: list[str] = []
-        for title in titles:
-            label = f"{title} {_pages_str(grouped.get(title, []))}"
-            if title.strip().lower().startswith("websearch:"):
-                web_badges.append(_badge_directive(label, "violet"))
-            else:
-                doc_badges.append(_badge_directive(label, "green"))
-
-        if doc_badges:
-            st.markdown(" ".join(doc_badges))
-        if web_badges:
-            st.markdown(" ".join(web_badges))
-
-    st.markdown("### 來源")
-    _render_badges(inline_titles)
-
-    if extra_titles:
-        with st.expander(f"更多來源（{len(extra_titles)}）", expanded=False):
-            _render_badges(extra_titles)
-
-
-def render_bullets_inline_badges(md_bullets: str, badge_color: str = "green"):
-    lines = [l.rstrip() for l in (md_bullets or "").splitlines() if l.strip()]
-    for line in lines:
-        if not BULLET_RE.match(line):
-            continue
-        full_cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
-        full_cits = [c for c in full_cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
-        clean = re.sub(r"\[[^\]]+?\s+p(\d+|-)\s*\]", "", line).strip()
-        parsed = _parse_citations(full_cits)
-        badges = [_badge_directive(f"{it['title']} p{it['page']}", badge_color) for it in parsed]
-        st.markdown(clean + (" " + " ".join(badges) if badges else ""))
-
-
-def bullets_all_have_citations(md: str) -> bool:
-    lines = (md or "").splitlines()
-    if not any(BULLET_RE.match(l) for l in lines):
-        return False
-    for line in lines:
-        if BULLET_RE.match(line):
-            cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
-            cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
-            if not cits:
-                return False
-    return True
-
-
-# =========================
-# OpenAI wrappers
+# OpenAI client + wrappers
 # =========================
 def get_openai_api_key() -> str:
     if "OPENAI_KEY" in st.secrets and st.secrets["OPENAI_KEY"]:
@@ -505,18 +248,6 @@ def get_openai_api_key() -> str:
 
 def get_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key)
-
-
-def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
-    resp = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=texts,
-        encoding_format="float",
-    )
-    vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    return vecs / norms
 
 
 def _to_messages(system: str, user: Any) -> list[Dict[str, Any]]:
@@ -562,12 +293,24 @@ def call_gpt(
     return out_text, sources
 
 
+def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=texts,
+        encoding_format="float",
+    )
+    vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return vecs / norms
+
+
 # =========================
 # OCR / PDF
 # =========================
 def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    out = []
+    out: list[Tuple[int, str]] = []
     for i, p in enumerate(reader.pages):
         try:
             t = p.extract_text() or ""
@@ -579,7 +322,7 @@ def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
 
 def extract_pdf_text_pages_pymupdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    out = []
+    out: list[Tuple[int, str]] = []
     for i in range(doc.page_count):
         page = doc.load_page(i)
         t = page.get_text("text") or ""
@@ -666,7 +409,7 @@ def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> 
 
 
 # =========================
-# FAISS store + indexing
+# FAISS store
 # =========================
 @dataclass
 class Chunk:
@@ -690,7 +433,7 @@ class FaissStore:
         if self.index.ntotal == 0:
             return []
         scores, idx = self.index.search(qvec.astype(np.float32), k)
-        out = []
+        out: list[Tuple[float, Chunk]] = []
         for s, i in zip(scores[0], idx[0]):
             if i < 0 or i >= len(self.chunks):
                 continue
@@ -698,6 +441,9 @@ class FaissStore:
         return out
 
 
+# =========================
+# File rows
+# =========================
 @dataclass
 class FileRow:
     file_id: str
@@ -708,10 +454,8 @@ class FileRow:
     pages: Optional[int]
     extracted_chars: int
     token_est: int
-
     text_pages: Optional[int]
     text_pages_ratio: Optional[float]
-
     blank_pages: Optional[int]
     blank_ratio: Optional[float]
     likely_scanned: bool
@@ -735,7 +479,7 @@ def build_indices_incremental_no_kg(
     new_chunks: list[Chunk] = []
     new_texts: list[str] = []
 
-    to_process = []
+    to_process: list[FileRow] = []
     for r in file_rows:
         key = (r.file_sig, bool(r.use_ocr))
         if key not in processed_keys:
@@ -769,7 +513,7 @@ def build_indices_incremental_no_kg(
         processed_keys.add((row.file_sig, bool(row.use_ocr)))
 
     if new_texts:
-        vecs_list = []
+        vecs_list: list[np.ndarray] = []
         for i in range(0, len(new_texts), EMBED_BATCH_SIZE):
             vecs_list.append(embed_texts(client, new_texts[i:i + EMBED_BATCH_SIZE]))
         vecs = np.vstack(vecs_list)
@@ -780,7 +524,264 @@ def build_indices_incremental_no_kg(
 
 
 # =========================
-# 預設輸出（三份 bullets + citations）
+# citations / rendering
+# =========================
+def file_to_text(file_obj: Any) -> str:
+    if file_obj is None:
+        return ""
+
+    if isinstance(file_obj, dict):
+        if "data" in file_obj:
+            return file_to_text(file_obj.get("data"))
+        if "content" in file_obj:
+            return file_to_text(file_obj.get("content"))
+        for k in ("text", "answer", "final", "output", "message"):
+            if k in file_obj:
+                return file_to_text(file_obj.get(k))
+        try:
+            return json.dumps(file_obj, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(file_obj)
+
+    if isinstance(file_obj, (bytes, bytearray)):
+        return file_obj.decode("utf-8", errors="ignore")
+
+    if isinstance(file_obj, str):
+        return file_obj
+
+    if isinstance(file_obj, (list, tuple)):
+        parts: list[str] = []
+        for x in file_obj:
+            t = file_to_text(x).strip()
+            if t:
+                parts.append(t)
+        return "\n".join(parts)
+
+    return str(file_obj)
+
+
+def get_files_text(files: Optional[dict], key: str) -> str:
+    if not isinstance(files, dict) or key not in files:
+        return ""
+    return file_to_text(files.get(key)).strip()
+
+
+def _badge_directive(label: str, color: str) -> str:
+    safe = label.replace("[", "(").replace("]", ")")
+    return f":{color}-badge[{safe}]"
+
+
+def _parse_citations(cits: list[str]) -> list[Dict[str, str]]:
+    parsed = []
+    for c in cits:
+        m = CIT_PARSE_RE.search(c)
+        if m:
+            parsed.append({"title": m.group(1).strip(), "page": m.group(2).strip()})
+    return parsed
+
+
+def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        for k in ("content", "answer", "final", "output", "text", "message"):
+            if k not in payload:
+                continue
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+            if isinstance(v, (list, tuple)):
+                joined = file_to_text(v).strip()
+                if joined:
+                    return joined
+        msgs = payload.get("messages")
+        if isinstance(msgs, list) and msgs:
+            last = msgs[-1]
+            if isinstance(last, dict):
+                c = last.get("content")
+                if isinstance(c, (str, list, tuple, dict)):
+                    out = file_to_text(c).strip()
+                    if out:
+                        return out
+            out = file_to_text(last).strip()
+            return out or None
+        return None
+
+    if isinstance(payload, list):
+        out = file_to_text(payload).strip()
+        return out or None
+
+    return None
+
+
+def _strip_citations_from_text(text: str) -> str:
+    """
+    移除引用 token，但保留換行（避免 Markdown 黏成一坨）
+    """
+    if not text:
+        return ""
+    pat = re.compile(r"[ \t]*\[[^\]]*?\s+p(\d+|-)(?:-\d+)?[^\]]*?\][ \t]*")
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        out_lines.append(pat.sub("", line).rstrip())
+    return "\n".join(out_lines).strip()
+
+
+def _extract_citation_items(text: str) -> list[tuple[str, str]]:
+    """
+    支援：
+    - [Title p12]
+    - [Title p2-3; Another Title p8]
+    - [A p2][B p8]
+    """
+    if not text:
+        return []
+
+    items: list[tuple[str, str]] = []
+    for m in re.finditer(r"\[([^\]]+)\]", text):
+        inner = (m.group(1) or "").strip()
+        if not inner:
+            continue
+
+        parts = [p.strip() for p in re.split(r"[;；]", inner) if p.strip()]
+        for p in parts:
+            mm = re.search(r"^(.*)\s+p(\d+(?:-\d+)?|-)\s*$", p)
+            if not mm:
+                continue
+            title = norm_space(mm.group(1))
+            page = mm.group(2).strip()
+            if EVIDENCE_PATH_IN_CIT_RE.search(f"[{title} p{page}]"):
+                continue
+            items.append((title, page))
+
+    return items
+
+
+def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
+    raw = (answer_text or "").strip()
+
+    if raw and CHUNK_ID_LEAK_PAT.search(raw):
+        raw = CHUNK_ID_LEAK_PAT.sub("", raw)
+
+    payload = _try_parse_json_or_py_literal(raw)
+    if payload is not None:
+        extracted = _extract_main_text_from_payload(payload)
+        if extracted is not None:
+            raw = extracted.strip()
+
+    cit_items = _extract_citation_items(raw)
+
+    clean = _strip_citations_from_text(raw)
+    st.markdown(clean if clean else "（無內容）")
+
+    if not cit_items:
+        return
+
+    grouped: dict[str, list[str]] = {}
+    for title, page in cit_items:
+        grouped.setdefault(title, []).append(page)
+
+    def _key(p: str):
+        if p.isdigit():
+            return (0, int(p))
+        if re.fullmatch(r"\d+-\d+", p):
+            a, b = p.split("-", 1)
+            return (1, int(a), int(b))
+        if p == "-":
+            return (9, 10**9)
+        return (10, p)
+
+    for t in list(grouped.keys()):
+        pages = _dedup_keep_order([p.strip() for p in grouped[t] if p.strip()])
+        grouped[t] = sorted(pages, key=_key)
+
+    titles_sorted = sorted(grouped.keys(), key=lambda x: (x.strip().lower().startswith("websearch:"), x.lower()))
+    max_inline = int(st.session_state.get("sources_badge_max_titles_inline", 4))
+    max_pages = int(st.session_state.get("sources_badge_max_pages_per_title", 10))
+
+    inline_titles = titles_sorted[:max_inline]
+    extra_titles = titles_sorted[max_inline:]
+
+    def _pages_str(pages: list[str]) -> str:
+        if not pages:
+            return "p-"
+        if len(pages) <= max_pages:
+            return "p" + ",".join(pages)
+        return "p" + ",".join(pages[:max_pages]) + "…"
+
+    def _render_badges(titles: list[str]) -> None:
+        doc_badges: list[str] = []
+        web_badges: list[str] = []
+        for title in titles:
+            label = f"{title} {_pages_str(grouped.get(title, []))}"
+            if title.strip().lower().startswith("websearch:"):
+                web_badges.append(_badge_directive(label, "violet"))
+            else:
+                doc_badges.append(_badge_directive(label, "green"))
+        if doc_badges:
+            st.markdown(" ".join(doc_badges))
+        if web_badges:
+            st.markdown(" ".join(web_badges))
+
+    st.markdown("### 來源")
+    _render_badges(inline_titles)
+    if extra_titles:
+        with st.expander(f"更多來源（{len(extra_titles)}）", expanded=False):
+            _render_badges(extra_titles)
+
+
+# =========================
+# Formatter（可愛但克制）
+# =========================
+FORMATTER_SYSTEM_PROMPT = r"""
+你是安妮亞（Anya Forger，《SPY×FAMILY》）風格的「可靠小幫手」，但你的本職是：Markdown 輸出排版美化（formatter）。
+風格目標：:orange-badge[可愛但克制]、:blue-badge[重點先行]、:green-badge[不出錯]
+
+最高優先順序：
+1) 正確性與可追溯性 ＞ 可愛
+2) 清楚好讀 ＞ 長篇敘事
+3) 人設點到為止
+
+任務（只做版面，不改內容）：
+- 調整標題層級（# / ## / ###）、補空行、分段
+- 過長段落可改成 bullets（每點一件事）
+- 統一章節結構、讓閱讀更清楚
+
+嚴格禁止：
+- 新增任何事實、數字、日期、主張、推論、案例
+- 改變原文意思
+- 捏造/補上不存在的引用
+
+引用 token 硬規則（必須逐字保留）：
+- 形如 [報告名稱 p頁]、[WebSearch:... p-]、[A p2][B p8] 的 token 不可改寫、不可刪除、不可合併
+- 若你把段落改成 bullet，引用 token 要放回對應 bullet 句尾
+
+Markdown 規則：
+- 只用 Streamlit 支援的 Markdown（禁止 HTML）
+- 顏色只用 blue/green/orange/red/violet/gray/grey/rainbow/primary，禁止 yellow
+- 公式預設不用 LaTeX；行內公式用 inline code，多行用 ```text```
+
+輸出：
+- 只輸出排版後的 Markdown，不要解釋、不加前言
+"""
+
+
+def format_markdown_output_preserve_citations(client: OpenAI, md: str) -> str:
+    raw = (md or "").strip()
+    if not raw:
+        return ""
+    out, _ = call_gpt(
+        client,
+        model=MODEL_MAIN,
+        system=FORMATTER_SYSTEM_PROMPT,
+        user=raw,
+        reasoning_effort=None,
+        tools=None,
+        include_sources=False,
+    )
+    return (out or "").strip() or raw
+
+
+# =========================
+# Default outputs (summary/claims/chain)
 # =========================
 def _split_default_bundle(text: str) -> Dict[str, str]:
     t = (text or "").strip()
@@ -820,7 +821,7 @@ def pick_corpus_chunks_for_default(all_chunks: list[Chunk]) -> list[Chunk]:
             p = c.page if c.page is not None else 0
             by_page.setdefault(p, []).append(c)
 
-        page_best = []
+        page_best: list[Chunk] = []
         for p, cs in by_page.items():
             cs = sorted(cs, key=score, reverse=True)
             page_best.append(cs[0])
@@ -838,6 +839,19 @@ def render_chunks_for_model(chunks: list[Chunk], max_chars_each: int = 900) -> s
         head = f"[{c.title} p{c.page if c.page is not None else '-'}]"
         parts.append(head + "\n" + c.text[:max_chars_each])
     return "\n\n".join(parts)
+
+
+def bullets_all_have_citations(md: str) -> bool:
+    lines = (md or "").splitlines()
+    if not any(BULLET_RE.match(l) for l in lines):
+        return False
+    for line in lines:
+        if BULLET_RE.match(line):
+            cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
+            cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
+            if not cits:
+                return False
+    return True
 
 
 def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_retries: int = 2) -> Dict[str, str]:
@@ -868,936 +882,1006 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
             return parts
         last = out
         user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁]；不得出現 /evidence/*.md。多引用用 [A p2][B p8]。"
+
     return _split_default_bundle(last)
 
 
 # =========================
-# Formatter（可愛但克制 prompt）
+# DeepAgent
 # =========================
-FORMATTER_SYSTEM_PROMPT = r"""
-你是安妮亞（Anya Forger，《SPY×FAMILY》）風格的「可靠小幫手」，但你的本職是：**Markdown 輸出排版美化（formatter）**。
-風格目標：:orange-badge[可愛但克制]、:blue-badge[重點先行]、:green-badge[不出錯]
+def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
+    _require_deepagents()
+    from langchain_core.tools import BaseTool, StructuredTool
 
-========================
-0) 最高優先順序（永遠不變）
-========================
-1) 正確性與可追溯性（能說清楚依據/來源/限制）＞ 可愛人設
-2) 清楚好讀（結構化、重點先行）＞ 長篇敘事
-3) 人設只是包裝：最多點到為止，不要干擾閱讀與可靠性
+    st.session_state.setdefault("deep_agent", None)
+    st.session_state.setdefault("deep_agent_web_flag", None)
+    st.session_state.setdefault("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})
 
-========================
-1) 你的任務（formatter）
-========================
-你會收到一份 Markdown 草稿（可能含引用 token）。
-你要做的是「改善可讀性與版面」：
-- 調整標題層級（# / ## / ###）
-- 補齊空行、分隔線
-- 長段落拆成短段或 bullets（每點一件事）
-- 統一風格（同層級章節一致的寫法）
+    if (st.session_state.deep_agent is not None) and (st.session_state.deep_agent_web_flag == bool(enable_web)):
+        return st.session_state.deep_agent
 
-你**不得**：
-- 新增任何事實、數字、日期、主張、推論、案例
-- 改變原文意思（只能更清楚地表達）
-- 捏造/補上不存在的引用
-- 刪除或改寫引用 token
-- 產生與原文矛盾的內容
+    lock = threading.Lock()
+    usage = {"doc_search_calls": 0, "web_search_calls": 0}
+    st.session_state["da_usage"] = usage
 
-========================
-2) 引用（Citations）硬規則：必須原樣保留
-========================
-引用 token 形式包含但不限於：
-- [報告名稱 p頁]
-- [WebSearch:... p-]
-- 多個引用可能連續出現，例如：[A p2][B p8]
+    def _inc(name: str, limit: int) -> bool:
+        with lock:
+            usage[name] += 1
+            st.session_state["da_usage"] = usage
+            return usage[name] <= limit
 
-硬規則：
-1) 所有引用 token 必須「逐字原樣保留」：括號、空白、大小寫、頁碼都不可改。
-2) 不得把多個引用塞回同一對 [] 用分號（若原文是連續多個 []，要維持連續多個 []）。
-3) 若你將段落改成 bullets，引用要移到**對應 bullet 的句尾**，仍保持原樣。
-4) 不要把引用 token 放進 code block 或 inline code（除非原本就在 code）。
+    def _get_usage_fn() -> str:
+        with lock:
+            return json.dumps(usage, ensure_ascii=False)
 
-========================
-3) Markdown 與彩色元素規則（Streamlit 相容）
-========================
-- 只用 Streamlit 支援的 Markdown，不要用 HTML（<div><span> 一律禁止）。
-- 彩色/徽章/emoji 是「導覽裝飾」，不可取代標題與條列。
-- emoji：最多少量（例如每大段 0~1 個），避免花。
+    def _doc_list_fn() -> str:
+        by_title: Dict[str, int] = {}
+        for c in store.chunks:
+            by_title[c.title] = by_title.get(c.title, 0) + 1
+        lines = [f"- {t} (chunks={n})" for t, n in sorted(by_title.items(), key=lambda x: x[0])]
+        return "\n".join(lines) if lines else "（目前沒有任何已索引文件）"
 
-允許語法：
-- **粗體**、*斜體*
-- # / ## / ### 標題
-- ---
-- > 引用塊
-- :small[小字]
-- :blue[...] / :green[...] / :orange[...] / :red[...] / :violet[...] / :gray[...] / :primary[...] / :rainbow[...]
-- :blue-badge[...] / :green-badge[...] / :orange-badge[...] / :red-badge[...] / :violet-badge[...] / :gray-badge[...] / :primary-badge[...] / :rainbow-badge[...]
-
-顏色限制：
-- 只能用 blue / green / orange / red / violet / gray/grey / rainbow / primary
-- 禁止 yellow（需要黃色感覺請用 orange 或 🟡✨🌟）
-
-========================
-4) 數學公式輸出規則（相容模式，預設啟用）
-========================
-- 預設不用 LaTeX（避免環境不渲染）
-- 行內公式用 inline code：`y(t) ≈ r_base(t) + s_credit(t)`
-- 多行推導用 code block（text）：
-```text
-PL = -P * (KRD_2Y*Δr_2Y + KRD_5Y*Δr_5Y)
-
-不要用 [...] 包公式（避免被誤判為引用語法）
-======================== 5) 版面輸出模板（請盡量套用，但尊重原文）
-A) 最上方（可選，且最多 1 行可愛導讀）：
-
-允許 0~1 行「安妮亞式導讀」，例如：安妮亞整理好了～ 以下是重點版面
-若原文本來就很正式，也可以完全不寫導讀。
-B) 接著一定要有「重點摘要」（擇一）：
-
-用 > 引用塊（2–5 行），或
-用 3–6 個 bullets（每點短、每點一件事）
-C) 正文結構：
-
-用 ## 作大章節
-每章節先 1–2 句結論（若原文已有就保留），再列 bullets 或小段落
-「資料限制/未覆蓋」類聲明用 ... 或 ... 強調，但不要太多
-D) 最少改動原則：
-
-原文已經清楚就少改；主要修「黏段」「過長段」「結構不一致」。
-======================== 99) 最終輸出要求
-只輸出「排版後的 Markdown」
-不要解釋你做了什麼
-不要附加任何與原文無關的內容 """
-def format_markdown_output_preserve_citations(client: OpenAI, md: str) → str: raw = (md or "").strip() if not raw: return "" out, _ = call_gpt( client, model=MODEL_MAIN, system=FORMATTER_SYSTEM_PROMPT, user=raw, reasoning_effort=None, tools=None, include_sources=False, ) return (out or "").strip() or raw
-
-=========================
-DeepAgent
-=========================
-def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool): _require_deepagents() from langchain_core.tools import BaseTool, StructuredTool
-
-st.session_state.setdefault("deep_agent", None)
-st.session_state.setdefault("deep_agent_web_flag", None)
-st.session_state.setdefault("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})
-
-if (st.session_state.deep_agent is not None) and (st.session_state.deep_agent_web_flag == bool(enable_web)):
-    return st.session_state.deep_agent
-
-lock = threading.Lock()
-usage = {"doc_search_calls": 0, "web_search_calls": 0}
-st.session_state["da_usage"] = usage
-
-def _inc(name: str, limit: int) -> bool:
-    with lock:
-        usage[name] += 1
-        st.session_state["da_usage"] = usage
-        return usage[name] <= limit
-
-def _get_usage_fn() -> str:
-    with lock:
-        return json.dumps(usage, ensure_ascii=False)
-
-def _doc_list_fn() -> str:
-    by_title: Dict[str, int] = {}
-    for c in store.chunks:
-        by_title[c.title] = by_title.get(c.title, 0) + 1
-    lines = [f"- {t} (chunks={n})" for t, n in sorted(by_title.items(), key=lambda x: x[0])]
-    return "\n".join(lines) if lines else "（目前沒有任何已索引文件）"
-
-def _doc_search_fn(query: str, k: int = 8) -> str:
-    if not _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS):
-        return json.dumps({"hits": [], "error": f"Budget exceeded: doc_search_calls > {DA_MAX_DOC_SEARCH_CALLS}"}, ensure_ascii=False)
-
-    q = (query or "").strip()
-    if not q:
-        return json.dumps({"hits": []}, ensure_ascii=False)
-
-    qvec = embed_texts(client, [q])
-    hits = store.search(qvec, k=max(1, min(12, int(k))))
-
-    payload = {"hits": []}
-    for score, ch in hits:
-        payload["hits"].append({
-            "title": ch.title,
-            "page": str(ch.page) if ch.page is not None else "-",
-            "chunk_id": ch.chunk_id,  # internal only
-            "text": (ch.text or "")[:1200],
-            "score": float(score),
-        })
-    return json.dumps(payload, ensure_ascii=False)
-
-def _doc_get_chunk_fn(chunk_id: str, max_chars: int = 2600) -> str:
-    cid = (chunk_id or "").strip()
-    if not cid:
-        return ""
-    for c in store.chunks:
-        if c.chunk_id == cid:
-            return (c.text or "")[:max_chars]
-    return ""
-
-def _mk_tool(fn, name: str, description: str) -> BaseTool:
-    return StructuredTool.from_function(fn, name=name, description=description)
-
-tool_get_usage = _mk_tool(_get_usage_fn, "get_usage", "Get current tool usage counters as JSON (budget/debug).")
-tool_doc_list = _mk_tool(_doc_list_fn, "doc_list", "List indexed documents and chunk counts.")
-tool_doc_search = _mk_tool(_doc_search_fn, "doc_search", "Semantic search over indexed chunks. Returns JSON hits with title/page/chunk_id/text.")
-tool_doc_get_chunk = _mk_tool(_doc_get_chunk_fn, "doc_get_chunk", "Fetch full text for a given chunk_id for close reading. Returns text only.")
-
-tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk]
-
-tool_web_search_summary: Optional[BaseTool] = None
-if enable_web:
-    def _web_search_summary_fn(query: str) -> str:
-        if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
-            return f"[WebSearch:{(query or '')[:30]} p-]\nBudget exceeded: web_search_calls > {DA_MAX_WEB_SEARCH_CALLS}"
+    def _doc_search_fn(query: str, k: int = 8) -> str:
+        if not _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS):
+            return json.dumps({"hits": [], "error": f"Budget exceeded: doc_search_calls > {DA_MAX_DOC_SEARCH_CALLS}"}, ensure_ascii=False)
 
         q = (query or "").strip()
         if not q:
-            return "[WebSearch:empty p-]\n（query 為空）"
+            return json.dumps({"hits": []}, ensure_ascii=False)
 
-        system = (
-            "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果成 2-4 段摘要，保留日期/名詞。"
-            "若矛盾要指出。最後用 Sources: 列出 title + url。"
-        )
-        user = f"Search term: {q}"
-        text, sources = call_gpt(
-            client,
-            model=MODEL_WEB,
-            system=system,
-            user=user,
-            reasoning_effort=None,
-            tools=[{"type": "web_search"}],
-            include_sources=True,
-        )
-        src_lines = []
-        for s in (sources or [])[:8]:
-            if isinstance(s, dict):
-                t = s.get("title") or s.get("source") or "source"
-                u = s.get("url") or ""
-                if u:
-                    src_lines.append(f"- {t} {u}".strip())
+        qvec = embed_texts(client, [q])
+        hits = store.search(qvec, k=max(1, min(12, int(k))))
 
-        out_text = (text or "").strip()
-        if src_lines:
-            out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
+        payload = {"hits": []}
+        for score, ch in hits:
+            payload["hits"].append({
+                "title": ch.title,
+                "page": str(ch.page) if ch.page is not None else "-",
+                "chunk_id": ch.chunk_id,  # internal only
+                "text": (ch.text or "")[:1200],
+                "score": float(score),
+            })
+        return json.dumps(payload, ensure_ascii=False)
 
-        return f"[WebSearch:{q[:30]} p-]\n" + out_text[:2400]
+    def _doc_get_chunk_fn(chunk_id: str, max_chars: int = 2600) -> str:
+        cid = (chunk_id or "").strip()
+        if not cid:
+            return ""
+        for c in store.chunks:
+            if c.chunk_id == cid:
+                return (c.text or "")[:max_chars]
+        return ""
 
-    tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources.")
-    tools.append(tool_web_search_summary)
+    def _mk_tool(fn, name: str, description: str) -> BaseTool:
+        return StructuredTool.from_function(fn, name=name, description=description)
 
-retriever_prompt = f"""
+    tool_get_usage = _mk_tool(_get_usage_fn, "get_usage", "Get current tool usage counters as JSON (budget/debug).")
+    tool_doc_list = _mk_tool(_doc_list_fn, "doc_list", "List indexed documents and chunk counts.")
+    tool_doc_search = _mk_tool(_doc_search_fn, "doc_search", "Semantic search over indexed chunks. Returns JSON hits with title/page/chunk_id/text.")
+    tool_doc_get_chunk = _mk_tool(_doc_get_chunk_fn, "doc_get_chunk", "Fetch full text for a given chunk_id for close reading. Returns text only.")
 
+    tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk]
+
+    tool_web_search_summary: Optional[BaseTool] = None
+    if enable_web:
+        def _web_search_summary_fn(query: str) -> str:
+            if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
+                return f"[WebSearch:{(query or '')[:30]} p-]\nBudget exceeded: web_search_calls > {DA_MAX_WEB_SEARCH_CALLS}"
+
+            q = (query or "").strip()
+            if not q:
+                return "[WebSearch:empty p-]\n（query 為空）"
+
+            system = (
+                "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果成 2-4 段摘要，保留日期/名詞。"
+                "若矛盾要指出。最後用 Sources: 列出 title + url。"
+            )
+            user = f"Search term: {q}"
+            text, sources = call_gpt(
+                client,
+                model=MODEL_WEB,
+                system=system,
+                user=user,
+                reasoning_effort=None,
+                tools=[{"type": "web_search"}],
+                include_sources=True,
+            )
+            src_lines = []
+            for s in (sources or [])[:8]:
+                if isinstance(s, dict):
+                    t = s.get("title") or s.get("source") or "source"
+                    u = s.get("url") or ""
+                    if u:
+                        src_lines.append(f"- {t} {u}".strip())
+
+            out_text = (text or "").strip()
+            if src_lines:
+                out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
+
+            return f"[WebSearch:{q[:30]} p-]\n" + out_text[:2400]
+
+        tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources.")
+        tools.append(tool_web_search_summary)
+
+    retriever_prompt = f"""
 你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
 
-facet 子任務格式： facet_slug: <英文小寫_底線> facet_goal: <這個面向要回答什麼> hints: <可能的關鍵字/指標/名詞（可空）>
+facet 子任務格式：
+facet_slug: <英文小寫_底線>
+facet_goal: <這個面向要回答什麼>
+hints: <可能的關鍵字/指標/名詞（可空）>
 
 硬規則：
+- 你要寫入 /evidence/doc_<facet_slug>.md
+- evidence 內容只能包含：
+  1) 引用標頭：[報告名稱 p頁]（不得包含 /evidence/ 路徑；不得用 doc_*.md 當報告名稱）
+  2) 原文片段（可截斷）
+  3) 一行說明「這段支持什麼」
+- 你可以用 doc_search 拿到 chunk_id，然後用 doc_get_chunk(chunk_id=...) 精讀，
+  但 chunk_id 絕對不能寫進 evidence。
 
-你要寫入 /evidence/doc_<facet_slug>.md
-evidence 內容只能包含：
-引用標頭：[報告名稱 p頁]（不得包含 /evidence/ 路徑；不得用 doc_*.md 當報告名稱）
-原文片段（可截斷）
-一行說明「這段支持什麼」
-你可以用 doc_search 拿到 chunk_id，然後用 doc_get_chunk(chunk_id=...) 精讀， 但 chunk_id 絕對不能寫進 evidence。
-若遇到 Budget exceeded：立刻停止並在 evidence 明講「證據不足」。 最後回覆 orchestrator：≤150 字摘要（找到什麼 + 最大缺口） """
+若遇到 Budget exceeded：立刻停止並在 evidence 明講「證據不足」。
+最後回覆 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
+"""
 
-writer_prompt = f"""
-
-你是寫作/整理專家（用 read_file/glob/grep/write_file/edit_file/ls）。 你必須整合 /evidence/ 底下所有檔案（doc_.md 與可選 web_.md）。
+    writer_prompt = f"""
+你是寫作/整理專家（用 read_file/glob/grep/write_file/edit_file/ls）。
+你必須整合 /evidence/ 底下所有檔案（doc_*.md 與可選 web_*.md）。
 
 任務類型判斷：
+- 完整報告/章節 → REPORT
+- 單題回答 → QA
+- 整理知識脈絡 → KNOWLEDGE
+- 使用者貼草稿要查核/除錯 → VERIFY_DRAFT（最多 {DA_MAX_CLAIMS} 條主張）
 
-完整報告/章節 → REPORT
-單題回答 → QA
-整理知識脈絡 → KNOWLEDGE
-使用者貼草稿要查核/除錯 → VERIFY_DRAFT（最多 {DA_MAX_CLAIMS} 條主張）
 引用規則（嚴格）：
+- QA：純 bullet（每行 -），每個 bullet 句尾必有引用 [報告名稱 p頁] 或 [WebSearch:* p-]
+- REPORT/KNOWLEDGE/VERIFY：Markdown；每個非標題段落至少 1 個引用
+- enable_web=false：不得出現 WebSearch
+- draft 絕對不能出現 chunk_id
+- 報告名稱不得是 /evidence/*.md
+- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
 
-QA：純 bullet（每行 -），每個 bullet 句尾必有引用 [報告名稱 p頁] 或 [WebSearch:* p-]
-REPORT/KNOWLEDGE/VERIFY：Markdown；每個非標題段落至少 1 個引用
-enable_web=false：不得出現 WebSearch
-draft 絕對不能出現 chunk_id
-報告名稱不得是 /evidence/*.md
-若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
-把結果寫到 /draft.md """
+把結果寫到 /draft.md
+"""
 
-verifier_prompt = f"""
-
-你是審稿查核專家（用 read_file/edit_file/grep）。 任務：檢查 /draft.md 是否符合引用覆蓋，並做『最少改動』修正。
+    verifier_prompt = f"""
+你是審稿查核專家（用 read_file/edit_file/grep）。
+任務：檢查 /draft.md 是否符合引用覆蓋，並做『最少改動』修正。
 
 規則：
+- QA：每個 bullet 句尾必有 [.. p..]
+- 其他：每個非標題段落至少 1 個引用 [.. p..]
+- enable_web=false：不得出現 WebSearch
+- 若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
+- 引用標頭不得使用 /evidence/*.md
+- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
 
-QA：每個 bullet 句尾必有 [.. p..]
-其他：每個非標題段落至少 1 個引用 [.. p..]
-enable_web=false：不得出現 WebSearch
-若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p_c），必須移除。
-引用標頭不得使用 /evidence/*.md
-若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。
 最多修正 {DA_MAX_REWRITE_ROUNDS} 輪：
+- 每輪：read /draft.md → edit_file 修正 → write /review.md 記錄
+"""
 
-每輪：read /draft.md → edit_file 修正 → write /review.md 記錄 """
+    subagents = [
+        {
+            "name": "retriever",
+            "description": "從上傳文件向量庫找證據，寫 /evidence/doc_*.md（不含 chunk_id）",
+            "system_prompt": retriever_prompt,
+            "tools": [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+        {
+            "name": "writer",
+            "description": "整合 /evidence/ → 產生 /draft.md",
+            "system_prompt": writer_prompt,
+            "tools": [],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+        {
+            "name": "verifier",
+            "description": "檢查引用覆蓋並修稿 /draft.md，寫 /review.md",
+            "system_prompt": verifier_prompt,
+            "tools": [],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+    ]
 
-subagents = [ { "name": "retriever", "description": "從上傳文件向量庫找證據，寫 /evidence/doc_*.md（不含 chunk_id）", "system_prompt": retriever_prompt, "tools": [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk], "model": f"openai:{MODEL_MAIN}", }, { "name": "writer", "description": "整合 /evidence/ → 產生 /draft.md", "system_prompt": writer_prompt, "tools": [], "model": f"openai:{MODEL_MAIN}", }, { "name": "verifier", "description": "檢查引用覆蓋並修稿 /draft.md，寫 /review.md", "system_prompt": verifier_prompt, "tools": [], "model": f"openai:{MODEL_MAIN}", }, ]
-
-if enable_web: web_prompt = """ 你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。 facet 子任務格式同 retriever。
+    if enable_web:
+        web_prompt = """
+你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。
+facet 子任務格式同 retriever。
 
 硬規則：
+- 寫入 /evidence/web_<facet_slug>.md
+- 每段要保留引用標頭 [WebSearch:... p-]
+- 禁止捏造來源；若 Budget exceeded 就停止並寫明缺口
+"""
+        subagents.insert(
+            1,
+            {
+                "name": "web-researcher",
+                "description": "用 OpenAI 內建 web_search 做少量高品質搜尋，寫 /evidence/web_*.md",
+                "system_prompt": web_prompt,
+                "tools": [tool_web_search_summary, tool_get_usage] if tool_web_search_summary else [tool_get_usage],
+                "model": f"openai:{MODEL_MAIN}",
+            },
+        )
 
-寫入 /evidence/web_<facet_slug>.md
+    orchestrator_prompt = f"""
+你是 Deep Doc Orchestrator（文件優先；enable_web={str(enable_web).lower()}）。
 
-每段要保留引用標頭 [WebSearch:... p-]
+固定流程（必做）：
+0) 立刻用 write_file 建立 /workspace/todos.json（JSON array of strings；5~9 步），並在第一步說明 enable_web 與目標。
+1) write_file /evidence/README.md 記錄本次需求與 enable_web
+2) 拆 2–4 個 facets（面向，不是章節）
+3) 平行派工：
+   - 每個 facet 至少派 1 個 retriever
+   - enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
+4) 叫 writer 產生 /draft.md
+5) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
+6) read_file /draft.md 作為最終回答
 
-禁止捏造來源；若 Budget exceeded 就停止並寫明缺口 """ subagents.insert( 1, { "name": "web-researcher", "description": "用 OpenAI 內建 web_search 做少量高品質搜尋，寫 /evidence/web_*.md", "system_prompt": web_prompt, "tools": [tool_web_search_summary, tool_get_usage] if tool_web_search_summary else [tool_get_usage], "model": f"openai:{MODEL_MAIN}", }, )
-
-orchestrator_prompt = f""" 你是 Deep Doc Orchestrator（文件優先；enable_web={str(enable_web).lower()}）。
-
-固定流程（必做）： 0) 立刻用 write_file 建立 /workspace/todos.json（JSON array of strings；5~9 步），並在第一步說明 enable_web 與目標。
-
-write_file /evidence/README.md 記錄本次需求與 enable_web
-拆 2–4 個 facets（面向，不是章節）
-平行派工：
-每個 facet 至少派 1 個 retriever
-enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
-叫 writer 產生 /draft.md
-叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
-read_file /draft.md 作為最終回答
 引用與隱私規則：
+- /evidence 與 /draft 絕對不能出現 chunk_id
+- 引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]
+- 報告名稱不得使用 /evidence/*.md 當作來源名稱
+- 多引用請用 [A p2][B p8]，不要在同一對 [] 內塞多筆
+"""
 
-/evidence 與 /draft 絕對不能出現 chunk_id
+    llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
+    recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
 
-引用只能用 [報告名稱 p頁] 或 [WebSearch:* p-]
+    agent = create_deep_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=orchestrator_prompt,
+        subagents=subagents,
+        debug=False,
+        name="deep-doc-agent",
+    ).with_config({"recursion_limit": recursion_limit})
 
-報告名稱不得使用 /evidence/*.md 當作來源名稱
+    st.session_state.deep_agent = agent
+    st.session_state.deep_agent_web_flag = bool(enable_web)
+    return agent
 
-多引用請用 [A p2][B p8]，不要在同一對 [] 內塞多筆 """
 
-llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT) recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
+# =========================
+# Fallback (RAG)
+# =========================
+def fallback_answer_from_store(
+    client: OpenAI,
+    store: Optional[FaissStore],
+    question: str,
+    *,
+    k: int = 10,
+) -> str:
+    q = (question or "").strip()
+    if not q:
+        return "（系統：問題為空，無法產生回答）"
 
-agent = create_deep_agent( model=llm, tools=tools, system_prompt=orchestrator_prompt, subagents=subagents, debug=False, name="deep-doc-agent", ).with_config({"recursion_limit": recursion_limit})
+    if store is None or getattr(store, "index", None) is None or store.index.ntotal == 0:
+        system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
+        ans, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=q, reasoning_effort=None, tools=None)
+        return ans or "（系統：無索引且模型未產出內容）"
 
-st.session_state.deep_agent = agent st.session_state.deep_agent_web_flag = bool(enable_web) return agent
+    qvec = embed_texts(client, [q])
+    hits = store.search(qvec, k=max(4, min(12, int(k))))
+    chunks = [ch for _, ch in hits]
+    ctx = render_chunks_for_model(chunks, max_chars_each=900)
 
-=========================
-DeepAgent run + fallback
-=========================
-def fallback_answer_from_store( client: OpenAI, store: Optional[FaissStore], question: str, *, k: int = 10, ) → str: q = (question or "").strip() if not q: return "（系統：問題為空，無法產生回答）"
+    system = (
+        "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
+        "輸出要求：\n"
+        "1) 純 bullet，每行以 - 開頭。\n"
+        "2) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]。\n"
+        "3) 引用中的報告名稱必須來自我提供的資料片段標頭（例如 [XXX p12]）。\n"
+        "4) 不可使用 /evidence/*.md 當作報告名稱。\n"
+        "5) 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]。\n"
+        "6) 若資料不足，請用 bullet 明確說明缺口，並引用最接近的來源。\n"
+    )
+    user = f"問題：{q}\n\n資料：\n{ctx}\n"
 
-if store is None or getattr(store, "index", None) is None or store.index.ntotal == 0:
-    system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
-    ans, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=q, reasoning_effort=None, tools=None)
-    return ans or "（系統：無索引且模型未產出內容）"
+    out, _ = call_gpt(
+        client,
+        model=MODEL_MAIN,
+        system=system,
+        user=user,
+        reasoning_effort=REASONING_EFFORT,
+        tools=None,
+        include_sources=False,
+    )
+    return (out or "").strip() or "（系統：fallback RAG 未產出內容）"
 
-qvec = embed_texts(client, [q])
-hits = store.search(qvec, k=max(4, min(12, int(k))))
-chunks = [ch for _, ch in hits]
-ctx = render_chunks_for_model(chunks, max_chars_each=900)
 
-system = (
-    "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
-    "輸出要求：\n"
-    "1) 純 bullet，每行以 - 開頭。\n"
-    "2) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]。\n"
-    "3) 引用中的報告名稱必須來自我提供的資料片段標頭（例如 [XXX p12]）。\n"
-    "4) 不可使用 /evidence/*.md 當作報告名稱。\n"
-    "5) 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]。\n"
-    "6) 若資料不足，請用 bullet 明確說明缺口，並引用最接近的來源。\n"
-)
-user = f"問題：{q}\n\n資料：\n{ctx}\n"
+# =========================
+# DeepAgent run + stall detect
+# =========================
+def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
+    final_state = None
+    todos_preview_written = False
 
-out, _ = call_gpt(
-    client,
-    model=MODEL_MAIN,
-    system=system,
-    user=user,
-    reasoning_effort=REASONING_EFFORT,
-    tools=None,
-    include_sources=False,
-)
-return (out or "").strip() or "（系統：fallback RAG 未產出內容）"
+    st.session_state["last_run_forced_end"] = None
 
-def deep_agent_run_with_live_status(agent, user_text: str) → Tuple[str, Optional[dict]]: final_state = None todos_preview_written = False
+    recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
+    stall_steps = int(st.session_state.get("citation_stall_steps", 12))
+    stall_min_chars = int(st.session_state.get("citation_stall_min_chars", 450))
 
-st.session_state["last_run_forced_end"] = None
+    draft_unchanged_streak = 0
+    draft_no_citation_streak = 0
+    last_draft_hash: Optional[str] = None
 
-recursion_limit = int(st.session_state.get("langgraph_recursion_limit", 200))
-stall_steps = int(st.session_state.get("citation_stall_steps", 12))
-stall_min_chars = int(st.session_state.get("citation_stall_min_chars", 450))
+    def set_phase(s, phase: str):
+        mapping = {
+            "start": ("DeepAgent：啟動中…", "running"),
+            "plan": ("DeepAgent：規劃中…", "running"),
+            "evidence": ("DeepAgent：蒐證中…", "running"),
+            "draft": ("DeepAgent：寫作中…", "running"),
+            "review": ("DeepAgent：審稿/補引用中…", "running"),
+            "done": ("DeepAgent：完成", "complete"),
+            "error": ("DeepAgent：發生錯誤", "error"),
+        }
+        label, state = mapping.get(phase, ("DeepAgent：執行中…", "running"))
+        s.update(label=label, state=state, expanded=False)
 
-draft_unchanged_streak = 0
-draft_no_citation_streak = 0
-last_draft_hash: Optional[str] = None
+    with st.status("DeepAgent：啟動中…", expanded=False) as s:
+        set_phase(s, "start")
+        set_phase(s, "plan")
 
-def set_phase(s, phase: str):
-    mapping = {
-        "start": ("DeepAgent：啟動中…", "running"),
-        "plan": ("DeepAgent：規劃中…", "running"),
-        "evidence": ("DeepAgent：蒐證中…", "running"),
-        "draft": ("DeepAgent：寫作中…", "running"),
-        "review": ("DeepAgent：審稿/補引用中…", "running"),
-        "done": ("DeepAgent：完成", "complete"),
-        "error": ("DeepAgent：發生錯誤", "error"),
-    }
-    label, state = mapping.get(phase, ("DeepAgent：執行中…", "running"))
-    s.update(label=label, state=state, expanded=False)
+        try:
+            for state in agent.stream(
+                {"messages": [{"role": "user", "content": user_text}]},
+                stream_mode="values",
+                config={"recursion_limit": recursion_limit},
+            ):
+                final_state = state
+                files = state.get("files") or {}
+                file_keys = set(files.keys()) if isinstance(files, dict) else set()
 
-with st.status("DeepAgent：啟動中…", expanded=False) as s:
-    set_phase(s, "start")
-    set_phase(s, "plan")
+                if (not todos_preview_written) and isinstance(files, dict) and "/workspace/todos.json" in files:
+                    todos_txt = get_files_text(files, "/workspace/todos.json")
+                    if todos_txt:
+                        s.write("### 本次 Todo（規劃結果預覽）")
+                        s.code(todos_txt[:4000], language="json")
+                        todos_preview_written = True
 
-    try:
-        for state in agent.stream(
-            {"messages": [{"role": "user", "content": user_text}]},
-            stream_mode="values",
-            config={"recursion_limit": recursion_limit},
-        ):
-            final_state = state
-            files = state.get("files") or {}
-            file_keys = set(files.keys()) if isinstance(files, dict) else set()
+                if any(k.startswith("/evidence/") for k in file_keys):
+                    set_phase(s, "evidence")
+                if "/draft.md" in file_keys:
+                    set_phase(s, "draft")
+                if "/review.md" in file_keys:
+                    set_phase(s, "review")
 
-            if (not todos_preview_written) and isinstance(files, dict) and "/workspace/todos.json" in files:
-                todos_txt = get_files_text(files, "/workspace/todos.json")
-                if todos_txt:
-                    s.write("### 本次 Todo（規劃結果預覽）")
-                    s.code(todos_txt[:4000], language="json")
-                    todos_preview_written = True
+                # ✅ 卡住判定：draft 夠長後才開始（不變 + 無引用）連續 N 步
+                if isinstance(files, dict) and "/draft.md" in files:
+                    draft_txt = get_files_text(files, "/draft.md")
+                    draft_norm = norm_space(draft_txt)
+                    if len(draft_norm) >= stall_min_chars:
+                        h = _hash_norm_text(draft_norm)
+                        if last_draft_hash == h:
+                            draft_unchanged_streak += 1
+                        else:
+                            draft_unchanged_streak = 0
+                            last_draft_hash = h
 
-            if any(k.startswith("/evidence/") for k in file_keys):
+                        if has_visible_citations(draft_norm):
+                            draft_no_citation_streak = 0
+                        else:
+                            draft_no_citation_streak += 1
+
+                        if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
+                            set_phase(s, "error")
+                            st.session_state["last_run_forced_end"] = "citation_stall"
+                            s.warning(
+                                f"判定卡住：/draft.md 內容連續 {draft_unchanged_streak} 步未變、且連續 {draft_no_citation_streak} 步無引用。"
+                                "已強制結束 DeepAgent，改用 fallback（向量搜尋 + 強制引用）產出答案。"
+                            )
+                            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
+                            return answer, files if isinstance(files, dict) and files else None
+
+        except GraphRecursionError:
+            set_phase(s, "error")
+            st.session_state["last_run_forced_end"] = "recursion_limit"
+
+            files = (final_state or {}).get("files") or {}
+            draft = get_files_text(files, "/draft.md") if isinstance(files, dict) else ""
+            if draft.strip():
+                s.warning(f"已達步數上限（recursion_limit={recursion_limit}），回傳目前 /draft.md。")
+                return draft.strip(), (files if isinstance(files, dict) and files else None)
+
+            s.warning(f"已達步數上限（recursion_limit={recursion_limit}），改用 fallback 產生回答。")
+            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
+            return answer, (files if isinstance(files, dict) and files else None)
+
+        except Exception as e:
+            msg = str(e)
+            if "Budget exceeded" in msg:
                 set_phase(s, "evidence")
-            if "/draft.md" in file_keys:
-                set_phase(s, "draft")
-            if "/review.md" in file_keys:
-                set_phase(s, "review")
-
-            # 卡住偵測：draft 夠長後才開始（不變 + 無引用）連續 N 步
-            if isinstance(files, dict) and "/draft.md" in files:
-                draft_txt = get_files_text(files, "/draft.md")
-                draft_norm = norm_space(draft_txt)
-                if len(draft_norm) >= stall_min_chars:
-                    h = _hash_norm_text(draft_norm)
-                    if last_draft_hash == h:
-                        draft_unchanged_streak += 1
-                    else:
-                        draft_unchanged_streak = 0
-                        last_draft_hash = h
-
-                    if has_visible_citations(draft_norm):
-                        draft_no_citation_streak = 0
-                    else:
-                        draft_no_citation_streak += 1
-
-                    if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
-                        set_phase(s, "error")
-                        st.session_state["last_run_forced_end"] = "citation_stall"
-                        s.warning(
-                            f"判定卡住：/draft.md 內容連續 {draft_unchanged_streak} 步未變、且連續 {draft_no_citation_streak} 步無引用。"
-                            "已強制結束 DeepAgent，改用 fallback（向量搜尋 + 強制引用）產出答案。"
-                        )
-                        answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
-                        return answer, files if isinstance(files, dict) and files else None
-
-    except GraphRecursionError:
-        set_phase(s, "error")
-        st.session_state["last_run_forced_end"] = "recursion_limit"
+                s.update(label="DeepAgent：已達工具預算上限（停止加搜證）", state="running", expanded=False)
+            else:
+                set_phase(s, "error")
+                raise
 
         files = (final_state or {}).get("files") or {}
-        draft = get_files_text(files, "/draft.md") if isinstance(files, dict) else ""
-        if draft.strip():
-            s.warning(f"已達步數上限（recursion_limit={recursion_limit}），回傳目前 /draft.md。")
-            return draft.strip(), (files if isinstance(files, dict) and files else None)
+        final_text = get_files_text(files, "/draft.md")
 
-        s.warning(f"已達步數上限（recursion_limit={recursion_limit}），改用 fallback 產生回答。")
-        answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
-        return answer, (files if isinstance(files, dict) and files else None)
+        if not final_text:
+            msgs = (final_state or {}).get("messages") or []
+            if msgs:
+                last = msgs[-1]
+                content = getattr(last, "content", None)
+                final_text = (file_to_text(content) or file_to_text(last)).strip()
 
-    except Exception as e:
-        msg = str(e)
-        if "Budget exceeded" in msg:
-            set_phase(s, "evidence")
-            s.update(label="DeepAgent：已達工具預算上限（停止加搜證）", state="running", expanded=False)
+        if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
+            final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
+
+        set_phase(s, "done")
+
+    return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
+
+
+# =========================
+# need_todo decision
+# =========================
+def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
+    system = (
+        "你是路由器。請判斷這個問題是否需要做『Todo + 文件/網路檢索』。\n"
+        "規則：\n"
+        "- 需要：涉及具體事實、數據、政策、版本、引用、研究、比較、出處；或需要引用上傳文件。\n"
+        "- 不需要：純意見/寫作/改寫/腦力激盪/不要求引用的泛泛解釋。\n"
+        "請輸出 JSON：{\"need_todo\": true/false, \"reason\": \"...\"}（只輸出 JSON）"
+    )
+    out, _ = call_gpt(
+        client,
+        model=MODEL_MAIN,
+        system=system,
+        user=question,
+        reasoning_effort=REASONING_EFFORT,
+        tools=None,
+        include_sources=False,
+    )
+    data = _try_parse_json_or_py_literal(out) or {}
+    need = bool(data.get("need_todo", False))
+    reason = str(data.get("reason", "")).strip() or "（未提供原因）"
+    return need, reason
+
+
+# =========================
+# UI badges
+# =========================
+def render_run_badges(
+    *,
+    mode: str,
+    need_todo: bool,
+    reason: str,
+    usage: dict,
+    enable_web: bool,
+    todo_file_present: Optional[bool] = None,
+    forced_end: Optional[str] = None,
+) -> None:
+    badges: List[str] = []
+    badges.append(_badge_directive(f"Mode:{mode}", "gray"))
+
+    if need_todo:
+        badges.append(_badge_directive("Todo:需要", "blue"))
+    else:
+        badges.append(_badge_directive("Todo:不需要", "blue"))
+        short_reason = reason if len(reason) <= 40 else reason[:40] + "…"
+        badges.append(_badge_directive(f"理由:{short_reason}", "gray"))
+
+    if todo_file_present is True:
+        badges.append(_badge_directive("Todos.json:有", "blue"))
+    elif todo_file_present is False and need_todo:
+        badges.append(_badge_directive("Todos.json:無(流程異常)", "orange"))
+
+    if forced_end:
+        mapping = {
+            "citation_stall": "ForcedStop:卡住(引用未生成)",
+            "recursion_limit": "ForcedStop:步數上限",
+        }
+        label = mapping.get(forced_end, f"ForcedStop:{forced_end}")
+        badges.append(_badge_directive(label, "orange"))
+        badges.append(_badge_directive("Fallback:RAG", "orange"))
+
+    doc_calls = int((usage or {}).get("doc_search_calls", 0) or 0)
+    web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
+
+    badges.append(_badge_directive(f"DB:{'used' if doc_calls else 'unused'}({doc_calls})" if doc_calls else "DB:unused", "green" if doc_calls else "gray"))
+
+    if enable_web:
+        badges.append(_badge_directive(f"Web:{'used' if web_calls else 'unused'}({web_calls})" if web_calls else "Web:unused", "violet" if web_calls else "gray"))
+    else:
+        badges.append(_badge_directive("Web:disabled", "gray"))
+
+    st.markdown(" ".join(badges))
+
+
+def get_forced_end() -> Optional[str]:
+    return st.session_state.get("last_run_forced_end", None)
+
+
+# =========================
+# Debug panel (selectable)
+# =========================
+def render_debug_panel(files: Optional[dict]) -> None:
+    if not files or not isinstance(files, dict):
+        st.write("（沒有 files）")
+        return
+
+    all_keys = sorted([k for k in files.keys() if isinstance(k, str)])
+    evidence_keys = [k for k in all_keys if k.startswith("/evidence/")]
+    doc_evidence_keys = [k for k in evidence_keys if k.startswith("/evidence/doc_")]
+    web_evidence_keys = [k for k in evidence_keys if k.startswith("/evidence/web_")]
+
+    todos = get_files_text(files, "/workspace/todos.json") if "/workspace/todos.json" in files else ""
+    readme = get_files_text(files, "/evidence/README.md") if "/evidence/README.md" in files else ""
+    draft = get_files_text(files, "/draft.md") if "/draft.md" in files else ""
+    review = get_files_text(files, "/review.md") if "/review.md" in files else ""
+
+    tab_overview, tab_orch, tab_retr, tab_web, tab_writer, tab_verifier, tab_browser = st.tabs(
+        ["總覽", "Orchestrator", "Retriever(evidence)", "Web(evidence)", "Writer(draft)", "Verifier(review)", "Files browser"]
+    )
+
+    with tab_overview:
+        st.write(f"files keys：{len(all_keys)}")
+        st.write(f"evidence：{len(evidence_keys)}")
+        st.code("\n".join(all_keys[:800]), language="text")
+
+    with tab_orch:
+        st.markdown("### /workspace/todos.json")
+        st.code((todos or "（無）")[:20000], language="json")
+        st.divider()
+        st.markdown("### /evidence/README.md")
+        st.code((readme or "（無）")[:20000], language="markdown")
+
+    with tab_retr:
+        if not doc_evidence_keys:
+            st.write("（沒有 /evidence/doc_*.md）")
         else:
-            set_phase(s, "error")
-            raise
+            pick = st.selectbox("選擇 retriever evidence", doc_evidence_keys, index=0)
+            st.code(get_files_text(files, pick)[:60000], language="markdown")
 
-    files = (final_state or {}).get("files") or {}
+    with tab_web:
+        if not web_evidence_keys:
+            st.write("（沒有 /evidence/web_*.md）")
+        else:
+            pick = st.selectbox("選擇 web evidence", web_evidence_keys, index=0)
+            st.code(get_files_text(files, pick)[:60000], language="markdown")
 
-    final_text = get_files_text(files, "/draft.md")
-    if not final_text:
-        msgs = (final_state or {}).get("messages") or []
-        if msgs:
-            last = msgs[-1]
-            content = getattr(last, "content", None)
-            final_text = (file_to_text(content) or file_to_text(last)).strip()
+    with tab_writer:
+        st.code((draft or "（沒有 /draft.md）")[:60000], language="markdown")
 
-    if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
-        final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
+    with tab_verifier:
+        st.code((review or "（沒有 /review.md）")[:60000], language="markdown")
 
-    set_phase(s, "done")
+    with tab_browser:
+        if not all_keys:
+            st.write("（files 為空）")
+        else:
+            pick = st.selectbox("選擇任一檔案（files）", all_keys, index=0)
+            st.code(get_files_text(files, pick)[:60000], language="text")
 
-return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
 
-=========================
-Todo decision + badges
-=========================
-def decide_need_todo(client: OpenAI, question: str) → Tuple[bool, str]: system = ( "你是路由器。請判斷這個問題是否需要做『Todo + 文件/網路檢索』。\n" "規則：\n" "- 需要：涉及具體事實、數據、政策、版本、引用、研究、比較、出處；或需要引用上傳文件。\n" "- 不需要：純意見/寫作/改寫/腦力激盪/不要求引用的泛泛解釋。\n" "請輸出 JSON：{"need_todo": true/false, "reason": "..."}（只輸出 JSON）" ) out, _ = call_gpt( client, model=MODEL_MAIN, system=system, user=question, reasoning_effort=REASONING_EFFORT, tools=None, include_sources=False, ) data = _try_parse_json_or_py_literal(out) or {} need = bool(data.get("need_todo", False)) reason = str(data.get("reason", "")).strip() or "（未提供原因）" return need, reason
+# =========================
+# Session init
+# =========================
+OPENAI_API_KEY = get_openai_api_key()
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+os.environ.setdefault("OPENAI_KEY", OPENAI_API_KEY)
 
-def render_run_badges( *, mode: str, need_todo: bool, reason: str, usage: dict, enable_web: bool, todo_file_present: Optional[bool] = None, forced_end: Optional[str] = None, ): badges: List[str] = [] badges.append(_badge_directive(f"Mode:{mode}", "gray"))
+client = get_client(OPENAI_API_KEY)
 
-if need_todo:
-    badges.append(_badge_directive("Todo:需要", "blue"))
-else:
-    badges.append(_badge_directive("Todo:不需要", "blue"))
-    short_reason = reason if len(reason) <= 40 else reason[:40] + "…"
-    badges.append(_badge_directive(f"理由:{short_reason}", "gray"))
+st.session_state.setdefault("file_rows", [])
+st.session_state.setdefault("file_bytes", {})
+st.session_state.setdefault("store", None)
+st.session_state.setdefault("processed_keys", set())
+st.session_state.setdefault("default_outputs", None)
+st.session_state.setdefault("chat_history", [])
 
-if todo_file_present is True:
-    badges.append(_badge_directive("Todos.json:有", "blue"))
-elif todo_file_present is False and need_todo:
-    badges.append(_badge_directive("Todos.json:無(流程異常)", "orange"))
+st.session_state.setdefault("enable_web_search_agent", False)
 
-if forced_end:
-    mapping = {
-        "citation_stall": "ForcedStop:卡住(引用未生成)",
-        "recursion_limit": "ForcedStop:步數上限",
-    }
-    label = mapping.get(forced_end, f"ForcedStop:{forced_end}")
-    badges.append(_badge_directive(label, "orange"))
-    badges.append(_badge_directive("Fallback:RAG", "orange"))
+st.session_state.setdefault("langgraph_recursion_limit", 200)
+st.session_state.setdefault("citation_stall_steps", 12)
+st.session_state.setdefault("citation_stall_min_chars", 450)
+st.session_state.setdefault("last_run_forced_end", None)
 
-doc_calls = int((usage or {}).get("doc_search_calls", 0) or 0)
-web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
+st.session_state.setdefault("enable_output_formatter", True)
+st.session_state.setdefault("sources_badge_max_titles_inline", 4)
+st.session_state.setdefault("sources_badge_max_pages_per_title", 10)
 
-if doc_calls > 0:
-    badges.append(_badge_directive(f"DB:used({doc_calls})", "green"))
-else:
-    badges.append(_badge_directive("DB:unused", "gray"))
 
-if enable_web:
-    if web_calls > 0:
-        badges.append(_badge_directive(f"Web:used({web_calls})", "violet"))
+# =========================
+# File table helpers
+# =========================
+def file_rows_to_df(rows: list[FileRow]) -> pd.DataFrame:
+    recs = []
+    for r in rows:
+        if r.ext == ".pdf":
+            pages_str = "-" if r.pages is None else str(r.pages)
+            text_pages_str = "-" if r.text_pages is None else str(r.text_pages)
+            text_ratio_str = "-" if r.text_pages_ratio is None else f"{r.text_pages_ratio:.0%}"
+        else:
+            pages_str = "-" if r.pages is None else str(r.pages)
+            text_pages_str = "-"
+            text_ratio_str = "-"
+
+        if r.ext == ".pdf" and r.likely_scanned:
+            suggest = "建議 OCR"
+        elif r.ext in (".png", ".jpg", ".jpeg"):
+            suggest = "必 OCR"
+        else:
+            suggest = ""
+
+        recs.append({
+            "_file_id": r.file_id,
+            "使用OCR": bool(r.use_ocr),
+            "檔名": truncate_filename(r.name, 52),
+            "格式": r.ext.replace(".", ""),
+            "頁數": pages_str,
+            "文字頁": text_pages_str,
+            "文字%": text_ratio_str,
+            "token估算": int(r.token_est),
+            "建議": suggest,
+        })
+    return pd.DataFrame(recs)
+
+
+def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
+    id_to_row_idx = {r.file_id: i for i, r in enumerate(rows)}
+    for _, rec in df.iterrows():
+        fid = rec.get("_file_id")
+        if fid not in id_to_row_idx:
+            continue
+        i = id_to_row_idx[fid]
+
+        ext = rows[i].ext
+        if ext in (".png", ".jpg", ".jpeg"):
+            rows[i].use_ocr = True
+        elif ext == ".txt":
+            rows[i].use_ocr = False
+        else:
+            rows[i].use_ocr = bool(rec.get("使用OCR", rows[i].use_ocr))
+
+
+# =========================
+# Popover：文件管理 + DeepAgent 設定（索引狀態保留在 popover）
+# =========================
+with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）"):
+    st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
+    st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
+
+    has_index = (
+        st.session_state.store is not None
+        and getattr(st.session_state.store, "index", None) is not None
+        and st.session_state.store.index.ntotal > 0
+    )
+    if has_index:
+        st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
+        st.caption("來源以 badge 顯示（檔名 + 頁碼彙總）；chunk_id 僅供內部精讀與校對。")
     else:
-        badges.append(_badge_directive("Web:unused", "gray"))
-else:
-    badges.append(_badge_directive("Web:disabled", "gray"))
+        st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
 
-st.markdown(" ".join(badges))
-
-def get_forced_end() → Optional[str]: return st.session_state.get("last_run_forced_end", None)
-
-=========================
-Debug panel（可看每個 agent 的輸出檔）
-=========================
-def render_debug_panel(files: Optional[dict]): if not files or not isinstance(files, dict): st.write("（沒有 files）") return
-
-all_keys = sorted([k for k in files.keys() if isinstance(k, str)])
-evidence_keys = [k for k in all_keys if k.startswith("/evidence/")]
-doc_evidence_keys = [k for k in evidence_keys if k.startswith("/evidence/doc_")]
-web_evidence_keys = [k for k in evidence_keys if k.startswith("/evidence/web_")]
-
-todos = get_files_text(files, "/workspace/todos.json") if "/workspace/todos.json" in files else ""
-readme = get_files_text(files, "/evidence/README.md") if "/evidence/README.md" in files else ""
-draft = get_files_text(files, "/draft.md") if "/draft.md" in files else ""
-review = get_files_text(files, "/review.md") if "/review.md" in files else ""
-
-tab_overview, tab_orch, tab_retr, tab_web, tab_writer, tab_verifier, tab_browser = st.tabs(
-    ["總覽", "Orchestrator", "Retriever(evidence)", "Web(evidence)", "Writer(draft)", "Verifier(review)", "Files browser"]
-)
-
-with tab_overview:
-    st.write(f"files keys：{len(all_keys)}")
-    st.write(f"evidence：{len(evidence_keys)}")
-    st.code("\n".join(all_keys[:800]), language="text")
-
-with tab_orch:
-    st.markdown("### /workspace/todos.json")
-    st.code((todos or "（無）")[:20000], language="json")
     st.divider()
-    st.markdown("### /evidence/README.md")
-    st.code((readme or "（無）")[:20000], language="markdown")
 
-with tab_retr:
-    if not doc_evidence_keys:
-        st.write("（沒有 /evidence/doc_*.md）")
+    st.session_state.enable_web_search_agent = st.checkbox(
+        "啟用網路搜尋（會增加成本）",
+        value=bool(st.session_state.enable_web_search_agent),
+    )
+    st.session_state.enable_output_formatter = st.checkbox(
+        "輸出排版美化（formatter；會多一次模型呼叫）",
+        value=bool(st.session_state.get("enable_output_formatter", True)),
+    )
+
+    st.session_state.langgraph_recursion_limit = st.number_input(
+        "LangGraph recursion_limit（步數上限）",
+        min_value=50,
+        max_value=3000,
+        value=int(st.session_state.get("langgraph_recursion_limit", 200)),
+        step=50,
+    )
+    st.session_state.citation_stall_steps = st.number_input(
+        "卡住判定：draft『不變 + 無引用』連續幾步就強制結束",
+        min_value=5,
+        max_value=80,
+        value=int(st.session_state.get("citation_stall_steps", 12)),
+        step=1,
+    )
+    st.session_state.citation_stall_min_chars = st.number_input(
+        "卡住判定：draft 最少字元數（太短不判定，避免誤殺）",
+        min_value=150,
+        max_value=5000,
+        value=int(st.session_state.get("citation_stall_min_chars", 450)),
+        step=50,
+    )
+
+    st.session_state.sources_badge_max_titles_inline = st.number_input(
+        "來源 badge：前台最多顯示幾個來源（其餘收合）",
+        min_value=1,
+        max_value=20,
+        value=int(st.session_state.get("sources_badge_max_titles_inline", 4)),
+        step=1,
+    )
+    st.session_state.sources_badge_max_pages_per_title = st.number_input(
+        "來源 badge：每個來源最多顯示幾個頁碼",
+        min_value=3,
+        max_value=40,
+        value=int(st.session_state.get("sources_badge_max_pages_per_title", 10)),
+        step=1,
+    )
+
+    st.divider()
+
+    uploaded = st.file_uploader(
+        "上傳文件",
+        type=["pdf", "txt", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded:
+        existing = {(r.name, r.bytes_len) for r in st.session_state.file_rows}
+        for f in uploaded:
+            data = f.read()
+            if (f.name, len(data)) in existing:
+                continue
+
+            ext = os.path.splitext(f.name)[1].lower()
+            fid = str(uuid.uuid4())[:10]
+            sig = sha1_bytes(data)
+            st.session_state.file_bytes[fid] = data
+
+            pages = None
+            extracted_chars = 0
+            blank_pages = None
+            blank_ratio = None
+            text_pages = None
+            text_pages_ratio = None
+
+            if ext == ".pdf":
+                pdf_pages = extract_pdf_text_pages(data)
+                pages = len(pdf_pages)
+                extracted_chars, blank_pages, blank_ratio, text_pages, text_pages_ratio = analyze_pdf_text_quality(pdf_pages)
+            elif ext == ".txt":
+                extracted_chars = len(norm_space(data.decode("utf-8", errors="ignore")))
+
+            token_est = estimate_tokens_from_chars(extracted_chars)
+            likely_scanned = should_suggest_ocr(ext, pages, extracted_chars, blank_ratio)
+
+            if ext in (".png", ".jpg", ".jpeg"):
+                use_ocr = True
+            elif ext == ".txt":
+                use_ocr = False
+            else:
+                use_ocr = bool(likely_scanned)
+
+            st.session_state.file_rows.append(
+                FileRow(
+                    file_id=fid,
+                    file_sig=sig,
+                    name=f.name,
+                    ext=ext,
+                    bytes_len=len(data),
+                    pages=pages,
+                    extracted_chars=extracted_chars,
+                    token_est=token_est,
+                    text_pages=text_pages,
+                    text_pages_ratio=text_pages_ratio,
+                    blank_pages=blank_pages,
+                    blank_ratio=blank_ratio,
+                    likely_scanned=likely_scanned,
+                    use_ocr=use_ocr,
+                )
+            )
+
+    st.markdown("### 文件清單（可逐檔勾選 OCR）")
+
+    if not st.session_state.file_rows:
+        st.info("尚未上傳文件。")
     else:
-        pick = st.selectbox("選擇 retriever evidence", doc_evidence_keys, index=0)
-        st.code(get_files_text(files, pick)[:60000], language="markdown")
+        df = file_rows_to_df(st.session_state.file_rows)
 
-with tab_web:
-    if not web_evidence_keys:
-        st.write("（沒有 /evidence/web_*.md）")
-    else:
-        pick = st.selectbox("選擇 web evidence", web_evidence_keys, index=0)
-        st.code(get_files_text(files, pick)[:60000], language="markdown")
+        edited = st.data_editor(
+            df.drop(columns=["_file_id"]),
+            key="file_table_editor",
+            width="stretch",
+            hide_index=True,
+            disabled=["檔名", "格式", "頁數", "文字頁", "文字%", "token估算", "建議"],
+            column_config={
+                "使用OCR": st.column_config.CheckboxColumn(
+                    "使用OCR",
+                    help="逐檔選擇是否啟用 OCR（PDF 可選；圖檔固定OCR；TXT固定不OCR）",
+                ),
+            },
+        )
 
-with tab_writer:
-    st.code((draft or "（沒有 /draft.md）")[:60000], language="markdown")
+        df_for_sync = df.copy()
+        df_for_sync["使用OCR"] = edited["使用OCR"].values
+        sync_df_to_file_rows(df_for_sync, st.session_state.file_rows)
 
-with tab_verifier:
-    st.code((review or "（沒有 /review.md）")[:60000], language="markdown")
+    st.divider()
+    col1, col2, col3 = st.columns([1, 1, 1])
+    build_btn = col1.button("🚀 建立索引", type="primary", width="stretch")
+    default_btn = col2.button("🧾 產生預設輸出", width="stretch")
+    clear_btn = col3.button("🧹 清空全部", width="stretch")
 
-with tab_browser:
-    if not all_keys:
-        st.write("（files 為空）")
-    else:
-        pick = st.selectbox("選擇任一檔案（files）", all_keys, index=0)
-        st.code(get_files_text(files, pick)[:60000], language="text")
+    if clear_btn:
+        st.session_state.file_rows = []
+        st.session_state.file_bytes = {}
+        st.session_state.store = None
+        st.session_state.processed_keys = set()
+        st.session_state.default_outputs = None
+        st.session_state.chat_history = []
+        st.session_state.deep_agent = None
+        st.session_state.deep_agent_web_flag = None
+        st.session_state.da_usage = {"doc_search_calls": 0, "web_search_calls": 0}
+        st.session_state["last_run_forced_end"] = None
+        st.rerun()
 
-=========================
-Session init
-=========================
-OPENAI_API_KEY = get_openai_api_key() os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY os.environ.setdefault("OPENAI_KEY", OPENAI_API_KEY) client = get_client(OPENAI_API_KEY)
+    if build_btn:
+        need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
+        if need_ocr and not HAS_PYMUPDF:
+            st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf。")
+            st.stop()
 
-st.session_state.setdefault("file_rows", []) st.session_state.setdefault("file_bytes", {}) st.session_state.setdefault("store", None) st.session_state.setdefault("processed_keys", set()) st.session_state.setdefault("default_outputs", None) st.session_state.setdefault("chat_history", []) st.session_state.setdefault("enable_web_search_agent", False)
+        with st.status("建索引中（OCR + embeddings）...", expanded=True) as s:
+            t0 = time.perf_counter()
+            store, stats, processed_keys = build_indices_incremental_no_kg(
+                client,
+                st.session_state.file_rows,
+                st.session_state.file_bytes,
+                st.session_state.store,
+                st.session_state.processed_keys,
+            )
+            st.session_state.store = store
+            st.session_state.processed_keys = processed_keys
+            s.write(f"新增報告數：{stats['new_reports']}")
+            s.write(f"新增 chunks：{stats['new_chunks']}")
+            s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
+            s.update(state="complete")
 
-DeepAgent tuning
-st.session_state.setdefault("langgraph_recursion_limit", 200) st.session_state.setdefault("citation_stall_steps", 12) st.session_state.setdefault("citation_stall_min_chars", 450) st.session_state.setdefault("last_run_forced_end", None)
+        st.session_state.deep_agent = None
+        st.session_state.deep_agent_web_flag = None
+        st.rerun()
 
-UI options
-st.session_state.setdefault("enable_output_formatter", True) st.session_state.setdefault("sources_badge_max_titles_inline", 4) st.session_state.setdefault("sources_badge_max_pages_per_title", 10)
+    if default_btn:
+        if st.session_state.store is None or st.session_state.store.index.ntotal == 0:
+            st.warning("尚未建立索引或沒有 chunks，請先按「建立索引」。")
+        else:
+            with st.status("產生預設輸出（摘要/主張/推論鏈）...", expanded=True) as s2:
+                chosen = pick_corpus_chunks_for_default(st.session_state.store.chunks)
+                ctx = render_chunks_for_model(chosen)
+                bundle = generate_default_outputs_bundle(client, "整體融合（全部上傳報告）", ctx, max_retries=2)
+                st.session_state.default_outputs = bundle
+                s2.update(state="complete")
 
-=========================
-File table helpers
-=========================
-def file_rows_to_df(rows: list[FileRow]) → pd.DataFrame: recs = [] for r in rows: if r.ext == ".pdf": pages_str = "-" if r.pages is None else str(r.pages) text_pages_str = "-" if r.text_pages is None else str(r.text_pages) text_ratio_str = "-" if r.text_pages_ratio is None else f"{r.text_pages_ratio:.0%}" else: pages_str = "-" if r.pages is None else str(r.pages) text_pages_str = "-" text_ratio_str = "-"
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "kind": "default",
+                "title": "整體融合（全部上傳報告）",
+                **(st.session_state.default_outputs or {}),
+            })
+            st.rerun()
 
-    if r.ext == ".pdf" and r.likely_scanned:
-        suggest = "建議 OCR"
-    elif r.ext in (".png", ".jpg", ".jpeg"):
-        suggest = "必 OCR"
-    else:
-        suggest = ""
 
-    recs.append({
-        "_file_id": r.file_id,
-        "使用OCR": bool(r.use_ocr),
-        "檔名": truncate_filename(r.name, 52),
-        "格式": r.ext.replace(".", ""),
-        "頁數": pages_str,
-        "文字頁": text_pages_str,
-        "文字%": text_ratio_str,
-        "token估算": int(r.token_est),
-        "建議": suggest,
-    })
-return pd.DataFrame(recs)
-
-def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) → None: id_to_row_idx = {r.file_id: i for i, r in enumerate(rows)} for _, rec in df.iterrows(): fid = rec.get("_file_id") if fid not in id_to_row_idx: continue i = id_to_row_idx[fid]
-
-    ext = rows[i].ext
-    if ext in (".png", ".jpg", ".jpeg"):
-        rows[i].use_ocr = True
-    elif ext == ".txt":
-        rows[i].use_ocr = False
-    else:
-        rows[i].use_ocr = bool(rec.get("使用OCR", rows[i].use_ocr))
-
-=========================
-Popover：文件管理 + DeepAgent 設定（索引狀態保留在 popover）
-=========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）", width="stretch"): st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。") st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
-
+# =========================
+# 主畫面：Chat
+# =========================
 has_index = (
     st.session_state.store is not None
     and getattr(st.session_state.store, "index", None) is not None
     and st.session_state.store.index.ntotal > 0
 )
-if has_index:
-    st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-    st.caption("來源以 badge 顯示（檔名 + 頁碼彙總）；chunk_id 僅供內部精讀與校對。")
-else:
-    st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
 
 st.divider()
+st.subheader("Chat（DeepAgent + Sources Badges + Todo decision）")
 
-st.session_state.enable_web_search_agent = st.checkbox(
-    "啟用網路搜尋（會增加成本）",
-    value=bool(st.session_state.enable_web_search_agent),
-)
-
-st.session_state.enable_output_formatter = st.checkbox(
-    "輸出排版美化（formatter；會多一次模型呼叫）",
-    value=bool(st.session_state.get("enable_output_formatter", True)),
-)
-
-st.session_state.langgraph_recursion_limit = st.number_input(
-    "LangGraph recursion_limit（步數上限）",
-    min_value=50,
-    max_value=3000,
-    value=int(st.session_state.get("langgraph_recursion_limit", 200)),
-    step=50,
-)
-
-st.session_state.citation_stall_steps = st.number_input(
-    "卡住判定：draft『不變 + 無引用』連續幾步就強制結束",
-    min_value=5,
-    max_value=80,
-    value=int(st.session_state.get("citation_stall_steps", 12)),
-    step=1,
-)
-
-st.session_state.citation_stall_min_chars = st.number_input(
-    "卡住判定：draft 最少字元數（太短不判定，避免誤殺）",
-    min_value=150,
-    max_value=5000,
-    value=int(st.session_state.get("citation_stall_min_chars", 450)),
-    step=50,
-)
-
-st.session_state.sources_badge_max_titles_inline = st.number_input(
-    "來源 badge：前台最多顯示幾個來源（其餘收合）",
-    min_value=1,
-    max_value=20,
-    value=int(st.session_state.get("sources_badge_max_titles_inline", 4)),
-    step=1,
-)
-st.session_state.sources_badge_max_pages_per_title = st.number_input(
-    "來源 badge：每個來源最多顯示幾個頁碼",
-    min_value=3,
-    max_value=40,
-    value=int(st.session_state.get("sources_badge_max_pages_per_title", 10)),
-    step=1,
-)
-
-st.divider()
-
-uploaded = st.file_uploader(
-    "上傳文件",
-    type=["pdf", "txt", "png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-)
-
-if uploaded:
-    existing = {(r.name, r.bytes_len) for r in st.session_state.file_rows}
-    for f in uploaded:
-        data = f.read()
-        if (f.name, len(data)) in existing:
-            continue
-
-        ext = os.path.splitext(f.name)[1].lower()
-        fid = str(uuid.uuid4())[:10]
-        sig = sha1_bytes(data)
-        st.session_state.file_bytes[fid] = data
-
-        pages = None
-        extracted_chars = 0
-        blank_pages = None
-        blank_ratio = None
-        text_pages = None
-        text_pages_ratio = None
-
-        if ext == ".pdf":
-            pdf_pages = extract_pdf_text_pages(data)
-            pages = len(pdf_pages)
-            extracted_chars, blank_pages, blank_ratio, text_pages, text_pages_ratio = analyze_pdf_text_quality(pdf_pages)
-        elif ext == ".txt":
-            extracted_chars = len(norm_space(data.decode("utf-8", errors="ignore")))
-
-        token_est = estimate_tokens_from_chars(extracted_chars)
-        likely_scanned = should_suggest_ocr(ext, pages, extracted_chars, blank_ratio)
-
-        if ext in (".png", ".jpg", ".jpeg"):
-            use_ocr = True
-        elif ext == ".txt":
-            use_ocr = False
+# 顯示歷史
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg.get("role", "assistant")):
+        if msg.get("kind") == "default":
+            st.markdown(f"## 預設輸出：{msg.get('title','')}")
+            st.markdown("### 1) 報告摘要")
+            # 這裡保持簡單，避免又刷一堆 badge（你要我也可改成來源清單/收合）
+            st.code((msg.get("summary", "") or "")[:20000], language="markdown")
+            st.markdown("### 2) 核心主張")
+            st.code((msg.get("claims", "") or "")[:20000], language="markdown")
+            st.markdown("### 3) 推論鏈")
+            st.code((msg.get("chain", "") or "")[:20000], language="markdown")
         else:
-            use_ocr = bool(likely_scanned)
-
-        st.session_state.file_rows.append(
-            FileRow(
-                file_id=fid,
-                file_sig=sig,
-                name=f.name,
-                ext=ext,
-                bytes_len=len(data),
-                pages=pages,
-                extracted_chars=extracted_chars,
-                token_est=token_est,
-                text_pages=text_pages,
-                text_pages_ratio=text_pages_ratio,
-                blank_pages=blank_pages,
-                blank_ratio=blank_ratio,
-                likely_scanned=likely_scanned,
-                use_ocr=use_ocr,
+            meta = msg.get("meta", {}) or {}
+            render_run_badges(
+                mode=meta.get("mode", "unknown"),
+                need_todo=bool(meta.get("need_todo", False)),
+                reason=str(meta.get("reason", "") or ""),
+                usage=meta.get("usage", {}) or {},
+                enable_web=bool(meta.get("enable_web", False)),
+                todo_file_present=meta.get("todo_file_present", None),
+                forced_end=meta.get("forced_end", None),
             )
-        )
+            render_markdown_answer_with_sources_badges(msg.get("content", ""))
 
-st.markdown("### 文件清單（可逐檔勾選 OCR）")
+prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
+if prompt:
+    st.session_state.chat_history.append({"role": "user", "kind": "text", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-if not st.session_state.file_rows:
-    st.info("尚未上傳文件。")
-else:
-    df = file_rows_to_df(st.session_state.file_rows)
+    with st.chat_message("assistant"):
+        enable_web = bool(st.session_state.enable_web_search_agent)
+        need_todo, reason = decide_need_todo(client, prompt)
 
-    edited = st.data_editor(
-        df.drop(columns=["_file_id"]),
-        key="file_table_editor",
-        width="stretch",
-        hide_index=True,
-        disabled=["檔名", "格式", "頁數", "文字頁", "文字%", "token估算", "建議"],
-        column_config={
-            "使用OCR": st.column_config.CheckboxColumn(
-                "使用OCR",
-                help="逐檔選擇是否啟用 OCR（PDF 可選；圖檔固定OCR；TXT固定不OCR）",
-            ),
-        },
-    )
+        # direct
+        if (not has_index) or (not need_todo):
+            system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
+            answer_text, _ = call_gpt(
+                client,
+                model=MODEL_MAIN,
+                system=system,
+                user=prompt,
+                reasoning_effort=None,
+                tools=None,
+            )
 
-    df_for_sync = df.copy()
-    df_for_sync["使用OCR"] = edited["使用OCR"].values
-    sync_df_to_file_rows(df_for_sync, st.session_state.file_rows)
+            if st.session_state.get("enable_output_formatter", True):
+                answer_text = format_markdown_output_preserve_citations(client, answer_text)
 
-st.divider()
-col1, col2, col3 = st.columns([1, 1, 1])
+            meta = {
+                "mode": "direct",
+                "need_todo": bool(need_todo),
+                "reason": reason,
+                "usage": {"doc_search_calls": 0, "web_search_calls": 0},
+                "enable_web": enable_web,
+                "todo_file_present": None,
+                "forced_end": None,
+            }
 
-build_btn = col1.button("🚀 建立索引", type="primary", width="stretch")
-default_btn = col2.button("🧾 產生預設輸出", width="stretch")
-clear_btn = col3.button("🧹 清空全部", width="stretch")
+            render_run_badges(
+                mode=meta["mode"],
+                need_todo=bool(need_todo),
+                reason=reason,
+                usage=meta["usage"],
+                enable_web=enable_web,
+                todo_file_present=None,
+                forced_end=meta.get("forced_end"),
+            )
+            render_markdown_answer_with_sources_badges(answer_text)
 
-if clear_btn:
-    st.session_state.file_rows = []
-    st.session_state.file_bytes = {}
-    st.session_state.store = None
-    st.session_state.processed_keys = set()
-    st.session_state.default_outputs = None
-    st.session_state.chat_history = []
-    st.session_state.deep_agent = None
-    st.session_state.deep_agent_web_flag = None
-    st.session_state.da_usage = {"doc_search_calls": 0, "web_search_calls": 0}
-    st.session_state["last_run_forced_end"] = None
-    st.rerun()
+            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+            st.stop()
 
-if build_btn:
-    need_ocr = any(r.ext == ".pdf" and r.use_ocr for r in st.session_state.file_rows)
-    if need_ocr and not HAS_PYMUPDF:
-        st.error("你有勾選 PDF OCR，但環境未安裝 pymupdf。請先 pip install pymupdf。")
-        st.stop()
-
-    with st.status("建索引中（OCR + embeddings）...", expanded=True) as s:
-        t0 = time.perf_counter()
-        store, stats, processed_keys = build_indices_incremental_no_kg(
-            client,
-            st.session_state.file_rows,
-            st.session_state.file_bytes,
-            st.session_state.store,
-            st.session_state.processed_keys,
-        )
-        st.session_state.store = store
-        st.session_state.processed_keys = processed_keys
-        s.write(f"新增報告數：{stats['new_reports']}")
-        s.write(f"新增 chunks：{stats['new_chunks']}")
-        s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
-        s.update(state="complete")
-
-    st.session_state.deep_agent = None
-    st.session_state.deep_agent_web_flag = None
-    st.rerun()
-
-if default_btn:
-    if st.session_state.store is None or st.session_state.store.index.ntotal == 0:
-        st.warning("尚未建立索引或沒有 chunks，請先按「建立索引」。")
-    else:
-        with st.status("產生預設輸出（摘要/主張/推論鏈）...", expanded=True) as s2:
-            chosen = pick_corpus_chunks_for_default(st.session_state.store.chunks)
-            ctx = render_chunks_for_model(chosen)
-            bundle = generate_default_outputs_bundle(client, "整體融合（全部上傳報告）", ctx, max_retries=2)
-            st.session_state.default_outputs = bundle
-            s2.update(state="complete")
-
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "kind": "default",
-            "title": "整體融合（全部上傳報告）",
-            **(st.session_state.default_outputs or {}),
-        })
-        st.rerun()
-
-=========================
-主畫面：Chat
-=========================
-has_index = ( st.session_state.store is not None and getattr(st.session_state.store, "index", None) is not None and st.session_state.store.index.ntotal > 0 )
-
-st.divider() st.subheader("Chat（DeepAgent + Badges + Todo decision）")
-
-for msg in st.session_state.chat_history: with st.chat_message(msg.get("role", "assistant")): if msg.get("kind") == "default": st.markdown(f"## 預設輸出：{msg.get('title','')}") st.markdown("### 1) 報告摘要") render_bullets_inline_badges(msg.get("summary", ""), badge_color="green") st.markdown("### 2) 核心主張") render_bullets_inline_badges(msg.get("claims", ""), badge_color="violet") st.markdown("### 3) 推論鏈") render_bullets_inline_badges(msg.get("chain", ""), badge_color="orange") else: meta = msg.get("meta", {}) or {} render_run_badges( mode=meta.get("mode", "unknown"), need_todo=bool(meta.get("need_todo", False)), reason=str(meta.get("reason", "") or ""), usage=meta.get("usage", {}) or {}, enable_web=bool(meta.get("enable_web", False)), todo_file_present=meta.get("todo_file_present", None), forced_end=meta.get("forced_end", None), ) render_markdown_answer_with_sources_badges(msg.get("content", ""))
-
-prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。") if prompt: st.session_state.chat_history.append({"role": "user", "kind": "text", "content": prompt}) with st.chat_message("user"): st.markdown(prompt)
-
-with st.chat_message("assistant"):
-    enable_web = bool(st.session_state.enable_web_search_agent)
-    need_todo, reason = decide_need_todo(client, prompt)
-
-    # direct
-    if (not has_index) or (not need_todo):
-        system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
-        answer_text, _ = call_gpt(
-            client,
-            model=MODEL_MAIN,
-            system=system,
-            user=prompt,
-            reasoning_effort=None,
-            tools=None,
-        )
+        # deepagent
+        agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
+        answer_text, files = deep_agent_run_with_live_status(agent, prompt)
 
         if st.session_state.get("enable_output_formatter", True):
             answer_text = format_markdown_output_preserve_citations(client, answer_text)
 
+        todo_file_present = isinstance(files, dict) and ("/workspace/todos.json" in files)
+
         meta = {
-            "mode": "direct",
-            "need_todo": bool(need_todo),
+            "mode": "deepagent",
+            "need_todo": True,
             "reason": reason,
-            "usage": {"doc_search_calls": 0, "web_search_calls": 0},
+            "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
             "enable_web": enable_web,
-            "todo_file_present": None,
-            "forced_end": None,
+            "todo_file_present": bool(todo_file_present),
+            "forced_end": get_forced_end(),
         }
 
         render_run_badges(
             mode=meta["mode"],
-            need_todo=bool(need_todo),
+            need_todo=True,
             reason=reason,
             usage=meta["usage"],
             enable_web=enable_web,
-            todo_file_present=None,
+            todo_file_present=meta["todo_file_present"],
             forced_end=meta.get("forced_end"),
         )
         render_markdown_answer_with_sources_badges(answer_text)
 
-        st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
-        st.stop()
+        with st.expander("Debug", expanded=False):
+            todos_txt = get_files_text(files, "/workspace/todos.json") if isinstance(files, dict) else ""
+            if todos_txt:
+                st.markdown("### 本次 Todo（完整）")
+                st.code(todos_txt[:20000], language="json")
+                st.divider()
+            render_debug_panel(files)
 
-    # deepagent
-    agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
-    answer_text, files = deep_agent_run_with_live_status(agent, prompt)
-
-    if st.session_state.get("enable_output_formatter", True):
-        answer_text = format_markdown_output_preserve_citations(client, answer_text)
-
-    todo_file_present = isinstance(files, dict) and ("/workspace/todos.json" in files)
-
-    meta = {
-        "mode": "deepagent",
-        "need_todo": True,
-        "reason": reason,
-        "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
-        "enable_web": enable_web,
-        "todo_file_present": bool(todo_file_present),
-        "forced_end": get_forced_end(),
-    }
-
-    render_run_badges(
-        mode=meta["mode"],
-        need_todo=True,
-        reason=reason,
-        usage=meta["usage"],
-        enable_web=enable_web,
-        todo_file_present=meta["todo_file_present"],
-        forced_end=meta.get("forced_end"),
-    )
-    render_markdown_answer_with_sources_badges(answer_text)
-
-    with st.expander("Debug", expanded=False):
-        todos_txt = get_files_text(files, "/workspace/todos.json") if isinstance(files, dict) else ""
-        if todos_txt:
-            st.markdown("### 本次 Todo（完整）")
-            st.code(todos_txt[:20000], language="json")
-            st.divider()
-        render_debug_panel(files)
-
-st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+    st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
