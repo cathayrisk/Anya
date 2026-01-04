@@ -247,6 +247,108 @@ def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
             return None
     return None
 
+def get_recent_chat_messages(max_messages: int = 10) -> list[dict]:
+    """
+    取最近 N 則「text」訊息當短期記憶（排除 default 大包輸出），避免 prompt 爆長。
+    回傳格式：[{role:"user"/"assistant", content:"..."}]
+    """
+    msgs: list[dict] = []
+    for m in st.session_state.get("chat_history", []):
+        if m.get("kind") != "text":
+            continue
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        # 避免太長（可視需要調）
+        if len(content) > 2000:
+            content = content[:2000] + "…"
+        msgs.append({"role": role, "content": content})
+
+    return msgs[-max_messages:]
+
+
+def _domain(u: str) -> str:
+    try:
+        host = urlparse(u).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host or "web"
+    except Exception:
+        return "web"
+
+
+def web_sources_from_openai_sources(sources: Optional[list[dict]]) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    將 OpenAI web_search sources 轉成：
+    {domain: [(title, url), ...]}
+    """
+    out: Dict[str, List[Tuple[str, str]]] = {}
+    if not sources:
+        return out
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        title = (s.get("title") or s.get("source") or "source").strip()
+        url = (s.get("url") or "").strip()
+        if not url:
+            continue
+        dom = _domain(url)
+        out.setdefault(dom, []).append((title, url))
+
+    # 去重
+    for dom in list(out.keys()):
+        seen = set()
+        uniq: List[Tuple[str, str]] = []
+        for t, u in out[dom]:
+            key = (t, u)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((t, u))
+        out[dom] = uniq
+    return out
+
+
+def render_web_sources_list(web_sources: Dict[str, List[Tuple[str, str]]], max_domains: int = 6, max_per_domain: int = 6) -> None:
+    """
+    B 方案：badge 只顯示 domain；URL 用清單列在下面。
+    """
+    if not web_sources:
+        return
+
+    st.markdown("#### Web Sources")
+    domains = sorted(web_sources.keys())
+    show = domains[:max_domains]
+    more = domains[max_domains:]
+
+    def _render(domains_list: list[str]):
+        for dom in domains_list:
+            items = web_sources.get(dom, [])
+            if not items:
+                continue
+            st.markdown(f"- **{dom}**")
+            for title, url in items[:max_per_domain]:
+                st.markdown(f"  - {title} — {url}")
+
+    _render(show)
+    if more:
+        with st.expander(f"更多 Web Sources（{len(more)}）", expanded=False):
+            _render(more)
+
+def ensure_web_citation_token(text: str, domain: str) -> str:
+    """
+    保證回答中至少有一個 [WebSearch:<domain> p-]，
+    讓你的 UI 能顯示 web badge。
+    """
+    if not text:
+        return text
+    if re.search(r"\[WebSearch:[^\]]+\s+p-\s*\]", text, re.IGNORECASE):
+        return text
+    dom = (domain or "web").strip() or "web"
+    return (text.rstrip() + f"\n\n[WebSearch:{dom} p-]").strip()
 
 def _domain_from_url(u: str) -> str:
     try:
@@ -2016,6 +2118,7 @@ for msg in st.session_state.chat_history:
                 forced_end=meta.get("forced_end", None),
             )
             render_markdown_answer_with_sources_badges(msg.get("content", ""))
+            render_web_sources_list(meta.get("web_sources", {}) or {})
 
 
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
