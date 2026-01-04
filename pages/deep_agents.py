@@ -1354,7 +1354,7 @@ DIRECT_WRITER_SYSTEM_PROMPT = """
 硬規則（重要）：
 1) 只能使用 EVIDENCE 內出現的事實/日期/主張；不可自行上網、不可腦補。
 2) 正文**不得**提及流程（例如：你蒐證、依你提供來源、根據蒐證、我查到、EVIDENCE寫到…），直接寫結論。
-3) 正文**不得**貼 URL；URL 統一留給「Web Sources」區塊顯示。
+3) 正文**不得**貼 URL。
 4) 內文引用格式統一放句尾，用：`（來源：domain）`
    - domain 必須能在 SOURCES 內找到（例如 reuters.com、apnews.com、ofac.treasury.gov）
 5) 若某段沒有來源可對應，直接刪掉不要寫（寧可少寫也不要硬寫）。
@@ -1370,7 +1370,7 @@ DIRECT_WRITER_SYSTEM_PROMPT = """
 
 ## 還有哪些關鍵細節未確認（待追）
 - 2–6 點 bullets
-- 只能寫「目前 EVIDENCE 沒提供/未描述到」的缺口；不要推測答案
+- 只能寫「目前資訊沒提供/未描述到/未蒐集到」的缺口；不要推測答案
 - 可不加來源（若你覺得仍需，最多用（來源：domain）指向提到「未見」的報導）
 
 ## 時間線（按日期）
@@ -1381,9 +1381,6 @@ DIRECT_WRITER_SYSTEM_PROMPT = """
 ## 影響與接下來 3–7 天觀察點
 - 3–7 點 bullets（可分「國際法/外交/能源/旅行安全」等小標）
 - 每點句尾加（來源：domain）
-
-提醒：
-- 若同一段連續多句都引用同 domain，請合併成一個 bullet，避免（來源：reuters.com）一直重複。
 """
 
 
