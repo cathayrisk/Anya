@@ -473,15 +473,35 @@ def web_sources_from_openai_sources(sources: Optional[list[dict]]) -> Dict[str, 
     return out
 
 
+def _domain_of(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host or "web"
+    except Exception:
+        return "web"
+
+def _dom_path(url: str, max_len: int = 72) -> str:
+    try:
+        u = urlparse(url)
+        host = u.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        txt = f"{host}{u.path}"
+        return (txt[:max_len] + "…") if len(txt) > max_len else txt
+    except Exception:
+        return url
+
 def render_web_sources_list(
     web_sources: Dict[str, List[Tuple[str, str]]],
-    max_domains: int = 6,
+    max_domains: int = 8,
     max_per_domain: int = 6,
 ) -> None:
     """
-    B 方案：
-    - badge：只顯示 domain（你已經做到了）
-    - Web Sources：列「可點連結」，顯示 domain + path 為主
+    乾淨版：
+    - 先顯示 domain（粗體）
+    - domain 下縮排列出「新聞標題（超連結）」；若沒有 title 就用 domain+path
     """
     if not web_sources:
         return
@@ -491,16 +511,18 @@ def render_web_sources_list(
     show = domains[:max_domains]
     more = domains[max_domains:]
 
-    def _render(domains_list: list[str]):
-        for dom in domains_list:
-            items = web_sources.get(dom, [])
+    def _render(dom_list: list[str]):
+        for dom in dom_list:
+            items = web_sources.get(dom, []) or []
             if not items:
                 continue
 
             st.markdown(f"- **{dom}**")
-            for _title, url in items[:max_per_domain]:
-                label = url_to_domain_path(url)
-                # ✅ 可點連結
+            for title, url in items[:max_per_domain]:
+                label = (title or "").strip()
+                if not label or label.lower() == "source":
+                    label = _dom_path(url)
+                # Streamlit markdown link
                 st.markdown(f"  - [{label}]({url})")
 
     _render(show)
@@ -1266,6 +1288,43 @@ FORMATTER_SYSTEM_PROMPT = r"""
 - 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
 - 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。
 - 建議只用標準 Markdown 語法，保證跨平台顯示正常。
+"""
+# =========================
+# 1) [新增] Direct evidence / writer prompts（取代你原本 direct 用的 system 內容）
+# 建議放在 FORMATTER_SYSTEM_PROMPT 附近
+# =========================
+
+DIRECT_EVIDENCE_SYSTEM_PROMPT = """
+你是新聞研究助理。你必須使用 web_search 先蒐集證據，然後只輸出『證據筆記』。
+
+輸出格式必須固定（嚴格遵守）：
+### EVIDENCE
+- 最多 8 點 bullets，每點一句，內容必須是「可核對的事實/說法」（含日期/人名/機構/地點/數字/引述摘要）
+### SOURCES
+- 最多 12 行，每行格式：- <domain> | <title> | <url>
+
+規則：
+- 不要寫評論或長篇推論（只做可核對的整理）。
+- EVIDENCE 的每一點都必須能在 SOURCES 中至少一個 URL 找到依據。
+- 不要提到「你提供的/我蒐證/我剛剛上網」等流程話術。
+- 不要提工具/額度/內部字樣。
+"""
+
+DIRECT_WRITER_SYSTEM_PROMPT = """
+你是嚴謹的整理者。你只能根據我提供的 EVIDENCE 與 SOURCES 寫作，不可腦補。
+
+輸出要求（嚴格）：
+- 先輸出「整理結果」（清楚分段：總覽、時間線、已知 vs 未確認、背景/影響）。
+- 內文不得出現以下措辭（完全禁止）：
+  - 「依你提供來源」「你提供的蒐證指出」「你蒐證寫到」「我蒐證」「我剛剛查到」「我無法上網」
+- 內文的每個 bullet（或每段落）句尾都必須附上來源標註，格式固定：
+  （來源：<domain>）
+  例：（來源：reuters.com）
+- <domain> 必須出現在你收到的 SOURCES 清單中；不得自造 domain。
+- 不要在內文貼長 URL；URL 只出現在 SOURCES（由 UI 顯示）。
+- 若 EVIDENCE 沒有支撐某個面向：請放到「未確認／待追」區塊，且不得下定論。
+
+最後不要再附一份「References/來源清單」：來源由系統的 Web Sources 區塊統一呈現。
 """
 
 
@@ -2403,7 +2462,6 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
             })
             st.rerun()
 
-
 # =========================
 # 主畫面：Chat
 # =========================
@@ -2471,45 +2529,186 @@ if prompt:
         if planned_mode == "direct":
             system = ANYA_SYSTEM_PROMPT
 
-            # 共用短期記憶文字（你原本已有）
-            memory_msgs = run_messages[:-1]
-            history_block = "\n".join([
-                f"{m['role'].upper()}: {m['content']}"
-                for m in memory_msgs
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ])
+# =========================
+# direct
+# =========================
+        if planned_mode == "direct":
+            system = ANYA_SYSTEM_PROMPT
 
-            context_block = f"對話脈絡（最近）：\n{history_block}" if history_block.strip() else ""
-            user_text = prompt
-            if context_block:
-                user_text = f"{context_block}\n\n目前問題：\n{prompt}"
+    # ---------- local helpers (放在分支內避免你漏貼) ----------
+            URL_RE = re.compile(r"https?://[^\s\)\]>\u3000]+", re.IGNORECASE)
 
-            web_sources = {}
+            def _domain_of(url: str) -> str:
+                try:
+                    host = urlparse(url).netloc.lower()
+                    if host.startswith("www."):
+                        host = host[4:]
+                    return host or "web"
+                except Exception:
+                    return "web"
+
+            def _extract_domains_from_evidence_sources(evidence_md: str) -> set[str]:
+                """
+                從 evidence 的 ### SOURCES 區塊抽 domain。
+                每行格式：- <domain> | <title> | <url>
+                """
+                domains = set()
+                in_sources = False
+                for line in (evidence_md or "").splitlines():
+                    t = line.strip()
+                    if t.lower().startswith("### sources"):
+                        in_sources = True
+                        continue
+                    if not in_sources:
+                        continue
+                    if not t.startswith("- "):
+                        continue
+                    parts = [p.strip() for p in t[2:].split("|")]
+                    if parts and parts[0]:
+                        domains.add(parts[0])
+                return domains
+
+            def _parse_web_sources_from_evidence_md(evidence_md: str, max_per_domain: int = 8) -> Dict[str, List[Tuple[str, str]]]:
+                """
+                只用 evidence 裡的 ### SOURCES 生成乾淨的 web_sources（domain->[(title,url)]）
+                """
+                out: Dict[str, List[Tuple[str, str]]] = {}
+                in_sources = False
+                for line in (evidence_md or "").splitlines():
+                    t = line.strip()
+                    if t.lower().startswith("### sources"):
+                        in_sources = True
+                        continue
+                    if not in_sources:
+                        continue
+                    if not t.startswith("- "):
+                        continue
+                    parts = [p.strip() for p in t[2:].split("|")]
+                    if len(parts) < 3:
+                        continue
+                    dom, title, url = parts[0], parts[1], parts[2]
+                    if not dom or not url:
+                        continue
+                    out.setdefault(dom, []).append((title or "source", url))
+        # 截斷 + 去重
+                for dom in list(out.keys()):
+                    seen = set()
+                    uniq: List[Tuple[str, str]] = []
+                    for title, url in out[dom]:
+                        if url in seen:
+                            continue
+                        seen.add(url)
+                        uniq.append((title, url))
+                    out[dom] = uniq[:max_per_domain]
+                return out
+
+            def _normalize_inline_citations_to_domain(text: str, allowed_domains: set[str]) -> str:
+                """
+                把正文引用統一成句尾（來源：domain），避免網址塞進正文、避免亂格式。
+                1) 把 (來源：https://...) 轉成 (來源：domain)
+                2) 把 "來源：" 開頭的獨立行（包含 URL）移除（來源集中到 Web Sources 區塊）
+                3) 移除「你蒐證/依你提供來源」等流程話術（雙保險）
+                """
+                raw = (text or "").strip()
+                if not raw:
+                    return raw
+
+                # 移除獨立來源行（例如：來源：xxx https://...）
+                lines = []
+                for ln in raw.splitlines():
+                    s = ln.strip()
+                    if s.lower().startswith("來源") and ("http://" in s or "https://" in s):
+                        continue
+                    lines.append(ln)
+                raw = "\n".join(lines).strip()
+
+                # URL -> domain inside (來源：...)
+                def _replace_source_url(m: re.Match) -> str:
+                    url = m.group(1)
+                    dom = _domain_of(url)
+                    if allowed_domains and (dom not in allowed_domains):
+                        # 不在 allowlist 就不要硬塞（避免假引用）
+                        return ""
+                    return f"（來源：{dom}）"
+
+                raw = re.sub(r"（來源：\s*(https?://[^\s\)]+)\s*）", _replace_source_url, raw)
+
+                # 若出現「來源：https://...」但沒有括號，也做一次收斂
+                raw = re.sub(r"來源：\s*(https?://[^\s]+)", lambda m: f"（來源：{_domain_of(m.group(1))}）", raw)
+
+                # 禁止流程話術（雙保險；以免 writer 沒聽話）
+                raw = re.sub(r"依你提供來源[^\n]*", "", raw)
+                raw = re.sub(r"你提供的蒐證指出：?", "", raw)
+                raw = re.sub(r"你蒐證寫到：?", "", raw)
+                raw = re.sub(r"我蒐證寫到：?", "", raw)
+
+                # 收尾：清掉多餘空白行
+                raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
+                return raw
+
+    # ---------- build short-term memory context ----------
+            memory_msgs = run_messages[:-1]  # 排除本次 prompt
+            history_block = "\n".join(
+                [
+                    f"{m['role'].upper()}: {m['content']}"
+                    for m in memory_msgs
+                    if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()
+                ]
+            ).strip()
+
+            context_block = f"對話脈絡（最近）：\n{history_block}" if history_block else ""
+            user_text = prompt if not context_block else f"{context_block}\n\n目前問題：\n{prompt}"
+
+            # ---------- Direct status + routing ----------
+            web_sources: Dict[str, List[Tuple[str, str]]] = {}
             evidence_md = ""
+            files = {"/workspace/todos.json": todos_json_text}
             usage = {"doc_search_calls": 0, "web_search_calls": 0}
 
-            # ✅ Direct 狀態列：永遠出現
+            # 兩段式 gating：你前面已經做 need_todo，這裡用它決定是否要 evidence→write
+            use_two_stage = bool(enable_web and need_todo)
+
             with st.status("Direct回應", expanded=False) as s:
-            #   ✅ 兩段式 gating：有啟用 web 且 need_todo 才做 evidence→write
-                use_two_stage = bool(enable_web and need_todo)
-
                 if use_two_stage:
+                    # (1) evidence
                     s.update(label="Direct：蒐證中（web_search）…", state="running", expanded=False)
-                    evidence_md, web_sources = build_web_evidence_direct(
-                        client,
-                        question=prompt,
-                        context_block=context_block,
-                        max_bullets=8,
-                        max_sources=12,
-                    )
-                    usage["web_search_calls"] = 1  # direct 至少一次
 
-                    s.update(label="Direct：寫作整合中…", state="running", expanded=False)
-                    writer_system = (
-                        system
-                        + "\n\n【硬規則】你只能根據我提供的 EVIDENCE 撰寫；缺少證據支撐的內容就不要寫。"
+                    # 產 evidence（<=8 bullets + Sources）
+                    evidence_system = DIRECT_EVIDENCE_SYSTEM_PROMPT  # 你先前已加的全域 prompt
+                    evidence_user = (f"{context_block}\n\n" if context_block else "") + f"問題：{prompt}"
+
+                    evidence_md, sources = call_gpt(
+                        client,
+                        model=MODEL_MAIN,
+                        system=evidence_system,
+                        user=evidence_user,
+                        reasoning_effort=REASONING_EFFORT,
+                        tools=[{"type": "web_search"}],
+                        include_sources=True,
+                        tool_choice="required",
                     )
-                    writer_user = f"{user_text}\n\n---\n\n以下是本次蒐證結果（EVIDENCE）：\n{evidence_md}"
+                    evidence_md = (evidence_md or "").strip()
+                    usage["web_search_calls"] = 1
+
+                    # 寫入 /evidence/web_direct.md（debug）
+                    if evidence_md:
+                        files["/evidence/web_direct.md"] = evidence_md
+
+                    # Web Sources：以 evidence 的 ### SOURCES 為準（避免亂）
+                    web_sources = _parse_web_sources_from_evidence_md(evidence_md)
+
+                    # (2) writer
+                    s.update(label="Direct：寫作整合中…", state="running", expanded=False)
+
+                    allowed_domains = set(web_sources.keys()) or _extract_domains_from_evidence_sources(evidence_md)
+
+                    writer_system = system + "\n\n" + DIRECT_WRITER_SYSTEM_PROMPT  # 你先前已加的全域 prompt
+                    writer_user = (
+                        f"{user_text}\n\n"
+                        "===\n"
+                        "EVIDENCE（只可依此寫作）：\n"
+                        f"{evidence_md}\n"
+                    )
 
                     answer_text, _ = call_gpt(
                         client,
@@ -2520,9 +2719,16 @@ if prompt:
                         tools=None,
                     )
 
+                    # 內文引用格式統一成（來源：domain）；正文不貼 URL
+                    answer_text = _normalize_inline_citations_to_domain(answer_text or "", allowed_domains)
+
+                    # 保證 badge 能辨識有用 web（固定 WebSearch，不帶 domain）
+                    answer_text = (answer_text.rstrip() + "\n\n[WebSearch:web p-]").strip()
+
                 else:
-                    # 單段式：不跑蒐證（所以 status 只顯示 Direct回應）
+                    # 單段式：不蒐證，直接回應（狀態只顯示 Direct回應）
                     s.update(label="Direct回應", state="running", expanded=False)
+
                     answer_text, _ = call_gpt(
                         client,
                         model=MODEL_MAIN,
@@ -2539,11 +2745,6 @@ if prompt:
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
             answer_text = strip_internal_process_lines(answer_text)
 
-            # ✅ direct 也造出 files（含 /evidence/web_direct.md）
-            files = {"/workspace/todos.json": todos_json_text}
-            if evidence_md.strip():
-                files["/evidence/web_direct.md"] = evidence_md
-
             meta = {
                 "mode": "direct",
                 "need_todo": True,
@@ -2552,7 +2753,7 @@ if prompt:
                 "enable_web": enable_web,
                 "todo_file_present": True,
                 "forced_end": None,
-                "web_sources": web_sources,
+                "web_sources": web_sources,  # ✅ 以 evidence SOURCES 生成，乾淨
             }
 
             render_run_badges(
@@ -2571,17 +2772,19 @@ if prompt:
                 st.markdown("### 本次 Todo（direct 產生）")
                 st.code(todos_json_text[:20000], language="json")
 
-                if evidence_md.strip():
+                if "/evidence/web_direct.md" in files:
                     st.divider()
                     st.markdown("### /evidence/web_direct.md")
-                    st.code(evidence_md[:60000], language="markdown")
+                    st.code((files["/evidence/web_direct.md"] or "")[:60000], language="markdown")
 
                 if enable_web:
                     st.divider()
-                    st.markdown("### 本次 Web Sources（direct）")
+                    st.markdown("### 本次 Web Sources（direct，以 evidence SOURCES 為準）")
                     st.code(json.dumps(web_sources, ensure_ascii=False, indent=2)[:20000], language="json")
 
-            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+            st.session_state.chat_history.append(
+                {"role": "assistant", "kind": "text", "content": answer_text, "meta": meta}
+            )
             st.stop()
         
         # deepagent
