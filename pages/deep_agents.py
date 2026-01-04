@@ -243,7 +243,7 @@ Before any significant tool call, state in one line: purpose + minimal inputs。
 - 表格（僅部分平台支援，建議用條列式）
 - 引用：`> 這是重點摘要`
 - emoji：直接輸入或貼上，如 😄
-- Material Symbols：如`:material_star:`
+- Material Symbols：如`:material/star:`
 - LaTeX 數學公式：`$公式$` 或 `$$公式$$`
 - 彩色文字：`:orange[重點]`、`:blue[說明]`
 - 彩色背景：`:orange-background[警告內容]`
@@ -279,10 +279,6 @@ Before any significant tool call, state in one line: purpose + minimal inputs。
 7. 適時穿插 emoji。
 8. 結尾可用「安妮亞回答完畢！」、「還有什麼想問安妮亞嗎？」等可愛語句。
 9. 請先思考再作答，確保每一題都用最合適的格式呈現。
-10. reasoning_effort：
-    - 預設使用 reasoning_effort = medium。
-    - 對於非常簡單或只需直接翻譯、格式轉換的任務，可以降低為 low。
-    - 對於多步驟推理、程式設計、嚴謹分析或需要綜合多段資訊的任務，可以提升為 high。
 
 # 《SPY×FAMILY 間諜家家酒》彩蛋模式
 - 若不是在討論法律、醫療、財經、學術等重要嚴肅主題，安妮亞可在回答中穿插趣味元素，但不要影響正確性與可讀性。
@@ -477,9 +473,15 @@ def web_sources_from_openai_sources(sources: Optional[list[dict]]) -> Dict[str, 
     return out
 
 
-def render_web_sources_list(web_sources: Dict[str, List[Tuple[str, str]]], max_domains: int = 6, max_per_domain: int = 6) -> None:
+def render_web_sources_list(
+    web_sources: Dict[str, List[Tuple[str, str]]],
+    max_domains: int = 6,
+    max_per_domain: int = 6,
+) -> None:
     """
-    B 方案：badge 只顯示 domain；URL 用清單列在下面。
+    B 方案：
+    - badge：只顯示 domain（你已經做到了）
+    - Web Sources：列「可點連結」，顯示 domain + path 為主
     """
     if not web_sources:
         return
@@ -494,9 +496,12 @@ def render_web_sources_list(web_sources: Dict[str, List[Tuple[str, str]]], max_d
             items = web_sources.get(dom, [])
             if not items:
                 continue
+
             st.markdown(f"- **{dom}**")
-            for title, url in items[:max_per_domain]:
-                st.markdown(f"  - {title} — {url}")
+            for _title, url in items[:max_per_domain]:
+                label = url_to_domain_path(url)
+                # ✅ 可點連結
+                st.markdown(f"  - [{label}]({url})")
 
     _render(show)
     if more:
@@ -539,6 +544,24 @@ def strip_internal_process_lines(md: str) -> str:
         kept.append(line)
     return "\n".join(kept).strip()
 
+def url_to_domain_path(url: str, max_len: int = 72) -> str:
+    """
+    把 URL 轉成適合顯示的 label：<domain><path>
+    - 不顯示 query/fragment（避免太長、也避免 utm 之類雜訊）
+    - 過長就截斷
+    """
+    try:
+        u = urlparse(url)
+        host = (u.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = u.path or "/"
+        label = f"{host}{path}"
+        if len(label) > max_len:
+            label = label[: max_len - 1] + "…"
+        return label or url
+    except Exception:
+        return url
 
 # =========================
 # OpenAI client + wrappers
