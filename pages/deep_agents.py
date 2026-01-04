@@ -1297,7 +1297,16 @@ def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_re
 # =========================
 # Direct mode todos.json（你要求 direct 也要產）
 # =========================
-def build_todos_json_for_question(client: OpenAI, question: str, *, enable_web: bool, has_index: bool, planned_mode: str) -> str:
+def build_todos_json_for_question(
+    client: OpenAI,
+    question: str,
+    *,
+    enable_web: bool,
+    has_index: bool,
+    planned_mode: str,
+    run_messages: Optional[list[dict]] = None,   # ✅ 新增
+    max_history_chars: int = 3200,               # ✅ 避免 todo prompt 過長
+) -> str:
     system = (
         "你是任務規劃器。請輸出 todos.json（JSON array of strings）。\n"
         "目的：用來規劃『如何回答使用者問題』。\n"
@@ -1305,17 +1314,43 @@ def build_todos_json_for_question(client: OpenAI, question: str, *, enable_web: 
         "1) 只輸出 JSON array（不要 markdown、不要解釋）。\n"
         "2) 5~9 個 steps。\n"
         "3) 第 1 步要說明 enable_web/has_index/planned_mode 與本題目標。\n"
+        "4) 需考慮對話脈絡（若提供）。\n"
     )
-    user = f"enable_web={str(enable_web).lower()}\nhas_index={str(has_index).lower()}\nplanned_mode={planned_mode}\n\n問題：{question}"
+
+    # ✅ 把 run_messages（最近對話）壓成「對話脈絡」給 todo 參考
+    history_block = ""
+    if run_messages:
+        # 排除最後一則（通常就是本次 question），避免重複
+        hist = run_messages[:-1]
+        lines = []
+        for m in hist:
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                lines.append(f"{role.upper()}: {content}")
+        history_block = "\n".join(lines).strip()
+
+        if len(history_block) > max_history_chars:
+            history_block = history_block[:max_history_chars] + "…"
+
+    user = (
+        f"enable_web={str(enable_web).lower()}\n"
+        f"has_index={str(has_index).lower()}\n"
+        f"planned_mode={planned_mode}\n\n"
+        + (f"對話脈絡（最近）：\n{history_block}\n\n" if history_block else "")
+        + f"目前問題：\n{question}"
+    )
+
     out, _ = call_gpt(
         client,
         model=MODEL_MAIN,
         system=system,
         user=user,
-        reasoning_effort=None,
+        reasoning_effort=REASONING_EFFORT,
         tools=None,
         include_sources=False,
     )
+
     data = _try_parse_json_or_py_literal(out)
     if isinstance(data, list):
         steps = [str(x) for x in data if str(x).strip()]
@@ -1323,9 +1358,10 @@ def build_todos_json_for_question(client: OpenAI, question: str, *, enable_web: 
 
     steps = [
         f"說明 enable_web={str(enable_web).lower()}、has_index={str(has_index).lower()}、planned_mode={planned_mode} 與本題目標",
+        "回顧對話脈絡：確認使用者目前的上下文、限制與偏好（若有）",
         "釐清問題範圍與關鍵名詞，避免誤解",
         "列出需要引用/查證的資訊點",
-        "若可用文件索引，規劃如何檢索與引用；若啟用網搜，規劃要查的主題與來源類型",
+        "若啟用網搜：列出要查的子問題與優先來源（官方/主流媒體/一手文件）",
         "整理可用證據後，產出結構化回覆（結論先行 + 分點）",
         "最終檢查：不提內部流程與檔名，只保留有來源支撐的內容",
     ]
@@ -1409,63 +1445,6 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk]
 
     tool_web_search_summary: Optional[BaseTool] = None
-    if enable_web:
-        def _web_search_summary_fn(query: str) -> str:
-            if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
-                # 仍回傳引用標頭，但不要把 Budget exceeded 寫進成品內容（writer 會省略無來源段落）
-                return "[WebSearch:web p-]\nSources:\n- web | (budget exceeded) |"
-
-            q = (query or "").strip()
-            if not q:
-                return "[WebSearch:web p-]\nSources:\n- web | (empty query) |"
-
-            system = (
-                "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果。\n"
-                "輸出格式必須固定：\n"
-                "1) 先用 3~8 個 bullets 摘要（每點一句，清楚、帶日期/數字則保留）。\n"
-                "2) 最後一定要有一段 Sources:，用條列列出來源。\n"
-                "   每列格式：- <domain> | <title> | <url>\n"
-                "規則：\n"
-                "- 不要提到工具流程/額度/Budget exceeded。\n"
-                "- 若找不到可靠來源：摘要可為空，但仍要輸出 Sources:（可能為空）。\n"
-            )
-            user = f"Search term: {q}"
-            text, sources = call_gpt(
-                client,
-                model=MODEL_WEB,
-                system=system,
-                user=user,
-                reasoning_effort=None,
-                tools=[{"type": "web_search"}],
-                include_sources=True,
-            )
-
-            src_lines = []
-            domains = []
-            for s in (sources or [])[:10]:
-                if isinstance(s, dict):
-                    t = (s.get("title") or s.get("source") or "source").strip()
-                    u = (s.get("url") or "").strip()
-                    dom = _domain_from_url(u) if u else "web"
-                    domains.append(dom)
-                    if u:
-                        src_lines.append(f"- {dom} | {t} | {u}")
-
-            out_text = (text or "").strip()
-            # ✅ 用第一個來源 domain 當 citation title（badge 就只會顯示 domain）
-            primary_domain = domains[0] if domains else "web"
-
-            # 保證有 Sources 段
-            if src_lines:
-                out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
-            else:
-                out_text = (out_text + "\n\nSources:").strip()
-
-            return f"[WebSearch:{primary_domain} p-]\n" + out_text[:2400]
-
-        tool_web_search_summary = _mk_tool(_web_search_summary_fn, "web_search_summary", "Run web_search and return a short Traditional Chinese summary with sources + domain.")
-        tools.append(tool_web_search_summary)
-
     if enable_web:
         def _web_search_summary_fn(query: str) -> str:
             if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
@@ -1778,7 +1757,28 @@ def fallback_answer_from_store(
 # =========================
 # DeepAgent run + stall detect
 # =========================
-def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optional[dict]]:
+# === Patch 1) 新增一個共用 helper：建立本次 run 的 messages（避免重複塞 prompt） ===
+# ------------------------------------------------------------
+# (1) 新增/確認：共用 run_messages 的 helper（若你已經加過 build_run_messages，略過）
+#     放在 get_recent_chat_messages() 附近最順
+# ------------------------------------------------------------
+def build_run_messages(prompt: str, max_messages: int = 10) -> list[dict]:
+    """
+    共用短期記憶（同一份給 direct / deepagent / todo 用）。
+    - 從 chat_history 抽最近 max_messages 則 kind=text 的 user/assistant
+    - 確保最後一則一定是本次 prompt 的 user 訊息（避免漏或重複）
+    """
+    msgs = get_recent_chat_messages(max_messages=max_messages)
+
+    # 若 chat_history 已經 append 本次 prompt，最後一則就是它 → 直接回傳
+    if msgs and msgs[-1].get("role") == "user" and (msgs[-1].get("content") or "").strip() == (prompt or "").strip():
+        return msgs
+
+    msgs.append({"role": "user", "content": (prompt or "").strip()})
+    return msgs
+
+# === Patch 2) 修改 deep_agent_run_with_live_status：多收一個 run_messages，並餵給 agent.stream ===
+def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[dict]) -> Tuple[str, Optional[dict]]:
     final_state = None
     todos_preview_written = False
 
@@ -1805,61 +1805,47 @@ def deep_agent_run_with_live_status(agent, user_text: str) -> Tuple[str, Optiona
         label, state = mapping.get(phase, ("DeepAgent：執行中…", "running"))
         s.update(label=label, state=state, expanded=False)
 
+    # ✅ 深度記憶：deepagent 直接吃 messages list（與 direct 共用同一份）
+    # 保險：確保最後是 user_text
+    msgs_for_agent = list(run_messages or [])
+    if not msgs_for_agent or msgs_for_agent[-1].get("role") != "user":
+        msgs_for_agent.append({"role": "user", "content": user_text})
+    elif (msgs_for_agent[-1].get("content") or "").strip() != (user_text or "").strip():
+        msgs_for_agent.append({"role": "user", "content": user_text})
+
     with st.status("DeepAgent：啟動中…", expanded=False) as s:
         set_phase(s, "start")
         set_phase(s, "plan")
 
         try:
             for state in agent.stream(
-                {"messages": [{"role": "user", "content": user_text}]},
+                {"messages": msgs_for_agent},   # ✅ 原本只塞一則 user，改成塞短期記憶
                 stream_mode="values",
                 config={"recursion_limit": recursion_limit},
             ):
+                # --- 下面你的原本程式照舊（不貼了，保持原樣） ---
                 final_state = state
                 files = state.get("files") or {}
                 file_keys = set(files.keys()) if isinstance(files, dict) else set()
+                ...
+        except GraphRecursionError:
+            ...
+        except Exception as e:
+            ...
+        ...
+    return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
 
-                if (not todos_preview_written) and isinstance(files, dict) and "/workspace/todos.json" in files:
-                    todos_txt = get_files_text(files, "/workspace/todos.json")
-                    if todos_txt:
-                        s.write("### 本次 Todo（規劃結果預覽）")
-                        s.code(todos_txt[:4000], language="json")
-                        todos_preview_written = True
 
-                if any(k.startswith("/evidence/") for k in file_keys):
-                    set_phase(s, "evidence")
-                if "/draft.md" in file_keys:
-                    set_phase(s, "draft")
-                if "/review.md" in file_keys:
-                    set_phase(s, "review")
+# === Patch 3) 主流程：只算一次 run_messages，direct/deepagent 共用 ===
+# 在你 if prompt: 的 assistant 區塊中，做完 need_todo / todos_json_text 後，加這行：
+run_messages = build_run_messages(prompt, max_messages=10)
 
-                # ✅ 卡住判定：draft 夠長後才開始（不變 + 無引用）連續 N 步
-                if isinstance(files, dict) and "/draft.md" in files:
-                    draft_txt = get_files_text(files, "/draft.md")
-                    draft_norm = norm_space(draft_txt)
-                    if len(draft_norm) >= stall_min_chars:
-                        h = _hash_norm_text(draft_norm)
-                        if last_draft_hash == h:
-                            draft_unchanged_streak += 1
-                        else:
-                            draft_unchanged_streak = 0
-                            last_draft_hash = h
+# direct 分支：把原本 memory_msgs = get_recent_chat_messages(...) 改成用 run_messages
+memory_msgs = run_messages[:-1]  # 排除最後一則（就是本次 prompt）
+history_block = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in memory_msgs])
 
-                        if has_visible_citations(draft_norm):
-                            draft_no_citation_streak = 0
-                        else:
-                            draft_no_citation_streak += 1
-
-                        if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
-                            set_phase(s, "error")
-                            st.session_state["last_run_forced_end"] = "citation_stall"
-                            s.warning(
-                                f"判定卡住：/draft.md 內容連續 {draft_unchanged_streak} 步未變、且連續 {draft_no_citation_streak} 步無引用。"
-                                "已強制結束 DeepAgent，改用 fallback 產出答案。"
-                            )
-                            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
-                            return answer, files if isinstance(files, dict) and files else None
-
+# deepagent 分支：呼叫改成多帶 run_messages
+answer_text, files = deep_agent_run_with_live_status(agent, prompt, run_messages)
         except GraphRecursionError:
             set_phase(s, "error")
             st.session_state["last_run_forced_end"] = "recursion_limit"
@@ -2355,6 +2341,7 @@ if prompt:
 
         # ✅ 不管 direct/deepagent，都做 todo 判斷（你要求）
         need_todo, reason = decide_need_todo(client, prompt)
+        run_messages = build_run_messages(prompt, max_messages=15)
 
         planned_mode = "deepagent" if (has_index and need_todo) else "direct"
         todos_json_text = build_todos_json_for_question(
@@ -2363,6 +2350,7 @@ if prompt:
             enable_web=enable_web,
             has_index=has_index,
             planned_mode=planned_mode,
+            run_messages=run_messages,  # ✅ 新增：Todo 吃共用記憶
         )
 
         # direct
@@ -2370,8 +2358,8 @@ if prompt:
             system = ANYA_SYSTEM_PROMPT
 
             # ✅ 短期記憶（N=10）：把最近對話壓成 context（不改 call_gpt wrapper 也能用）
-            memory_msgs = get_recent_chat_messages(max_messages=10)
-            history_block = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in memory_msgs])
+            memory_msgs = run_messages[:-1]  # 排除本次 prompt
+            history_block = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in memory_msgs if m.get("role") in ("user", "assistant") and m.get("content")])
             user_text = prompt
             if history_block.strip():
                 user_text = f"對話脈絡（最近）：\n{history_block}\n\n目前問題：\n{prompt}"
