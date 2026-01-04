@@ -570,33 +570,92 @@ def call_gpt(
     reasoning_effort: Optional[str] = None,
     tools: Optional[list] = None,
     include_sources: bool = False,
+    tool_choice: Optional[Any] = None,  # ✅ 新增
 ) -> Tuple[str, Optional[list[Dict[str, Any]]]]:
     messages = _to_messages(system, user)
+
+    if tool_choice is None:
+        tc = "auto" if tools else "none"
+    else:
+        tc = tool_choice
+
     resp = client.responses.create(
         model=model,
         input=messages,
         tools=tools,
-        tool_choice="auto" if tools else "none",
+        tool_choice=tc,
         parallel_tool_calls=True if tools else None,
         reasoning={"effort": reasoning_effort} if reasoning_effort in ("low", "medium", "high") else None,
         include=["web_search_call.action.sources"] if (tools and include_sources) else None,
         truncation="auto",
     )
+
     out_text = resp.output_text
     sources = None
+
     if tools and include_sources:
+        sources_list: list[Dict[str, Any]] = []
+
+        def _as_dict(x: Any) -> dict:
+            if isinstance(x, dict):
+                return x
+            d = getattr(x, "__dict__", None)
+            return d if isinstance(d, dict) else {}
+
+        # (A) 嘗試從 web_search_call.action.sources 抓
         try:
-            sources_list = []
-            if hasattr(resp, "output") and resp.output:
-                for item in resp.output:
-                    d = item if isinstance(item, dict) else getattr(item, "__dict__", {})
-                    if isinstance(d, dict) and d.get("type") == "web_search_call":
-                        action = d.get("action", {}) or {}
-                        if isinstance(action, dict) and action.get("sources"):
-                            sources_list.extend(action["sources"])
-            sources = sources_list if sources_list else None
+            for item in (getattr(resp, "output", None) or []):
+                d = _as_dict(item)
+                typ = d.get("type") or getattr(item, "type", None)
+                if typ == "web_search_call":
+                    action = d.get("action") or getattr(item, "action", None) or {}
+                    action_d = _as_dict(action)
+                    ss = action_d.get("sources") or []
+                    for s in ss:
+                        sd = _as_dict(s)
+                        url = (sd.get("url") or "").strip()
+                        title = (sd.get("title") or sd.get("source") or "source").strip()
+                        if url:
+                            sources_list.append({"title": title, "url": url})
         except Exception:
-            sources = None
+            pass
+
+        # (B) ✅ 再從 message.content[].annotations(url_citation) 抓（很多模型會走這裡）
+        try:
+            for item in (getattr(resp, "output", None) or []):
+                d = _as_dict(item)
+                typ = d.get("type") or getattr(item, "type", None)
+                if typ != "message":
+                    continue
+
+                content = d.get("content") or getattr(item, "content", None) or []
+                for part in (content or []):
+                    pd = _as_dict(part)
+                    annotations = pd.get("annotations") or getattr(part, "annotations", None) or []
+                    for ann in (annotations or []):
+                        ad = _as_dict(ann)
+                        at = ad.get("type") or getattr(ann, "type", None)
+                        if at != "url_citation":
+                            continue
+                        url = (ad.get("url") or "").strip()
+                        title = (ad.get("title") or ad.get("source") or ad.get("name") or "source").strip()
+                        if url:
+                            sources_list.append({"title": title, "url": url})
+        except Exception:
+            pass
+
+        # 去重（以 url 為準）
+        if sources_list:
+            seen = set()
+            uniq = []
+            for s in sources_list:
+                u = (s.get("url") or "").strip()
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                uniq.append(s)
+            sources = uniq if uniq else None
+
     return out_text, sources
 
 
@@ -2326,9 +2385,10 @@ if prompt:
                     model=MODEL_MAIN,
                     system=system,
                     user=user_text,
-                    reasoning_effort=None,
+                    reasoning_effort=REASONING_EFFORT,
                     tools=[{"type": "web_search"}],
                     include_sources=True,
+                    tool_choice="required",  # ✅ 關鍵：保證真的 call web_search 才會有 sources
                 )
 
                 web_sources = web_sources_from_openai_sources(sources)
@@ -2337,7 +2397,10 @@ if prompt:
                 primary_domain = "web"
                 if web_sources:
                     primary_domain = sorted(web_sources.keys())[0]  # 取一個穩定的 domain
-                answer_text = ensure_web_citation_token(answer_text or "", primary_domain)
+                    answer_text = ensure_web_citation_token(answer_text or "", primary_domain)
+                else:
+                    # 沒抓到 sources，就不要硬塞 [WebSearch:web p-]，避免誤導
+                    pass
 
                 # usage 記一個（call_gpt 內部 tool 可能多次 call，但 direct 我們至少標示有用 web）
                 usage = {"doc_search_calls": 0, "web_search_calls": 1}
@@ -2347,7 +2410,7 @@ if prompt:
                     model=MODEL_MAIN,
                     system=system,
                     user=user_text,
-                    reasoning_effort=None,
+                    reasoning_effort=REASONING_EFFORT,
                     tools=None,
                 )
                 usage = {"doc_search_calls": 0, "web_search_calls": 0}
