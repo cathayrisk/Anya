@@ -563,6 +563,19 @@ def url_to_domain_path(url: str, max_len: int = 72) -> str:
     except Exception:
         return url
 
+EMPH_FIX_RE = re.compile(r"\*\*\s+(.+?)\s+\*\*")
+
+def normalize_markdown_emphasis(md: str) -> str:
+    if not md:
+        return md
+    # ** text ** -> **text**
+    md = EMPH_FIX_RE.sub(r"**\1**", md)
+
+    # 常見不可見空白
+    md = md.replace("\u00A0", " ")  # NBSP
+    md = md.replace("\u200B", "")   # ZWSP
+    return md
+
 # =========================
 # OpenAI client + wrappers
 # =========================
@@ -1038,14 +1051,12 @@ def _extract_citation_items(text: str) -> list[tuple[str, str]]:
 def _title_to_display_domain(title: str) -> str:
     """
     B 方案：badge 只顯示 domain
-    - doc: 그대로用 title
+    - doc: 用 title
     - web: [WebSearch:domain p-] -> 顯示 domain
     """
     t = (title or "").strip()
-    low = t.lower()
-    if low.startswith("websearch:"):
-        dom = t.split(":", 1)[1].strip() if ":" in t else "web"
-        return dom or "web"
+    if t.lower().startswith("websearch:"):
+        return "websearch"
     return t
 
 
@@ -1067,6 +1078,7 @@ def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
     cit_items = _extract_citation_items(raw)
 
     clean = _strip_citations_from_text(raw)
+    clean = normalize_markdown_emphasis(clean)
     st.markdown(clean if clean else "（無內容）")
 
     if not cit_items:
