@@ -412,7 +412,7 @@ def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
             return None
     return None
 
-def get_recent_chat_messages(max_messages: int = 10) -> list[dict]:
+def get_recent_chat_messages(max_messages: int = 15) -> list[dict]:
     """
     取最近 N 則「text」訊息當短期記憶（排除 default 大包輸出），避免 prompt 爆長。
     回傳格式：[{role:"user"/"assistant", content:"..."}]
@@ -1762,7 +1762,7 @@ def fallback_answer_from_store(
 # (1) 新增/確認：共用 run_messages 的 helper（若你已經加過 build_run_messages，略過）
 #     放在 get_recent_chat_messages() 附近最順
 # ------------------------------------------------------------
-def build_run_messages(prompt: str, max_messages: int = 10) -> list[dict]:
+def build_run_messages(prompt: str, max_messages: int = 15) -> list[dict]:
     """
     共用短期記憶（同一份給 direct / deepagent / todo 用）。
     - 從 chat_history 抽最近 max_messages 則 kind=text 的 user/assistant
@@ -1819,33 +1819,55 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
 
         try:
             for state in agent.stream(
-                {"messages": msgs_for_agent},   # ✅ 原本只塞一則 user，改成塞短期記憶
+                {"messages": [{"role": "user", "content": user_text}]},
                 stream_mode="values",
                 config={"recursion_limit": recursion_limit},
             ):
-                # --- 下面你的原本程式照舊（不貼了，保持原樣） ---
                 final_state = state
                 files = state.get("files") or {}
                 file_keys = set(files.keys()) if isinstance(files, dict) else set()
-                ...
-        except GraphRecursionError:
-            ...
-        except Exception as e:
-            ...
-        ...
-    return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
 
+                if (not todos_preview_written) and isinstance(files, dict) and "/workspace/todos.json" in files:
+                    todos_txt = get_files_text(files, "/workspace/todos.json")
+                    if todos_txt:
+                        s.write("### 本次 Todo（規劃結果預覽）")
+                        s.code(todos_txt[:4000], language="json")
+                        todos_preview_written = True
 
-# === Patch 3) 主流程：只算一次 run_messages，direct/deepagent 共用 ===
-# 在你 if prompt: 的 assistant 區塊中，做完 need_todo / todos_json_text 後，加這行：
-run_messages = build_run_messages(prompt, max_messages=10)
+                if any(k.startswith("/evidence/") for k in file_keys):
+                    set_phase(s, "evidence")
+                if "/draft.md" in file_keys:
+                    set_phase(s, "draft")
+                if "/review.md" in file_keys:
+                    set_phase(s, "review")
 
-# direct 分支：把原本 memory_msgs = get_recent_chat_messages(...) 改成用 run_messages
-memory_msgs = run_messages[:-1]  # 排除最後一則（就是本次 prompt）
-history_block = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in memory_msgs])
+                # ✅ 卡住判定：draft 夠長後才開始（不變 + 無引用）連續 N 步
+                if isinstance(files, dict) and "/draft.md" in files:
+                    draft_txt = get_files_text(files, "/draft.md")
+                    draft_norm = norm_space(draft_txt)
+                    if len(draft_norm) >= stall_min_chars:
+                        h = _hash_norm_text(draft_norm)
+                        if last_draft_hash == h:
+                            draft_unchanged_streak += 1
+                        else:
+                            draft_unchanged_streak = 0
+                            last_draft_hash = h
 
-# deepagent 分支：呼叫改成多帶 run_messages
-answer_text, files = deep_agent_run_with_live_status(agent, prompt, run_messages)
+                        if has_visible_citations(draft_norm):
+                            draft_no_citation_streak = 0
+                        else:
+                            draft_no_citation_streak += 1
+
+                        if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
+                            set_phase(s, "error")
+                            st.session_state["last_run_forced_end"] = "citation_stall"
+                            s.warning(
+                                f"判定卡住：/draft.md 內容連續 {draft_unchanged_streak} 步未變、且連續 {draft_no_citation_streak} 步無引用。"
+                                "已強制結束 DeepAgent，改用 fallback 產出答案。"
+                            )
+                            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
+                            return answer, files if isinstance(files, dict) and files else None
+
         except GraphRecursionError:
             set_phase(s, "error")
             st.session_state["last_run_forced_end"] = "recursion_limit"
@@ -1888,7 +1910,6 @@ answer_text, files = deep_agent_run_with_live_status(agent, prompt, run_messages
         set_phase(s, "done")
 
     return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
-
 
 # =========================
 # need_todo decision
@@ -2295,10 +2316,6 @@ has_index = (
     and st.session_state.store.index.ntotal > 0
 )
 
-st.divider()
-st.subheader("Chat（DeepAgent + Sources Badges + Todo decision）")
-
-
 # 顯示歷史（✅ user 不顯示 badge）
 for msg in st.session_state.chat_history:
     role = msg.get("role", "assistant")
@@ -2449,7 +2466,7 @@ if prompt:
             st.stop()
         # deepagent
         agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
-        answer_text, files = deep_agent_run_with_live_status(agent, prompt)
+        answer_text, files = deep_agent_run_with_live_status(agent, prompt, run_messages)
 
         if ENABLE_FORMATTER_FOR_DEEPAGENT and st.session_state.get("enable_output_formatter", True):
             answer_text = format_markdown_output_preserve_citations(client, answer_text)
