@@ -576,6 +576,68 @@ def normalize_markdown_emphasis(md: str) -> str:
     md = md.replace("\u200B", "")   # ZWSP
     return md
 
+def build_web_evidence_direct(
+    client: OpenAI,
+    *,
+    question: str,
+    context_block: str,
+    max_bullets: int = 8,
+    max_sources: int = 12,
+) -> Tuple[str, Dict[str, List[Tuple[str, str]]]]:
+    """
+    回傳：
+    - evidence_md: markdown，固定格式：
+      ### EVIDENCE
+      - ...
+      ### SOURCES
+      - domain | title | url
+    - web_sources: {domain: [(title,url), ...]} 供 UI 列表用
+    """
+    system = (
+        "你是新聞研究助理。你必須使用 web_search 先蒐集證據，然後只輸出『證據筆記』。\n"
+        "輸出格式必須固定：\n"
+        "### EVIDENCE\n"
+        f"- 最多 {max_bullets} 點，每點一句，盡量可核對（日期/人物/地點/機構/主張），不要長篇評論。\n"
+        "### SOURCES\n"
+        f"- 最多 {max_sources} 行，每行格式：- <domain> | <title> | <url>\n"
+        "規則：\n"
+        "- 只寫你在來源裡確實看到可支持的內容；不確定就不要寫。\n"
+        "- 不要提工具流程/額度/內部字樣。\n"
+    )
+
+    user = (
+        (context_block.strip() + "\n\n") if context_block.strip() else ""
+    ) + f"問題：{question}"
+
+    evidence_text, sources = call_gpt(
+        client,
+        model=MODEL_MAIN,
+        system=system,
+        user=user,
+        reasoning_effort=REASONING_EFFORT,
+        tools=[{"type": "web_search"}],
+        include_sources=True,
+        tool_choice="required",  # ✅ 強制一定要真的 call web_search
+    )
+
+    web_sources = web_sources_from_openai_sources(sources)
+
+    # 若模型沒乖乖列 Sources，這裡補齊（讓 downstream 好 parse）
+    src_lines = []
+    if web_sources:
+        for dom in sorted(web_sources.keys()):
+            for title, url in web_sources[dom][:max_sources]:
+                src_lines.append(f"- {dom} | {title} | {url}")
+
+    md = (evidence_text or "").strip()
+    if "### SOURCES" not in md:
+        md = (md + "\n\n### SOURCES\n" + "\n".join(src_lines)).strip()
+    elif not src_lines:
+        # 至少保留標頭
+        md = md.strip()
+
+    return md, web_sources
+
 # =========================
 # OpenAI client + wrappers
 # =========================
@@ -2100,7 +2162,7 @@ st.session_state.setdefault("default_outputs", None)
 st.session_state.setdefault("chat_history", [])
 
 # Popover 只留 web 開關
-st.session_state.setdefault("enable_web_search_agent", False)
+st.session_state.setdefault("enable_web_search_agent", True)
 
 # 其餘固定預設（不提供 UI）
 st.session_state.setdefault("langgraph_recursion_limit", DEFAULT_RECURSION_LIMIT)
@@ -2409,59 +2471,78 @@ if prompt:
         if planned_mode == "direct":
             system = ANYA_SYSTEM_PROMPT
 
-            # ✅ 短期記憶（N=10）：把最近對話壓成 context（不改 call_gpt wrapper 也能用）
-            memory_msgs = run_messages[:-1]  # 排除本次 prompt
-            history_block = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in memory_msgs if m.get("role") in ("user", "assistant") and m.get("content")])
+            # 共用短期記憶文字（你原本已有）
+            memory_msgs = run_messages[:-1]
+            history_block = "\n".join([
+                f"{m['role'].upper()}: {m['content']}"
+                for m in memory_msgs
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ])
+
+            context_block = f"對話脈絡（最近）：\n{history_block}" if history_block.strip() else ""
             user_text = prompt
-            if history_block.strip():
-                user_text = f"對話脈絡（最近）：\n{history_block}\n\n目前問題：\n{prompt}"
+            if context_block:
+                user_text = f"{context_block}\n\n目前問題：\n{prompt}"
 
             web_sources = {}
+            evidence_md = ""
+            usage = {"doc_search_calls": 0, "web_search_calls": 0}
 
-            if enable_web:
-                # ✅ direct 也支援 web_search（並回收 sources）
-                answer_text, sources = call_gpt(
-                    client,
-                    model=MODEL_MAIN,
-                    system=system,
-                    user=user_text,
-                    reasoning_effort=REASONING_EFFORT,
-                    tools=[{"type": "web_search"}],
-                    include_sources=True,
-                    tool_choice="required",  # ✅ 關鍵：保證真的 call web_search 才會有 sources
-                )
+            # ✅ Direct 狀態列：永遠出現
+            with st.status("Direct回應", expanded=False) as s:
+            #   ✅ 兩段式 gating：有啟用 web 且 need_todo 才做 evidence→write
+                use_two_stage = bool(enable_web and need_todo)
 
-                web_sources = web_sources_from_openai_sources(sources)
+                if use_two_stage:
+                    s.update(label="Direct：蒐證中（web_search）…", state="running", expanded=False)
+                    evidence_md, web_sources = build_web_evidence_direct(
+                        client,
+                        question=prompt,
+                        context_block=context_block,
+                        max_bullets=8,
+                        max_sources=12,
+                    )
+                    usage["web_search_calls"] = 1  # direct 至少一次
 
-                # ✅ 保證至少有一個 WebSearch 引用 token，讓 badge 能顯示
-                primary_domain = "web"
-                if web_sources:
-                    primary_domain = sorted(web_sources.keys())[0]  # 取一個穩定的 domain
-                    answer_text = ensure_web_citation_token(answer_text or "", primary_domain)
+                    s.update(label="Direct：寫作整合中…", state="running", expanded=False)
+                    writer_system = (
+                        system
+                        + "\n\n【硬規則】你只能根據我提供的 EVIDENCE 撰寫；缺少證據支撐的內容就不要寫。"
+                    )
+                    writer_user = f"{user_text}\n\n---\n\n以下是本次蒐證結果（EVIDENCE）：\n{evidence_md}"
+
+                    answer_text, _ = call_gpt(
+                        client,
+                        model=MODEL_MAIN,
+                        system=writer_system,
+                        user=writer_user,
+                        reasoning_effort=REASONING_EFFORT,
+                        tools=None,
+                    )
+
                 else:
-                    # 沒抓到 sources，就不要硬塞 [WebSearch:web p-]，避免誤導
-                    pass
+                    # 單段式：不跑蒐證（所以 status 只顯示 Direct回應）
+                    s.update(label="Direct回應", state="running", expanded=False)
+                    answer_text, _ = call_gpt(
+                        client,
+                        model=MODEL_MAIN,
+                        system=system,
+                        user=user_text,
+                        reasoning_effort=REASONING_EFFORT,
+                        tools=None,
+                    )
 
-                # usage 記一個（call_gpt 內部 tool 可能多次 call，但 direct 我們至少標示有用 web）
-                usage = {"doc_search_calls": 0, "web_search_calls": 1}
-            else:
-                answer_text, _ = call_gpt(
-                    client,
-                    model=MODEL_MAIN,
-                    system=system,
-                    user=user_text,
-                    reasoning_effort=REASONING_EFFORT,
-                    tools=None,
-                )
-                usage = {"doc_search_calls": 0, "web_search_calls": 0}
+                s.update(label="Direct：完成", state="complete", expanded=False)
 
             # formatter（只留 direct） + 去內部流程
             if ENABLE_FORMATTER_FOR_DIRECT and st.session_state.get("enable_output_formatter", True):
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
             answer_text = strip_internal_process_lines(answer_text)
 
-            # ✅ direct 也造出 files（供 debug / badges）
+            # ✅ direct 也造出 files（含 /evidence/web_direct.md）
             files = {"/workspace/todos.json": todos_json_text}
+            if evidence_md.strip():
+                files["/evidence/web_direct.md"] = evidence_md
 
             meta = {
                 "mode": "direct",
@@ -2471,7 +2552,7 @@ if prompt:
                 "enable_web": enable_web,
                 "todo_file_present": True,
                 "forced_end": None,
-                "web_sources": web_sources,  # ✅ 之後你要在 UI 列 URL 就用這個
+                "web_sources": web_sources,
             }
 
             render_run_badges(
@@ -2484,13 +2565,16 @@ if prompt:
                 forced_end=None,
             )
             render_markdown_answer_with_sources_badges(answer_text)
-
-            # （可選）如果你已經有 render_web_sources_list，就可以直接把 URL 列出來
-            # render_web_sources_list(web_sources)
+            render_web_sources_list(web_sources)
 
             with st.expander("Debug", expanded=False):
                 st.markdown("### 本次 Todo（direct 產生）")
                 st.code(todos_json_text[:20000], language="json")
+
+                if evidence_md.strip():
+                    st.divider()
+                    st.markdown("### /evidence/web_direct.md")
+                    st.code(evidence_md[:60000], language="markdown")
 
                 if enable_web:
                     st.divider()
@@ -2499,6 +2583,7 @@ if prompt:
 
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
+        
         # deepagent
         agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
         answer_text, files = deep_agent_run_with_live_status(agent, prompt, run_messages)
