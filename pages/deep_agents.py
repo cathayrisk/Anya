@@ -495,40 +495,74 @@ def _dom_path(url: str, max_len: int = 72) -> str:
 
 def render_web_sources_list(
     web_sources: Dict[str, List[Tuple[str, str]]],
-    max_domains: int = 8,
+    max_domains: int = 6,
     max_per_domain: int = 6,
+    max_path_len: int = 80,
 ) -> None:
     """
-    乾淨版：
-    - 先顯示 domain（粗體）
-    - domain 下縮排列出「新聞標題（超連結）」；若沒有 title 就用 domain+path
+    Web Sources（可點連結版本）
+    - 用單一 st.markdown() 輸出，確保巢狀清單縮排穩定
+    - 每則顯示：標題超連結 + 下一行縮排顯示 domain+path（較好讀）
     """
     if not web_sources:
         return
 
-    st.markdown("#### Web Sources")
+    def _domain(u: str) -> str:
+        try:
+            host = urlparse(u).netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
+            return host or "web"
+        except Exception:
+            return "web"
+
+    def _path(u: str) -> str:
+        try:
+            p = urlparse(u)
+            path = (p.path or "/").strip()
+            if p.query:
+                path = f"{path}?{p.query}"
+            # 避免過長
+            if len(path) > max_path_len:
+                path = path[:max_path_len] + "…"
+            return path
+        except Exception:
+            return "/"
+
+    # domains 排序：穩定、好預期
     domains = sorted(web_sources.keys())
     show = domains[:max_domains]
     more = domains[max_domains:]
 
-    def _render(dom_list: list[str]):
-        for dom in dom_list:
+    def _build_md(domains_list: list[str]) -> str:
+        lines: list[str] = []
+        for dom in domains_list:
             items = web_sources.get(dom, []) or []
             if not items:
                 continue
 
-            st.markdown(f"- **{dom}**")
+            lines.append(f"- **{dom}**")
             for title, url in items[:max_per_domain]:
-                label = (title or "").strip()
-                if not label or label.lower() == "source":
-                    label = _dom_path(url)
-                # Streamlit markdown link
-                st.markdown(f"  - [{label}]({url})")
+                t = (title or "").strip() or dom
+                u = (url or "").strip()
+                if not u:
+                    continue
+                # 子項目（巢狀清單）
+                lines.append(f"  - [{t}]({u})")
+                # 再縮排一層顯示 domain+path（你要的）
+                lines.append(f"    :small[`{_domain(u)}{_path(u)}`]")
+        return "\n".join(lines).strip()
 
-    _render(show)
+    st.markdown("#### Web Sources")
+
+    md_main = _build_md(show)
+    if md_main:
+        st.markdown(md_main)
+
     if more:
+        md_more = _build_md(more)
         with st.expander(f"更多 Web Sources（{len(more)}）", expanded=False):
-            _render(more)
+            st.markdown(md_more if md_more else "（無）")
 
 def ensure_web_citation_token(text: str, domain: str) -> str:
     """
@@ -1311,20 +1345,45 @@ DIRECT_EVIDENCE_SYSTEM_PROMPT = """
 """
 
 DIRECT_WRITER_SYSTEM_PROMPT = """
-你是嚴謹的整理者。你只能根據我提供的 EVIDENCE 與 SOURCES 寫作，不可腦補。
+你是寫作/整理專家。你會收到：
+- 使用者問題（可能含對話脈絡）
+- 一份 EVIDENCE（bullet 摘要）與 SOURCES 清單
 
-輸出要求（嚴格）：
-- 先輸出「整理結果」（清楚分段：總覽、時間線、已知 vs 未確認、背景/影響）。
-- 內文不得出現以下措辭（完全禁止）：
-  - 「依你提供來源」「你提供的蒐證指出」「你蒐證寫到」「我蒐證」「我剛剛查到」「我無法上網」
-- 內文的每個 bullet（或每段落）句尾都必須附上來源標註，格式固定：
-  （來源：<domain>）
-  例：（來源：reuters.com）
-- <domain> 必須出現在你收到的 SOURCES 清單中；不得自造 domain。
-- 不要在內文貼長 URL；URL 只出現在 SOURCES（由 UI 顯示）。
-- 若 EVIDENCE 沒有支撐某個面向：請放到「未確認／待追」區塊，且不得下定論。
+你的任務：只根據 EVIDENCE 寫出「先結論、後展開」的整理稿。
 
-最後不要再附一份「References/來源清單」：來源由系統的 Web Sources 區塊統一呈現。
+硬規則（重要）：
+1) 只能使用 EVIDENCE 內出現的事實/日期/主張；不可自行上網、不可腦補。
+2) 正文**不得**提及流程（例如：你蒐證、依你提供來源、根據蒐證、我查到、EVIDENCE寫到…），直接寫結論。
+3) 正文**不得**貼 URL；URL 統一留給「Web Sources」區塊顯示。
+4) 內文引用格式統一放句尾，用：`（來源：domain）`
+   - domain 必須能在 SOURCES 內找到（例如 reuters.com、apnews.com、ofac.treasury.gov）
+5) 若某段沒有來源可對應，直接刪掉不要寫（寧可少寫也不要硬寫）。
+
+輸出版型（固定順序）：
+## 重點摘要（先看這裡）
+- 3–6 點 bullets：必須是「分析結果/結論」，不是流水帳。
+- 每點一句話，句尾加（來源：domain）
+
+## 我們目前能確定什麼（已知）
+- 3–8 點 bullets
+- 每點句尾加（來源：domain）
+
+## 還有哪些關鍵細節未確認（待追）
+- 2–6 點 bullets
+- 只能寫「目前 EVIDENCE 沒提供/未描述到」的缺口；不要推測答案
+- 可不加來源（若你覺得仍需，最多用（來源：domain）指向提到「未見」的報導）
+
+## 時間線（按日期）
+- 依日期排序（YYYY-MM-DD）
+- 每個日期下 1–4 點 bullets
+- 每點句尾加（來源：domain）
+
+## 影響與接下來 3–7 天觀察點
+- 3–7 點 bullets（可分「國際法/外交/能源/旅行安全」等小標）
+- 每點句尾加（來源：domain）
+
+提醒：
+- 若同一段連續多句都引用同 domain，請合併成一個 bullet，避免（來源：reuters.com）一直重複。
 """
 
 
