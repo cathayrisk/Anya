@@ -37,8 +37,8 @@ except Exception:
 # =========================
 # Streamlit config
 # =========================
-st.set_page_config(page_title="研究報告助手（DeepAgent + Badges）", layout="wide")
-st.title("研究報告助手（DeepAgent + Badges）")
+st.set_page_config(page_title="研究報告助手（DeepAgent）", layout="wide")
+st.title("研究報告助手（DeepAgent）")
 # ✅ 依你要求：不注入任何 CSS（回到 Streamlit 預設排版）
 
 
