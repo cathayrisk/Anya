@@ -394,7 +394,7 @@ try:
     murmur_resp = client.responses.create(
         model="gpt-4.1-nano",   # 也可用 gpt-4.1-mini
         input=[{"role": "user", "content": status_prompt}],
-        timeout=12
+        timeout=6
     )
     status_label = (getattr(murmur_resp, "output_text", "") or "").strip()
     if not status_label:
@@ -409,8 +409,8 @@ try:
                 if status_label:
                     break
     status_label = status_label.replace("\n", "").replace("\r", "").strip("「」\"' ")
-    if len(status_label) > 15:
-        status_label = status_label[:15]
+    if len(status_label) > 20:
+        status_label = status_label[:20]
 except Exception:
     status_label = "今天氣氛好可愛✨"  # 兜底 murmur
 
