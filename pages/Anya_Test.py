@@ -94,72 +94,88 @@ def ensure_session_defaults():
 ensure_session_defaults()
 
 # =========================
-# ✅ [新增] 放在 fake_stream_markdown 之前（任意位置，但要在使用前定義）
+# ✅ 1) [新增] 放在 fake_stream_markdown 定義之前（任意位置）
 # =========================
-import re
-
 _ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")  # zero width chars
 _NBSP_RE = re.compile(r"[\u00a0\u202f]")  # nbsp / narrow nbsp
 
-def normalize_markdown_for_streamlit(text: str) -> str:
+def sanitize_markdown_text(text: str) -> str:
     """
-    修正常見導致 Streamlit markdown 失效的「空白/不可見字元」問題：
-    - 移除 zero-width / nbsp / 全形空白
-    - 把 ** 內側的空白/換行收掉： ** TL;DR ** -> **TL;DR**
+    在丟給 st.markdown() 之前先清：
+    - 一般空白 / 全形空白 / NBSP / zero-width
+    - 修正強調標記內側空白：** TL;DR：** -> **TL;DR：**
     """
     if not text:
         return text
 
     t = text
+    t = t.replace("\u3000", " ")      # 全形空白
+    t = _NBSP_RE.sub(" ", t)          # NBSP 類 -> 一般空白
+    t = _ZERO_WIDTH_RE.sub("", t)     # zero-width 類 -> 移除
 
-    # 1) 不可見/特殊空白
-    t = t.replace("\u3000", " ")          # 全形空白 -> 半形
-    t = _NBSP_RE.sub(" ", t)              # NBSP 類 -> 半形空白
-    t = _ZERO_WIDTH_RE.sub("", t)         # zero width 類 -> 移除
-
-    # 2) 粗體/底線強調：把標記內側的空白收掉（最常見壞掉點）
-    #    ** TL;DR：** -> **TL;DR：**
-    #    **TL;DR： ** -> **TL;DR：**
-    t = re.sub(r"(\*\*|__)\s+([^\s])", r"\1\2", t)     # 開頭標記後面不允許空白
-    t = re.sub(r"([^\s])\s+(\*\*|__)", r"\1\2", t)     # 結尾標記前面不允許空白
+    # 收掉 ** / __ 標記「內側」空白（粗體常見壞點）
+    t = re.sub(r"(\*\*|__)\s+([^\s])", r"\1\2", t)   # ** 後面不應直接接空白
+    t = re.sub(r"([^\s])\s+(\*\*|__)", r"\1\2", t)   # ** 前面不應直接有空白
 
     return t
 
+def _count_substr(haystack: str, needle: str) -> int:
+    return haystack.count(needle) if haystack and needle else 0
 
-def render_markdown_final(text: str, placeholder, empty_msg="安妮亞找不到答案～（抱歉啦！）") -> str:
+def make_stream_renderable_markdown(buf: str) -> str:
     """
-    最後一次性渲染 markdown（先正規化），並回傳「應存進 chat_history」的版本。
+    串流顯示用：把目前 buf 變成「此刻可被 Markdown 正常解析」的版本。
+    注意：這個回傳值只拿來 placeholder.markdown 顯示，不能存進 chat_history。
     """
-    t = normalize_markdown_for_streamlit(text or "")
-    if not t.strip():
-        placeholder.markdown(empty_msg)
-        return empty_msg
-    placeholder.markdown(t)
+    t = sanitize_markdown_text(buf or "")
+
+    # 1) code fence：``` 出現奇數次 => 暫時補一個結尾，避免整頁變 code block
+    if _count_substr(t, "```") % 2 == 1:
+        return t + "\n```"
+
+    # 2) 行內 code：反引號數量奇數 => 暫時補一個
+    if _count_substr(t, "`") % 2 == 1:
+        t += "`"
+
+    # 3) 粗體：** / __ 若奇數組 => 暫時補一組
+    if _count_substr(t, "**") % 2 == 1:
+        t += "**"
+    if _count_substr(t, "__") % 2 == 1:
+        t += "__"
+
+    # 4) Streamlit 樣式標記 :blue[ ... ] 若最後一個未閉合 => 暫時補 ]
+    tag_matches = list(re.finditer(r":[A-Za-z][\w\-]*\[", t))
+    if tag_matches:
+        last = tag_matches[-1]
+        if "]" not in t[last.end():]:
+            t += "]"
+
     return t
 
 # =========================
-# ✅ [整段替換] 你原本的 fake_stream_markdown
+# ✅ 2) [整段替換] 你的 fake_stream_markdown()
 # =========================
 def fake_stream_markdown(
     text: str,
     placeholder,
     step_chars=8,
     delay=0.02,
-    empty_msg="安妮亞找不到答案～（抱歉啦！）",
+    empty_msg="安妮亞找不到答案～（抱歉啦！）"
 ):
-    """
-    串流時先用純文字顯示（避免 markdown 半套狀態），最後再一次渲染 markdown。
-    """
     if not text:
         placeholder.markdown(empty_msg)
         return empty_msg
 
+    buf = ""
     for i in range(0, len(text), step_chars):
         buf = text[: i + step_chars]
-        placeholder.text(buf)  # ✅ 串流過程不用 markdown，避免 ** 尚未閉合導致顯示不穩
+        placeholder.markdown(make_stream_renderable_markdown(buf))
         time.sleep(delay)
 
-    return render_markdown_final(text, placeholder, empty_msg=empty_msg)
+    # 最終：用「只 sanitize、不補符號」版本渲染＋存進 history
+    final_text = sanitize_markdown_text(text)
+    placeholder.markdown(final_text)
+    return final_text
 
 class AsyncLoopRunner:
     """
@@ -1585,7 +1601,7 @@ def build_fastagent_query_from_history(
 for msg in st.session_state.get("chat_history", []):
     with st.chat_message(msg.get("role", "assistant")):
         if msg.get("text"):
-            st.markdown(normalize_markdown_for_streamlit(msg["text"]))
+            st.markdown(sanitize_markdown_text(msg["text"]))
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
@@ -1609,11 +1625,11 @@ def call_fast_agent_once(query: str) -> str:
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
 # =========================
-# ✅ [整段替換] 你原本的 fast_agent_stream
+# ✅ 3) [整段替換] 你的 fast_agent_stream()
 # =========================
 async def fast_agent_stream(query: str, placeholder) -> str:
     """
-    ✅ 真串流：串流時先顯示純文字；最後再一次渲染 markdown（並做正規化）。
+    ✅ 真串流：串流時就用 markdown，但先做 sanitize + 暫時補閉合，避免中途解析壞
     """
     buf = ""
     result = Runner.run_streamed(fast_agent, input=query)
@@ -1624,9 +1640,11 @@ async def fast_agent_stream(query: str, placeholder) -> str:
             if not delta:
                 continue
             buf += delta
-            placeholder.text(buf)  # ✅ 串流中先用 text，避免半套 markdown
+            placeholder.markdown(make_stream_renderable_markdown(buf))
 
-    return render_markdown_final(buf, placeholder)
+    final_text = sanitize_markdown_text(buf) if buf else "安妮亞找不到答案～（抱歉啦！）"
+    placeholder.markdown(final_text)
+    return final_text
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
