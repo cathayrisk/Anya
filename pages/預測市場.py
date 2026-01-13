@@ -21,11 +21,6 @@ RANGE_MAP = {
 # Network helpers (retry + backoff)
 # -----------------------
 def _http_get_json(url: str, params: dict, timeout: int = 30, retries: int = 3, backoff: float = 0.7):
-    """
-    對外 HTTP GET（requests）加重試：處理 DNS 暫時失敗、網路抖動等。
-    - retries: 總嘗試次數
-    - backoff: 每次失敗後 sleep 秒數（指數退避）
-    """
     last_exc = None
     for attempt in range(1, retries + 1):
         try:
@@ -38,7 +33,6 @@ def _http_get_json(url: str, params: dict, timeout: int = 30, retries: int = 3, 
                 time.sleep(backoff * (2 ** (attempt - 1)))
             else:
                 raise
-    # 理論上不會走到這裡
     raise last_exc
 
 
@@ -66,12 +60,10 @@ def _cached_markets(
     try:
         data = _http_get_json(f"{gamma_base}/markets", params=params, timeout=30, retries=3, backoff=0.7)
     except Exception:
-        # 網路/DNS 失敗：回傳空 df，讓 UI 端顯示友善錯誤並 stop
         return pd.DataFrame()
 
     df = pd.DataFrame(data)
 
-    # numeric clean
     for c in ["volume24hr", "volume", "liquidity", "lastTradePrice"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -93,13 +85,10 @@ def _cached_prices_history(
     fidelity: int = 5,
 ) -> list[dict]:
     params = {"market": token_id, "interval": interval, "fidelity": fidelity}
-
     try:
         j = _http_get_json(f"{clob_base}/prices-history", params=params, timeout=30, retries=3, backoff=0.7)
     except Exception:
-        # 網路/DNS 失敗：回傳空 list，UI 會顯示「沒資料」提示
         return []
-
     return j.get("history", [])
 
 
@@ -120,14 +109,12 @@ class PolySDK:
             return x
         if isinstance(x, str):
             s = x.strip()
-            # try JSON
             try:
                 v = json.loads(s)
                 if isinstance(v, list):
                     return v
             except Exception:
                 pass
-            # fallback: split
             s = s.strip("[]")
             if not s:
                 return []
@@ -159,6 +146,9 @@ class PolySDK:
         return [str(x) for x in self._safe_list(row.get("outcomes"))]
 
 
+# -----------------------
+# Helpers
+# -----------------------
 def to_prob_percent(p: pd.Series) -> pd.Series:
     p = pd.to_numeric(p, errors="coerce")
     mx = p.max()
@@ -196,7 +186,6 @@ def pick_sort_col(df: pd.DataFrame, preferred: str) -> str | None:
 
 
 def _format_enddate_ymd(v):
-    """把 endDate 轉成 YYYY-MM-DD（處理 NaT/None）。"""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
     try:
@@ -208,28 +197,65 @@ def _format_enddate_ymd(v):
         return None
 
 
+def _format_compact_number(x, digits: int = 2) -> str:
+    """把 5413482.27 -> 5.41M；None/NaN -> N/A"""
+    try:
+        if x is None:
+            return "N/A"
+        if isinstance(x, float) and pd.isna(x):
+            return "N/A"
+        v = float(x)
+    except Exception:
+        return "N/A"
+
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+
+    units = [("", 1.0), ("K", 1e3), ("M", 1e6), ("B", 1e9), ("T", 1e12)]
+    unit = ""
+    scale = 1.0
+    for u, s in units:
+        unit = u
+        scale = s
+        if v < s * 1000:
+            break
+    val = v / scale
+    if unit == "":
+        return f"{sign}{val:,.0f}"
+    return f"{sign}{val:.{digits}f}{unit}"
+
+
+def _short_id(s: str, head: int = 8, tail: int = 6) -> str:
+    s = str(s or "")
+    if len(s) <= head + tail + 3:
+        return s
+    return f"{s[:head]}…{s[-tail:]}"
+
+
+# -----------------------
+# Detail Renderer (beautified layout)
+# -----------------------
 def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
-    """在表格下方渲染走勢與控制項（Outcome / Range / Fidelity）。"""
     picked_q = str(picked_row.get("question", "") or "")
 
-    with st.container(border=True):
-        st.subheader("走勢詳情")
+    token_ids = sdk.market_token_ids(picked_row)
+    outcomes = sdk.market_outcomes(picked_row)
 
-        token_ids = sdk.market_token_ids(picked_row)
-        outcomes = sdk.market_outcomes(picked_row)
+    with st.container(border=True):
+        # 1) Controls row
+        st.markdown("### 走勢詳情")
 
         if not token_ids:
             st.warning("這個事件沒有 clobTokenIds（可能不是 orderbook 市場或資料缺失）。換一個試試。")
             return
 
-        # outcome selector
         if outcomes and len(outcomes) == len(token_ids):
-            labels = [f"{outcomes[i]} (idx={i})" for i in range(len(outcomes))]
+            labels = [str(outcomes[i]) for i in range(len(outcomes))]
         else:
-            labels = [f"Outcome idx={i}" for i in range(len(token_ids))]
+            labels = [f"Outcome {i}" for i in range(len(token_ids))]
 
-        top = st.columns([2, 2, 2, 3])
-        with top[0]:
+        ctrl = st.columns([2, 2, 2, 3])
+        with ctrl[0]:
             outcome_idx = st.radio(
                 "Outcome",
                 options=list(range(len(token_ids))),
@@ -238,7 +264,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
                 index=0,
                 key="detail_outcome_idx",
             )
-        with top[1]:
+        with ctrl[1]:
             range_ui = st.radio(
                 "區間",
                 ["1H", "6H", "1D", "1W", "1M", "ALL"],
@@ -246,30 +272,23 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
                 index=5,
                 key="detail_range_ui",
             )
-        with top[2]:
+        with ctrl[2]:
             fidelity = st.slider("fidelity（分鐘）", 1, 60, 5, 1, key="detail_fidelity")
-        with top[3]:
+        with ctrl[3]:
             st.markdown("####")
             st.caption("提示：ALL 沒資料時可改 1W/1M；或把 fidelity 調大/調小。")
 
         token_id = token_ids[outcome_idx]
         interval = RANGE_MAP[range_ui]
+
         hist = sdk.prices_history(token_id=token_id, interval=interval, fidelity=int(fidelity))
         series = build_series(hist)
 
-        header_left, header_right = st.columns([3, 2])
-        with header_left:
-            st.markdown(f"### {picked_q}")
-
-            meta = st.columns(3)
-            if "volume24hr" in picked_row.index:
-                meta[0].write(f"**24h Vol**：{picked_row.get('volume24hr')}")
-            if "endDate" in picked_row.index:
-                end_ymd = _format_enddate_ymd(picked_row.get("endDate"))
-                meta[1].write(f"**End**：{end_ymd.isoformat() if end_ymd else 'N/A'}")
-            meta[2].write(f"**token_id**：{token_id}")
-
-        with header_right:
+        # 2) Header + KPI row
+        header_l, header_r = st.columns([3, 1.2])
+        with header_l:
+            st.markdown(f"## {picked_q}")
+        with header_r:
             m = metric_delta(series)
             if m is None:
                 st.metric("chance", "N/A")
@@ -279,13 +298,35 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
                 st.metric("chance", f"{last_v:.1f}%")
                 st.metric("變化（pp）", f"{delta_pp:+.1f} pp")
 
+        # 3) Meta cards row (compact + no ugly long token)
+        end_ymd = _format_enddate_ymd(picked_row.get("endDate"))
+        vol24 = picked_row.get("volume24hr")
+        token_short = _short_id(token_id)
+
+        meta = st.columns(3)
+        meta[0].metric("24h Vol", _format_compact_number(vol24, digits=2))
+        meta[1].metric("End", end_ymd.isoformat() if end_ymd else "N/A")
+        meta[2].metric("Token", token_short)
+
+        with st.expander("顯示完整 token_id（可複製）", expanded=False):
+            st.code(str(token_id), language="text")
+
+        # 4) Chart
         if series.empty:
             st.warning("這個區間沒有足夠成交資料畫圖。試試看切到 ALL 或把 fidelity 調大/調小。")
             return
 
         fig = px.line(series, x="timestamp", y="prob_%")
-        fig.update_yaxes(range=[0, 100], title="Chance (%)")
-        fig.update_xaxes(title="")
+        fig.update_traces(line=dict(width=2), hovertemplate="%{x}<br>Chance: %{y:.2f}%<extra></extra>")
+        fig.update_layout(
+            template="plotly_white",
+            height=420,
+            margin=dict(l=40, r=20, t=10, b=40),
+            hovermode="x unified",
+        )
+        fig.update_yaxes(range=[0, 100], title="Chance (%)", ticksuffix="%", showgrid=True, gridcolor="rgba(0,0,0,0.06)")
+        fig.update_xaxes(title="", showgrid=False)
+
         st.plotly_chart(fig, use_container_width=True)
 
 
@@ -323,11 +364,9 @@ if kw:
 if only_orderbook and "enableOrderBook" in df.columns:
     df = df[df["enableOrderBook"] == True]
 
-# 加一個穩定 rowid（用來做勾選與 session_state）
 df_view = df.reset_index(drop=True).copy()
 df_view["_rowid"] = range(len(df_view))
 
-# endDate 只顯示年月日（表格用）
 if "endDate" in df_view.columns:
     df_view["endDate_ymd"] = df_view["endDate"].apply(_format_enddate_ymd)
 
@@ -337,7 +376,6 @@ if "selected_rowid" not in st.session_state:
 if "editor_nonce" not in st.session_state:
     st.session_state.editor_nonce = 0
 
-# 如果篩選後原本選的 row 不存在了，就清掉
 if st.session_state.selected_rowid is not None:
     if st.session_state.selected_rowid not in set(df_view["_rowid"].tolist()):
         st.session_state.selected_rowid = None
@@ -360,12 +398,11 @@ with tabs[0]:
     if sort_col:
         work = work.sort_values(sort_col, ascending=False, na_position="last")
 
-    # 顯示欄位（endDate 改成 endDate_ymd）
     show_cols = [c for c in ["question", "implied_prob_%", "volume24hr", "liquidity", "volume"] if c in work.columns]
     if "endDate_ymd" in work.columns:
         show_cols.append("endDate_ymd")
 
-    # 目前選取 chip + 清除按鈕（你要的第 1 點）
+    # Selected chip + clear button
     chip_left, chip_right = st.columns([6, 1])
     with chip_left:
         if st.session_state.selected_rowid is None:
@@ -380,15 +417,13 @@ with tabs[0]:
     with chip_right:
         if st.button("清除選取", use_container_width=True, disabled=(st.session_state.selected_rowid is None)):
             st.session_state.selected_rowid = None
-            st.session_state.editor_nonce += 1  # 重置 data_editor 狀態
+            st.session_state.editor_nonce += 1
             st.rerun()
 
     st.caption("在表格勾選「選取」後，下方會直接顯示走勢（建議只勾一個最清楚）。")
 
-    # 用 index 當 rowid，這樣可以 hide_index=True 讓 ID 不出現在表格
     topn = work.head(50).set_index("_rowid")[show_cols].copy()
     topn.insert(0, "選取", False)
-
     if st.session_state.selected_rowid is not None and st.session_state.selected_rowid in topn.index:
         topn.loc[st.session_state.selected_rowid, "選取"] = True
 
@@ -402,9 +437,10 @@ with tabs[0]:
             "選取": st.column_config.CheckboxColumn("選取", help="勾選後在下方顯示走勢", default=False),
             "question": st.column_config.TextColumn("question", width="large"),
             "implied_prob_%": st.column_config.NumberColumn("implied_prob_%", format="%.1f"),
-            "volume24hr": st.column_config.NumberColumn("volume24hr"),
-            "liquidity": st.column_config.NumberColumn("liquidity"),
-            "volume": st.column_config.NumberColumn("volume"),
+            # 表格這裡也順手讓數字不要一堆小數
+            "volume24hr": st.column_config.NumberColumn("volume24hr", format="%.0f"),
+            "liquidity": st.column_config.NumberColumn("liquidity", format="%.0f"),
+            "volume": st.column_config.NumberColumn("volume", format="%.0f"),
             "endDate_ymd": st.column_config.DateColumn("endDate", help="只顯示年月日"),
         },
         key=editor_key,
@@ -412,7 +448,6 @@ with tabs[0]:
 
     selected_ids = edited.index[edited["選取"] == True].tolist()
     if not selected_ids:
-        # 允許使用者把勾選全部取消
         st.session_state.selected_rowid = None
         st.info("勾選一個事件，就會在下面看到走勢。")
     else:
@@ -461,7 +496,7 @@ with tabs[1]:
                 progress.progress(i / int(top_k))
                 continue
 
-            token_id = token_ids[0]  # 預設 outcome 0
+            token_id = token_ids[0]
             try:
                 hist = sdk.prices_history(token_id=token_id, interval=interval, fidelity=int(fidelity))
                 series = build_series(hist)
