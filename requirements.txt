@@ -51,6 +51,8 @@ langchain-pymupdf4llm
 unstructured[all-docs]
 langextract[openai]
 streamlit-agraph
+plotly
+streamlit-extras
 
 # Web page processing tools
 bs4
