@@ -225,11 +225,54 @@ def _format_compact_number(x, digits: int = 2) -> str:
     return f"{sign}{val:.{digits}f}{unit}"
 
 
-def _short_id(s: str, head: int = 8, tail: int = 6) -> str:
-    s = str(s or "")
-    if len(s) <= head + tail + 3:
-        return s
-    return f"{s[:head]}…{s[-tail:]}"
+def _add_latest_marker_and_hline(fig, series: pd.DataFrame, color: str = "#EF553B"):
+    """在 Plotly 圖上加：最新值 marker + label + 水平虛線"""
+    if series.empty:
+        return fig
+
+    last_ts = series["timestamp"].iloc[-1]
+    last_v = float(series["prob_%"].iloc[-1])
+
+    # 最新點 marker + label
+    fig.add_scatter(
+        x=[last_ts],
+        y=[last_v],
+        mode="markers+text",
+        name="Latest",
+        marker=dict(size=10, color=color, line=dict(width=1, color="white")),
+        text=[f"{last_v:.1f}%"],
+        textposition="top right",
+        hovertemplate="%{x}<br>Latest: %{y:.2f}%<extra></extra>",
+        showlegend=False,
+    )
+
+    # 水平線（shape）+ 右上角註記
+    fig.add_shape(
+        type="line",
+        xref="paper",
+        x0=0,
+        x1=1,
+        yref="y",
+        y0=last_v,
+        y1=last_v,
+        line=dict(color="rgba(239,85,59,0.55)", width=1, dash="dot"),
+    )
+    fig.add_annotation(
+        xref="paper",
+        x=1,
+        y=last_v,
+        yref="y",
+        text=f"Latest {last_v:.1f}%",
+        showarrow=False,
+        xanchor="right",
+        yanchor="bottom",
+        font=dict(size=11, color="rgba(239,85,59,0.95)"),
+        bgcolor="rgba(255,255,255,0.75)",
+        bordercolor="rgba(239,85,59,0.25)",
+        borderwidth=1,
+        borderpad=3,
+    )
+    return fig
 
 
 # -----------------------
@@ -242,7 +285,6 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
     outcomes = sdk.market_outcomes(picked_row)
 
     with st.container(border=True):
-        # 1) Controls row
         st.markdown("### 走勢詳情")
 
         if not token_ids:
@@ -254,6 +296,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         else:
             labels = [f"Outcome {i}" for i in range(len(token_ids))]
 
+        # Controls row
         ctrl = st.columns([2, 2, 2, 3])
         with ctrl[0]:
             outcome_idx = st.radio(
@@ -280,51 +323,57 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
 
         token_id = token_ids[outcome_idx]
         interval = RANGE_MAP[range_ui]
-
         hist = sdk.prices_history(token_id=token_id, interval=interval, fidelity=int(fidelity))
         series = build_series(hist)
 
-        # 2) Header + KPI row
-        header_l, header_r = st.columns([3, 1.2])
-        with header_l:
-            st.markdown(f"## {picked_q}")
-        with header_r:
-            m = metric_delta(series)
-            if m is None:
-                st.metric("chance", "N/A")
-                st.metric("變化（pp）", "N/A")
-            else:
-                last_v, delta_pp, _ = m
-                st.metric("chance", f"{last_v:.1f}%")
-                st.metric("變化（pp）", f"{delta_pp:+.1f} pp")
-
-        # 3) Meta cards row (compact + no ugly long token)
-        end_ymd = _format_enddate_ymd(picked_row.get("endDate"))
-        vol24 = picked_row.get("volume24hr")
-        token_short = _short_id(token_id)
-
-        meta = st.columns(3)
-        meta[0].metric("24h Vol", _format_compact_number(vol24, digits=2))
-        meta[1].metric("End", end_ymd.isoformat() if end_ymd else "N/A")
-        meta[2].metric("Token", token_short)
-
-        with st.expander("顯示完整 token_id（可複製）", expanded=False):
-            st.code(str(token_id), language="text")
-
-        # 4) Chart
         if series.empty:
             st.warning("這個區間沒有足夠成交資料畫圖。試試看切到 ALL 或把 fidelity 調大/調小。")
             return
 
+        # Finance-like header: title left, KPI right (upgrade #2)
+        header = st.columns([4.8, 1.1, 1.1])
+        with header[0]:
+            st.markdown(f"## {picked_q}")
+        m = metric_delta(series)
+        if m is None:
+            with header[1]:
+                st.metric("chance", "N/A")
+            with header[2]:
+                st.metric("變化(pp)", "N/A")
+        else:
+            last_v, delta_pp, _ = m
+            with header[1]:
+                st.metric("chance", f"{last_v:.1f}%")
+            with header[2]:
+                st.metric("變化(pp)", f"{delta_pp:+.1f}")
+
+        # Meta row (no Token; compact)
+        end_ymd = _format_enddate_ymd(picked_row.get("endDate"))
+        vol24 = picked_row.get("volume24hr")
+
+        meta = st.columns([1, 1, 2])
+        meta[0].metric("24h Vol", _format_compact_number(vol24, digits=2))
+        meta[1].metric("End", end_ymd.isoformat() if end_ymd else "N/A")
+        meta[2].caption("")
+
+        # Chart + latest marker/hline (upgrade #1)
         fig = px.line(series, x="timestamp", y="prob_%")
         fig.update_traces(line=dict(width=2), hovertemplate="%{x}<br>Chance: %{y:.2f}%<extra></extra>")
+        fig = _add_latest_marker_and_hline(fig, series)
+
         fig.update_layout(
             template="plotly_white",
-            height=420,
+            height=440,
             margin=dict(l=40, r=20, t=10, b=40),
             hovermode="x unified",
         )
-        fig.update_yaxes(range=[0, 100], title="Chance (%)", ticksuffix="%", showgrid=True, gridcolor="rgba(0,0,0,0.06)")
+        fig.update_yaxes(
+            range=[0, 100],
+            title="Chance (%)",
+            ticksuffix="%",
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.06)",
+        )
         fig.update_xaxes(title="", showgrid=False)
 
         st.plotly_chart(fig, use_container_width=True)
@@ -437,7 +486,6 @@ with tabs[0]:
             "選取": st.column_config.CheckboxColumn("選取", help="勾選後在下方顯示走勢", default=False),
             "question": st.column_config.TextColumn("question", width="large"),
             "implied_prob_%": st.column_config.NumberColumn("implied_prob_%", format="%.1f"),
-            # 表格這裡也順手讓數字不要一堆小數
             "volume24hr": st.column_config.NumberColumn("volume24hr", format="%.0f"),
             "liquidity": st.column_config.NumberColumn("liquidity", format="%.0f"),
             "volume": st.column_config.NumberColumn("volume", format="%.0f"),
