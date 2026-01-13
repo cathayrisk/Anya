@@ -309,7 +309,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
             template="plotly_white",
             height=440,
             margin=dict(l=40, r=20, t=10, b=40),
-            hovermode="x unified",
+            hovermode="closest",
             showlegend=False,
         )
         fig.update_yaxes(
