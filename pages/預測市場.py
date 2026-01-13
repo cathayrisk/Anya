@@ -226,28 +226,8 @@ def _format_compact_number(x, digits: int = 2) -> str:
     return f"{sign}{val:.{digits}f}{unit}"
 
 
-def _add_latest_hover_only(fig, series: pd.DataFrame):
-    """只加最後一個紅點 + hover 文字；不畫固定在圖上的標籤/水平線。"""
-    if series.empty:
-        return fig
-
-    last_ts = series["timestamp"].iloc[-1]
-    last_v = float(series["prob_%"].iloc[-1])
-
-    fig.add_scatter(
-        x=[last_ts],
-        y=[last_v],
-        mode="markers",
-        name="Latest",
-        marker=dict(size=9, color="#E45756", line=dict(width=1, color="white")),
-        hovertemplate="Latest %{y:.1f}%<extra></extra>",
-        showlegend=False,
-    )
-    return fig
-
-
 # -----------------------
-# Detail Renderer (clean top + hover-only latest label)
+# Detail Renderer (clean top + minimal hover)
 # -----------------------
 def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
     picked_q = str(picked_row.get("question", "") or "")
@@ -267,7 +247,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         else:
             labels = [f"Outcome {i}" for i in range(len(token_ids))]
 
-        # Controls row (no hint text)
+        # Controls row（上半部乾淨）
         ctrl = st.columns([2, 2, 2, 3])
         with ctrl[0]:
             outcome_idx = st.radio(
@@ -319,14 +299,12 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         c3.metric("24h Vol", _format_compact_number(vol24, digits=2))
         c4.metric("End", end_ymd.isoformat() if end_ymd else "N/A")
 
-        # Chart (simple + hover-only Latest)
+        # Chart（hover 只顯示百分比；時間由 unified header 顯示）
         fig = px.line(series, x="timestamp", y="prob_%")
         fig.update_traces(
             line=dict(width=2, color="#1f77b4"),
-            hovertemplate="%{x}<br>Chance: %{y:.2f}%<extra></extra>",
+            hovertemplate="%{y:.1f}%<extra></extra>",
         )
-        fig = _add_latest_hover_only(fig, series)
-
         fig.update_layout(
             template="plotly_white",
             height=440,
@@ -341,7 +319,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
             showgrid=True,
             gridcolor="rgba(0,0,0,0.06)",
         )
-        fig.update_xaxes(title="", showgrid=False)
+        fig.update_xaxes(title="", showgrid=False, hoverformat="%Y-%m-%d %H:%M")
 
         st.plotly_chart(fig, use_container_width=True)
         st.caption("提示：ALL 沒資料時可改 1W/1M；或把 fidelity 調大/調小。")
