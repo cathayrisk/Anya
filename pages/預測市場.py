@@ -219,64 +219,15 @@ def _format_compact_number(x, digits: int = 2) -> str:
         scale = s
         if v < s * 1000:
             break
+
     val = v / scale
     if unit == "":
         return f"{sign}{val:,.0f}"
     return f"{sign}{val:.{digits}f}{unit}"
 
 
-def _add_latest_marker_and_hline(fig, series: pd.DataFrame, color: str = "#EF553B"):
-    """在 Plotly 圖上加：最新值 marker + label + 水平虛線"""
-    if series.empty:
-        return fig
-
-    last_ts = series["timestamp"].iloc[-1]
-    last_v = float(series["prob_%"].iloc[-1])
-
-    # 最新點 marker + label
-    fig.add_scatter(
-        x=[last_ts],
-        y=[last_v],
-        mode="markers+text",
-        name="Latest",
-        marker=dict(size=10, color=color, line=dict(width=1, color="white")),
-        text=[f"{last_v:.1f}%"],
-        textposition="top right",
-        hovertemplate="%{x}<br>Latest: %{y:.2f}%<extra></extra>",
-        showlegend=False,
-    )
-
-    # 水平線（shape）+ 右上角註記
-    fig.add_shape(
-        type="line",
-        xref="paper",
-        x0=0,
-        x1=1,
-        yref="y",
-        y0=last_v,
-        y1=last_v,
-        line=dict(color="rgba(239,85,59,0.55)", width=1, dash="dot"),
-    )
-    fig.add_annotation(
-        xref="paper",
-        x=1,
-        y=last_v,
-        yref="y",
-        text=f"Latest {last_v:.1f}%",
-        showarrow=False,
-        xanchor="right",
-        yanchor="bottom",
-        font=dict(size=11, color="rgba(239,85,59,0.95)"),
-        bgcolor="rgba(255,255,255,0.75)",
-        bordercolor="rgba(239,85,59,0.25)",
-        borderwidth=1,
-        borderpad=3,
-    )
-    return fig
-
-
 # -----------------------
-# Detail Renderer (beautified layout)
+# Detail Renderer (clean top, caption under chart)
 # -----------------------
 def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
     picked_q = str(picked_row.get("question", "") or "")
@@ -296,7 +247,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         else:
             labels = [f"Outcome {i}" for i in range(len(token_ids))]
 
-        # Controls row
+        # Controls row (no hint text)
         ctrl = st.columns([2, 2, 2, 3])
         with ctrl[0]:
             outcome_idx = st.radio(
@@ -318,8 +269,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         with ctrl[2]:
             fidelity = st.slider("fidelity（分鐘）", 1, 60, 5, 1, key="detail_fidelity")
         with ctrl[3]:
-            st.markdown("####")
-            st.caption("提示：ALL 沒資料時可改 1W/1M；或把 fidelity 調大/調小。")
+            st.write("")  # 留白，讓上半部更乾淨
 
         token_id = token_ids[outcome_idx]
         interval = RANGE_MAP[range_ui]
@@ -330,42 +280,34 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
             st.warning("這個區間沒有足夠成交資料畫圖。試試看切到 ALL 或把 fidelity 調大/調小。")
             return
 
-        # Finance-like header: title left, KPI right (upgrade #2)
-        header = st.columns([4.8, 1.1, 1.1])
-        with header[0]:
-            st.markdown(f"## {picked_q}")
-        m = metric_delta(series)
-        if m is None:
-            with header[1]:
-                st.metric("chance", "N/A")
-            with header[2]:
-                st.metric("變化(pp)", "N/A")
-        else:
-            last_v, delta_pp, _ = m
-            with header[1]:
-                st.metric("chance", f"{last_v:.1f}%")
-            with header[2]:
-                st.metric("變化(pp)", f"{delta_pp:+.1f}")
+        # Title alone line
+        st.markdown(f"## {picked_q}")
 
-        # Meta row (no Token; compact)
+        # Metrics: same row (chance / delta pp / 24h vol / end)
+        m = metric_delta(series)
         end_ymd = _format_enddate_ymd(picked_row.get("endDate"))
         vol24 = picked_row.get("volume24hr")
 
-        meta = st.columns([1, 1, 2])
-        meta[0].metric("24h Vol", _format_compact_number(vol24, digits=2))
-        meta[1].metric("End", end_ymd.isoformat() if end_ymd else "N/A")
-        meta[2].caption("")
+        c1, c2, c3, c4 = st.columns(4)
+        if m is None:
+            c1.metric("chance", "N/A")
+            c2.metric("變化(pp)", "N/A")
+        else:
+            last_v, delta_pp, _ = m
+            c1.metric("chance", f"{last_v:.1f}%")
+            c2.metric("變化(pp)", f"{delta_pp:+.1f}")
+        c3.metric("24h Vol", _format_compact_number(vol24, digits=2))
+        c4.metric("End", end_ymd.isoformat() if end_ymd else "N/A")
 
-        # Chart + latest marker/hline (upgrade #1)
+        # Simple chart
         fig = px.line(series, x="timestamp", y="prob_%")
         fig.update_traces(line=dict(width=2), hovertemplate="%{x}<br>Chance: %{y:.2f}%<extra></extra>")
-        fig = _add_latest_marker_and_hline(fig, series)
-
         fig.update_layout(
             template="plotly_white",
             height=440,
             margin=dict(l=40, r=20, t=10, b=40),
             hovermode="x unified",
+            showlegend=False,
         )
         fig.update_yaxes(
             range=[0, 100],
@@ -378,20 +320,27 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
 
         st.plotly_chart(fig, use_container_width=True)
 
+        # Hint moved under chart
+        st.caption("提示：ALL 沒資料時可改 1W/1M；或把 fidelity 調大/調小。")
+
 
 # -----------------------
 # Streamlit UI
 # -----------------------
-st.set_page_config(page_title="Polymarket Dashboard", layout="wide")
+st.set_page_config(page_title="Polymarket Dashboard", layout="wide", initial_sidebar_state="collapsed")
 st.title("Polymarket 互動儀表板（官方 REST）")
 
 sdk = PolySDK()
 
-# Sidebar (global)
-st.sidebar.header("全域篩選")
-kw = st.sidebar.text_input("關鍵字（question 包含）", "")
-only_open = st.sidebar.checkbox("只看未關閉（closed=false）", value=True)
-only_orderbook = st.sidebar.checkbox("只看可用 Orderbook（enableOrderBook=true）", value=True)
+# Filters moved from sidebar to main (sidebar empty)
+with st.container(border=True):
+    f1, f2, f3 = st.columns([2.2, 1.4, 2.4])
+    with f1:
+        kw = st.text_input("關鍵字（question 包含）", "")
+    with f2:
+        only_open = st.checkbox("只看未關閉", value=True)
+    with f3:
+        only_orderbook = st.checkbox("只看可用 Orderbook（enableOrderBook=true）", value=True)
 
 tabs = st.tabs(["Trending 熱門", "Volatility 波動"])
 
@@ -468,8 +417,6 @@ with tabs[0]:
             st.session_state.selected_rowid = None
             st.session_state.editor_nonce += 1
             st.rerun()
-
-    st.caption("在表格勾選「選取」後，下方會直接顯示走勢（建議只勾一個最清楚）。")
 
     topn = work.head(50).set_index("_rowid")[show_cols].copy()
     topn.insert(0, "選取", False)
