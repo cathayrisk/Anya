@@ -18,6 +18,59 @@ RANGE_MAP = {
 }
 
 # -----------------------
+# Cached API functions (avoid hashing `self`)
+# -----------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_markets(
+    gamma_base: str,
+    limit: int = 400,
+    offset: int = 0,
+    closed: bool | None = False,
+    order: str = "volume24hr",
+    ascending: bool = False,
+) -> pd.DataFrame:
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "order": order,
+        "ascending": str(ascending).lower(),
+    }
+    if closed is not None:
+        params["closed"] = str(closed).lower()
+
+    r = requests.get(f"{gamma_base}/markets", params=params, timeout=30)
+    r.raise_for_status()
+    df = pd.DataFrame(r.json())
+
+    # numeric clean
+    for c in ["volume24hr", "volume", "liquidity", "lastTradePrice"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "endDate" in df.columns:
+        df["endDate"] = pd.to_datetime(df["endDate"], errors="coerce", utc=True)
+
+    if "lastTradePrice" in df.columns:
+        df["implied_prob_%"] = (df["lastTradePrice"] * 100).round(1)
+
+    return df
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_prices_history(
+    clob_base: str,
+    token_id: str,
+    interval: str,
+    fidelity: int = 5,
+) -> list[dict]:
+    params = {"market": token_id, "interval": interval, "fidelity": fidelity}
+    r = requests.get(f"{clob_base}/prices-history", params=params, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    return j.get("history", [])
+
+
+# -----------------------
 # Tiny "SDK" wrapper
 # -----------------------
 class PolySDK:
@@ -48,41 +101,25 @@ class PolySDK:
             return [p.strip().strip('"').strip("'") for p in s.split(",")]
         return []
 
-    @st.cache_data(ttl=60)
     def markets(self, limit=400, offset=0, closed=False, order="volume24hr", ascending=False):
-        params = {
-            "limit": limit,
-            "offset": offset,
-            "order": order,
-            "ascending": str(ascending).lower(),
-        }
-        if closed is not None:
-            params["closed"] = str(closed).lower()
+        # 注意：快取在 _cached_markets，不會 hash 到 self
+        return _cached_markets(
+            self.gamma_base,
+            limit=limit,
+            offset=offset,
+            closed=closed,
+            order=order,
+            ascending=ascending,
+        )
 
-        r = requests.get(f"{self.gamma_base}/markets", params=params, timeout=30)
-        r.raise_for_status()
-        df = pd.DataFrame(r.json())
-
-        # numeric clean
-        for c in ["volume24hr", "volume", "liquidity", "lastTradePrice"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        if "endDate" in df.columns:
-            df["endDate"] = pd.to_datetime(df["endDate"], errors="coerce", utc=True)
-
-        if "lastTradePrice" in df.columns:
-            df["implied_prob_%"] = (df["lastTradePrice"] * 100).round(1)
-
-        return df
-
-    @st.cache_data(ttl=30)
     def prices_history(self, token_id: str, interval: str, fidelity: int = 5):
-        params = {"market": token_id, "interval": interval, "fidelity": fidelity}
-        r = requests.get(f"{self.clob_base}/prices-history", params=params, timeout=30)
-        r.raise_for_status()
-        j = r.json()
-        return j.get("history", [])
+        # 注意：快取在 _cached_prices_history，不會 hash 到 self
+        return _cached_prices_history(
+            self.clob_base,
+            token_id=token_id,
+            interval=interval,
+            fidelity=fidelity,
+        )
 
     def market_token_ids(self, row: pd.Series):
         return [str(x) for x in self._safe_list(row.get("clobTokenIds"))]
@@ -168,7 +205,6 @@ if "selected_question" not in st.session_state:
 with tabs[0]:
     st.subheader("熱門事件排行")
 
-    # pills: choose ranking metric
     pill = st.pills(
         "排行依據",
         options=["volume24hr", "liquidity", "volume"],
@@ -186,10 +222,13 @@ with tabs[0]:
 
     st.markdown("### 選一個事件看詳情")
     options = work["question"].fillna("").head(200).tolist()
-    picked = st.selectbox("事件", options=options, index=0 if options else None)
-    if picked:
-        st.session_state.selected_question = picked
-        st.info("已選擇，切到「Market 詳情」分頁看走勢。")
+    if not options:
+        st.warning("目前沒有可選事件（可能被篩選條件過濾光了）。")
+    else:
+        picked = st.selectbox("事件", options=options, index=0)
+        if picked:
+            st.session_state.selected_question = picked
+            st.info("已選擇，切到「Market 詳情」分頁看走勢。")
 
 # -----------------------
 # Tab 2: Volatility
@@ -206,7 +245,6 @@ with tabs[1]:
     with colC:
         fidelity = st.slider("fidelity（分鐘）", 1, 60, 10, 1)
 
-    # 用 volume24hr 當作「熱門」基準（沒有就用 volume）
     base_sort = "volume24hr" if "volume24hr" in df.columns else ("volume" if "volume" in df.columns else None)
     base = df.copy()
     if base_sort:
@@ -244,6 +282,7 @@ with tabs[1]:
                     "liquidity": r.get("liquidity"),
                 })
             except Exception:
+                # 這裡你原本就是 pass；保留不吵 UI
                 pass
 
             progress.progress(i / int(top_k))
@@ -256,10 +295,12 @@ with tabs[1]:
             res = res.sort_values("abs_delta_pp", ascending=False, na_position="last")
             st.dataframe(res.head(30), use_container_width=True, hide_index=True)
 
-            picked2 = st.selectbox("點一個波動事件，帶到 Market 詳情", options=res["question"].dropna().tolist())
-            if picked2:
-                st.session_state.selected_question = picked2
-                st.info("已選擇，切到「Market 詳情」分頁看走勢。")
+            opts2 = res["question"].dropna().tolist()
+            if opts2:
+                picked2 = st.selectbox("點一個波動事件，帶到 Market 詳情", options=opts2)
+                if picked2:
+                    st.session_state.selected_question = picked2
+                    st.info("已選擇，切到「Market 詳情」分頁看走勢。")
 
 # -----------------------
 # Tab 3: Market detail
@@ -270,7 +311,10 @@ with tabs[2]:
     # fallback selector
     if st.session_state.selected_question is None:
         options = df["question"].fillna("").head(200).tolist()
-        st.session_state.selected_question = st.selectbox("先選一個事件", options=options)
+        if not options:
+            st.warning("目前沒有可選事件（可能被篩選條件過濾光了）。")
+            st.stop()
+        st.session_state.selected_question = st.selectbox("先選一個事件", options=options, index=0)
 
     picked_q = st.session_state.selected_question
     row_df = df[df["question"] == picked_q].head(1)
