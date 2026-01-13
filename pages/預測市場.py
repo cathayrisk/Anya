@@ -226,57 +226,28 @@ def _format_compact_number(x, digits: int = 2) -> str:
     return f"{sign}{val:.{digits}f}{unit}"
 
 
-def _add_latest_label(fig, series: pd.DataFrame):
-    """加上你截圖那種：最後一點紅點 + 右側 Latest 標籤 + 水平虛線"""
+def _add_latest_hover_only(fig, series: pd.DataFrame):
+    """只加最後一個紅點 + hover 文字；不畫固定在圖上的標籤/水平線。"""
     if series.empty:
         return fig
 
     last_ts = series["timestamp"].iloc[-1]
     last_v = float(series["prob_%"].iloc[-1])
 
-    # 最後一點 marker（紅點）
     fig.add_scatter(
         x=[last_ts],
         y=[last_v],
         mode="markers",
+        name="Latest",
         marker=dict(size=9, color="#E45756", line=dict(width=1, color="white")),
-        hovertemplate="%{x}<br>Latest: %{y:.2f}%<extra></extra>",
+        hovertemplate="Latest %{y:.1f}%<extra></extra>",
         showlegend=False,
-    )
-
-    # 水平虛線
-    fig.add_shape(
-        type="line",
-        xref="paper",
-        x0=0,
-        x1=1,
-        yref="y",
-        y0=last_v,
-        y1=last_v,
-        line=dict(color="rgba(0,0,0,0.22)", width=1, dash="dot"),
-    )
-
-    # 右側標籤（白底小框）
-    fig.add_annotation(
-        xref="paper",
-        x=1.0,
-        yref="y",
-        y=last_v,
-        text=f"Latest {last_v:.1f}%",
-        showarrow=False,
-        xanchor="right",
-        yanchor="middle",
-        font=dict(size=12, color="rgba(0,0,0,0.78)"),
-        bgcolor="rgba(255,255,255,0.85)",
-        bordercolor="rgba(0,0,0,0.18)",
-        borderwidth=1,
-        borderpad=4,
     )
     return fig
 
 
 # -----------------------
-# Detail Renderer (clean top + latest label like screenshot)
+# Detail Renderer (clean top + hover-only latest label)
 # -----------------------
 def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
     picked_q = str(picked_row.get("question", "") or "")
@@ -348,13 +319,13 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         c3.metric("24h Vol", _format_compact_number(vol24, digits=2))
         c4.metric("End", end_ymd.isoformat() if end_ymd else "N/A")
 
-        # Chart (simple + latest label)
+        # Chart (simple + hover-only Latest)
         fig = px.line(series, x="timestamp", y="prob_%")
         fig.update_traces(
             line=dict(width=2, color="#1f77b4"),
             hovertemplate="%{x}<br>Chance: %{y:.2f}%<extra></extra>",
         )
-        fig = _add_latest_label(fig, series)
+        fig = _add_latest_hover_only(fig, series)
 
         fig.update_layout(
             template="plotly_white",
@@ -373,8 +344,6 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         fig.update_xaxes(title="", showgrid=False)
 
         st.plotly_chart(fig, use_container_width=True)
-
-        # Hint moved under chart
         st.caption("提示：ALL 沒資料時可改 1W/1M；或把 fidelity 調大/調小。")
 
 
@@ -386,7 +355,7 @@ st.title("Polymarket 互動儀表板（官方 REST）")
 
 sdk = PolySDK()
 
-# Filters moved from sidebar to main, wrapped in expander
+# Filters wrapped in expander (sidebar empty)
 with st.expander("篩選 / 設定", expanded=False):
     f1, f2, f3 = st.columns([2.2, 1.4, 2.4])
     with f1:
