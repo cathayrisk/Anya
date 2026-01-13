@@ -226,8 +226,57 @@ def _format_compact_number(x, digits: int = 2) -> str:
     return f"{sign}{val:.{digits}f}{unit}"
 
 
+def _add_latest_label(fig, series: pd.DataFrame):
+    """加上你截圖那種：最後一點紅點 + 右側 Latest 標籤 + 水平虛線"""
+    if series.empty:
+        return fig
+
+    last_ts = series["timestamp"].iloc[-1]
+    last_v = float(series["prob_%"].iloc[-1])
+
+    # 最後一點 marker（紅點）
+    fig.add_scatter(
+        x=[last_ts],
+        y=[last_v],
+        mode="markers",
+        marker=dict(size=9, color="#E45756", line=dict(width=1, color="white")),
+        hovertemplate="%{x}<br>Latest: %{y:.2f}%<extra></extra>",
+        showlegend=False,
+    )
+
+    # 水平虛線
+    fig.add_shape(
+        type="line",
+        xref="paper",
+        x0=0,
+        x1=1,
+        yref="y",
+        y0=last_v,
+        y1=last_v,
+        line=dict(color="rgba(0,0,0,0.22)", width=1, dash="dot"),
+    )
+
+    # 右側標籤（白底小框）
+    fig.add_annotation(
+        xref="paper",
+        x=1.0,
+        yref="y",
+        y=last_v,
+        text=f"Latest {last_v:.1f}%",
+        showarrow=False,
+        xanchor="right",
+        yanchor="middle",
+        font=dict(size=12, color="rgba(0,0,0,0.78)"),
+        bgcolor="rgba(255,255,255,0.85)",
+        bordercolor="rgba(0,0,0,0.18)",
+        borderwidth=1,
+        borderpad=4,
+    )
+    return fig
+
+
 # -----------------------
-# Detail Renderer (clean top, caption under chart)
+# Detail Renderer (clean top + latest label like screenshot)
 # -----------------------
 def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
     picked_q = str(picked_row.get("question", "") or "")
@@ -269,7 +318,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         with ctrl[2]:
             fidelity = st.slider("fidelity（分鐘）", 1, 60, 5, 1, key="detail_fidelity")
         with ctrl[3]:
-            st.write("")  # 留白，讓上半部更乾淨
+            st.write("")  # 留白
 
         token_id = token_ids[outcome_idx]
         interval = RANGE_MAP[range_ui]
@@ -283,7 +332,7 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         # Title alone line
         st.markdown(f"## {picked_q}")
 
-        # Metrics: same row (chance / delta pp / 24h vol / end)
+        # Metrics: same row
         m = metric_delta(series)
         end_ymd = _format_enddate_ymd(picked_row.get("endDate"))
         vol24 = picked_row.get("volume24hr")
@@ -299,9 +348,14 @@ def _render_market_detail(sdk: PolySDK, picked_row: pd.Series):
         c3.metric("24h Vol", _format_compact_number(vol24, digits=2))
         c4.metric("End", end_ymd.isoformat() if end_ymd else "N/A")
 
-        # Simple chart
+        # Chart (simple + latest label)
         fig = px.line(series, x="timestamp", y="prob_%")
-        fig.update_traces(line=dict(width=2), hovertemplate="%{x}<br>Chance: %{y:.2f}%<extra></extra>")
+        fig.update_traces(
+            line=dict(width=2, color="#1f77b4"),
+            hovertemplate="%{x}<br>Chance: %{y:.2f}%<extra></extra>",
+        )
+        fig = _add_latest_label(fig, series)
+
         fig.update_layout(
             template="plotly_white",
             height=440,
@@ -332,8 +386,8 @@ st.title("Polymarket 互動儀表板（官方 REST）")
 
 sdk = PolySDK()
 
-# Filters moved from sidebar to main (sidebar empty)
-with st.container(border=True):
+# Filters moved from sidebar to main, wrapped in expander
+with st.expander("篩選 / 設定", expanded=False):
     f1, f2, f3 = st.columns([2.2, 1.4, 2.4])
     with f1:
         kw = st.text_input("關鍵字（question 包含）", "")
@@ -400,7 +454,6 @@ with tabs[0]:
     if "endDate_ymd" in work.columns:
         show_cols.append("endDate_ymd")
 
-    # Selected chip + clear button
     chip_left, chip_right = st.columns([6, 1])
     with chip_left:
         if st.session_state.selected_rowid is None:
