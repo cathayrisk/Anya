@@ -21,7 +21,7 @@ RANGE_MAP = {
 # Tiny "SDK" wrapper
 # -----------------------
 class PolySDK:
-    def__init__(self, gamma_base=GAMMA, clob_base=CLOB):
+    def __init__(self, gamma_base=GAMMA, clob_base=CLOB):
         self.gamma_base = gamma_base
         self.clob_base = clob_base
 
