@@ -95,161 +95,100 @@ ensure_session_defaults()
 
 # ====== 2) 整段貼上（建議放在 ensure_session_defaults() 後、fake_stream_markdown() 前） ======
 
-# 這些：看起來像 * 但不是 ASCII *（非常常造成你現在這種「明明有 ** 但不粗體」）
-_ASTERISK_LIKE = {
-    "*",            # ASCII
-    "\u2217",       # ∗
-    "\uFF0A",       # ＊
-    "\uFE61",       # ﹡
-    "\u204E",       # ⁎
-    "\u2731",       # ✱
-    "\u2732",       # ✲
-    "\u2733",       # ✳
-    "\u2743",       # ❃
-    "\u274A",       # ❊
-    "\u274B",       # ❋
-    "\u066D",       # ٭
-    "\u2055",       # ⁕
-}
-
-# 特殊換行分隔符（有些來源會混進來）
-_LINE_SEPARATORS = ("\u2028", "\u2029")  # LINE/PARAGRAPH SEPARATOR
-
 _ST_COLOR_OPEN_RE = re.compile(r":[a-zA-Z-]+\[")         # :blue[  :orange-badge[  :small[
-_CODE_FENCE_RE = re.compile(r"```.*?```", flags=re.S)
-_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+_CODE_FENCE_RE = re.compile(r"```", flags=re.M)
 
-# Regex：任何「星狀字元」都視作 *
-_ASTERISK_CLASS = "[" + re.escape("".join(sorted(_ASTERISK_LIKE))) + "]"
-
-def _normalize_unicode_spaces(text: str) -> str:
+def _force_close_markdown(text: str) -> str:
     """
-    把所有 Unicode Space_Separator (Zs) 統一成普通空白。
-    這比只處理 NBSP 更全面（\u202F / \u2007 等都會被抓到）。
-    """
-    if not text:
-        return text
-    out = []
-    for ch in text:
-        # 保留換行/Tab
-        if ch in ("\n", "\t"):
-            out.append(ch)
-            continue
-        cat = unicodedata.category(ch)
-        if cat == "Zs":
-            out.append(" ")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-def _strip_invisible_controls_keep_newlines(text: str) -> str:
-    """
-    移除所有 Unicode category 以 'C' 開頭的字元（Control/Format/...），但保留 \n \t。
-    這是「肉眼看不到但會讓 markdown 壞掉」的最大宗。
+    讓最後一次 render 一定是「可解析」的 Markdown。
+    會做：
+    - 若 ``` 出現奇數次 → 自動在尾端補一個 ``` 收尾
+    - 若 ` 出現奇數次（且不在 code fence 裡）→ 尾端補一個 `
+    - 若 :blue[ 這類 bracket 沒收 → 尾端補一個 ]
+    - 若 ** 出現奇數次（且不在 code fence 裡）→ 尾端補一個 **
+    這樣可以避免「前面某處漏關閉，導致後面整段都變 code/plain」。
     """
     if not text:
         return text
-    out = []
-    for ch in text:
-        if ch in ("\n", "\t"):
-            out.append(ch)
-            continue
-        cat = unicodedata.category(ch)
-        if cat and cat[0] == "C":
-            continue
-        out.append(ch)
-    return "".join(out)
 
-def _normalize_asterisks(text: str) -> str:
-    """把所有星狀字元統一成 ASCII '*'。"""
-    if not text:
-        return text
-    trans = {ord(ch): "*" for ch in _ASTERISK_LIKE if ch != "*"}
-    return text.translate(trans)
+    # 1) code fence：``` 成對
+    fence_count = text.count("```")
+    if fence_count % 2 != 0:
+        text = text.rstrip() + "\n```"
+
+    # 2) 把 code fence 內容先拿掉，避免在 code block 內算 ` / ** / :blue[
+    #    用 split 方式處理最簡單：偶數段是 fence 外，奇數段是 fence 內
+    parts = text.split("```")
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+
+        # 2.1) 行內 code：` 成對
+        if seg.count("`") % 2 != 0:
+            seg = seg + "`"
+
+        # 2.2) 粗體：** 成對（只在 fence 外處理）
+        if seg.count("**") % 2 != 0:
+            seg = seg + "**"
+
+        # 2.3) Streamlit color bracket：最後一個 :xxx[ 後面沒 ] 就補 ]
+        opens = [m.start() for m in _ST_COLOR_OPEN_RE.finditer(seg)]
+        if opens:
+            last_open = opens[-1]
+            if "]" not in seg[last_open:]:
+                seg = seg + "]"
+
+        parts[i] = seg
+
+    return "```".join(parts)
 
 def sanitize_markdown_for_render(text: str) -> str:
     """
-    ✅ 用在 placeholder.markdown() 前（串流/非串流都要用）
-    專門針對：
-    - 兩顆星其實不是同一種字元（* + ∗ 之類）
-    - 各種不可見字元（bidi mark、word joiner、奇怪空白）
-    - PDF/雙欄複製造成的拆字換行（710\\nb\\nn）
-    - 行首「・」這種非 markdown list marker
+    這裡只做你已經在做的「安全正規化」，
+    最重要是最後會走 _force_close_markdown() 保證可解析。
     """
     if not text:
         return text
 
-    # 1) Unicode 正規化
     text = unicodedata.normalize("NFKC", text)
-
-    # 2) 特殊換行符號轉換成 \n
-    for ls in _LINE_SEPARATORS:
-        text = text.replace(ls, "\n")
-
-    # 3) 先把空白、星號都統一（很重要：避免 * + ∗ 假裝成 **）
-    text = _normalize_unicode_spaces(text)
-    text = _normalize_asterisks(text)
-
-    # 4) 去掉不可見控制/格式字元
-    text = _strip_invisible_controls_keep_newlines(text)
-
-    # 5) 換行統一
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # 6) 保守修復：英數/單位符號夾住的換行（710\nb\nn -> 710bn）
-    text = re.sub(
-        r"(?<=[0-9A-Za-z$%+\-.\u2013\u2014/])\n(?=[0-9A-Za-z$%+\-.\u2013\u2014/])",
-        "",
-        text,
-    )
-
-    # 7) 把各種「項目符號」行首統一轉成 markdown list
+    # 把行首項目符號轉成 markdown list（可留可不留）
     text = re.sub(r"(?m)^\s*[·•・‧∙●]\s+", "- ", text)
-    # list 前補空行（讓解析穩）
-    text = re.sub(r"(?m)([^\n])\n(-\s)", r"\1\n\n\2", text)
 
-    # 8) 修粗體：把 ** 內容 ** 或 ** 內容** 這種修成 **內容**
-    #    這裡用「星號class」抓，因為前面已全部 normalize 成 ASCII *
+    # 修 ** 內側空白：** MSFT ** -> **MSFT**
     def _fix_strong(m: re.Match) -> str:
         inner = (m.group(1) or "").strip(" \t\r\n")
         return f"**{inner}**"
-
-    # match: ** ... **（允許中間含換行）
     text = re.sub(r"\*\*(.+?)\*\*", _fix_strong, text, flags=re.S)
 
-    # 9) 修：有些來源會把 ** 拆成 "*  *" 或 "*\n*"
-    text = re.sub(r"\*\s*\n\s*\*", "**", text)
-    text = re.sub(r"\*\s{1,3}\*", "**", text)
-
-    # 10) 修 Streamlit :color[...] 內側空白
-    def _fix_color(m: re.Match) -> str:
-        prefix, inner = m.group(1), m.group(2)
-        return f"{prefix}{inner.strip(' \t\r\n')}]"
-    text = re.sub(r"(:[a-zA-Z-]+\[)(.*?)]", _fix_color, text, flags=re.S)
-
+    # 最後：強制補齊未閉合語法（✅ 這是這次真正關鍵）
+    text = _force_close_markdown(text)
     return text
 
-def _is_streamlit_md_balanced(text: str) -> bool:
-    """串流時避免壞幀：語法未閉合就先不要更新畫面。"""
+def _is_streamlit_md_balanced_for_stream(text: str) -> bool:
+    """
+    串流時避免壞幀：如果 fence 或 ` 或 ** 沒閉合，就先不要更新 UI。
+    （注意：這只是串流用；finalize 會強制補齊後 render）
+    """
     if not text:
         return True
 
     if text.count("```") % 2 != 0:
         return False
 
-    tmp = _CODE_FENCE_RE.sub("", text)
-    if tmp.count("`") % 2 != 0:
-        return False
-
-    tmp2 = _INLINE_CODE_RE.sub("", tmp)
-    if tmp2.count("**") % 2 != 0:
-        return False
-
-    opens = [m.start() for m in _ST_COLOR_OPEN_RE.finditer(tmp2)]
-    if opens:
-        last_open = opens[-1]
-        if "]" not in tmp2[last_open:]:
+    # fence 外才檢查
+    parts = text.split("```")
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        if seg.count("`") % 2 != 0:
             return False
+        if seg.count("**") % 2 != 0:
+            return False
+        opens = [m.start() for m in _ST_COLOR_OPEN_RE.finditer(seg)]
+        if opens:
+            last_open = opens[-1]
+            if "]" not in seg[last_open:]:
+                return False
 
     return True
 
@@ -263,18 +202,21 @@ class MarkdownStreamRenderer:
         if not delta:
             return
         self._raw += delta
+
         clean = sanitize_markdown_for_render(self._raw)
 
-        if _is_streamlit_md_balanced(clean):
+        # 串流時：不平衡就不更新（避免某一幀把整段變 code）
+        if _is_streamlit_md_balanced_for_stream(clean):
             self._last_good = clean
             self.placeholder.markdown(clean)
         else:
-            # 不更新壞幀，維持上一個可渲染版本
             if self._last_good:
                 self.placeholder.markdown(self._last_good)
 
     def finalize(self) -> str:
+        # ✅ 最後一次：一定要用「強制補齊後」的版本 render
         clean = sanitize_markdown_for_render(self._raw)
+        clean = _force_close_markdown(clean)
         self.placeholder.markdown(clean)
         self._last_good = clean
         return clean
@@ -290,6 +232,7 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty
     for i in range(0, len(text), step_chars):
         r.feed(text[i:i+step_chars])
         time.sleep(delay)
+
     return r.finalize()
 
 class AsyncLoopRunner:
@@ -1758,6 +1701,7 @@ def call_fast_agent_once(query: str) -> str:
         text = str(result or "")
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
+# ====== [請整段替換] fast_agent_stream ======
 async def fast_agent_stream(query: str, placeholder) -> str:
     r = MarkdownStreamRenderer(placeholder)
     result = Runner.run_streamed(fast_agent, input=query)
@@ -1955,7 +1899,7 @@ if prompt is not None:
 
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)   # ✅ 避免模型自己再列一次「來源」
-                        ai_text = sanitize_markdown_for_render(ai_text)  # ✅ 新增：把 *∗ 混用、怪空白、** 內容 ** 全修掉
+                        ai_text = sanitize_markdown_for_render(ai_text)  # ✅ 新增
                         ai_text = debug_near_asterisks(ai_text) # Test
                         final_text = fake_stream_markdown(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
