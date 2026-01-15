@@ -16,7 +16,7 @@ from datetime import datetime
 import socket
 import ipaddress
 from urllib.parse import urlparse
-
+import unicodedata
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -93,89 +93,77 @@ def ensure_session_defaults():
 
 ensure_session_defaults()
 
-# =========================
-# ✅ 1) [新增] 放在 fake_stream_markdown 定義之前（任意位置）
-# =========================
-_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")  # zero width chars
-_NBSP_RE = re.compile(r"[\u00a0\u202f]")  # nbsp / narrow nbsp
+# ====== [2] 新增：放在 ensure_session_defaults() 後、fake_stream_markdown() 前（任意位置但要在使用前） ======
 
-def sanitize_markdown_text(text: str) -> str:
+# --- 貼上文字清洗（通用，不只 PDF） ---
+NBSP = "\u00A0"               # no-break space
+IDEOGRAPHIC_SPACE = "\u3000"  # 全形空白
+SOFT_HYPHEN = "\u00AD"        # soft hyphen（看不到但會干擾）
+UNICODE_ASTERISK = "\u2217"   # ∗（看起來像*但不是）
+FULLWIDTH_ASTERISK = "\uFF0A" # ＊
+
+ZERO_WIDTH_CHARS = (
+    "\u200B",  # zero width space
+    "\u200C",  # ZWNJ
+    "\u200D",  # ZWJ
+    "\u2060",  # word joiner
+    "\uFEFF",  # BOM / zero width no-break space
+)
+
+def sanitize_pasted_text(text: str) -> str:
     """
-    在丟給 st.markdown() 之前先清：
-    - 一般空白 / 全形空白 / NBSP / zero-width
-    - 修正強調標記內側空白：** TL;DR：** -> **TL;DR：**
+    專門處理「不知道哪裡複製貼上」帶來的隱形字元/怪字元/拆字換行，避免污染 LLM 與 Markdown。
+
+    永遠做（幾乎不影響語意）：
+    - Unicode NFKC 正規化（全形/相容字元 → 標準）
+    - 移除零寬字元、soft-hyphen
+    - NBSP/全形空白 → 一般空白
+    - ∗、＊ → *
+
+    保守修復（只修明顯是排版拆字的換行）：
+    - 710\\nb\\nn → 710bn（只在英數/單位符號夾住換行時才移除）
+    - *\\n* → **（避免粗體分隔符被拆開）
     """
     if not text:
         return text
 
-    t = text
-    t = t.replace("\u3000", " ")      # 全形空白
-    t = _NBSP_RE.sub(" ", t)          # NBSP 類 -> 一般空白
-    t = _ZERO_WIDTH_RE.sub("", t)     # zero-width 類 -> 移除
+    # 1) Unicode 正規化（把全形數字、相容標點等轉成比較一致的形式）
+    text = unicodedata.normalize("NFKC", text)
 
-    # 收掉 ** / __ 標記「內側」空白（粗體常見壞點）
-    t = re.sub(r"(\*\*|__)\s+([^\s])", r"\1\2", t)   # ** 後面不應直接接空白
-    t = re.sub(r"([^\s])\s+(\*\*|__)", r"\1\2", t)   # ** 前面不應直接有空白
+    # 2) 移除不可見字元
+    for ch in ZERO_WIDTH_CHARS:
+        text = text.replace(ch, "")
+    text = text.replace(SOFT_HYPHEN, "")
 
-    return t
+    # 3) 空白/星號正規化
+    text = text.replace(NBSP, " ").replace(IDEOGRAPHIC_SPACE, " ")
+    text = text.replace(UNICODE_ASTERISK, "*").replace(FULLWIDTH_ASTERISK, "*")
 
-def _count_substr(haystack: str, needle: str) -> int:
-    return haystack.count(needle) if haystack and needle else 0
+    # 4) 換行統一
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-def make_stream_renderable_markdown(buf: str) -> str:
-    """
-    串流顯示用：把目前 buf 變成「此刻可被 Markdown 正常解析」的版本。
-    注意：這個回傳值只拿來 placeholder.markdown 顯示，不能存進 chat_history。
-    """
-    t = sanitize_markdown_text(buf or "")
+    # 5) 修：英數/常見單位符號中間被硬塞換行（PDF/雙欄/表格複製很常見）
+    text = re.sub(
+        r"(?<=[0-9A-Za-z$%+\-.\u2013\u2014/])\n(?=[0-9A-Za-z$%+\-.\u2013\u2014/])",
+        "",
+        text,
+    )
 
-    # 1) code fence：``` 出現奇數次 => 暫時補一個結尾，避免整頁變 code block
-    if _count_substr(t, "```") % 2 == 1:
-        return t + "\n```"
+    # 6) 修：Markdown 粗體界線被拆開（* \n *）
+    text = re.sub(r"\*\s*\n\s*\*", "**", text)
 
-    # 2) 行內 code：反引號數量奇數 => 暫時補一個
-    if _count_substr(t, "`") % 2 == 1:
-        t += "`"
+    return text
 
-    # 3) 粗體：** / __ 若奇數組 => 暫時補一組
-    if _count_substr(t, "**") % 2 == 1:
-        t += "**"
-    if _count_substr(t, "__") % 2 == 1:
-        t += "__"
-
-    # 4) Streamlit 樣式標記 :blue[ ... ] 若最後一個未閉合 => 暫時補 ]
-    tag_matches = list(re.finditer(r":[A-Za-z][\w\-]*\[", t))
-    if tag_matches:
-        last = tag_matches[-1]
-        if "]" not in t[last.end():]:
-            t += "]"
-
-    return t
-
-# =========================
-# ✅ 2) [整段替換] 你的 fake_stream_markdown()
-# =========================
-def fake_stream_markdown(
-    text: str,
-    placeholder,
-    step_chars=8,
-    delay=0.02,
-    empty_msg="安妮亞找不到答案～（抱歉啦！）"
-):
-    if not text:
-        placeholder.markdown(empty_msg)
-        return empty_msg
-
+# === 共用：假串流打字效果 ===
+def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
     buf = ""
     for i in range(0, len(text), step_chars):
         buf = text[: i + step_chars]
-        placeholder.markdown(make_stream_renderable_markdown(buf))
+        placeholder.markdown(buf)
         time.sleep(delay)
-
-    # 最終：用「只 sanitize、不補符號」版本渲染＋存進 history
-    final_text = sanitize_markdown_text(text)
-    placeholder.markdown(final_text)
-    return final_text
+    if not text:
+        placeholder.markdown(empty_msg)
+    return text
 
 class AsyncLoopRunner:
     """
@@ -1601,7 +1589,7 @@ def build_fastagent_query_from_history(
 for msg in st.session_state.get("chat_history", []):
     with st.chat_message(msg.get("role", "assistant")):
         if msg.get("text"):
-            st.markdown(sanitize_markdown_text(msg["text"]))
+            st.markdown(msg["text"])
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
@@ -1624,31 +1612,28 @@ def call_fast_agent_once(query: str) -> str:
         text = str(result or "")
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
-# =========================
-# ✅ 3) [整段替換] 你的 fast_agent_stream()
-# =========================
 async def fast_agent_stream(query: str, placeholder) -> str:
     """
-    ✅ 真串流：串流時就用 markdown，但先做 sanitize + 暫時補閉合，避免中途解析壞
+    ✅ 真串流：一邊收到 token，一邊更新 Streamlit placeholder
     """
     buf = ""
     result = Runner.run_streamed(fast_agent, input=query)
 
     async for event in result.stream_events():
+        # Agents SDK 會把底層 OpenAI Responses 的 delta 包在 raw_response_event
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             delta = event.data.delta or ""
             if not delta:
                 continue
             buf += delta
-            placeholder.markdown(make_stream_renderable_markdown(buf))
+            placeholder.markdown(buf)
 
-    final_text = sanitize_markdown_text(buf) if buf else "安妮亞找不到答案～（抱歉啦！）"
-    placeholder.markdown(final_text)
-    return final_text
+    return buf or "安妮亞找不到答案～（抱歉啦！）"
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
-    user_text = (prompt.text or "").strip()
+    raw_user_text = (prompt.text or "")
+    user_text = sanitize_pasted_text(raw_user_text).strip()
 
     images_for_history = []
     docs_for_history = []
