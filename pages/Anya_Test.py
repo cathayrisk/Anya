@@ -93,86 +93,103 @@ def ensure_session_defaults():
 
 ensure_session_defaults()
 
-# ========= [2] 新增：放在 ensure_session_defaults() 後、fake_stream_markdown() 前 =========
+# ====== 2) 整段貼上（建議放在 ensure_session_defaults() 後、fake_stream_markdown() 前） ======
 
-NBSP = "\u00A0"               # no-break space
-IDEOGRAPHIC_SPACE = "\u3000"  # 全形空白
-SOFT_HYPHEN = "\u00AD"        # soft hyphen（看不到但會干擾）
-UNICODE_ASTERISK = "\u2217"   # ∗（看起來像*但不是）
-FULLWIDTH_ASTERISK = "\uFF0A" # ＊
+NBSP = "\u00A0"
+IDEOGRAPHIC_SPACE = "\u3000"
+SOFT_HYPHEN = "\u00AD"
+UNICODE_ASTERISK = "\u2217"     # ∗
+FULLWIDTH_ASTERISK = "\uFF0A"   # ＊
 
-ZERO_WIDTH_CHARS = (
-    "\u200B",  # zero width space
-    "\u200C",  # ZWNJ
-    "\u200D",  # ZWJ
-    "\u2060",  # word joiner
-    "\uFEFF",  # BOM / zero width no-break space
-)
+# 一些常見但你肉眼看不到、卻會害 Markdown parser 爆炸的字元（bidi/format/control）
+_EXTRA_LINE_SEPARATORS = ("\u2028", "\u2029")  # LINE/PARAGRAPH SEPARATOR
 
 _ST_COLOR_OPEN_RE = re.compile(r":[a-zA-Z-]+\[")         # :blue[  :orange-badge[  :small[
 _CODE_FENCE_RE = re.compile(r"```.*?```", flags=re.S)
 _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 
-def sanitize_markdown_for_render(text: str) -> str:
+def _strip_invisible_controls_keep_newlines(text: str) -> str:
     """
-    用在「渲染前」（尤其串流）：
-    - 清掉看不到的字元（NBSP/零寬/soft-hyphen）
-    - 把 ∗/＊ 轉成 *
-    - 修掉 ** 內側空白：** 2026 ** -> **2026**
-    - 修掉 Streamlit :blue[...] 內側空白
-    - 把常見的 '·' / '•' 行首項目符號轉成 Markdown '- '（讓清單格式穩）
-    - 保守修復英數被拆行：710\nb\nn -> 710bn（不動中文段落換行）
+    移除所有 Unicode category 以 'C' 開頭的字元（Control/Format/Surrogate/Private use/Unassigned），
+    但保留 '\n' '\t'（以及一般可視字元）。
     """
     if not text:
         return text
 
-    # 1) Unicode 正規化
+    out = []
+    for ch in text:
+        if ch in ("\n", "\t"):
+            out.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat and cat[0] == "C":
+            continue
+        out.append(ch)
+    return "".join(out)
+
+def sanitize_markdown_for_render(text: str) -> str:
+    """
+    ✅ 用在 placeholder.markdown() 前（串流/非串流皆適用）
+    目標：讓 Streamlit Markdown 盡量穩定可解析，不要因為不可見字元/怪星號/拆字換行/非標準項目符號而失效。
+    """
+    if not text:
+        return text
+
+    # 1) NFKC 正規化（全形→半形、相容字元統一）
     text = unicodedata.normalize("NFKC", text)
 
-    # 2) 移除不可見字元
-    for ch in ZERO_WIDTH_CHARS:
-        text = text.replace(ch, "")
-    text = text.replace(SOFT_HYPHEN, "")
+    # 2) 把特殊換行分隔符轉成真正換行
+    for ls in _EXTRA_LINE_SEPARATORS:
+        text = text.replace(ls, "\n")
 
-    # 3) 空白/星號正規化
+    # 3) 去掉 soft-hyphen、空白正規化、星號正規化
+    text = text.replace(SOFT_HYPHEN, "")
     text = text.replace(NBSP, " ").replace(IDEOGRAPHIC_SPACE, " ")
     text = text.replace(UNICODE_ASTERISK, "*").replace(FULLWIDTH_ASTERISK, "*")
 
-    # 4) 換行統一
+    # 4) 移除所有不可見 control/format 字元（這一步是你現在最缺、也是最可能的真正兇手）
+    text = _strip_invisible_controls_keep_newlines(text)
+
+    # 5) 換行統一
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # 5) 保守修復：英數/常見符號夾住的換行（PDF/雙欄/表格複製常見）
+    # 6) 保守修復：英數/單位符號被拆行（710\nb\nn -> 710bn）
     text = re.sub(
         r"(?<=[0-9A-Za-z$%+\-.\u2013\u2014/])\n(?=[0-9A-Za-z$%+\-.\u2013\u2014/])",
         "",
         text,
     )
 
-    # 6) 把 '·' '•' 轉成 markdown list（行首才轉）
-    text = re.sub(r"(?m)^\s*[·•]\s+", "- ", text)
+    # 7) 把各種「看起來是項目符號」的行首轉成 markdown list
+    #    包含你貼圖常見的：・
+    text = re.sub(r"(?m)^\s*[·•・‧∙●]\s+", "- ", text)
 
-    # 7) 修粗體：把 **...** 內側的前後空白拿掉（關鍵：** 2026 ** -> **2026**）
+    # 8) 確保 list 前有空行（讓解析更穩）
+    text = re.sub(r"(?m)([^\n])\n(-\s)", r"\1\n\n\2", text)
+
+    # 9) 修粗體：** 內容 ** -> **內容**
     def _fix_strong(m: re.Match) -> str:
         inner = m.group(1).strip(" \t\r\n")
         return f"**{inner}**"
     text = re.sub(r"\*\*(.+?)\*\*", _fix_strong, text, flags=re.S)
 
-    # 8) 修 Streamlit :color[...] 內側空白
+    # 10) 修：粗體界線被拆（* \n * -> **）
+    text = re.sub(r"\*\s*\n\s*\*", "**", text)
+
+    # 11) 修 Streamlit :color[...] 內側空白
     def _fix_color(m: re.Match) -> str:
         prefix, inner = m.group(1), m.group(2)
         return f"{prefix}{inner.strip(' \t\r\n')}]"
     text = re.sub(r"(:[a-zA-Z-]+\[)(.*?)]", _fix_color, text, flags=re.S)
 
-    # 9) 修：粗體界線被拆開（* \n *）
-    text = re.sub(r"\*\s*\n\s*\*", "**", text)
+    # 12) 讓 "**TL;DR:**2026" 這種更穩：若粗體後面立刻接英數，補一個空格
+    text = re.sub(r"(\*\*[^*]+?\*\*)(?=[0-9A-Za-z])", r"\1 ", text)
 
     return text
 
-
 def _is_streamlit_md_balanced(text: str) -> bool:
     """
-    串流時避免「壞幀」：只要語法還沒閉合，就先不要更新畫面。
-    做保守平衡檢查：```、`、**、:color[...]
+    串流時避免壞幀：語法未閉合就先不要更新畫面。
     """
     if not text:
         return True
@@ -196,14 +213,7 @@ def _is_streamlit_md_balanced(text: str) -> bool:
 
     return True
 
-
 class MarkdownStreamRenderer:
-    """
-    保持「串流時就用 markdown」的體驗：
-    - 每次增量 feed 後先 sanitize
-    - 只有在語法平衡時才 placeholder.markdown()
-    - 結束後再用完整 sanitize 版覆蓋一次（確保最終一定正確）
-    """
     def __init__(self, placeholder):
         self.placeholder = placeholder
         self._raw = ""
@@ -219,7 +229,6 @@ class MarkdownStreamRenderer:
             self._last_good = clean
             self.placeholder.markdown(clean)
         else:
-            # 不更新壞幀，維持上一個可渲染版本
             if self._last_good:
                 self.placeholder.markdown(self._last_good)
 
@@ -230,6 +239,7 @@ class MarkdownStreamRenderer:
         return clean
 
 # === 共用：假串流打字效果 ===
+# ====== 3) 整段替換你的 fake_stream_markdown() ======
 def fake_stream_markdown(
     text: str,
     placeholder,
@@ -1892,7 +1902,7 @@ if prompt is not None:
 
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)   # ✅ 避免模型自己再列一次「來源」
-                        ai_text = sanitize_markdown_for_render(ai_text)   # ✅ 新增：把 ** 2026 ** 修成 **2026**
+                        ai_text = sanitize_markdown_for_render(ai_text)  # ✅ 新增：修 ** 內側空白/不可見字元/・清單等
                         final_text = fake_stream_markdown(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
 
