@@ -93,9 +93,8 @@ def ensure_session_defaults():
 
 ensure_session_defaults()
 
-# ====== [2] 新增：放在 ensure_session_defaults() 後、fake_stream_markdown() 前（任意位置但要在使用前） ======
+# ========= [2] 新增：放在 ensure_session_defaults() 後、fake_stream_markdown() 前 =========
 
-# --- 貼上文字清洗（通用，不只 PDF） ---
 NBSP = "\u00A0"               # no-break space
 IDEOGRAPHIC_SPACE = "\u3000"  # 全形空白
 SOFT_HYPHEN = "\u00AD"        # soft hyphen（看不到但會干擾）
@@ -110,24 +109,24 @@ ZERO_WIDTH_CHARS = (
     "\uFEFF",  # BOM / zero width no-break space
 )
 
-def sanitize_pasted_text(text: str) -> str:
+_ST_COLOR_OPEN_RE = re.compile(r":[a-zA-Z-]+\[")         # :blue[  :orange-badge[  :small[
+_CODE_FENCE_RE = re.compile(r"```.*?```", flags=re.S)
+_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+
+def sanitize_markdown_for_render(text: str) -> str:
     """
-    專門處理「不知道哪裡複製貼上」帶來的隱形字元/怪字元/拆字換行，避免污染 LLM 與 Markdown。
-
-    永遠做（幾乎不影響語意）：
-    - Unicode NFKC 正規化（全形/相容字元 → 標準）
-    - 移除零寬字元、soft-hyphen
-    - NBSP/全形空白 → 一般空白
-    - ∗、＊ → *
-
-    保守修復（只修明顯是排版拆字的換行）：
-    - 710\\nb\\nn → 710bn（只在英數/單位符號夾住換行時才移除）
-    - *\\n* → **（避免粗體分隔符被拆開）
+    用在「渲染前」（尤其串流）：
+    - 清掉看不到的字元（NBSP/零寬/soft-hyphen）
+    - 把 ∗/＊ 轉成 *
+    - 修掉 ** 內側空白：** 2026 ** -> **2026**
+    - 修掉 Streamlit :blue[...] 內側空白
+    - 把常見的 '·' / '•' 行首項目符號轉成 Markdown '- '（讓清單格式穩）
+    - 保守修復英數被拆行：710\nb\nn -> 710bn（不動中文段落換行）
     """
     if not text:
         return text
 
-    # 1) Unicode 正規化（把全形數字、相容標點等轉成比較一致的形式）
+    # 1) Unicode 正規化
     text = unicodedata.normalize("NFKC", text)
 
     # 2) 移除不可見字元
@@ -142,28 +141,112 @@ def sanitize_pasted_text(text: str) -> str:
     # 4) 換行統一
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # 5) 修：英數/常見單位符號中間被硬塞換行（PDF/雙欄/表格複製很常見）
+    # 5) 保守修復：英數/常見符號夾住的換行（PDF/雙欄/表格複製常見）
     text = re.sub(
         r"(?<=[0-9A-Za-z$%+\-.\u2013\u2014/])\n(?=[0-9A-Za-z$%+\-.\u2013\u2014/])",
         "",
         text,
     )
 
-    # 6) 修：Markdown 粗體界線被拆開（* \n *）
+    # 6) 把 '·' '•' 轉成 markdown list（行首才轉）
+    text = re.sub(r"(?m)^\s*[·•]\s+", "- ", text)
+
+    # 7) 修粗體：把 **...** 內側的前後空白拿掉（關鍵：** 2026 ** -> **2026**）
+    def _fix_strong(m: re.Match) -> str:
+        inner = m.group(1).strip(" \t\r\n")
+        return f"**{inner}**"
+    text = re.sub(r"\*\*(.+?)\*\*", _fix_strong, text, flags=re.S)
+
+    # 8) 修 Streamlit :color[...] 內側空白
+    def _fix_color(m: re.Match) -> str:
+        prefix, inner = m.group(1), m.group(2)
+        return f"{prefix}{inner.strip(' \t\r\n')}]"
+    text = re.sub(r"(:[a-zA-Z-]+\[)(.*?)]", _fix_color, text, flags=re.S)
+
+    # 9) 修：粗體界線被拆開（* \n *）
     text = re.sub(r"\*\s*\n\s*\*", "**", text)
 
     return text
 
+
+def _is_streamlit_md_balanced(text: str) -> bool:
+    """
+    串流時避免「壞幀」：只要語法還沒閉合，就先不要更新畫面。
+    做保守平衡檢查：```、`、**、:color[...]
+    """
+    if not text:
+        return True
+
+    if text.count("```") % 2 != 0:
+        return False
+
+    tmp = _CODE_FENCE_RE.sub("", text)
+    if tmp.count("`") % 2 != 0:
+        return False
+
+    tmp2 = _INLINE_CODE_RE.sub("", tmp)
+    if tmp2.count("**") % 2 != 0:
+        return False
+
+    opens = [m.start() for m in _ST_COLOR_OPEN_RE.finditer(tmp2)]
+    if opens:
+        last_open = opens[-1]
+        if "]" not in tmp2[last_open:]:
+            return False
+
+    return True
+
+
+class MarkdownStreamRenderer:
+    """
+    保持「串流時就用 markdown」的體驗：
+    - 每次增量 feed 後先 sanitize
+    - 只有在語法平衡時才 placeholder.markdown()
+    - 結束後再用完整 sanitize 版覆蓋一次（確保最終一定正確）
+    """
+    def __init__(self, placeholder):
+        self.placeholder = placeholder
+        self._raw = ""
+        self._last_good = ""
+
+    def feed(self, delta: str):
+        if not delta:
+            return
+        self._raw += delta
+
+        clean = sanitize_markdown_for_render(self._raw)
+        if _is_streamlit_md_balanced(clean):
+            self._last_good = clean
+            self.placeholder.markdown(clean)
+        else:
+            # 不更新壞幀，維持上一個可渲染版本
+            if self._last_good:
+                self.placeholder.markdown(self._last_good)
+
+    def finalize(self) -> str:
+        clean = sanitize_markdown_for_render(self._raw)
+        self.placeholder.markdown(clean)
+        self._last_good = clean
+        return clean
+
 # === 共用：假串流打字效果 ===
-def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
-    buf = ""
-    for i in range(0, len(text), step_chars):
-        buf = text[: i + step_chars]
-        placeholder.markdown(buf)
-        time.sleep(delay)
+def fake_stream_markdown(
+    text: str,
+    placeholder,
+    step_chars=8,
+    delay=0.02,
+    empty_msg="安妮亞找不到答案～（抱歉啦！）"
+):
     if not text:
         placeholder.markdown(empty_msg)
-    return text
+        return empty_msg
+
+    r = MarkdownStreamRenderer(placeholder)
+    for i in range(0, len(text), step_chars):
+        r.feed(text[i : i + step_chars])
+        time.sleep(delay)
+
+    return r.finalize()
 
 class AsyncLoopRunner:
     """
@@ -1613,22 +1696,17 @@ def call_fast_agent_once(query: str) -> str:
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
 async def fast_agent_stream(query: str, placeholder) -> str:
-    """
-    ✅ 真串流：一邊收到 token，一邊更新 Streamlit placeholder
-    """
-    buf = ""
+    r = MarkdownStreamRenderer(placeholder)
     result = Runner.run_streamed(fast_agent, input=query)
 
     async for event in result.stream_events():
-        # Agents SDK 會把底層 OpenAI Responses 的 delta 包在 raw_response_event
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             delta = event.data.delta or ""
             if not delta:
                 continue
-            buf += delta
-            placeholder.markdown(buf)
+            r.feed(delta)
 
-    return buf or "安妮亞找不到答案～（抱歉啦！）"
+    return r.finalize() or "安妮亞找不到答案～（抱歉啦！）"
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
@@ -1814,6 +1892,7 @@ if prompt is not None:
 
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)   # ✅ 避免模型自己再列一次「來源」
+                        ai_text = sanitize_markdown_for_render(ai_text)   # ✅ 新增：把 ** 2026 ** 修成 **2026**
                         final_text = fake_stream_markdown(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
 
