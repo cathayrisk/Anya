@@ -570,6 +570,25 @@ def strip_trailing_sources_section(text: str) -> str:
 
     return text
 
+# Test!
+def debug_near_asterisks(s: str, window: int = 40):
+    idx = s.find("**")
+    if idx == -1:
+        # 找任何星狀符號
+        for ch in s:
+            if ch in _ASTERISK_LIKE:
+                idx = s.find(ch)
+                break
+    if idx == -1:
+        st.write("no asterisks found")
+        return
+
+    start = max(0, idx - window)
+    end = min(len(s), idx + window)
+    snippet = s[start:end]
+    st.code(repr(snippet))
+    st.write([(c, hex(ord(c)), unicodedata.name(c, "?"), unicodedata.category(c)) for c in snippet])
+    
 # === 小工具：注入 handoff 官方前綴 ===
 def with_handoff_prefix(text: str) -> str:
     pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
@@ -1937,6 +1956,7 @@ if prompt is not None:
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)   # ✅ 避免模型自己再列一次「來源」
                         ai_text = sanitize_markdown_for_render(ai_text)  # ✅ 新增：把 *∗ 混用、怪空白、** 內容 ** 全修掉
+                        ai_text = debug_near_asterisks(ai_text) # Test
                         final_text = fake_stream_markdown(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
 
