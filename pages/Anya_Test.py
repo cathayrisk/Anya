@@ -1711,7 +1711,7 @@ async def fast_agent_stream(query: str, placeholder) -> str:
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
     raw_user_text = (prompt.text or "")
-    user_text = sanitize_pasted_text(raw_user_text).strip()
+    user_text = sanitize_markdown_for_render(raw_user_text).strip()
 
     images_for_history = []
     docs_for_history = []
