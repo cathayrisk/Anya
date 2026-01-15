@@ -16,7 +16,7 @@ from datetime import datetime
 import socket
 import ipaddress
 from urllib.parse import urlparse
-import unicodedata
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -93,156 +93,16 @@ def ensure_session_defaults():
 
 ensure_session_defaults()
 
-# ====== 2) 整段貼上（建議放在 ensure_session_defaults() 後、fake_stream_markdown() 前） ======
-
-_ST_COLOR_OPEN_RE = re.compile(r":[a-zA-Z-]+\[")  # :blue[ :orange-badge[ :small[
-_CODE_FENCE_RE = re.compile(r"```.*?```", flags=re.S)
-_INLINE_CODE_RE = re.compile(r"`[^`]*`")
-
-def _normalize_unicode_spaces(text: str) -> str:
-    """把所有 Unicode Space_Separator (Zs) 統一成普通空白（比只處理 NBSP 更全面）。"""
-    if not text:
-        return text
-    out = []
-    for ch in text:
-        if ch in ("\n", "\t"):
-            out.append(ch)
-            continue
-        if unicodedata.category(ch) == "Zs":
-            out.append(" ")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-def _strip_invisible_controls_keep_newlines(text: str) -> str:
-    """
-    移除所有 Unicode category 以 'C' 開頭的字元（Control/Format/...），但保留 \n \t。
-    這類字元是「肉眼看不到、卻會讓 Markdown parser 行為怪掉」的最大宗。
-    """
-    if not text:
-        return text
-    out = []
-    for ch in text:
-        if ch in ("\n", "\t"):
-            out.append(ch)
-            continue
-        cat = unicodedata.category(ch)
-        if cat and cat[0] == "C":
-            continue
-        out.append(ch)
-    return "".join(out)
-
-def sanitize_markdown_for_render(text: str) -> str:
-    """
-    ✅ 渲染前清洗（你目前真正需要的版本）
-    重點修復：
-    - 把 '* <任何空白> *' 一律黏成 '**'（包含不可見空白/換行）
-    - 把 '** 內容 **' 修成 '**內容**'
-    - 把行首 '·/•/・' 轉成 '- '（讓清單穩）
-    """
-    if not text:
-        return text
-
-    # 1) 正規化（NFKC + 空白統一 + 清掉不可見控制字元）
-    text = unicodedata.normalize("NFKC", text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = _normalize_unicode_spaces(text)
-    text = _strip_invisible_controls_keep_newlines(text)
-
-    # 2) 把「兩顆星中間被塞空白」黏回 '**'
-    #    這個超關鍵：* * / *\n* / *\t* / *\u202F* -> **
-    #    （不會影響 a*b 這種乘號寫法，因為那只有單顆星）
-    text = re.sub(r"\*\s+\*", "**", text, flags=re.S)
-
-    # 3) 把行首項目符號轉成 markdown list
-    text = re.sub(r"(?m)^\s*[·•・‧∙●]\s+", "- ", text)
-
-    # 4) 修粗體：把 **...** 內側左右空白去掉（** MSFT ** -> **MSFT**）
-    def _fix_strong(m: re.Match) -> str:
-        inner = (m.group(1) or "").strip(" \t\r\n")
-        return f"**{inner}**"
-    text = re.sub(r"\*\*(.+?)\*\*", _fix_strong, text, flags=re.S)
-
-    # 5) list 前補空行（更穩）
-    text = re.sub(r"(?m)([^\n])\n(-\s)", r"\1\n\n\2", text)
-
-    # 6) 修 Streamlit :color[...] 內側空白（可選但常踩）
-    def _fix_color(m: re.Match) -> str:
-        prefix, inner = m.group(1), m.group(2)
-        return f"{prefix}{inner.strip(' \t\r\n')}]"
-    text = re.sub(r"(:[a-zA-Z-]+\[)(.*?)]", _fix_color, text, flags=re.S)
-
-    return text
-
-def _is_streamlit_md_balanced(text: str) -> bool:
-    """串流時避免壞幀：```、`、**、:color[... 都要閉合才更新畫面。"""
-    if not text:
-        return True
-
-    if text.count("```") % 2 != 0:
-        return False
-
-    tmp = _CODE_FENCE_RE.sub("", text)
-    if tmp.count("`") % 2 != 0:
-        return False
-
-    tmp2 = _INLINE_CODE_RE.sub("", tmp)
-    if tmp2.count("**") % 2 != 0:
-        return False
-
-    opens = [m.start() for m in _ST_COLOR_OPEN_RE.finditer(tmp2)]
-    if opens:
-        last_open = opens[-1]
-        if "]" not in tmp2[last_open:]:
-            return False
-
-    return True
-
-class MarkdownStreamRenderer:
-    """維持「串流時就用 markdown」：不平衡就不更新，結束後再用清洗後全文覆蓋一次。"""
-    def __init__(self, placeholder):
-        self.placeholder = placeholder
-        self._raw = ""
-        self._last_good = ""
-
-    def feed(self, delta: str):
-        if not delta:
-            return
-        self._raw += delta
-
-        clean = sanitize_markdown_for_render(self._raw)
-        if _is_streamlit_md_balanced(clean):
-            self._last_good = clean
-            self.placeholder.markdown(clean)
-        else:
-            if self._last_good:
-                self.placeholder.markdown(self._last_good)
-
-    def finalize(self) -> str:
-        clean = sanitize_markdown_for_render(self._raw)
-        self.placeholder.markdown(clean)
-        self._last_good = clean
-        return clean
-
 # === 共用：假串流打字效果 ===
-# ========= 整段替換你的 fake_stream_markdown =========
-def fake_stream_markdown(
-    text: str,
-    placeholder,
-    step_chars=8,
-    delay=0.02,
-    empty_msg="安妮亞找不到答案～（抱歉啦！）"
-):
+def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
+    buf = ""
+    for i in range(0, len(text), step_chars):
+        buf = text[: i + step_chars]
+        placeholder.markdown(buf)
+        time.sleep(delay)
     if not text:
         placeholder.markdown(empty_msg)
-        return empty_msg
-
-    r = MarkdownStreamRenderer(placeholder)
-    for i in range(0, len(text), step_chars):
-        r.feed(text[i : i + step_chars])
-        time.sleep(delay)
-
-    return r.finalize()
+    return text
 
 class AsyncLoopRunner:
     """
@@ -316,6 +176,121 @@ def run_async(coro):
     if result_container["error"] is not None:
         raise result_container["error"]
     return result_container["value"]
+
+# =========================
+# ✅ [新增/替換] Markdown 修復 + 單 placeholder two-stage
+# 放在 fake_stream_markdown / fast_agent_stream 附近
+# =========================
+CODE_FENCE_WHOLE_BLOCK_RE = re.compile(
+    r"^\s*```(?:markdown|md|text)?\s*\r?\n([\s\S]*?)\r?\n```\s*$",
+    flags=re.IGNORECASE,
+)
+
+def _strip_unbalanced_code_fences(text: str) -> str:
+    if not text:
+        return text
+    if text.count("```") % 2 == 0:
+        return text
+
+    # 奇數個 fence：移除 fence 行，避免整段被當 code block
+    out = []
+    for ln in text.splitlines():
+        if re.match(r"^\s*```", ln):
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+def _maybe_unindent_indented_block(text: str) -> str:
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    non_empty = [ln for ln in lines if ln.strip() != ""]
+    if not non_empty:
+        return text
+
+    indented = sum(1 for ln in non_empty if ln.startswith("    ") or ln.startswith("\t"))
+    if (indented / len(non_empty)) < 0.7:
+        return text
+
+    new_lines = []
+    for ln in lines:
+        if ln.startswith("    "):
+            new_lines.append(ln[4:])
+        elif ln.startswith("\t"):
+            new_lines.append(ln[1:])
+        else:
+            new_lines.append(ln)
+    return "\n".join(new_lines)
+
+def normalize_markdown_for_streamlit(text: str) -> str:
+    if not text:
+        return ""
+
+    t = text.strip("\ufeff")
+
+    # 1) 整段被 ```...``` 包住：拆掉外層
+    m = CODE_FENCE_WHOLE_BLOCK_RE.match(t.strip())
+    if m:
+        t = m.group(1)
+
+    # 2) 未閉合 fence（奇數個 ```）
+    t = _strip_unbalanced_code_fences(t)
+
+    # 3) 整段縮排導致 code block
+    t = _maybe_unindent_indented_block(t)
+
+    # 4) 常見跳脫還原：\*\*TL;DR\*\* -> **TL;DR**
+    t = re.sub(r"\\([*_`])", r"\1", t)
+
+    return t
+
+def fake_stream_markdown_replace(
+    text: str,
+    placeholder,
+    step_chars: int = 8,
+    delay: float = 0.02,
+    empty_msg: str = "安妮亞找不到答案～（抱歉啦！）",
+) -> str:
+    """
+    ✅ 同一個 placeholder：
+    - 第一階段：一路 placeholder.markdown(buf) 串流（中途怪沒關係）
+    - 第二階段：placeholder.markdown(fixed) 覆蓋成正常 Markdown
+    回傳 fixed（建議直接存入 chat_history）
+    """
+    if not text:
+        placeholder.markdown(empty_msg)
+        return empty_msg
+
+    buf = ""
+    for i in range(0, len(text), step_chars):
+        buf = text[: i + step_chars]
+        placeholder.markdown(buf)   # 第一階段：仍用 markdown
+        time.sleep(delay)
+
+    fixed = normalize_markdown_for_streamlit(text)
+    placeholder.markdown(fixed)     # 第二階段：覆蓋同一塊位置
+    return fixed
+
+async def fast_agent_stream_replace(query: str, placeholder) -> str:
+    """
+    ✅ 同一個 placeholder（真串流）
+    """
+    buf = ""
+    result = Runner.run_streamed(fast_agent, input=query)
+
+    async for event in result.stream_events():
+        if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+            delta = event.data.delta or ""
+            if not delta:
+                continue
+            buf += delta
+            placeholder.markdown(buf)
+
+    final = buf or "安妮亞找不到答案～（抱歉啦！）"
+    fixed = normalize_markdown_for_streamlit(final)
+    placeholder.markdown(fixed)
+    return fixed
 
 # === 1.1 圖片工具：縮圖 & data URL ===
 @st.cache_data(show_spinner=False, max_entries=256)
@@ -522,25 +497,6 @@ def strip_trailing_sources_section(text: str) -> str:
 
     return text
 
-# Test!
-def debug_near_asterisks(s: str, window: int = 40):
-    idx = s.find("**")
-    if idx == -1:
-        # 找任何星狀符號
-        for ch in s:
-            if ch in _ASTERISK_LIKE:
-                idx = s.find(ch)
-                break
-    if idx == -1:
-        st.write("no asterisks found")
-        return
-
-    start = max(0, idx - window)
-    end = min(len(s), idx + window)
-    snippet = s[start:end]
-    st.code(repr(snippet))
-    st.write([(c, hex(ord(c)), unicodedata.name(c, "?"), unicodedata.category(c)) for c in snippet])
-    
 # === 小工具：注入 handoff 官方前綴 ===
 def with_handoff_prefix(text: str) -> str:
     pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
@@ -1687,7 +1643,7 @@ def build_fastagent_query_from_history(
 for msg in st.session_state.get("chat_history", []):
     with st.chat_message(msg.get("role", "assistant")):
         if msg.get("text"):
-            st.markdown(msg["text"])
+            st.markdown(normalize_markdown_for_streamlit(msg["text"]))
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
@@ -1710,24 +1666,27 @@ def call_fast_agent_once(query: str) -> str:
         text = str(result or "")
     return text or "安妮亞找不到答案～（抱歉啦！）"
 
-# ========= 整段替換你的 fast_agent_stream =========
 async def fast_agent_stream(query: str, placeholder) -> str:
-    r = MarkdownStreamRenderer(placeholder)
+    """
+    ✅ 真串流：一邊收到 token，一邊更新 Streamlit placeholder
+    """
+    buf = ""
     result = Runner.run_streamed(fast_agent, input=query)
 
     async for event in result.stream_events():
+        # Agents SDK 會把底層 OpenAI Responses 的 delta 包在 raw_response_event
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             delta = event.data.delta or ""
             if not delta:
                 continue
-            r.feed(delta)
+            buf += delta
+            placeholder.markdown(buf)
 
-    return r.finalize() or "安妮亞找不到答案～（抱歉啦！）"
+    return buf or "安妮亞找不到答案～（抱歉啦！）"
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 if prompt is not None:
-    raw_user_text = (prompt.text or "")
-    user_text = sanitize_markdown_for_render(raw_user_text).strip()
+    user_text = (prompt.text or "").strip()
 
     images_for_history = []
     docs_for_history = []
@@ -1855,7 +1814,8 @@ if prompt is not None:
                         )
                         # ✅ 新增：日期只進本回合 query，不進 chat_history
                         fast_query_runtime = f"{today_line}\n\n{fast_query_with_history}".strip()
-                        final_text = run_async(fast_agent_stream(fast_query_runtime, placeholder))
+                        #final_text = run_async(fast_agent_stream(fast_query_runtime, placeholder))
+                        fixed_text = run_async(fast_agent_stream_replace(fast_query_runtime, placeholder))
                         
                         with sources_container:
                             if docs_for_history:
@@ -1866,7 +1826,7 @@ if prompt is not None:
                         ensure_session_defaults()
                         st.session_state.chat_history.append({
                             "role": "assistant",
-                            "text": final_text,
+                            "text": fixed_text,  # ✅ 存修好版本
                             "images": [],
                             "docs": []
                         })
@@ -1908,8 +1868,8 @@ if prompt is not None:
 
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)   # ✅ 避免模型自己再列一次「來源」
-                        ai_text = sanitize_markdown_for_render(ai_text)  # ✅ 新增
-                        final_text = fake_stream_markdown(ai_text, placeholder)
+                        #final_text = fake_stream_markdown(ai_text, placeholder)
+                        fixed_text = fake_stream_markdown_replace(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
 
                         with sources_container:
@@ -1971,7 +1931,7 @@ if prompt is not None:
                         ensure_session_defaults()
                         st.session_state.chat_history.append({
                             "role": "assistant",
-                            "text": final_text,
+                            "text": fixed_text,  # ✅ 存修好版本
                             "images": [],
                             "docs": []
                         })
