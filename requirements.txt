@@ -21,6 +21,7 @@ pypandoc
 python-docx
 #sentence-transformers
 pymupdf4llm
+rank_bm25
 
 # Web tools and research
 wikipedia
