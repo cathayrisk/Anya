@@ -2413,11 +2413,10 @@ if prompt:
         st.session_state["current_difficulty"] = plan.difficulty
 
         # ✅ 不管走哪個流程，都先顯示一個 status（至少讓你看得到路由結果）
-        with st.status("路由中…", expanded=False) as route_status:
-            route_status.write(f"- mode={plan.mode}")
-            route_status.write(f"- difficulty={plan.difficulty}")
-            route_status.write(f"- has_index={str(bool(has_index)).lower()}")
-            route_status.update(label="路由完成", state="complete")
+        with st.status("執行中…", expanded=bool(st.session_state.get("da_status_expanded", False))) as main_status:
+            main_status.write(f"- mode={plan.mode}")
+            main_status.write(f"- difficulty={plan.difficulty}")
+            main_status.write(f"- has_index={str(bool(has_index)).lower()}")
 
         # doc_suff gate（只有文件不足且允許才 web；advisor 也可用，但先保守）
         enable_web = bool(plan.enable_web)
@@ -2435,11 +2434,13 @@ if prompt:
             agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
 
             # deep_agent_run_with_live_status 內部本來就有 st.status（會顯示 todos/evidence/claims/反思/doc hits）
-            answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages, client=client)
+            answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages, client=client, status=main_status,   # ✅ 共享同一個 status)
 
             answer_text = strip_internal_process_lines(answer_text)
             if st.session_state.get("enable_output_formatter", True):
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
+            
+            main_status.update(label="完成", state="complete", expanded=False)
 
             meta = {
                 "mode": "advisor",
@@ -2456,7 +2457,7 @@ if prompt:
 
         # === 沒索引：也要有 st.status ===
         if not has_index:
-            with st.status("Direct：生成回答中…", expanded=False) as s:
+            with main_status.update(label="Direct：生成回答中…", state="running", expanded=False) as s:
                 web_sources: Dict[str, List[Tuple[str, str]]] = {}
                 usage = {"doc_search_calls": 0, "web_search_calls": 0}
 
