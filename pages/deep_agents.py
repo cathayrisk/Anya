@@ -1420,7 +1420,23 @@ def grade_doc_evidence_sufficiency(client: OpenAI, question: str, ctx: str) -> f
     except Exception:
         return 0.45
 
+# ========= [A] 新增：放在 Router 區塊附近（utilities） =========
+def has_built_index() -> bool:
+    store = st.session_state.get("store", None)
+    try:
+        return bool(store is not None and getattr(store, "index", None) is not None and store.index.ntotal > 0)
+    except Exception:
+        return False
 
+
+def force_mode_when_indexed(plan_mode: str, has_index: bool) -> str:
+    """
+    你拍板的規則：只要有索引，一律走 advisor（讓 DeepAgent 自己評估怎麼回）。
+    """
+    if has_index:
+        return "advisor"
+    return plan_mode
+    
 # =========================
 # Fallback RAG
 # =========================
@@ -2384,6 +2400,7 @@ if prompt:
 
         run_messages = build_run_messages(prompt, max_messages=15)
 
+        # ========= [B] 修改：Chat main 中「取得 plan 後」到「分支處理」這段（整段替換） =========
         plan = decide_route_plan(
             client,
             prompt,
@@ -2391,19 +2408,20 @@ if prompt:
             allow_web=allow_web,
             run_messages=run_messages,
         )
+
+        # ✅ 強制：有索引就一律 advisor
+        plan.mode = force_mode_when_indexed(plan.mode, has_index=has_index)
+        plan.needs_clarification = False  # 有索引不再走 clarify（交給 advisor 自己問/自己整合）
         st.session_state["current_difficulty"] = plan.difficulty
 
-        # clarify
-        if plan.needs_clarification or plan.mode == "clarify":
-            qs = plan.clarifying_questions[:3]
-            answer_text = "我需要先確認幾個小地方，才不會答歪：\n\n" + "\n".join([f"- {q}" for q in qs])
-            render_markdown_answer_with_sources_badges(answer_text)
-            st.session_state.chat_history.append(
-                {"role": "assistant", "kind": "text", "content": answer_text, "meta": {"mode": "clarify", "enable_web": False, "usage": {}, "difficulty": plan.difficulty}}
-            )
-            st.stop()
+        # ✅ 不管走哪個流程，都先顯示一個 status（至少讓你看得到路由結果）
+        with st.status("路由中…", expanded=False) as route_status:
+            route_status.write(f"- mode={plan.mode}")
+            route_status.write(f"- difficulty={plan.difficulty}")
+            route_status.write(f"- has_index={str(bool(has_index)).lower()}")
+            route_status.update(label="路由完成", state="complete")
 
-        # doc_suff gate（只有文件不足且允許才 web）
+        # doc_suff gate（只有文件不足且允許才 web；advisor 也可用，但先保守）
         enable_web = bool(plan.enable_web)
         if has_index and allow_web and enable_web:
             qvec = embed_texts(client, [prompt])
@@ -2414,9 +2432,11 @@ if prompt:
             if doc_suff >= 0.70:
                 enable_web = False
 
-        # advisor / deepagent：只要 has_index 就一定走 deepagent（不再被 need_todo 擋掉）
-        if plan.mode in ("advisor", "deepagent") and has_index:
+        # ✅ advisor（有索引必走）
+        if plan.mode == "advisor" and has_index:
             agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
+
+            # deep_agent_run_with_live_status 內部本來就有 st.status（會顯示 todos/evidence/claims/反思/doc hits）
             answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages, client=client)
 
             answer_text = strip_internal_process_lines(answer_text)
@@ -2424,7 +2444,7 @@ if prompt:
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
 
             meta = {
-                "mode": plan.mode,
+                "mode": "advisor",
                 "enable_web": enable_web,
                 "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
                 "difficulty": plan.difficulty,
@@ -2432,6 +2452,78 @@ if prompt:
             }
             render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
             render_markdown_answer_with_sources_badges(answer_text)
+
+            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+            st.stop()
+
+        # === 沒索引：也要有 st.status ===
+        if not has_index:
+            with st.status("Direct：生成回答中…", expanded=False) as s:
+                web_sources: Dict[str, List[Tuple[str, str]]] = {}
+                usage = {"doc_search_calls": 0, "web_search_calls": 0}
+
+                history_msgs = run_messages[:-1]
+                history_block = "\n".join(
+                    [f"{m['role'].upper()}: {m['content']}" for m in history_msgs if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()]
+                ).strip()
+                user_text = prompt if not history_block else f"對話脈絡（最近）：\n{history_block}\n\n目前問題：\n{prompt}"
+
+                if enable_web:
+                    s.update(label="Direct：web_search 蒐證中…", state="running", expanded=False)
+                    evidence_md, sources = call_gpt(
+                        client,
+                        model=MODEL_MAIN,
+                        system=DIRECT_EVIDENCE_SYSTEM_PROMPT,
+                        user=f"{user_text}\n\n（請開始 web_search 蒐證）",
+                        reasoning_effort=REASONING_EFFORT,
+                        tools=[{"type": "web_search"}],
+                        include_sources=True,
+                        tool_choice="required",
+                    )
+                    usage["web_search_calls"] = 1
+                    web_sources = web_sources_from_openai_sources(sources)
+
+                    s.write("#### 蒐證摘要（節錄）")
+                    s.write((evidence_md or "")[:800])
+
+                    s.update(label="Direct：寫作整理中…", state="running", expanded=False)
+                    writer_user = f"{user_text}\n\n=== EVIDENCE ===\n{(evidence_md or '').strip()}\n"
+                    ans, _ = call_gpt(
+                        client,
+                        model=MODEL_MAIN,
+                        system=ANYA_SYSTEM_PROMPT + "\n\n" + DIRECT_WRITER_SYSTEM_PROMPT,
+                        user=writer_user,
+                        reasoning_effort=REASONING_EFFORT,
+                    )
+                    answer_text = (ans or "").strip()
+                    answer_text = (answer_text.rstrip() + "\n\n[WebSearch:web p-]").strip()
+                else:
+                    s.update(label="Direct：生成中…", state="running", expanded=False)
+                    ans, _ = call_gpt(
+                        client,
+                        model=MODEL_MAIN,
+                        system=ANYA_SYSTEM_PROMPT,
+                        user=user_text,
+                        reasoning_effort=REASONING_EFFORT,
+                    )
+                    answer_text = (ans or "").strip()
+
+                if st.session_state.get("enable_output_formatter", True):
+                    answer_text = format_markdown_output_preserve_citations(client, answer_text)
+                answer_text = strip_internal_process_lines(answer_text)
+
+                s.update(label="Direct：完成", state="complete", expanded=False)
+
+            meta = {
+                "mode": "direct",
+                "enable_web": enable_web,
+                "usage": usage,
+                "difficulty": plan.difficulty,
+                "web_sources": web_sources,
+            }
+            render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
+            render_markdown_answer_with_sources_badges(answer_text)
+            render_web_sources_list(web_sources)
 
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
