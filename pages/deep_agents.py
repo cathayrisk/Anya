@@ -1821,28 +1821,28 @@ hints: <關鍵字可空>
         {
             "name": "retriever",
             "description": "從文件索引找證據，寫 /evidence/doc_*.md（不含 chunk_id）",
-            "prompt": retriever_prompt,
+            "system_prompt": retriever_prompt,
             "tools": [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk],
             "model": f"openai:{MODEL_MAIN}",
         },
         {
             "name": "analyst",
             "description": "claims-first 推理分析，產出 /analysis/claims.json 與 /analysis/reflections.json",
-            "prompt": analyst_prompt,
+            "system_prompt": analyst_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
         },
         {
             "name": "writer",
             "description": "整合 evidence + claims/reflections → 產生 /draft.md",
-            "prompt": writer_prompt,
+            "system_prompt": writer_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
         },
         {
             "name": "verifier",
             "description": "檢查引用覆蓋並修稿 /draft.md",
-            "prompt": verifier_prompt,
+            "system_prompt": verifier_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
         },
@@ -1854,7 +1854,7 @@ hints: <關鍵字可空>
             {
                 "name": "web-researcher",
                 "description": "用 web_search 補外部背景，寫 /evidence/web_*.md",
-                "prompt": web_prompt,
+                "system_prompt": web_prompt,
                 "tools": [tool_web_search_summary, tool_get_usage],
                 "model": f"openai:{MODEL_MAIN}",
             },
@@ -1889,9 +1889,11 @@ def _safe_json_preview(text: str, max_chars: int = 1400) -> str:
     return t
 
 
-def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[dict], client: OpenAI) -> Tuple[str, Optional[dict]]:
+def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[dict], client: OpenAI, status=None) -> Tuple[str, Optional[dict]]:
     """
-    st.status：顯示工作產物（todos/facets/evidence/claims/反思/doc_search hits），不顯示 chain-of-thought。
+    ✅ 共用同一個 st.status（避免巢狀 status 導致畫面只顯示「路由完成」）
+    - 不顯示 chain-of-thought
+    - 顯示：todos/facets/claims/反思、doc_search 命中段落、evidence/draft/review 節錄
     """
     final_state = None
     st.session_state["last_run_forced_end"] = None
@@ -1930,12 +1932,25 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
     show_files = bool(st.session_state.get("da_show_status_files", True))
     show_doc_hits = bool(st.session_state.get("da_show_status_doc_hits", True))
 
-    with st.status("DeepAgent：啟動中…", expanded=bool(st.session_state.get("da_status_expanded", False))) as s:
+    # ✅ 若外部沒給 status，才自己開一個
+    if status is None:
+        status_cm = st.status("DeepAgent：啟動中…", expanded=bool(st.session_state.get("da_status_expanded", False)))
+        s = status_cm.__enter__()
+        _need_exit = True
+    else:
+        s = status
+        _need_exit = False
+
+    try:
         set_phase(s, "start")
 
         memo_ph = st.empty()
         doc_hits_ph = st.empty()
         files_ph = st.empty()
+
+        def _safe(s0: str, max_chars: int = 1200) -> str:
+            s0 = (s0 or "").strip()
+            return s0 if len(s0) <= max_chars else s0[:max_chars] + "…"
 
         def _render_doc_hits():
             if not show_doc_hits:
@@ -1944,7 +1959,7 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
             if not log:
                 doc_hits_ph.markdown(":small[（尚未觸發 doc_search）]")
                 return
-            lines = ["#### 🔎 最近文件檢索命中（節錄）"]
+            lines = ["#### 🔎 最近文件檢索命中（Top3 節錄）"]
             for item in log[-UI_MAX_DOC_SEARCH_LOG:][::-1]:
                 q = item.get("query") or ""
                 lines.append(f"- **Query**：{q}")
@@ -1960,45 +1975,29 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
                     lines.append(f"  - [{title} p{page}] score={score_s}：{snippet}")
             doc_hits_ph.markdown("\n".join(lines))
 
-        def _render_memo_from_state(state: dict, files: dict):
+        def _render_memo(files: dict):
             if not show_debug:
                 return
-
-            # 1) todos：先嘗試從 state 取（不同版本 schema 可能不同），不行再讀 /workspace/todos.json
-            todos_obj = state.get("todos", None)
-            todos = ""
-            if todos_obj is not None:
-                try:
-                    todos = json.dumps(todos_obj, ensure_ascii=False, indent=2)
-                except Exception:
-                    todos = str(todos_obj)
-
-            if not todos:
-                todos = (files.get("/workspace/todos.json") or "").strip()
-                if not isinstance(todos, str):
-                    todos = ""
-
-            facets = (files.get("/workspace/facets.json") or "")
-            claims = (files.get("/analysis/claims.json") or "")
-            refl = (files.get("/analysis/reflections.json") or "")
+            todos = (files.get("/workspace/todos.json") or "").strip()
+            facets = (files.get("/workspace/facets.json") or "").strip()
+            claims = (files.get("/analysis/claims.json") or "").strip()
+            refl = (files.get("/analysis/reflections.json") or "").strip()
 
             blocks = []
             if todos:
-                blocks.append("#### 📝 Agent Memo：Todos\n```json\n" + _safe_json_preview(todos, 1200) + "\n```")
+                blocks.append("#### 📝 Todos\n```json\n" + _safe(todos, 1400) + "\n```")
             if facets:
-                blocks.append("#### 🧭 Facets\n```json\n" + _safe_json_preview(facets, 1200) + "\n```")
+                blocks.append("#### 🧭 Facets\n```json\n" + _safe(facets, 1400) + "\n```")
             if claims and st.session_state.get("da_show_claims", True):
-                blocks.append("#### 🧠 Claims（結構化主張）\n```json\n" + _safe_json_preview(claims, 1400) + "\n```")
+                blocks.append("#### 🧠 Claims\n```json\n" + _safe(claims, 1600) + "\n```")
             if refl and st.session_state.get("da_show_reflections", True):
-                blocks.append("#### 🤔 反思（風險/盲點/需驗證）\n```json\n" + _safe_json_preview(refl, 1400) + "\n```")
+                blocks.append("#### 🤔 反思\n```json\n" + _safe(refl, 1600) + "\n```")
 
-            memo_ph.markdown("\n\n".join(blocks) if blocks else ":small[（目前尚未產生 todos/facets/claims 產物）]")
+            memo_ph.markdown("\n\n".join(blocks) if blocks else ":small[（尚未產生 todos/facets/claims/反思）]")
 
         def _render_files_preview(files: dict):
             if not (show_files and show_debug):
                 return
-
-            # 只節錄：evidence/draft/review
             keys = sorted([k for k in files.keys() if isinstance(k, str)])
             evidence_keys = [k for k in keys if k.startswith("/evidence/")][:12]
             draft = (files.get("/draft.md") or "")
@@ -2017,85 +2016,84 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
             if isinstance(review, str) and review.strip():
                 lines.append("#### ✅ Review（節錄）\n```text\n" + review[:900] + "\n```")
 
-            files_ph.markdown("\n\n".join(lines) if lines else ":small[（尚未產生 evidence/draft/review 檔）]")
+            files_ph.markdown("\n\n".join(lines) if lines else ":small[（尚未產生 evidence/draft/review）]")
 
         set_phase(s, "plan")
 
-        try:
-            stream_iter = _agent_stream_with_files(
-                agent,
-                {"messages": msgs_for_agent},
-                files_seed=seed_files,
-                stream_mode="values",
-                config={"recursion_limit": recursion_limit},
-            )
+        stream_iter = _agent_stream_with_files(
+            agent,
+            {"messages": msgs_for_agent},
+            files_seed=seed_files,
+            stream_mode="values",
+            config={"recursion_limit": recursion_limit},
+        )
 
-            for state in stream_iter:
-                final_state = state
-                files = state.get("files") or {}
-                files = files if isinstance(files, dict) else {}
-
-                file_keys = set(files.keys())
-
-                # phase inference（依檔案產物）
-                if "/analysis/claims.json" in file_keys or "/analysis/reflections.json" in file_keys:
-                    set_phase(s, "analysis")
-                if any(k.startswith("/evidence/") for k in file_keys):
-                    set_phase(s, "evidence")
-                if "/draft.md" in file_keys:
-                    set_phase(s, "draft")
-                if "/review.md" in file_keys:
-                    set_phase(s, "review")
-
-                _render_doc_hits()
-                _render_memo_from_state(state, files)
-                _render_files_preview(files)
-
-                # stall detection：draft 一直不變且無引用 → fallback
-                draft_txt = files.get("/draft.md") or ""
-                if isinstance(draft_txt, str):
-                    draft_norm = norm_space(draft_txt)
-                    if len(draft_norm) >= stall_min_chars:
-                        h = _hash_norm_text(draft_norm)
-                        if last_draft_hash == h:
-                            draft_unchanged_streak += 1
-                        else:
-                            draft_unchanged_streak = 0
-                            last_draft_hash = h
-
-                        if has_visible_citations(draft_norm):
-                            draft_no_citation_streak = 0
-                        else:
-                            draft_no_citation_streak += 1
-
-                        if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
-                            set_phase(s, "error")
-                            st.session_state["last_run_forced_end"] = "citation_stall"
-                            s.warning("判定卡住（引用未生成），已改用 fallback。")
-                            diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
-                            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
-                            return answer, files if files else None
-
-        except GraphRecursionError:
-            set_phase(s, "error")
-            st.session_state["last_run_forced_end"] = "recursion_limit"
-            files = (final_state or {}).get("files") or {}
+        for state in stream_iter:
+            final_state = state
+            files = state.get("files") or {}
             files = files if isinstance(files, dict) else {}
-            draft = (files.get("/draft.md") or "")
-            draft = strip_internal_process_lines(draft if isinstance(draft, str) else "")
-            if draft.strip():
-                return draft.strip(), (files if files else None)
-            diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
-            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
-            return answer, (files if files else None)
+            file_keys = set(files.keys())
+
+            if "/analysis/claims.json" in file_keys or "/analysis/reflections.json" in file_keys:
+                set_phase(s, "analysis")
+            if any(k.startswith("/evidence/") for k in file_keys):
+                set_phase(s, "evidence")
+            if "/draft.md" in file_keys:
+                set_phase(s, "draft")
+            if "/review.md" in file_keys:
+                set_phase(s, "review")
+
+            _render_doc_hits()
+            _render_memo(files)
+            _render_files_preview(files)
+
+            draft_txt = files.get("/draft.md") or ""
+            if isinstance(draft_txt, str):
+                draft_norm = norm_space(draft_txt)
+                if len(draft_norm) >= stall_min_chars:
+                    h = _hash_norm_text(draft_norm)
+                    if last_draft_hash == h:
+                        draft_unchanged_streak += 1
+                    else:
+                        draft_unchanged_streak = 0
+                        last_draft_hash = h
+
+                    if has_visible_citations(draft_norm):
+                        draft_no_citation_streak = 0
+                    else:
+                        draft_no_citation_streak += 1
+
+                    if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
+                        set_phase(s, "error")
+                        st.session_state["last_run_forced_end"] = "citation_stall"
+                        s.warning("判定卡住（引用未生成），已改用 fallback。")
+                        diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
+                        answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
+                        return answer, files if files else None
 
         files = (final_state or {}).get("files") or {}
         files = files if isinstance(files, dict) else {}
         final_text = files.get("/draft.md") or ""
         final_text = strip_internal_process_lines(final_text if isinstance(final_text, str) else "")
         set_phase(s, "done")
+        return final_text or "（DeepAgent 沒有產出內容）", (files if files else None)
 
-    return final_text or "（DeepAgent 沒有產出內容）", files if files else None
+    except GraphRecursionError:
+        set_phase(s, "error")
+        st.session_state["last_run_forced_end"] = "recursion_limit"
+        files = (final_state or {}).get("files") or {}
+        files = files if isinstance(files, dict) else {}
+        draft = files.get("/draft.md") or ""
+        draft = strip_internal_process_lines(draft if isinstance(draft, str) else "")
+        if draft.strip():
+            return draft.strip(), (files if files else None)
+        diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
+        answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
+        return answer, (files if files else None)
+
+    finally:
+        if _need_exit:
+            status_cm.__exit__(None, None, None)
 
 
 # =========================
