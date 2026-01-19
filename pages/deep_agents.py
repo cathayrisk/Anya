@@ -2434,7 +2434,7 @@ if prompt:
             agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
 
             # deep_agent_run_with_live_status 內部本來就有 st.status（會顯示 todos/evidence/claims/反思/doc hits）
-            answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages, client=client, status=main_status,   # ✅ 共享同一個 status)
+            answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages, client=client, status=main_status,)
 
             answer_text = strip_internal_process_lines(answer_text)
             if st.session_state.get("enable_output_formatter", True):
