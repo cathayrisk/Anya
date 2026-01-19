@@ -2271,7 +2271,7 @@ with st.popover("📦 文件管理 / Skills / Debug"):
         st.markdown("#### 文件清單")
         st.dataframe(
             df_files.drop(columns=["file_id"]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
