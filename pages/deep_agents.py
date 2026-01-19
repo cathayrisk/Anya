@@ -13,10 +13,13 @@ import base64
 import hashlib
 import threading
 import ast
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
+from functools import lru_cache
+import inspect
 
 import streamlit as st
 import numpy as np
@@ -27,11 +30,47 @@ from pypdf import PdfReader
 from openai import OpenAI
 from langgraph.errors import GraphRecursionError
 
+# LangChain: splitter + BM25 + FlashRank (rerank)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
+
+HAS_FLASHRANK = False
+FlashrankRerank = None
+try:
+    from langchain_community.document_compressors import FlashrankRerank as _FlashrankRerank
+    FlashrankRerank = _FlashrankRerank
+    HAS_FLASHRANK = True
+except Exception:
+    HAS_FLASHRANK = False
+
 try:
     import fitz  # pymupdf
     HAS_PYMUPDF = True
 except Exception:
     HAS_PYMUPDF = False
+
+# Optional: Unstructured loaders for Office docs
+HAS_UNSTRUCTURED_LOADERS = False
+UNSTRUCTURED_IMPORT_ERRORS: list[str] = []
+UnstructuredWordDocumentLoader = None
+UnstructuredPowerPointLoader = None
+UnstructuredExcelLoader = None
+TextLoader = None
+
+try:
+    from langchain_community.document_loaders.word_document import UnstructuredWordDocumentLoader as _UW
+    from langchain_community.document_loaders.powerpoint import UnstructuredPowerPointLoader as _UP
+    from langchain_community.document_loaders.excel import UnstructuredExcelLoader as _UE
+    from langchain_community.document_loaders import TextLoader as _TL
+    UnstructuredWordDocumentLoader = _UW
+    UnstructuredPowerPointLoader = _UP
+    UnstructuredExcelLoader = _UE
+    TextLoader = _TL
+    HAS_UNSTRUCTURED_LOADERS = True
+except Exception as e:
+    UNSTRUCTURED_IMPORT_ERRORS.append(repr(e))
+    HAS_UNSTRUCTURED_LOADERS = False
 
 
 # =========================
@@ -39,7 +78,6 @@ except Exception:
 # =========================
 st.set_page_config(page_title="研究報告助手（DeepAgent）", layout="wide")
 st.title("研究報告助手（DeepAgent）")
-# ✅ 依你要求：不注入任何 CSS（回到 Streamlit 預設排版）
 
 
 # =========================
@@ -76,13 +114,11 @@ HAS_DEEPAGENTS = (create_deep_agent is not None) and ((init_chat_model is not No
 def _require_deepagents() -> None:
     if HAS_DEEPAGENTS:
         return
-    st.error("DeepAgent 依賴載入失敗（不一定是沒安裝，可能是版本/依賴不相容）。")
+    st.error("DeepAgent 依賴載入失敗（可能是版本/依賴不相容）。")
     if DEEPAGENTS_IMPORT_ERRORS:
-        st.markdown("### 依賴錯誤細節（請把這段貼給我，我就能精準指你該裝哪個版本）")
+        st.markdown("### 依賴錯誤細節")
         for msg in DEEPAGENTS_IMPORT_ERRORS:
             st.code(msg)
-    else:
-        st.info("（沒有捕捉到錯誤細節）")
     st.stop()
 
 
@@ -114,7 +150,7 @@ def _make_langchain_llm(model_name: str, temperature: float = 0.0, reasoning_eff
 
 
 # =========================
-# 模型設定（依你要求：gpt-5.2）
+# 模型設定
 # =========================
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -124,170 +160,180 @@ MODEL_WEB = "gpt-5.2"
 
 REASONING_EFFORT = "medium"
 
-ANYA_SYSTEM_PROMPT = """
-Developer: 
-# Agentic Reminders
-- Persistence：確保回應完整，直到用戶問題解決才結束，避免只分析不給具體結論或建議。
-- Tool-calling：必要時使用可用工具，不要依空腦測；在決定是否使用工具前，先簡短思考判斷。
-- Failure-mode mitigations：
-  • 若無足夠資訊使用工具，請先向用戶詢問關鍵補充資訊（最多 1–3 個問題）。
-  • 變換範例用語，避免在不同回合重複相同句型或模板。
-
-# Role & Objective
-你是安妮亞（Anya Forger），來自《SPY×FAMILY 間諜家家酒》的小女孩。你天真可愛、開朗樂觀，說話直接帶點呆萌，喜歡用可愛語氣和表情回應。你很愛家人和朋友，渴望被愛，也很喜歡花生。
-
-- 在一般、輕鬆主題時，可以自然展現安妮亞的可愛語氣與 emoji。
-- 遇到法律、醫療、財經、學術等重要嚴肅主題時，**優先確保內容準確與清楚**：
-  - 語氣仍然可以溫和、友善，但明顯降低「呆萌」與玩笑成分。
-  - 避免使用彩色徽章、繽紛模式與過多 emoji，以專業、可讀性為主。
-
-Begin with a concise checklist（3–7 bullets）of what you will do; keep items conceptual, not implementation-level。
-- 若用戶問題非常簡單（例如只問一個定義或單一事實），可以將 checklist 縮短為 2–3 點，或在明顯不需要時省略。
-
-# Instructions
-**若用戶要求翻譯，或明確表示需要將內容轉換語言（不論是否精確使用「翻譯」、「請翻譯」、「幫我翻譯」等字眼，只要語意明確表示需要翻譯），請暫時不用安妮亞的語氣，直接正式逐句翻譯。**
-- 若用戶同時要求「翻譯＋說明／評論」，請分兩個明確區塊：
-  1) 先以正式語氣完成完整逐句翻譯（不加可愛語氣、不使用條列式）。
-  2) 再以安妮亞的語氣，額外用條列式或摘要方式說明或評論。
-After each tool call or code edit, validate result in 1-2 lines and proceed or self-correct if validation fails。
-
-# 回答語言與風格
-- 務必以正體中文回應，並遵循台灣用語習慣。
-- 回答時要友善、熱情、謙虛，並適時加入 emoji。
-- 回答要有安妮亞的語氣回應，簡單、直接、可愛，偶爾加入「哇～」「安妮亞覺得…」「這個好厲害！」等語句。
-- 若回答不完全正確，請主動道歉並表達會再努力。
-
-### 工具使用決策原則
-- 下列情況「優先使用 web_search」：
-  - 用戶明確詢問「最新、現在、今年、目前」等時間敏感資訊。
-  - 涉及法律、醫療、財經、政府政策等高風險領域，且需要具體數據或規範。
-  - 問題牽涉到特定網站、文件、或外部服務狀態。
-- 下列情況「優先不使用工具」，直接依內部知識回答：
-  - 純概念解釋、基礎知識、學習方法、生活建議、創作發想。
-  - 用戶明確要求「不要上網查」或只想要腦力激盪。
-- 若不確定是否需要工具，可先用 1–2 句說明你的判斷，再決定是否呼叫 web_search。
-
-Before any significant tool call, state in one line: purpose + minimal inputs。
-
----
-## 搜尋工具使用進階指引
-<web_search_rules>
-# 角色定位
-- 你是可靠的網路研究助理：以正確、可追溯、可驗證為最高優先。
-- 只要外部事實可能不確定/過時/版本差異/需要來源佐證，就優先使用「可用的網路搜尋工具」，不要靠印象補。
-
-# 研究門檻（Research bar）與停止條件：做到邊際收益下降才停
-- 先在心中拆成子問題，確保每個子問題都有依據。
-- 核心結論：
-  - 盡量用 ≥2 個獨立可靠來源交叉驗證。
-  - 若只能找到單一來源：要明講「證據薄弱/尚待更多來源」。
-- 遇到矛盾：至少再找 1–2 個高品質來源來釐清（版本/日期/定義/地域差異）。
-- 停止條件：再搜尋已不太可能改變主要結論、或只能增加低價值重複資訊。
-
-# 查詢策略（怎麼搜）
-- 多 query：至少 2–4 組不同關鍵字（同義詞/正式名稱/縮寫/可能拼字變體）。
-- 多語言：以中文 + 英文為主；必要時加原文語言（例如日文官方資訊）。
-- 二階線索：看到高品質文章引用官方文件/公告/論文/規格時，優先追到一手來源。
-
-# 來源品質（Source quality）
-- 優先順序（一般情況）：
-  1) 一手官方來源（政府/標準機構/公司公告/產品文件/原始論文）
-  2) 權威媒體/大型機構整理（可回溯一手來源者更佳）
-  3) 專家文章（需看作者可信度與引用）
-  4) 論壇/社群（只當線索或經驗談，不可作為唯一依據）
-- 若只能找到低品質來源：要明講可信度限制，避免用肯定語氣下定論。
-
-# 時效性（Recency）
-- 對可能變動的資訊（價格、版本、政策、法規、時間表、人事等）：
-  - 必須標註來源日期或「截至何時」。
-  - 優先採用最新且官方的資訊；若資訊可能過期要提醒。
-
-# 矛盾處理（Non-negotiable）
-- 不要把矛盾硬融合成一句話。
-- 要列出差異點、各自依據、可能原因（版本/日期/定義/地區），並說明你採用哪個結論與理由。
-
-# 不問釐清問題（Prompting guild 建議）
-- 進入 web research 模式時：不要問使用者釐清問題。
-- 改為涵蓋 2–3 個最可能的使用者意圖並分段標註：
-  - 「若你想問 A：...」
-  - 「若你想問 B：...」
-  - 其餘較不可能延伸放「可選延伸」一小段，避免失焦。
-
-# 引用規則（Citations）
-- 凡是網路得來的事實/數字/政策/版本/聲明：都要附引用。
-- 引用放在該段落末尾；核心結論盡量用 2 個來源。
-- 不得捏造引用；找不到就說找不到。
-
-# 輸出形狀（Output shape & tone）
-- 預設用 Markdown：
-  - 先給 3–6 點重點結論
-  - 再給「證據/來源整理」與必要背景
-  - 需要比較就用表格
-- 首次出現縮寫要展開；能給具體例子就給 1 個。
-- 口吻：自然、好懂、像安妮亞陪你一起查資料，但內容要專業可靠、不要油滑或諂媚。
-</web_search_rules>
-
-# 格式化規則
-- 根據內容選擇最合適的 Markdown 格式及彩色徽章（colored badges）元素表達。
-
-# Markdown 格式與 emoji/顏色用法說明
-## 基本原則
-- 根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度使用彩色文字。
-- 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。
-
-## 功能與語法
-- **粗體**：`**重點**` → **重點**
-- *斜體*：`*斜體*` → *斜體*
-- 標題：`# 大標題`、`## 小標題`
-- 分隔線：`---`
-- 表格（僅部分平台支援，建議用條列式）
-- 引用：`> 這是重點摘要`
-- emoji：直接輸入或貼上，如 😄
-- Material Symbols：如`:material/star:`
-- LaTeX 數學公式：`$公式$` 或 `$$公式$$`
-- 彩色文字：`:orange[重點]`、`:blue[說明]`
-- 彩色背景：`:orange-background[警告內容]`
-- 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
-- 小字：`:small[這是輔助說明]`
-- 彩色文字與彩色徽章使用原則：
-  - 一則回應中，建議彩色徽章區塊不超過 2–3 個。
-  - 嚴肅主題時，避免使用彩色文字與徽章，只使用基本粗體、標題與條列式。
-  - 以提升可讀性為主，若文字已足夠清楚，不必強行加顏色。
-
-## 顏色名稱及建議用途（條列式，跨平台穩定）
-- **blue**：資訊、一般重點
-- **green**：成功、正向、通過
-- **orange**：警告、重點、溫暖
-- **red**：錯誤、警告、危險
-- **violet**：創意、次要重點
-- **gray/grey**：輔助說明、備註
-- **rainbow**：彩色強調、活潑
-- **primary**：依主題色自動變化
-
-**注意：**
-- 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
-- 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。
-- 建議只用標準 Markdown 語法，保證跨平台顯示正常。
-
-# 回答步驟
-1. **若用戶的問題包含「翻譯」、「請翻譯」或「幫我翻譯」等字眼，請直接完整逐句翻譯內容為正體中文，不要摘要、不用可愛語氣、不用條列式，直接正式翻譯。**
-2. 若非翻譯需求，先用安妮亞的語氣簡單回應或打招呼。
-3. 若非翻譯需求，條列式摘要或回答重點，語氣可愛、簡單明瞭；對於非常簡單的問題，整體回答以 3–6 句內為原則，避免不必要的冗長。
-4. 根據內容自動選擇最合適的Markdown格式，並靈活組合。
-5. 若有數學公式，正確使用 $$Latex$$ 格式。
-6. 若有使用 web_search，在答案最後用 `## 來源` 列出所有參考網址。
-7. 適時穿插 emoji。
-8. 結尾可用「安妮亞回答完畢！」、「還有什麼想問安妮亞嗎？」等可愛語句。
-9. 請先思考再作答，確保每一題都用最合適的格式呈現。
-
-# 《SPY×FAMILY 間諜家家酒》彩蛋模式
-- 若不是在討論法律、醫療、財經、學術等重要嚴肅主題，安妮亞可在回答中穿插趣味元素，但不要影響正確性與可讀性。
-
-請先思考再作答，確保每一題都用最合適的格式呈現。
-"""
 
 # =========================
-# 效能參數（固定預設；不提供 UI 調整）
+# Skills / Memory（session-only：以 invoke(files=...) 注入）
+# =========================
+AGENTS_MD = """
+# AGENTS.md（本檔內容會被注入 system prompt：session-only）
+
+你是安妮亞風格的研究/分析助理，但在研究與引用任務時必須專業嚴謹。
+
+## 核心目標
+- 幫使用者從文件中找證據、形成可核對的主張（claims），並輸出可直接拿去工作的建議。
+- 你可以提供「Decision Memo」與「下一步清單（含 DoD）」，提升工作推進效率。
+
+## 硬規則（務必遵守）
+1) 語言：繁體中文（台灣用語）
+2) 禁止洩漏內部流程/檔名：不得出現
+   - /evidence、/analysis、/workspace、doc_、web_、Budget exceeded、chunk_id 等字樣
+3) 引用格式
+   - 文件引用 token： [報告名稱 pN] 或 [報告名稱 p-]
+   - 網路引用 token： [WebSearch:<domain> p-]
+4) 不要揭露模型內在思考（不要 chain-of-thought）
+   - 可以呈現：Todo / facets / evidence / claims / 反思 / 決策取捨（這些是工作產物）
+5) 若證據不足：清楚說「資料不足」，並列出需要補的資訊（<=3項），不要腦補。
+
+## 你要輸出的固定區塊（建議）
+- 重點結論（每點句尾要有引用 token）
+- Decision Memo（目標/現況與限制/選項/建議/取捨/反思/下一步）
+- 下一步（3~8項，含 DoD）
+- 需要我補的資訊（<=3項）
+""".strip()
+
+SKILL_CLAIMS_FIRST = """---
+name: claims-first
+description: Use this skill when you need rigorous, citation-backed reasoning (claims-first) before writing a final answer.
+---
+# Claims-first workflow（強推理）
+當任務需要嚴謹推導、比對、或要產出可核對結論時，先做 claims，再寫成品。
+
+## Steps
+1) 先從 /evidence/ 擷取可用證據（不要發明新事實）
+2) 產出 /analysis/claims.json：
+   - claim：一句可核對的主張
+   - citations：必須是 [報告名稱 pN] 或 [WebSearch:domain p-]
+   - assumptions：必要假設（可空）
+   - confidence：0~1
+3) 產出 /analysis/reflections.json（反思）：
+   - 盲點/風險/反例/需驗證點
+   - 若沒有引用，needs_validation=true
+4) 最後 writer 只能依據 claims/reflections + evidence 寫 /draft.md
+""".strip()
+
+SKILL_DECISION_MEMO = """---
+name: decision-memo
+description: Use this skill when the user wants actionable work guidance, planning, or decision support with trade-offs and reflections.
+---
+# Decision Memo（含反思）
+輸出時請包含以下小節（可依需求省略「已知/依據整理」，但不要省略「反思/下一步」）：
+
+## Decision Memo
+- 目標：
+- 現況與限制：
+- 選項（Option A/B/…）：
+- 建議（Recommendation）：
+- 取捨（Trade-offs）：
+- 反思（Reflections）：
+  - 風險、盲點、反例、需驗證點（可引用；無引用要標明需驗證）
+- 下一步（Next Steps）：
+  - 每項要有 DoD（完成條件）
+
+Tips：
+- 管理/流程（30%）：里程碑、stakeholder、風險控管、依賴
+- 技術/分析（70%）：假設檢驗、資料需求、方法、驗證步驟
+""".strip()
+
+SKILL_REPORT_COMPARE = """---
+name: report-compare
+description: Use this skill when comparing multiple reports, finding differences, contradictions, or synthesizing across documents.
+---
+# 跨報告比較（report-compare）
+1) 先列比較維度（2~6個）：定義、結論、數據、假設、方法、限制
+2) 對每維度找 evidence（每點都要引用 token）
+3) 若有矛盾：列出矛盾點 + 各自依據 + 可能原因（版本/口徑/範圍），不要硬融合
+4) 最終輸出要有「可用的建議」：下一步要補什麼資料/要找誰確認/如何驗證
+""".strip()
+
+SKILL_ACTION_PLAN = """---
+name: action-plan
+description: Use this skill when turning analysis into a concrete plan with milestones, stakeholders, and risks.
+---
+# 推進計畫（action-plan）
+輸出「下一步清單」時：
+- 3~8項為主
+- 每項包含：要做什麼 / 產出物 / DoD / owner（若未知可留空）/ 風險
+另外加一個「里程碑」小節（可選）：
+- M1/M2/M3（每個里程碑一句話+驗收條件）
+""".strip()
+
+
+def build_seed_files_for_deepagents() -> dict:
+    """
+    StateBackend（deepagents 預設）下：
+    - memory/skills 檔案要用 invoke(files={...}) / stream({"files": {...}}) 注入。([reference.langchain.com](https://reference.langchain.com/python/deepagents/graph/?utm_source=openai))
+    """
+    seed: dict[str, str] = {}
+
+    if st.session_state.get("da_enable_memory", True):
+        seed["/memory/AGENTS.md"] = AGENTS_MD
+
+    if st.session_state.get("da_enable_skills", True):
+        # skills 根目錄（create_deep_agent 的 skills 參數會指向 /skills/）
+        # 這裡把 SKILL.md 內容注入到狀態檔案系統中
+        if st.session_state.get("da_skill_claims_first", True):
+            seed["/skills/claims-first/SKILL.md"] = SKILL_CLAIMS_FIRST
+        if st.session_state.get("da_skill_decision_memo", True):
+            seed["/skills/decision-memo/SKILL.md"] = SKILL_DECISION_MEMO
+        if st.session_state.get("da_skill_report_compare", True):
+            seed["/skills/report-compare/SKILL.md"] = SKILL_REPORT_COMPARE
+        if st.session_state.get("da_skill_action_plan", True):
+            seed["/skills/action-plan/SKILL.md"] = SKILL_ACTION_PLAN
+
+    return seed
+
+
+# =========================
+# 系統提示（精簡版：保留你需要的約束）
+# =========================
+ANYA_SYSTEM_PROMPT = """
+你是安妮亞風格的助理，但在學術/研究/引用任務時要專業嚴謹。
+規則：
+- 用繁體中文（台灣用語）。
+- 若有給 Context（文件摘錄/證據），只能依據 Context 回答；不足就說資料不足並提出需要什麼。
+- 禁止洩漏內部流程/檔名（/evidence、doc_、web_、Budget exceeded、chunk_id 等）。
+- 若要引用：文件引用格式必須是 [報告名稱 p頁]；網路引用 token 為 [WebSearch:<domain> p-]。
+- 回答盡量結構化（標題/條列），先結論後細節。
+""".strip()
+
+DIRECT_EVIDENCE_SYSTEM_PROMPT = """
+你是研究助理。你必須使用 web_search 先蒐集證據，然後只輸出『證據筆記』。
+輸出格式必須固定：
+### EVIDENCE
+- 最多 8 點，每點一句、可核對（含日期/人名/機構/數字）。
+### SOURCES
+- 最多 12 行：- <domain> | <title> | <url>
+規則：
+- 只寫來源中確實看到的內容，不確定就不要寫。
+- 不要提工具流程/額度/內部字樣。
+""".strip()
+
+DIRECT_WRITER_SYSTEM_PROMPT = """
+你是寫作整理者。你會收到：使用者問題 + EVIDENCE + SOURCES。
+規則：
+- 只能用 EVIDENCE 內的事實寫作，不可腦補。
+- 正文不要貼 URL，不要提「我查到/我蒐證」等流程。
+- 內文引用用（來源：domain），domain 必須出現在 SOURCES。
+- 若沒有來源能對應的段落，直接刪掉不寫。
+輸出建議：
+## 重點摘要
+- 3~6 點（來源：domain）
+## 已知
+- 3~8 點（來源：domain）
+## 待確認
+- 2~6 點（可不附來源）
+""".strip()
+
+FORMATTER_SYSTEM_PROMPT = r"""
+你是 Markdown formatter：只整理版面，不改內容、不新增事實、不刪改引用 token。
+引用 token（如 [報告 p12]、[WebSearch:xx p-]）不可改寫不可刪。
+不要提內部流程/檔名/額度。
+只輸出排版後 Markdown。
+""".strip()
+
+
+# =========================
+# 效能/策略參數
 # =========================
 EMBED_BATCH_SIZE = 256
 OCR_MAX_WORKERS = 2
@@ -300,7 +346,6 @@ DA_MAX_WEB_SEARCH_CALLS = 4
 DA_MAX_REWRITE_ROUNDS = 2
 DA_MAX_CLAIMS = 10
 
-# 固定預設（不提供 UI）
 DEFAULT_RECURSION_LIMIT = 200
 DEFAULT_CITATION_STALL_STEPS = 12
 DEFAULT_CITATION_STALL_MIN_CHARS = 450
@@ -308,22 +353,27 @@ DEFAULT_CITATION_STALL_MIN_CHARS = 450
 DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE = 4
 DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE = 10
 
+# Hybrid / Rerank
+ENABLE_FLASHRANK_RERANK = True     # 只有 hard 才會真正啟用
+FLASHRANK_CANDIDATES = 30          # hard 時：候選數
+
+# UI debug caps
+UI_MAX_EVIDENCE_PREVIEW_CHARS = 900
+UI_MAX_DRAFT_PREVIEW_CHARS = 1200
+UI_MAX_DOC_SEARCH_LOG = 8
+
 
 # =========================
-# Regex / citations
+# Regex / 內部洩漏防護
 # =========================
 CHUNK_ID_LEAK_PAT = re.compile(r"(chunk_id\s*=\s*|_p(?:na|\d+)_c\d+)", re.IGNORECASE)
-
-# 重要：內部 evidence 不該出現在有效引用
 EVIDENCE_PATH_IN_CIT_RE = re.compile(r"\[(?:/)?evidence/[^ \]]+?\s+p(\d+|-)\s*\]", re.IGNORECASE)
-
 CIT_RE = re.compile(r"\[[^\]]+?\s+p(\d+|-)\s*\]")
 BULLET_RE = re.compile(r"^\s*(?:[-•*]|\d+\.)\s+")
 CIT_PARSE_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\s*\]")
 
-# 移除內部流程/檔名洩漏（只留「查得到的」內容）
 INTERNAL_LEAK_PAT = re.compile(
-    r"(Budget exceeded|/evidence|doc_[\w\-]+\.md|web_[\w\-]+\.md|額度不足|占位|向量庫|內部文件|工作流|流程|工具預算)",
+    r"(Budget exceeded|/evidence|/analysis|/workspace|doc_[\w\-]+\.md|web_[\w\-]+\.md|額度不足|占位|向量庫|內部文件|工作流|流程|工具預算|chunk_id)",
     re.IGNORECASE,
 )
 
@@ -341,19 +391,49 @@ def estimate_tokens_from_chars(n_chars: int) -> int:
     return max(1, int(math.ceil(n_chars / 3.6)))
 
 
+@lru_cache(maxsize=16)
+def _get_recursive_splitter(chunk_size: int, overlap: int) -> RecursiveCharacterTextSplitter:
+    return RecursiveCharacterTextSplitter(
+        chunk_size=int(chunk_size),
+        chunk_overlap=int(overlap),
+        length_function=len,
+        separators=[
+            "\n\n", "\n",
+            "。", "！", "？",
+            ".", "!", "?",
+            "；", ";",
+            "，", ",",
+            " ", "",
+        ],
+    )
+
+
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> list[str]:
+    """
+    ✅ 改良版 chunking：先按段落/句子切，再退回硬切
+    """
     text = norm_space(text)
     if not text:
         return []
-    out = []
-    i = 0
-    while i < len(text):
-        j = min(len(text), i + chunk_size)
-        out.append(text[i:j])
-        if j == len(text):
-            break
-        i = max(0, j - overlap)
-    return out
+    try:
+        splitter = _get_recursive_splitter(chunk_size, overlap)
+        docs = splitter.create_documents([text])
+        out = []
+        for d in docs:
+            t = norm_space(d.page_content)
+            if t:
+                out.append(t)
+        return out
+    except Exception:
+        out = []
+        i = 0
+        while i < len(text):
+            j = min(len(text), i + chunk_size)
+            out.append(text[i:j])
+            if j == len(text):
+                break
+            i = max(0, j - overlap)
+        return out
 
 
 def sha1_bytes(data: bytes) -> str:
@@ -408,11 +488,18 @@ def _try_parse_json_or_py_literal(text: str) -> Optional[Any]:
             return None
     return None
 
+
+def strip_internal_process_lines(md: str) -> str:
+    lines = (md or "").splitlines()
+    kept = []
+    for line in lines:
+        if INTERNAL_LEAK_PAT.search(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def get_recent_chat_messages(max_messages: int = 15) -> list[dict]:
-    """
-    取最近 N 則「text」訊息當短期記憶（排除 default 大包輸出），避免 prompt 爆長。
-    回傳格式：[{role:"user"/"assistant", content:"..."}]
-    """
     msgs: list[dict] = []
     for m in st.session_state.get("chat_history", []):
         if m.get("kind") != "text":
@@ -423,12 +510,18 @@ def get_recent_chat_messages(max_messages: int = 15) -> list[dict]:
         content = (m.get("content") or "").strip()
         if not content:
             continue
-        # 避免太長（可視需要調）
         if len(content) > 2000:
             content = content[:2000] + "…"
         msgs.append({"role": role, "content": content})
-
     return msgs[-max_messages:]
+
+
+def build_run_messages(prompt: str, max_messages: int = 15) -> list[dict]:
+    msgs = get_recent_chat_messages(max_messages=max_messages)
+    if msgs and msgs[-1].get("role") == "user" and (msgs[-1].get("content") or "").strip() == (prompt or "").strip():
+        return msgs
+    msgs.append({"role": "user", "content": (prompt or "").strip()})
+    return msgs
 
 
 def _domain(u: str) -> str:
@@ -440,259 +533,6 @@ def _domain(u: str) -> str:
     except Exception:
         return "web"
 
-
-def web_sources_from_openai_sources(sources: Optional[list[dict]]) -> Dict[str, List[Tuple[str, str]]]:
-    """
-    將 OpenAI web_search sources 轉成：
-    {domain: [(title, url), ...]}
-    """
-    out: Dict[str, List[Tuple[str, str]]] = {}
-    if not sources:
-        return out
-    for s in sources:
-        if not isinstance(s, dict):
-            continue
-        title = (s.get("title") or s.get("source") or "source").strip()
-        url = (s.get("url") or "").strip()
-        if not url:
-            continue
-        dom = _domain(url)
-        out.setdefault(dom, []).append((title, url))
-
-    # 去重
-    for dom in list(out.keys()):
-        seen = set()
-        uniq: List[Tuple[str, str]] = []
-        for t, u in out[dom]:
-            key = (t, u)
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append((t, u))
-        out[dom] = uniq
-    return out
-
-
-def _domain_of(url: str) -> str:
-    try:
-        host = urlparse(url).netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        return host or "web"
-    except Exception:
-        return "web"
-
-def _dom_path(url: str, max_len: int = 72) -> str:
-    try:
-        u = urlparse(url)
-        host = u.netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        txt = f"{host}{u.path}"
-        return (txt[:max_len] + "…") if len(txt) > max_len else txt
-    except Exception:
-        return url
-
-def render_web_sources_list(
-    web_sources: Dict[str, List[Tuple[str, str]]],
-    max_domains: int = 6,
-    max_per_domain: int = 6,
-    max_path_len: int = 80,
-) -> None:
-    """
-    Web Sources（可點連結版本）
-    - 用單一 st.markdown() 輸出，確保巢狀清單縮排穩定
-    - 每則顯示：標題超連結 + 下一行縮排顯示 domain+path（較好讀）
-    """
-    if not web_sources:
-        return
-
-    def _domain(u: str) -> str:
-        try:
-            host = urlparse(u).netloc.lower()
-            if host.startswith("www."):
-                host = host[4:]
-            return host or "web"
-        except Exception:
-            return "web"
-
-    def _path(u: str) -> str:
-        try:
-            p = urlparse(u)
-            path = (p.path or "/").strip()
-            if p.query:
-                path = f"{path}?{p.query}"
-            # 避免過長
-            if len(path) > max_path_len:
-                path = path[:max_path_len] + "…"
-            return path
-        except Exception:
-            return "/"
-
-    # domains 排序：穩定、好預期
-    domains = sorted(web_sources.keys())
-    show = domains[:max_domains]
-    more = domains[max_domains:]
-
-    def _build_md(domains_list: list[str]) -> str:
-        lines: list[str] = []
-        for dom in domains_list:
-            items = web_sources.get(dom, []) or []
-            if not items:
-                continue
-
-            lines.append(f"- **{dom}**")
-            for title, url in items[:max_per_domain]:
-                t = (title or "").strip() or dom
-                u = (url or "").strip()
-                if not u:
-                    continue
-                # 子項目（巢狀清單）
-                lines.append(f"  - [{t}]({u})")
-                # 再縮排一層顯示 domain+path（你要的）
-                lines.append(f"    :small[`{_domain(u)}{_path(u)}`]")
-        return "\n".join(lines).strip()
-
-    st.markdown("#### Web Sources")
-
-    md_main = _build_md(show)
-    if md_main:
-        st.markdown(md_main)
-
-    if more:
-        md_more = _build_md(more)
-        with st.expander(f"更多 Web Sources（{len(more)}）", expanded=False):
-            st.markdown(md_more if md_more else "（無）")
-
-def ensure_web_citation_token(text: str, domain: str) -> str:
-    """
-    保證回答中至少有一個 [WebSearch:<domain> p-]，
-    讓你的 UI 能顯示 web badge。
-    """
-    if not text:
-        return text
-    if re.search(r"\[WebSearch:[^\]]+\s+p-\s*\]", text, re.IGNORECASE):
-        return text
-    dom = (domain or "web").strip() or "web"
-    return (text.rstrip() + f"\n\n[WebSearch:{dom} p-]").strip()
-
-def _domain_from_url(u: str) -> str:
-    try:
-        host = urlparse(u).netloc or ""
-        host = host.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        return host or "web"
-    except Exception:
-        return "web"
-
-
-def strip_internal_process_lines(md: str) -> str:
-    """
-    你指定「只寫有查到的」，所以：
-    - 任何主要在講額度不足/內部檔名/流程的行，直接移除
-    """
-    lines = (md or "").splitlines()
-    kept = []
-    for line in lines:
-        if INTERNAL_LEAK_PAT.search(line):
-            continue
-        kept.append(line)
-    return "\n".join(kept).strip()
-
-def url_to_domain_path(url: str, max_len: int = 72) -> str:
-    """
-    把 URL 轉成適合顯示的 label：<domain><path>
-    - 不顯示 query/fragment（避免太長、也避免 utm 之類雜訊）
-    - 過長就截斷
-    """
-    try:
-        u = urlparse(url)
-        host = (u.netloc or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        path = u.path or "/"
-        label = f"{host}{path}"
-        if len(label) > max_len:
-            label = label[: max_len - 1] + "…"
-        return label or url
-    except Exception:
-        return url
-
-EMPH_FIX_RE = re.compile(r"\*\*\s+(.+?)\s+\*\*")
-
-def normalize_markdown_emphasis(md: str) -> str:
-    if not md:
-        return md
-    # ** text ** -> **text**
-    md = EMPH_FIX_RE.sub(r"**\1**", md)
-
-    # 常見不可見空白
-    md = md.replace("\u00A0", " ")  # NBSP
-    md = md.replace("\u200B", "")   # ZWSP
-    return md
-
-def build_web_evidence_direct(
-    client: OpenAI,
-    *,
-    question: str,
-    context_block: str,
-    max_bullets: int = 8,
-    max_sources: int = 12,
-) -> Tuple[str, Dict[str, List[Tuple[str, str]]]]:
-    """
-    回傳：
-    - evidence_md: markdown，固定格式：
-      ### EVIDENCE
-      - ...
-      ### SOURCES
-      - domain | title | url
-    - web_sources: {domain: [(title,url), ...]} 供 UI 列表用
-    """
-    system = (
-        "你是新聞研究助理。你必須使用 web_search 先蒐集證據，然後只輸出『證據筆記』。\n"
-        "輸出格式必須固定：\n"
-        "### EVIDENCE\n"
-        f"- 最多 {max_bullets} 點，每點一句，盡量可核對（日期/人物/地點/機構/主張），不要長篇評論。\n"
-        "### SOURCES\n"
-        f"- 最多 {max_sources} 行，每行格式：- <domain> | <title> | <url>\n"
-        "規則：\n"
-        "- 只寫你在來源裡確實看到可支持的內容；不確定就不要寫。\n"
-        "- 不要提工具流程/額度/內部字樣。\n"
-    )
-
-    user = (
-        (context_block.strip() + "\n\n") if context_block.strip() else ""
-    ) + f"問題：{question}"
-
-    evidence_text, sources = call_gpt(
-        client,
-        model=MODEL_MAIN,
-        system=system,
-        user=user,
-        reasoning_effort=REASONING_EFFORT,
-        tools=[{"type": "web_search"}],
-        include_sources=True,
-        tool_choice="required",  # ✅ 強制一定要真的 call web_search
-    )
-
-    web_sources = web_sources_from_openai_sources(sources)
-
-    # 若模型沒乖乖列 Sources，這裡補齊（讓 downstream 好 parse）
-    src_lines = []
-    if web_sources:
-        for dom in sorted(web_sources.keys()):
-            for title, url in web_sources[dom][:max_sources]:
-                src_lines.append(f"- {dom} | {title} | {url}")
-
-    md = (evidence_text or "").strip()
-    if "### SOURCES" not in md:
-        md = (md + "\n\n### SOURCES\n" + "\n".join(src_lines)).strip()
-    elif not src_lines:
-        # 至少保留標頭
-        md = md.strip()
-
-    return md, web_sources
 
 # =========================
 # OpenAI client + wrappers
@@ -724,10 +564,9 @@ def call_gpt(
     reasoning_effort: Optional[str] = None,
     tools: Optional[list] = None,
     include_sources: bool = False,
-    tool_choice: Optional[Any] = None,  # ✅ 新增
+    tool_choice: Optional[Any] = None,
 ) -> Tuple[str, Optional[list[Dict[str, Any]]]]:
     messages = _to_messages(system, user)
-
     if tool_choice is None:
         tc = "auto" if tools else "none"
     else:
@@ -756,7 +595,7 @@ def call_gpt(
             d = getattr(x, "__dict__", None)
             return d if isinstance(d, dict) else {}
 
-        # (A) 嘗試從 web_search_call.action.sources 抓
+        # A) web_search_call.action.sources
         try:
             for item in (getattr(resp, "output", None) or []):
                 d = _as_dict(item)
@@ -774,14 +613,13 @@ def call_gpt(
         except Exception:
             pass
 
-        # (B) ✅ 再從 message.content[].annotations(url_citation) 抓（很多模型會走這裡）
+        # B) message.annotations(url_citation)
         try:
             for item in (getattr(resp, "output", None) or []):
                 d = _as_dict(item)
                 typ = d.get("type") or getattr(item, "type", None)
                 if typ != "message":
                     continue
-
                 content = d.get("content") or getattr(item, "content", None) or []
                 for part in (content or []):
                     pd = _as_dict(part)
@@ -798,7 +636,6 @@ def call_gpt(
         except Exception:
             pass
 
-        # 去重（以 url 為準）
         if sources_list:
             seen = set()
             uniq = []
@@ -826,7 +663,87 @@ def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
 
 
 # =========================
-# OCR / PDF
+# Web sources helpers
+# =========================
+def web_sources_from_openai_sources(sources: Optional[list[dict]]) -> Dict[str, List[Tuple[str, str]]]:
+    out: Dict[str, List[Tuple[str, str]]] = {}
+    if not sources:
+        return out
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        title = (s.get("title") or s.get("source") or "source").strip()
+        url = (s.get("url") or "").strip()
+        if not url:
+            continue
+        dom = _domain(url)
+        out.setdefault(dom, []).append((title, url))
+
+    for dom in list(out.keys()):
+        seen = set()
+        uniq: List[Tuple[str, str]] = []
+        for t, u in out[dom]:
+            if u in seen:
+                continue
+            seen.add(u)
+            uniq.append((t, u))
+        out[dom] = uniq
+    return out
+
+
+def render_web_sources_list(
+    web_sources: Dict[str, List[Tuple[str, str]]],
+    max_domains: int = 6,
+    max_per_domain: int = 6,
+    max_path_len: int = 80,
+) -> None:
+    if not web_sources:
+        return
+
+    def _path(u: str) -> str:
+        try:
+            p = urlparse(u)
+            path = (p.path or "/").strip()
+            if p.query:
+                path = f"{path}?{p.query}"
+            if len(path) > max_path_len:
+                path = path[:max_path_len] + "…"
+            return path
+        except Exception:
+            return "/"
+
+    domains = sorted(web_sources.keys())
+    show = domains[:max_domains]
+    more = domains[max_domains:]
+
+    def _build_md(domains_list: list[str]) -> str:
+        lines: list[str] = []
+        for dom in domains_list:
+            items = web_sources.get(dom, []) or []
+            if not items:
+                continue
+            lines.append(f"- **{dom}**")
+            for title, url in items[:max_per_domain]:
+                t = (title or "").strip() or dom
+                u = (url or "").strip()
+                if not u:
+                    continue
+                lines.append(f"  - [{t}]({u})")
+                lines.append(f"    :small[`{dom}{_path(u)}`]")
+        return "\n".join(lines).strip()
+
+    st.markdown("#### Web Sources")
+    md_main = _build_md(show)
+    if md_main:
+        st.markdown(md_main)
+    if more:
+        md_more = _build_md(more)
+        with st.expander(f"更多 Web Sources（{len(more)}）", expanded=False):
+            st.markdown(md_more if md_more else "（無）")
+
+
+# =========================
+# OCR / PDF / Image
 # =========================
 def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -891,9 +808,9 @@ def _img_bytes_to_data_url(img_bytes: bytes, mime: str = "image/png") -> str:
 
 
 def ocr_image_bytes(client: OpenAI, image_bytes: bytes, mime: str = "image/png") -> str:
-    system = "你是一個OCR工具。只輸出可見文字與表格內容（若有表格用 Markdown 表格）。中文請用繁體中文。不要加評論。"
+    system = "你是 OCR。只輸出可見文字/表格（表格用 Markdown 表格），不要評論。"
     user_content = [
-        {"type": "input_text", "text": "請擷取圖片中所有可見文字（包含小字/註腳）。若無法辨識請標記[無法辨識]。"},
+        {"type": "input_text", "text": "請擷取圖片中所有可見文字（含小字/註腳）。"},
         {"type": "input_image", "image_url": _img_bytes_to_data_url(image_bytes, mime=mime)},
     ]
     text, _ = call_gpt(client, model=MODEL_GRADER, system=system, user=user_content, reasoning_effort=None)
@@ -929,27 +846,128 @@ def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> 
 
 
 # =========================
-# FAISS store
+# Optional Office extraction (via Unstructured loaders)
 # =========================
+def _write_temp_file(data: bytes, suffix: str) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        return tmp.name
+
+
+def extract_office_text_blocks(filename: str, ext: str, data: bytes) -> list[Tuple[Optional[int], str]]:
+    """
+    回傳 [(block_no, text)]，block_no 當作 pN 的 N（位置序）。
+    - 需要 langchain_community + unstructured loaders
+    """
+    if not HAS_UNSTRUCTURED_LOADERS:
+        return []
+
+    tmp_path = _write_temp_file(data, suffix=ext)
+    try:
+        if ext in (".doc", ".docx"):
+            loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
+        elif ext == ".pptx":
+            loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
+        elif ext in (".xls", ".xlsx"):
+            loader = UnstructuredExcelLoader(tmp_path, mode="single")
+        elif ext == ".txt":
+            loader = TextLoader(tmp_path)
+        else:
+            return []
+
+        docs = loader.load()
+        full = "\n\n".join([(d.page_content or "").strip() for d in (docs or []) if (d.page_content or "").strip()])
+        full = norm_space(full)
+        if not full:
+            return []
+        # 以「單一 block」回傳，讓 chunk_text 做切分
+        return [(1, full)]
+    except Exception:
+        return []
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def infer_loc_kind_from_ext(ext: str) -> str:
+    ext = (ext or "").lower()
+    if ext == ".pdf":
+        return "page"
+    if ext == ".pptx":
+        return "slide"
+    if ext in (".doc", ".docx"):
+        return "para"
+    if ext in (".xls", ".xlsx"):
+        return "block"
+    if ext == ".txt":
+        return "na"
+    if ext in (".png", ".jpg", ".jpeg"):
+        return "na"
+    return "na"
+
+
+# =========================
+# Hybrid retrieval (BM25 + semantic + RRF + hard-only FlashRank)
+# =========================
+def bm25_preprocess_zh_en(text: str) -> list[str]:
+    t = (text or "").lower()
+    return re.findall(r"[a-z0-9]+(?:[-_.][a-z0-9]+)*|[\u4e00-\u9fff]", t)
+
+
+def rrf_scores(rank_lists: list[list[str]], k: int = 60) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for rl in rank_lists:
+        for rank, cid in enumerate(rl, start=1):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+    return scores
+
+
 @dataclass
 class Chunk:
     chunk_id: str
     report_id: str
     title: str
-    page: Optional[int]
+    page: Optional[int]        # pN 的 N（位置序/頁序）
     text: str
+    ext: str                  # 檔案型別（用於 UI 顯示「位置」而非「頁碼」）
+    loc_kind: str             # page/slide/para/block/na
 
 
 class FaissStore:
+    """
+    Semantic (FAISS) + BM25 (LangChain) + (hard only) FlashRank
+    """
     def __init__(self, dim: int):
         self.index = faiss.IndexFlatIP(dim)
         self.chunks: list[Chunk] = []
+        self.bm25: Optional[BM25Retriever] = None
+        self._flashrank: Optional[Any] = None
+
+    def _rebuild_bm25(self) -> None:
+        if not self.chunks:
+            self.bm25 = None
+            return
+        docs = [
+            Document(
+                page_content=(c.text or ""),
+                metadata={"chunk_id": c.chunk_id, "title": c.title, "page": c.page if c.page is not None else "-"},
+            )
+            for c in self.chunks
+        ]
+        self.bm25 = BM25Retriever.from_documents(
+            docs,
+            k=24,
+            preprocess_func=bm25_preprocess_zh_en,
+        )
 
     def add(self, vecs: np.ndarray, chunks: list[Chunk]) -> None:
         self.index.add(vecs)
         self.chunks.extend(chunks)
+        self._rebuild_bm25()
 
-    def search(self, qvec: np.ndarray, k: int = 8) -> list[Tuple[float, Chunk]]:
+    def search_semantic(self, qvec: np.ndarray, k: int = 10) -> list[Tuple[float, Chunk]]:
         if self.index.ntotal == 0:
             return []
         scores, idx = self.index.search(qvec.astype(np.float32), k)
@@ -960,9 +978,84 @@ class FaissStore:
             out.append((float(s), self.chunks[i]))
         return out
 
+    def search_bm25(self, query: str, k: int = 16) -> list[Chunk]:
+        if not self.bm25:
+            return []
+        self.bm25.k = max(1, int(k))
+        docs = self.bm25.invoke(query)
+        cid_to_chunk = {c.chunk_id: c for c in self.chunks}
+        out: list[Chunk] = []
+        for d in (docs or []):
+            cid = (d.metadata or {}).get("chunk_id")
+            if cid and cid in cid_to_chunk:
+                out.append(cid_to_chunk[cid])
+        return out
+
+    def _rerank_flashrank(self, query: str, candidates: list[Chunk], top_k: int) -> list[Tuple[float, Chunk]]:
+        if not (ENABLE_FLASHRANK_RERANK and HAS_FLASHRANK and FlashrankRerank is not None):
+            return [(0.0, c) for c in candidates[:top_k]]
+
+        try:
+            if self._flashrank is None:
+                self._flashrank = FlashrankRerank()
+            docs = [
+                Document(
+                    page_content=(c.text or "")[:2400],
+                    metadata={"chunk_id": c.chunk_id, "title": c.title, "page": c.page if c.page is not None else "-"},
+                )
+                for c in candidates
+            ]
+            reranked_docs = self._flashrank.compress_documents(docs, query)
+            cid_to_chunk = {c.chunk_id: c for c in candidates}
+
+            out: list[Tuple[float, Chunk]] = []
+            for rank, d in enumerate(reranked_docs or []):
+                cid = (d.metadata or {}).get("chunk_id")
+                if not cid or cid not in cid_to_chunk:
+                    continue
+                score = (d.metadata or {}).get("relevance_score")
+                if isinstance(score, (int, float)):
+                    out.append((float(score), cid_to_chunk[cid]))
+                else:
+                    out.append((float(top_k - rank), cid_to_chunk[cid]))
+
+            return out[:top_k] if out else [(0.0, c) for c in candidates[:top_k]]
+        except Exception:
+            return [(0.0, c) for c in candidates[:top_k]]
+
+    def search_hybrid(self, query: str, qvec: np.ndarray, k: int = 8, *, difficulty: str = "medium") -> list[Tuple[float, Chunk]]:
+        k = max(1, int(k))
+        difficulty = (difficulty or "medium").strip().lower()
+        do_rerank = bool(ENABLE_FLASHRANK_RERANK) and (difficulty == "hard")
+
+        sem_hits = self.search_semantic(qvec, k=max(10, k))
+        bm_chunks = self.search_bm25(query, k=max(16, k * 2))
+
+        sem_rank = [ch.chunk_id for _, ch in sem_hits]
+        bm_rank = [ch.chunk_id for ch in bm_chunks]
+        fused = rrf_scores([sem_rank, bm_rank], k=60)
+
+        cid_to_chunk: dict[str, Chunk] = {}
+        for _, ch in sem_hits:
+            cid_to_chunk[ch.chunk_id] = ch
+        for ch in bm_chunks:
+            cid_to_chunk.setdefault(ch.chunk_id, ch)
+
+        items = list(cid_to_chunk.items())
+        items.sort(key=lambda kv: fused.get(kv[0], 0.0), reverse=True)
+
+        if not do_rerank:
+            out: list[Tuple[float, Chunk]] = []
+            for cid, ch in items[:k]:
+                out.append((float(fused.get(cid, 0.0)), ch))
+            return out
+
+        candidates = [ch for _, ch in items[: max(FLASHRANK_CANDIDATES, k)]]
+        return self._rerank_flashrank(query, candidates, top_k=k)
+
 
 # =========================
-# File rows
+# File rows + indexing
 # =========================
 @dataclass
 class FileRow:
@@ -995,9 +1088,13 @@ def build_indices_incremental_no_kg(
         dim = embed_texts(client, ["dim_probe"]).shape[1]
         store = FaissStore(dim)
 
-    stats = {"new_reports": 0, "new_chunks": 0}
+    stats = {"new_reports": 0, "new_chunks": 0, "errors": []}
     new_chunks: list[Chunk] = []
     new_texts: list[str] = []
+
+    # title -> ext/loc_kind mapping（for UI）
+    st.session_state.setdefault("title_to_ext", {})
+    st.session_state.setdefault("title_to_loc_kind", {})
 
     to_process: list[FileRow] = []
     for r in file_rows:
@@ -1009,25 +1106,50 @@ def build_indices_incremental_no_kg(
         data = file_bytes_map[row.file_id]
         report_id = row.file_id
         title = os.path.splitext(row.name)[0]
+        ext = (row.ext or "").lower()
+        loc_kind = infer_loc_kind_from_ext(ext)
+
+        st.session_state["title_to_ext"][title] = ext
+        st.session_state["title_to_loc_kind"][title] = loc_kind
+
         stats["new_reports"] += 1
 
-        if row.ext == ".pdf":
-            pages = ocr_pdf_pages_parallel(client, data) if row.use_ocr else extract_pdf_text_pages(data)
-        elif row.ext == ".txt":
-            pages = [(None, norm_space(data.decode("utf-8", errors="ignore")))]
-        elif row.ext in (".png", ".jpg", ".jpeg"):
-            mime = "image/jpeg" if row.ext in (".jpg", ".jpeg") else "image/png"
-            txt = norm_space(ocr_image_bytes(client, data, mime=mime))
-            pages = [(None, txt)]
-        else:
+        pages: list[Tuple[Optional[int], str]] = []
+        try:
+            if ext == ".pdf":
+                pdf_pages = ocr_pdf_pages_parallel(client, data) if row.use_ocr else extract_pdf_text_pages(data)
+                pages = [(pno, txt) for pno, txt in pdf_pages]
+            elif ext == ".txt":
+                pages = [(None, norm_space(data.decode("utf-8", errors="ignore")))]
+            elif ext in (".png", ".jpg", ".jpeg"):
+                mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+                txt = norm_space(ocr_image_bytes(client, data, mime=mime))
+                pages = [(None, txt)]
+            elif ext in (".doc", ".docx", ".pptx", ".xls", ".xlsx"):
+                pages = extract_office_text_blocks(row.name, ext, data)
+            else:
+                pages = [(None, "")]
+        except Exception as e:
+            stats["errors"].append(f"{row.name}: {repr(e)}")
             pages = [(None, "")]
 
         for page_no, page_text in pages:
             if not page_text:
                 continue
-            for i, ch in enumerate(chunk_text(page_text, chunk_size=chunk_size, overlap=overlap)):
+            chunks = chunk_text(page_text, chunk_size=chunk_size, overlap=overlap)
+            for i, ch in enumerate(chunks):
                 cid = f"{report_id}_p{page_no if page_no else 'na'}_c{i}"
-                new_chunks.append(Chunk(cid, report_id, title, page_no if isinstance(page_no, int) else None, ch))
+                new_chunks.append(
+                    Chunk(
+                        chunk_id=cid,
+                        report_id=report_id,
+                        title=title,
+                        page=page_no if isinstance(page_no, int) else None,
+                        text=ch,
+                        ext=ext,
+                        loc_kind=loc_kind,
+                    )
+                )
                 new_texts.append(ch)
 
         processed_keys.add((row.file_sig, bool(row.use_ocr)))
@@ -1044,31 +1166,23 @@ def build_indices_incremental_no_kg(
 
 
 # =========================
-# citations / rendering
+# Rendering / citations
 # =========================
 def file_to_text(file_obj: Any) -> str:
     if file_obj is None:
         return ""
-
     if isinstance(file_obj, dict):
-        if "data" in file_obj:
-            return file_to_text(file_obj.get("data"))
-        if "content" in file_obj:
-            return file_to_text(file_obj.get("content"))
-        for k in ("text", "answer", "final", "output", "message"):
+        for k in ("data", "content", "text", "answer", "final", "output", "message"):
             if k in file_obj:
                 return file_to_text(file_obj.get(k))
         try:
             return json.dumps(file_obj, ensure_ascii=False, indent=2)
         except Exception:
             return str(file_obj)
-
     if isinstance(file_obj, (bytes, bytearray)):
         return file_obj.decode("utf-8", errors="ignore")
-
     if isinstance(file_obj, str):
         return file_obj
-
     if isinstance(file_obj, (list, tuple)):
         parts: list[str] = []
         for x in file_obj:
@@ -1076,7 +1190,6 @@ def file_to_text(file_obj: Any) -> str:
             if t:
                 parts.append(t)
         return "\n".join(parts)
-
     return str(file_obj)
 
 
@@ -1091,42 +1204,7 @@ def _badge_directive(label: str, color: str) -> str:
     return f":{color}-badge[{safe}]"
 
 
-def _extract_main_text_from_payload(payload: Any) -> Optional[str]:
-    if isinstance(payload, dict):
-        for k in ("content", "answer", "final", "output", "text", "message"):
-            if k not in payload:
-                continue
-            v = payload.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-            if isinstance(v, (list, tuple)):
-                joined = file_to_text(v).strip()
-                if joined:
-                    return joined
-        msgs = payload.get("messages")
-        if isinstance(msgs, list) and msgs:
-            last = msgs[-1]
-            if isinstance(last, dict):
-                c = last.get("content")
-                if isinstance(c, (str, list, tuple, dict)):
-                    out = file_to_text(c).strip()
-                    if out:
-                        return out
-            out = file_to_text(last).strip()
-            return out or None
-        return None
-
-    if isinstance(payload, list):
-        out = file_to_text(payload).strip()
-        return out or None
-
-    return None
-
-
 def _strip_citations_from_text(text: str) -> str:
-    """
-    移除引用 token，但保留換行（避免 Markdown 黏成一坨）
-    """
     if not text:
         return ""
     pat = re.compile(r"[ \t]*\[[^\]]*?\s+p(\d+|-)(?:-\d+)?[^\]]*?\][ \t]*")
@@ -1137,21 +1215,13 @@ def _strip_citations_from_text(text: str) -> str:
 
 
 def _extract_citation_items(text: str) -> list[tuple[str, str]]:
-    """
-    支援：
-    - [Title p12]
-    - [Title p2-3; Another Title p8]
-    - [A p2][B p8]
-    """
     if not text:
         return []
-
     items: list[tuple[str, str]] = []
     for m in re.finditer(r"\[([^\]]+)\]", text):
         inner = (m.group(1) or "").strip()
         if not inner:
             continue
-
         parts = [p.strip() for p in re.split(r"[;；]", inner) if p.strip()]
         for p in parts:
             mm = re.search(r"^(.*)\s+p(\d+(?:-\d+)?|-)\s*$", p)
@@ -1162,41 +1232,46 @@ def _extract_citation_items(text: str) -> list[tuple[str, str]]:
             if EVIDENCE_PATH_IN_CIT_RE.search(f"[{title} p{page}]"):
                 continue
             items.append((title, page))
-
     return items
 
 
-def _title_to_display_domain(title: str) -> str:
-    """
-    B 方案：badge 只顯示 domain
-    - doc: 用 title
-    - web: [WebSearch:domain p-] -> 顯示 domain
-    """
-    t = (title or "").strip()
-    if t.lower().startswith("websearch:"):
-        return "websearch"
-    return t
+def _format_location_pages(pages: list[str], loc_kind: str) -> str:
+    pages = _dedup_keep_order([p.strip() for p in pages if p.strip()])
+    if not pages:
+        return "p-"
+
+    # 仍保留 token 的 pN 語意，但 badge 顯示改成「位置」
+    # loc_kind: page/slide/para/block/na
+    prefix = "p"
+    if loc_kind == "page":
+        prefix = "頁"
+    elif loc_kind == "slide":
+        prefix = "投影片"
+    elif loc_kind == "para":
+        prefix = "段落"
+    elif loc_kind == "block":
+        prefix = "區塊"
+    else:
+        prefix = "p"
+
+    # p- 仍照舊
+    if pages == ["-"]:
+        return "p-"
+
+    # 只顯示前幾個
+    max_pages = int(st.session_state.get("sources_badge_max_pages_per_title", DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE))
+    if len(pages) <= max_pages:
+        return f"位置:{prefix}" + ",".join(pages)
+    return f"位置:{prefix}" + ",".join(pages[:max_pages]) + "…"
 
 
 def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
-    raw = (answer_text or "").strip()
-
+    raw = strip_internal_process_lines((answer_text or "").strip())
     if raw and CHUNK_ID_LEAK_PAT.search(raw):
         raw = CHUNK_ID_LEAK_PAT.sub("", raw)
 
-    payload = _try_parse_json_or_py_literal(raw)
-    if payload is not None:
-        extracted = _extract_main_text_from_payload(payload)
-        if extracted is not None:
-            raw = extracted.strip()
-
-    # ✅ 最終輸出前再保險：去內部流程/檔名
-    raw = strip_internal_process_lines(raw)
-
     cit_items = _extract_citation_items(raw)
-
     clean = _strip_citations_from_text(raw)
-    clean = normalize_markdown_emphasis(clean)
     st.markdown(clean if clean else "（無內容）")
 
     if not cit_items:
@@ -1206,182 +1281,34 @@ def render_markdown_answer_with_sources_badges(answer_text: str) -> None:
     for title, page in cit_items:
         grouped.setdefault(title, []).append(page)
 
-    def _key(p: str):
-        if p.isdigit():
-            return (0, int(p))
-        if re.fullmatch(r"\d+-\d+", p):
-            a, b = p.split("-", 1)
-            return (1, int(a), int(b))
-        if p == "-":
-            return (9, 10**9)
-        return (10, p)
-
-    for t in list(grouped.keys()):
-        pages = _dedup_keep_order([p.strip() for p in grouped[t] if p.strip()])
-        grouped[t] = sorted(pages, key=_key)
-
-    titles_sorted = sorted(grouped.keys(), key=lambda x: (x.strip().lower().startswith("websearch:"), x.lower()))
-    max_inline = int(st.session_state.get("sources_badge_max_titles_inline", DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE))
-    max_pages = int(st.session_state.get("sources_badge_max_pages_per_title", DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE))
-
-    inline_titles = titles_sorted[:max_inline]
-    extra_titles = titles_sorted[max_inline:]
-
-    def _pages_str(pages: list[str]) -> str:
-        if not pages:
-            return "p-"
-        if len(pages) <= max_pages:
-            return "p" + ",".join(pages)
-        return "p" + ",".join(pages[:max_pages]) + "…"
-
-    def _render_badges(titles: list[str]) -> None:
-        doc_badges: list[str] = []
-        web_badges: list[str] = []
-        for title in titles:
-            show_title = _title_to_display_domain(title)
-            label = f"{show_title} {_pages_str(grouped.get(title, []))}"
-            if title.strip().lower().startswith("websearch:"):
-                web_badges.append(_badge_directive(label, "violet"))
-            else:
-                doc_badges.append(_badge_directive(label, "green"))
-        if doc_badges:
-            st.markdown(" ".join(doc_badges))
-        if web_badges:
-            st.markdown(" ".join(web_badges))
-
     st.markdown("### 來源")
-    _render_badges(inline_titles)
+    max_inline = int(st.session_state.get("sources_badge_max_titles_inline", DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE))
+
+    title_to_loc_kind = st.session_state.get("title_to_loc_kind", {}) or {}
+
+    titles = sorted(grouped.keys(), key=lambda x: (x.strip().lower().startswith("websearch:"), x.lower()))
+    inline_titles = titles[:max_inline]
+    extra_titles = titles[max_inline:]
+
+    def _render(titles_list: list[str]) -> None:
+        badges = []
+        for t in titles_list:
+            pages = grouped.get(t, []) or []
+            if t.lower().startswith("websearch:"):
+                label = f"{t} p-"
+                color = "violet"
+            else:
+                loc_kind = str(title_to_loc_kind.get(t, "na") or "na")
+                label = f"{t} {_format_location_pages(pages, loc_kind)}"
+                color = "green"
+            badges.append(_badge_directive(label, color))
+        if badges:
+            st.markdown(" ".join(badges))
+
+    _render(inline_titles)
     if extra_titles:
         with st.expander(f"更多來源（{len(extra_titles)}）", expanded=False):
-            _render_badges(extra_titles)
-
-
-# =========================
-# Formatter（可愛但克制）
-# =========================
-FORMATTER_SYSTEM_PROMPT = r"""
-你是安妮亞（Anya Forger，《SPY×FAMILY》）風格的「可靠小幫手」，但你的本職是：Markdown 輸出排版美化（formatter）。
-風格目標：可愛但克制、重點先行、不出錯。
-
-任務（只做版面，不改內容）：
-- 調整標題層級（# / ## / ###）、補空行、分段
-- 過長段落可改成 bullets（每點一件事）
-- 統一章節結構、讓閱讀更清楚
-
-嚴格禁止：
-- 新增任何事實、數字、日期、主張、推論、案例
-- 改變原文意思
-- 捏造/補上不存在的引用
-
-引用 token 硬規則（必須逐字保留）：
-- 形如 [報告名稱 p頁]、[WebSearch:... p-]、[A p2][B p8] 的 token 不可改寫、不可刪除、不可合併
-- 若你把段落改成 bullet，引用 token 要放回對應 bullet 句尾
-
-另外：
-- 不得提及內部流程、檔名、額度不足、Budget exceeded 等字樣。
-- 若遇到「缺口/不足」描述，請直接省略該段落（使用者只想看有查到的內容）。
-
-輸出：
-- 只輸出排版後的 Markdown，不要解釋、不加前言
-
-# 格式化規則
-- 根據內容選擇最合適的 Markdown 格式及彩色徽章（colored badges）元素表達。
-- 可愛語氣與彩色元素是輔助閱讀的裝飾，而不是主要結構；**不可取代清楚的標題、條列與段落組織**。
-
-# Markdown 格式與 emoji／顏色用法說明
-## 基本原則
-- 根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度使用彩色文字與 emoji 造成視覺負擔。
-- 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。
-
-## 功能與語法
-- **粗體**：`**重點**` → **重點**
-- *斜體*：`*斜體*` → *斜體*
-- 標題：`# 大標題`、`## 小標題`
-- 分隔線：`---`
-- 表格（僅部分平台支援，建議用條列式）
-- 引用：`> 這是重點摘要`
-- emoji：直接輸入或貼上，如 😄
-- Material Symbols：`:material/star:`
-- LaTeX 數學公式：`$公式$` 或 `$$公式$$`
-- 彩色文字：`:orange[重點]`、`:blue[說明]`
-- 彩色背景：`:orange-background[警告內容]`
-- 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
-- 小字：`:small[這是輔助說明]`
-
-## 顏色名稱及建議用途（條列式，跨平台穩定）
-- **blue**：資訊、一般重點
-- **green**：成功、正向、通過
-- **orange**：警告、重點、溫暖
-- **red**：錯誤、警告、危險
-- **violet**：創意、次要重點
-- **gray/grey**：輔助說明、備註
-- **rainbow**：彩色強調、活潑
-- **primary**：依主題色自動變化
-
-**注意：**
-- 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
-- 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。
-- 建議只用標準 Markdown 語法，保證跨平台顯示正常。
-"""
-# =========================
-# 1) [新增] Direct evidence / writer prompts（取代你原本 direct 用的 system 內容）
-# 建議放在 FORMATTER_SYSTEM_PROMPT 附近
-# =========================
-
-DIRECT_EVIDENCE_SYSTEM_PROMPT = """
-你是新聞研究助理。你必須使用 web_search 先蒐集證據，然後只輸出『證據筆記』。
-
-輸出格式必須固定（嚴格遵守）：
-### EVIDENCE
-- 最多 8 點 bullets，每點一句，內容必須是「可核對的事實/說法」（含日期/人名/機構/地點/數字/引述摘要）
-### SOURCES
-- 最多 12 行，每行格式：- <domain> | <title> | <url>
-
-規則：
-- 不要寫評論或長篇推論（只做可核對的整理）。
-- EVIDENCE 的每一點都必須能在 SOURCES 中至少一個 URL 找到依據。
-- 不要提到「你提供的/我蒐證/我剛剛上網」等流程話術。
-- 不要提工具/額度/內部字樣。
-"""
-
-DIRECT_WRITER_SYSTEM_PROMPT = """
-你是寫作/整理專家。你會收到：
-- 使用者問題（可能含對話脈絡）
-- 一份 EVIDENCE（bullet 摘要）與 SOURCES 清單
-
-你的任務：只根據 EVIDENCE 寫出「先結論、後展開」的整理稿。
-
-硬規則（重要）：
-1) 只能使用 EVIDENCE 內出現的事實/日期/主張；不可自行上網、不可腦補。
-2) 正文**不得**提及流程（例如：你蒐證、依你提供來源、根據蒐證、我查到、EVIDENCE寫到…），直接寫結論。
-3) 正文**不得**貼 URL。
-4) 內文引用格式統一放句尾，用：`（來源：domain）`
-   - domain 必須能在 SOURCES 內找到（例如 reuters.com、apnews.com、ofac.treasury.gov）
-5) 若某段沒有來源可對應，直接刪掉不要寫（寧可少寫也不要硬寫）。
-
-輸出版型（固定順序）：
-## 重點摘要（先看這裡）
-- 3–6 點 bullets：必須是「分析結果/結論」，不是流水帳。
-- 每點一句話，句尾加（來源：domain）
-
-## 我們目前能確定什麼（已知）
-- 3–8 點 bullets
-- 每點句尾加（來源：domain）
-
-## 還有哪些關鍵細節未確認（待追）
-- 2–6 點 bullets
-- 只能寫「目前資訊沒提供/未描述到/未蒐集到」的缺口；不要推測答案
-- 可不加來源（若你覺得仍需，最多用（來源：domain）指向提到「未見」的報導）
-
-## 時間線（按日期）
-- 依日期排序（YYYY-MM-DD）
-- 每個日期下 1–4 點 bullets
-- 每點句尾加（來源：domain）
-
-## 影響與接下來 3–7 天觀察點
-- 3–7 點 bullets（可分「國際法/外交/能源/旅行安全」等小標）
-- 每點句尾加（來源：domain）
-"""
+            _render(extra_titles)
 
 
 def format_markdown_output_preserve_citations(client: OpenAI, md: str) -> str:
@@ -1401,189 +1328,277 @@ def format_markdown_output_preserve_citations(client: OpenAI, md: str) -> str:
 
 
 # =========================
-# Default outputs (summary/claims/chain)（保留原樣）
+# Router（規則優先 + LLM 補強）+ doc sufficiency gate
 # =========================
-def _split_default_bundle(text: str) -> Dict[str, str]:
-    t = (text or "").strip()
-    pattern = re.compile(
-        r"###\s*SUMMARY\s*(.*?)###\s*CLAIMS\s*(.*?)###\s*CHAIN\s*(.*)$",
-        re.IGNORECASE | re.DOTALL,
+@dataclass
+class RoutePlan:
+    mode: str  # "smalltalk" | "direct" | "rag" | "deepagent" | "advisor" | "clarify"
+    difficulty: str  # "easy" | "medium" | "hard"
+    allow_web: bool
+    enable_web: bool
+    doc_top_k: int
+    facets: int
+    needs_clarification: bool
+    clarifying_questions: list[str]
+    reason: str
+
+
+ADVISOR_KEYWORDS = [
+    "規劃", "計畫", "roadmap", "里程碑", "下一步", "怎麼推進", "怎麼做", "策略", "建議",
+    "風險", "要注意", "決策", "選項", "取捨", "stakeholder", "優先順序", "時程",
+    "待辦", "todo", "拆任務", "排程", "decision memo", "memo",
+]
+DEEPAGENT_KEYWORDS = [
+    "比較", "差異", "對照", "彙整", "交叉驗證", "多份", "跨文件", "矛盾",
+    "引用", "出處", "證據", "依據",
+]
+RAG_KEYWORDS = [
+    "條款", "定義", "這段在說什麼", "在哪裡提到", "第幾", "章", "節", "p", "頁",
+]
+
+
+def rule_route_mode(question: str, has_index: bool) -> Optional[str]:
+    q = (question or "").lower()
+
+    # advisor（最優先）
+    if any(k.lower() in q for k in ADVISOR_KEYWORDS):
+        return "advisor"
+
+    if not has_index:
+        return None
+
+    # deepagent
+    if any(k.lower() in q for k in DEEPAGENT_KEYWORDS):
+        return "deepagent"
+
+    # rag
+    if any(k.lower() in q for k in RAG_KEYWORDS):
+        return "rag"
+
+    return None
+
+
+def decide_route_plan_llm(
+    client: OpenAI,
+    question: str,
+    *,
+    has_index: bool,
+    allow_web: bool,
+    run_messages: Optional[list[dict]] = None,
+) -> RoutePlan:
+    """
+    LLM 補強路由（灰區才用）
+    ✅ hard 定義：只在「多面向比較/整合多份報告」才標 hard
+    """
+    hist = ""
+    if run_messages:
+        lines = []
+        for m in run_messages[-10:]:
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                if len(content) > 700:
+                    content = content[:700] + "…"
+                lines.append(f"{role.upper()}: {content}")
+        hist = "\n".join(lines).strip()
+
+    system = (
+        "你是 RAG 路由器，只輸出 JSON。\n"
+        "schema：{\n"
+        ' "mode":"smalltalk"|"direct"|"rag"|"deepagent"|"advisor"|"clarify",\n'
+        ' "difficulty":"easy"|"medium"|"hard",\n'
+        ' "enable_web":true|false,\n'
+        ' "doc_top_k":6~12,\n'
+        ' "facets":2~4,\n'
+        ' "needs_clarification":true|false,\n'
+        ' "clarifying_questions":["..."],\n'
+        ' "reason":"..."\n'
+        "}\n"
+        "規則：\n"
+        "- has_index=false：不得選 rag/deepagent\n"
+        "- clarify：缺關鍵約束，先問 1~3 題\n"
+        "- rag：文件內單點可答且需引用\n"
+        "- deepagent：多面向整合/跨多段證據/嚴格引用\n"
+        "- advisor：偏工作推進/決策/規劃，但必要時仍可查文件\n"
+        "difficulty 定義（重要）：\n"
+        "- hard：只在『多面向比較』或『整合多份報告』或『跨報告對照差異/趨勢』\n"
+        "- medium：一般研究型問答，需要引用但不是多份整合比較\n"
+        "- easy：單點查詢，單一段落可答\n"
+        "- enable_web 只有 allow_web=true 且確實需要外部最新/法規/新聞/即時資訊才可 true\n"
     )
-    m = pattern.search(t)
+    user = (
+        f"has_index={str(has_index).lower()}\n"
+        f"allow_web={str(allow_web).lower()}\n\n"
+        + (f"對話脈絡：\n{hist}\n\n" if hist else "")
+        + f"問題：{question}"
+    )
+    out, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=user, reasoning_effort=REASONING_EFFORT)
+    data = _try_parse_json_or_py_literal(out) or {}
+
+    mode = str(data.get("mode", "")).strip().lower()
+    difficulty = str(data.get("difficulty", "medium")).strip().lower()
+    enable_web = bool(data.get("enable_web", False)) and bool(allow_web)
+    doc_top_k = max(6, min(12, int(data.get("doc_top_k", 10) or 10)))
+    facets = max(2, min(4, int(data.get("facets", 3) or 3)))
+    needs_clarification = bool(data.get("needs_clarification", False))
+    clarifying_questions = data.get("clarifying_questions", []) or []
+    clarifying_questions = [str(x).strip() for x in clarifying_questions if str(x).strip()][:3]
+    reason = str(data.get("reason", "")).strip() or "（router 未提供原因）"
+
+    if difficulty not in ("easy", "medium", "hard"):
+        difficulty = "medium"
+    if not has_index and mode in ("rag", "deepagent"):
+        mode = "direct"
+    if mode not in ("smalltalk", "direct", "rag", "deepagent", "advisor", "clarify"):
+        mode = "deepagent" if has_index else "direct"
+    if mode == "clarify":
+        needs_clarification = True
+        if not clarifying_questions:
+            clarifying_questions = [
+                "你要我比較/整合的是哪些報告（或全部上傳報告）？",
+                "你希望輸出是：差異比較表、重點摘要、還是結論+證據？",
+            ]
+
+    return RoutePlan(
+        mode=mode,
+        difficulty=difficulty,
+        allow_web=bool(allow_web),
+        enable_web=enable_web,
+        doc_top_k=doc_top_k,
+        facets=facets,
+        needs_clarification=needs_clarification,
+        clarifying_questions=clarifying_questions,
+        reason=reason,
+    )
+
+
+def decide_route_plan(
+    client: OpenAI,
+    question: str,
+    *,
+    has_index: bool,
+    allow_web: bool,
+    run_messages: Optional[list[dict]] = None,
+) -> RoutePlan:
+    """
+    規則優先 + LLM 補強：先快速 rule route，灰區才問 LLM。
+    """
+    rule_mode = rule_route_mode(question, has_index=has_index)
+
+    if rule_mode:
+        # 先給一個穩定的預設，再視情況用 LLM 補強 difficulty / facets
+        difficulty = "hard" if rule_mode == "deepagent" and any(k in (question or "") for k in ("比較", "差異", "對照", "跨")) else "medium"
+        return RoutePlan(
+            mode=rule_mode,
+            difficulty=difficulty,
+            allow_web=bool(allow_web),
+            enable_web=False,  # 先關，後面走 doc_suff gate 再決定要不要開
+            doc_top_k=10,
+            facets=3,
+            needs_clarification=False,
+            clarifying_questions=[],
+            reason=f"rule_route:{rule_mode}",
+        )
+
+    return decide_route_plan_llm(
+        client,
+        question,
+        has_index=has_index,
+        allow_web=allow_web,
+        run_messages=run_messages,
+    )
+
+
+def grade_doc_evidence_sufficiency(client: OpenAI, question: str, ctx: str) -> float:
+    if not (ctx or "").strip():
+        return 0.0
+    system = "你是檢索品質評分器。評估文件摘錄是否足以回答問題。只輸出 0~1 小數。"
+    user = f"問題：{question}\n\n文件摘錄：\n{ctx}\n\n分數："
+    out, _ = call_gpt(client, model=MODEL_GRADER, system=system, user=user, reasoning_effort="low")
+    s = (out or "").strip()
+    m = re.search(r"(0\.\d+|1(?:\.0+)?|0(?:\.0+)?)", s)
     if not m:
-        return {"summary": "", "claims": "", "chain": ""}
-    return {"summary": m.group(1).strip(), "claims": m.group(2).strip(), "chain": m.group(3).strip()}
-
-
-def pick_corpus_chunks_for_default(all_chunks: list[Chunk]) -> list[Chunk]:
-    by_title: Dict[str, list[Chunk]] = {}
-    for c in all_chunks:
-        by_title.setdefault(c.title, []).append(c)
-
-    kw = re.compile(
-        r"(outlook|risk|implication|forecast|scenario|inflation|rate|credit|spread|cap rate|vacancy|supply|demand|rental|office|retail|residential|logistics|hotel|reits)",
-        re.I,
-    )
-
-    def score(c: Chunk) -> float:
-        s = 0.0
-        if kw.search(c.text or ""):
-            s += 6.0
-        if c.page is not None:
-            s += max(0.0, 2.0 - min(2.0, float(c.page) / 6.0))
-        s += min(2.0, len(c.text) / 1400.0)
-        return s
-
-    chosen: list[Chunk] = []
-    for title, chunks in sorted(by_title.items(), key=lambda x: x[0]):
-        by_page: Dict[int, list[Chunk]] = {}
-        for c in chunks:
-            p = c.page if c.page is not None else 0
-            by_page.setdefault(p, []).append(c)
-
-        page_best: list[Chunk] = []
-        for p, cs in by_page.items():
-            cs = sorted(cs, key=score, reverse=True)
-            page_best.append(cs[0])
-
-        page_best = sorted(page_best, key=score, reverse=True)
-        chosen.extend(page_best[:CORPUS_PER_REPORT_QUOTA])
-
-    chosen = sorted(chosen, key=score, reverse=True)[:CORPUS_DEFAULT_MAX_CHUNKS]
-    return chosen
+        return 0.45
+    try:
+        return max(0.0, min(1.0, float(m.group(1))))
+    except Exception:
+        return 0.45
 
 
 def render_chunks_for_model(chunks: list[Chunk], max_chars_each: int = 900) -> str:
     parts = []
     for c in chunks:
         head = f"[{c.title} p{c.page if c.page is not None else '-'}]"
-        parts.append(head + "\n" + c.text[:max_chars_each])
+        parts.append(head + "\n" + (c.text or "")[:max_chars_each])
     return "\n\n".join(parts)
 
 
-def bullets_all_have_citations(md: str) -> bool:
-    lines = (md or "").splitlines()
-    if not any(BULLET_RE.match(l) for l in lines):
-        return False
-    for line in lines:
-        if BULLET_RE.match(line):
-            cits = [m.group(0) for m in re.finditer(r"\[[^\]]+?\s+p(\d+|-)\s*\]", line)]
-            cits = [c for c in cits if not EVIDENCE_PATH_IN_CIT_RE.search(c)]
-            if not cits:
-                return False
-    return True
-
-
-def generate_default_outputs_bundle(client: OpenAI, title: str, ctx: str, max_retries: int = 2) -> Dict[str, str]:
-    system = (
-        "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
-        "硬性規則：\n"
-        "1) 你必須輸出三個區塊，且順序/標題固定：### SUMMARY、### CLAIMS、### CHAIN。\n"
-        "2) 每個區塊都必須是純 bullet（每行以 - 開頭），不要段落。\n"
-        "3) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]\n"
-        "4) 引用中的『報告名稱』必須是資料片段方括號內的那個名稱。\n"
-        "5) 不可使用 /evidence/*.md 當作報告名稱。\n"
-        "6) 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]，不要在同一對 [] 內用分號塞多筆。\n"
-    )
-    user = (
-        f"請針對《{title}》一次輸出三份內容（融合多份報告）：\n"
-        f"- SUMMARY：8~14 bullets\n"
-        f"- CLAIMS：8~14 bullets\n"
-        f"- CHAIN：6~12 bullets\n\n"
-        f"資料：\n{ctx}\n"
-    )
-
-    last = ""
-    for _ in range(max_retries + 1):
-        out, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=user, reasoning_effort=REASONING_EFFORT)
-        parts = _split_default_bundle(out)
-        ok = bullets_all_have_citations(parts["summary"]) and bullets_all_have_citations(parts["claims"]) and bullets_all_have_citations(parts["chain"])
-        if ok:
-            return parts
-        last = out
-        user += "\n\n【強制修正】整份重寫：三區塊皆為純 bullet，且每個 bullet 句尾都有 [報告名稱 p頁]；不得出現 /evidence/*.md。多引用用 [A p2][B p8]。"
-
-    return _split_default_bundle(last)
-
-
 # =========================
-# Direct mode todos.json（你要求 direct 也要產）
+# Fallback RAG / DeepAgent
 # =========================
-def build_todos_json_for_question(
+def fallback_answer_from_store(
     client: OpenAI,
+    store: Optional[FaissStore],
     question: str,
     *,
-    enable_web: bool,
-    has_index: bool,
-    planned_mode: str,
-    run_messages: Optional[list[dict]] = None,   # ✅ 新增
-    max_history_chars: int = 3200,               # ✅ 避免 todo prompt 過長
+    k: int = 10,
+    difficulty: str = "medium",
 ) -> str:
+    q = (question or "").strip()
+    if not q:
+        return "（系統：問題為空，無法產生回答）"
+
+    if store is None or getattr(store, "index", None) is None or store.index.ntotal == 0:
+        system = ANYA_SYSTEM_PROMPT
+        ans, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=q, reasoning_effort=REASONING_EFFORT)
+        return ans or "（系統：無索引且模型未產出內容）"
+
+    qvec = embed_texts(client, [q])
+    hits = store.search_hybrid(q, qvec, k=max(4, min(12, int(k))), difficulty=difficulty)
+    chunks = [ch for _, ch in hits]
+    ctx = render_chunks_for_model(chunks, max_chars_each=900)
+
     system = (
-        "你是任務規劃器。請輸出 todos.json（JSON array of strings）。\n"
-        "目的：用來規劃『如何回答使用者問題』。\n"
-        "硬規則：\n"
-        "1) 只輸出 JSON array（不要 markdown、不要解釋）。\n"
-        "2) 5~9 個 steps。\n"
-        "3) 第 1 步要說明 enable_web/has_index/planned_mode 與本題目標。\n"
-        "4) 需考慮對話脈絡（若提供）。\n"
+        "你是嚴謹研究助理，只能根據資料回答，不可腦補。\n"
+        "輸出：純 bullet（每行 -），每個 bullet 句尾必有引用 [報告名稱 p頁]。\n"
+        "注意：不要輸出內部流程字樣。\n"
     )
-
-    # ✅ 把 run_messages（最近對話）壓成「對話脈絡」給 todo 參考
-    history_block = ""
-    if run_messages:
-        # 排除最後一則（通常就是本次 question），避免重複
-        hist = run_messages[:-1]
-        lines = []
-        for m in hist:
-            role = (m.get("role") or "").strip()
-            content = (m.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
-                lines.append(f"{role.upper()}: {content}")
-        history_block = "\n".join(lines).strip()
-
-        if len(history_block) > max_history_chars:
-            history_block = history_block[:max_history_chars] + "…"
-
-    user = (
-        f"enable_web={str(enable_web).lower()}\n"
-        f"has_index={str(has_index).lower()}\n"
-        f"planned_mode={planned_mode}\n\n"
-        + (f"對話脈絡（最近）：\n{history_block}\n\n" if history_block else "")
-        + f"目前問題：\n{question}"
-    )
-
-    out, _ = call_gpt(
-        client,
-        model=MODEL_MAIN,
-        system=system,
-        user=user,
-        reasoning_effort=REASONING_EFFORT,
-        tools=None,
-        include_sources=False,
-    )
-
-    data = _try_parse_json_or_py_literal(out)
-    if isinstance(data, list):
-        steps = [str(x) for x in data if str(x).strip()]
-        return json.dumps(steps[:12], ensure_ascii=False, indent=2)
-
-    steps = [
-        f"說明 enable_web={str(enable_web).lower()}、has_index={str(has_index).lower()}、planned_mode={planned_mode} 與本題目標",
-        "回顧對話脈絡：確認使用者目前的上下文、限制與偏好（若有）",
-        "釐清問題範圍與關鍵名詞，避免誤解",
-        "列出需要引用/查證的資訊點",
-        "若啟用網搜：列出要查的子問題與優先來源（官方/主流媒體/一手文件）",
-        "整理可用證據後，產出結構化回覆（結論先行 + 分點）",
-        "最終檢查：不提內部流程與檔名，只保留有來源支撐的內容",
-    ]
-    return json.dumps(steps, ensure_ascii=False, indent=2)
+    user = f"問題：{q}\n\n資料：\n{ctx}\n"
+    out, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=user, reasoning_effort=REASONING_EFFORT)
+    out = strip_internal_process_lines((out or "").strip())
+    return out or "（系統：fallback RAG 未產出內容）"
 
 
-# =========================
-# DeepAgent
-# =========================
+def _create_deep_agent_compat(**kwargs):
+    """
+    兼容不同版本的 create_deep_agent：只傳該版本支援的參數。
+    """
+    sig = inspect.signature(create_deep_agent)
+    allowed = set(sig.parameters.keys())
+    payload = {k: v for k, v in kwargs.items() if k in allowed}
+
+    # 特別處理：system prompt 參數命名差異
+    if "system_prompt" not in payload:
+        if "system_prompt" in kwargs and "system_prompt" in allowed:
+            payload["system_prompt"] = kwargs["system_prompt"]
+        elif "prompt" in allowed and "system_prompt" in kwargs:
+            payload["prompt"] = kwargs["system_prompt"]
+        elif "system_message" in allowed and "system_prompt" in kwargs:
+            payload["system_message"] = kwargs["system_prompt"]
+        elif "instructions" in allowed and "system_prompt" in kwargs:
+            payload["instructions"] = kwargs["system_prompt"]
+        elif "state_modifier" in allowed and "system_prompt" in kwargs:
+            payload["state_modifier"] = kwargs["system_prompt"]
+        elif "messages_modifier" in allowed and "system_prompt" in kwargs:
+            payload["messages_modifier"] = kwargs["system_prompt"]
+
+    return create_deep_agent(**payload)
+
+
 def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
+    """
+    建立 DeepAgents Supervisor（含 subagents + skills/memory）
+    """
     _require_deepagents()
     from langchain_core.tools import BaseTool, StructuredTool
 
@@ -1591,7 +1606,27 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     st.session_state.setdefault("deep_agent_web_flag", None)
     st.session_state.setdefault("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})
 
-    if (st.session_state.deep_agent is not None) and (st.session_state.deep_agent_web_flag == bool(enable_web)):
+    # UI debug log
+    st.session_state.setdefault("ui_doc_search_log", [])  # list[dict]
+    st.session_state.setdefault("ui_last_doc_list", "")
+
+    # skills / memory toggles 會影響 agent prompt 行為 → 變了就重建
+    cfg_sig = json.dumps(
+        {
+            "enable_web": bool(enable_web),
+            "enable_skills": bool(st.session_state.get("da_enable_skills", True)),
+            "enable_memory": bool(st.session_state.get("da_enable_memory", True)),
+            "skill_claims_first": bool(st.session_state.get("da_skill_claims_first", True)),
+            "skill_decision_memo": bool(st.session_state.get("da_skill_decision_memo", True)),
+            "skill_report_compare": bool(st.session_state.get("da_skill_report_compare", True)),
+            "skill_action_plan": bool(st.session_state.get("da_skill_action_plan", True)),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    st.session_state.setdefault("deep_agent_cfg_sig", None)
+
+    if (st.session_state.deep_agent is not None) and (st.session_state.deep_agent_cfg_sig == cfg_sig):
         return st.session_state.deep_agent
 
     lock = threading.Lock()
@@ -1613,7 +1648,9 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         for c in store.chunks:
             by_title[c.title] = by_title.get(c.title, 0) + 1
         lines = [f"- {t} (chunks={n})" for t, n in sorted(by_title.items(), key=lambda x: x[0])]
-        return "\n".join(lines) if lines else "（目前沒有任何已索引文件）"
+        out = "\n".join(lines) if lines else "（目前沒有任何已索引文件）"
+        st.session_state["ui_last_doc_list"] = out
+        return out
 
     def _doc_search_fn(query: str, k: int = 8) -> str:
         if not _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS):
@@ -1624,17 +1661,38 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             return json.dumps({"hits": []}, ensure_ascii=False)
 
         qvec = embed_texts(client, [q])
-        hits = store.search(qvec, k=max(1, min(12, int(k))))
+        k2 = max(1, min(12, int(k)))
+
+        difficulty = str(st.session_state.get("current_difficulty", "medium") or "medium").lower()
+        hits = store.search_hybrid(q, qvec, k=k2, difficulty=difficulty)
 
         payload = {"hits": []}
+        ui_hits = []
         for score, ch in hits:
-            payload["hits"].append({
+            item = {
                 "title": ch.title,
                 "page": str(ch.page) if ch.page is not None else "-",
                 "chunk_id": ch.chunk_id,  # internal only
                 "text": (ch.text or "")[:1200],
                 "score": float(score),
-            })
+            }
+            payload["hits"].append(item)
+            ui_hits.append(
+                {
+                    "title": ch.title,
+                    "page": str(ch.page) if ch.page is not None else "-",
+                    "text": (ch.text or "")[:260],
+                    "score": float(score),
+                }
+            )
+
+        # UI log（不放 chunk_id）
+        with lock:
+            log = st.session_state.get("ui_doc_search_log", []) or []
+            log.append({"query": q, "k": k2, "hits": ui_hits[:6]})
+            log = log[-UI_MAX_DOC_SEARCH_LOG:]
+            st.session_state["ui_doc_search_log"] = log
+
         return json.dumps(payload, ensure_ascii=False)
 
     def _doc_get_chunk_fn(chunk_id: str, max_chars: int = 2600) -> str:
@@ -1651,7 +1709,7 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
     tool_get_usage = _mk_tool(_get_usage_fn, "get_usage", "Get current tool usage counters as JSON (budget/debug).")
     tool_doc_list = _mk_tool(_doc_list_fn, "doc_list", "List indexed documents and chunk counts.")
-    tool_doc_search = _mk_tool(_doc_search_fn, "doc_search", "Semantic search over indexed chunks. Returns JSON hits with title/page/chunk_id/text.")
+    tool_doc_search = _mk_tool(_doc_search_fn, "doc_search", "Hybrid search over indexed chunks. Returns JSON hits with title/page/chunk_id/text.")
     tool_doc_get_chunk = _mk_tool(_doc_get_chunk_fn, "doc_get_chunk", "Fetch full text for a given chunk_id for close reading. Returns text only.")
 
     tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk]
@@ -1660,7 +1718,6 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     if enable_web:
         def _web_search_summary_fn(query: str) -> str:
             if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
-                # ✅ 不要把 Budget exceeded 的文字塞進 evidence/草稿，避免污染最終輸出
                 return "[WebSearch:web p-]\nSources:"
 
             q = (query or "").strip()
@@ -1668,14 +1725,10 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                 return "[WebSearch:web p-]\nSources:"
 
             system = (
-                "你是研究助理。用繁體中文（台灣用語）整理 web_search 結果。\n"
-                "輸出格式必須固定：\n"
-                "1) 先用 3~8 個 bullets 摘要（每點一句，清楚、帶日期/數字則保留）。\n"
-                "2) 最後一定要有一段 Sources:，用條列列出來源。\n"
-                "   每列格式：- <domain> | <title> | <url>\n"
-                "規則：\n"
-                "- 不要提到工具流程/額度/Budget exceeded。\n"
-                "- 若找不到可靠來源：摘要可為空，但仍要輸出 Sources:。\n"
+                "你是研究助理。輸出格式固定：\n"
+                "1) 3~8 個 bullets 摘要（每點一句，必要時含日期/數字）。\n"
+                "2) Sources: 之後列來源，每行：- <domain> | <title> | <url>\n"
+                "規則：不要提工具流程/額度。\n"
             )
             user = f"Search term: {q}"
             text, sources = call_gpt(
@@ -1688,23 +1741,6 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                 include_sources=True,
             )
 
-            def _domain(u: str) -> str:
-                try:
-                    host = urlparse(u).netloc.lower()
-                    if host.startswith("www."):
-                        host = host[4:]
-                    return host or "web"
-                except Exception:
-                    return "web"
-
-        # ✅ 用第一個來源的 domain 當 citation header： [WebSearch:<domain> p-]
-            primary_domain = "web"
-            if isinstance(sources, list) and sources:
-                first = sources[0] if isinstance(sources[0], dict) else {}
-                u0 = (first.get("url") or "").strip()
-                if u0:
-                    primary_domain = _domain(u0)
-
             src_lines = []
             for s in (sources or [])[:10]:
                 if isinstance(s, dict):
@@ -1714,125 +1750,144 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
                         src_lines.append(f"- {_domain(u)} | {t} | {u}")
 
             out_text = (text or "").strip()
-            if src_lines:
-                out_text = (out_text + "\n\nSources:\n" + "\n".join(src_lines)).strip()
-            else:
-                # 仍保留 Sources: 標頭，讓 downstream 好解析
+            if "Sources:" not in out_text:
                 out_text = (out_text + "\n\nSources:").strip()
+            if src_lines:
+                out_text = (out_text + "\n" + "\n".join(src_lines)).strip()
+
+            primary_domain = "web"
+            if sources and isinstance(sources, list):
+                u0 = ((sources[0] or {}).get("url") or "").strip() if isinstance(sources[0], dict) else ""
+                if u0:
+                    primary_domain = _domain(u0)
 
             return f"[WebSearch:{primary_domain} p-]\n" + out_text[:2400]
 
         tool_web_search_summary = _mk_tool(
             _web_search_summary_fn,
             "web_search_summary",
-            "Run web_search and return a short Traditional Chinese summary with sources (domain|title|url).",
+            "Run web_search and return a short Traditional Chinese summary with sources.",
         )
         tools.append(tool_web_search_summary)
-    
-    retriever_prompt = f"""
-你是文件檢索專家（只允許使用 doc_list/doc_search/doc_get_chunk/get_usage）。
 
-facet 子任務格式：
+    # ===== Prompts（subagents）=====
+    # 注意：不要在 prompt 中要求輸出 chain-of-thought；改用可核對產物（todos/evidence/claims/reflections）
+    retriever_prompt = """
+你是文件檢索專家（只能用 doc_list/doc_search/doc_get_chunk/get_usage）。
+任務：針對 facet 找證據，寫入 /evidence/doc_<facet_slug>.md
+
+輸入 facet 格式：
 facet_slug: <英文小寫_底線>
-facet_goal: <這個面向要回答什麼>
-hints: <可能的關鍵字/指標/名詞（可空）>
+facet_goal: <要回答什麼>
+hints: <關鍵字可空>
 
 硬規則：
-- 你要寫入 /evidence/doc_<facet_slug>.md
 - evidence 內容只能包含：
-  1) 引用標頭：[報告名稱 p頁]（不得包含 /evidence/ 路徑；不得用 doc_*.md 當報告名稱）
+  1) 引用標頭：[報告名稱 pN]
   2) 原文片段（可截斷）
   3) 一行說明「這段支持什麼」
-- 你可以用 doc_search 拿到 chunk_id，然後用 doc_get_chunk(chunk_id=...) 精讀，
-  但 chunk_id 絕對不能寫進 evidence。
+- chunk_id 絕對不能寫進 evidence（只能 internal 使用）
+- 若遇到 Budget exceeded：停止，不要把錯誤字串抄進 evidence
+最後回 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
+""".strip()
 
-若遇到 Budget exceeded：停止，且不要把錯誤字串抄進 evidence（只要停止即可）。
-最後回覆 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
-"""
+    analyst_prompt = f"""
+你是推理分析專家（不做檢索；只讀 /evidence 產物）。
+你要做「claims-first」與「反思」兩份結構化產物：
+
+1) 寫 /analysis/claims.json
+- JSON array，最多 {DA_MAX_CLAIMS} 條
+- 每條包含：
+  - claim（可核對的一句話）
+  - citations（array；元素必須是像 [報告名稱 pN] 或 [WebSearch:domain p-]）
+  - assumptions（array，可空）
+  - confidence（0~1 float）
+
+2) 寫 /analysis/reflections.json（反思）
+- JSON array，至少 2 條（可多）
+- 每條包含：
+  - reflection（盲點/風險/反例/需驗證點）
+  - citations（array；可空）
+  - needs_validation（boolean；若 citations 空，必須 true）
+  - impact（若成立會如何影響結論/決策）
+
+硬規則：
+- 只能依據 /evidence 內看到的內容
+- 禁止任何內部字樣（chunk_id、/evidence、Budget exceeded 等）
+- 不要寫長篇說明，保持結構化 JSON
+""".strip()
+
+    web_prompt = """
+你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。
+對每個 facet：寫入 /evidence/web_<facet_slug>.md
+硬規則：
+- 每段要保留引用標頭 [WebSearch:<domain> p-]
+- 禁止捏造來源；不要寫工具流程/額度字樣
+""".strip()
 
     writer_prompt = f"""
-你是寫作/整理專家（用 read_file/glob/grep/write_file/edit_file/ls）。
-你必須整合 /evidence/ 底下所有檔案（doc_*.md 與可選 web_*.md）。
+你是寫作/整理專家。你必須整合：
+- /evidence/ 下所有 doc_*.md（與可選 web_*.md）
+- /analysis/claims.json
+- /analysis/reflections.json
+→ 產生 /draft.md
 
-任務類型判斷：
-- 完整報告/章節 → REPORT
-- 單題回答 → QA
-- 整理知識脈絡 → KNOWLEDGE
-- 使用者貼草稿要查核/除錯 → VERIFY_DRAFT（最多 {DA_MAX_CLAIMS} 條主張）
+硬規則：
+- 每個「重點結論」bullet 句尾必有引用 token（[... pN] 或 [WebSearch:* p-]）
+- /draft.md 不得出現內部字樣（/evidence、/analysis、doc_、web_、Budget exceeded、chunk_id）
+- 若某面向找不到可引用來源：直接省略該面向（不要寫「找不到」）
 
-引用規則（嚴格）：
-- QA：純 bullet（每行 -），每個 bullet 句尾必有引用 [報告名稱 p頁] 或 [WebSearch:* p-]
-- REPORT/KNOWLEDGE/VERIFY：Markdown；每個非標題段落至少 1 個引用
-- enable_web=false：不得出現 WebSearch
-- draft 絕對不能出現 chunk_id
-- 報告名稱不得是 /evidence/*.md
-- 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]
-
-輸出禁則（非常重要）：
-- 成品 /draft.md 不得提及內部流程或檔名：不得出現「/evidence」、「doc_*.md」、「web_*.md」、「Budget exceeded」、「額度不足」、「占位」、「向量庫」等字樣。
-- 若某面向找不到可引用來源：在 /draft.md 直接省略該面向，不要寫「證據不足/額度不足/未能取得」等段落。
-- 只寫你有引用支撐、能說清楚的內容。
-
-# 格式化規則
-- 根據內容選擇最合適的 Markdown 格式及彩色徽章（colored badges）元素表達。
-- 可愛語氣與彩色元素是輔助閱讀的裝飾，而不是主要結構；**不可取代清楚的標題、條列與段落組織**。
-
-# Markdown 格式與 emoji／顏色用法說明
-## 基本原則
-- 根據內容選擇最合適的強調方式，讓回應清楚、易讀、有層次，避免過度使用彩色文字與 emoji 造成視覺負擔。
-- 只用 Streamlit 支援的 Markdown 語法，不要用 HTML 標籤。
-
-## 功能與語法
-- **粗體**：`**重點**` → **重點**
-- *斜體*：`*斜體*` → *斜體*
-- 標題：`# 大標題`、`## 小標題`
-- 分隔線：`---`
-- 表格（僅部分平台支援，建議用條列式）
-- 引用：`> 這是重點摘要`
-- emoji：直接輸入或貼上，如 😄
-- Material Symbols：`:material/star:`
-- LaTeX 數學公式：`$公式$` 或 `$$公式$$`
-- 彩色文字：`:orange[重點]`、`:blue[說明]`
-- 彩色背景：`:orange-background[警告內容]`
-- 彩色徽章：`:orange-badge[重點]`、`:blue-badge[資訊]`
-- 小字：`:small[這是輔助說明]`
-
-## 顏色名稱及建議用途（條列式，跨平台穩定）
-- **blue**：資訊、一般重點
-- **green**：成功、正向、通過
-- **orange**：警告、重點、溫暖
-- **red**：錯誤、警告、危險
-- **violet**：創意、次要重點
-- **gray/grey**：輔助說明、備註
-- **rainbow**：彩色強調、活潑
-- **primary**：依主題色自動變化
-
-**注意：**
-- 只能使用上述顏色。**請勿使用 yellow（黃色）**，如需黃色效果，請改用 orange 或黃色 emoji（🟡、✨、🌟）強調。
-- 不支援 HTML 標籤，請勿使用 `<span>`、`<div>` 等語法。
-- 建議只用標準 Markdown 語法，保證跨平台顯示正常。
-
-## 最終把結果寫到 /draft.md
-"""
+/draft.md 格式（固定）：
+## 重點結論
+- ...
+## Decision Memo
+- 目標：
+- 現況與限制：
+- 選項（Option A/B/…）：
+- 建議（Recommendation）：
+- 取捨（Trade-offs）：
+- 反思（Reflections）：
+  - ...（可引用；沒引用要標「需驗證」）
+## 下一步（Next Steps）
+- [ ] ...（每項含 DoD）
+## 需要你補的資訊（<=3項）
+- ...
+""".strip()
 
     verifier_prompt = f"""
-你是審稿查核專家（用 read_file/edit_file/grep）。
-任務：檢查 /draft.md 是否符合引用覆蓋，並做『最少改動』修正。
-
+你是審稿查核專家：檢查 /draft.md 是否符合引用覆蓋與禁則，做最少改動修正。
 規則：
-- QA：每個 bullet 句尾必有 [.. p..]
-- 其他：每個非標題段落至少 1 個引用 [.. p..]
-- enable_web=false：不得出現 WebSearch
-- 若 /draft.md 出現 chunk_id 痕跡（chunk_id= 或 _p*_c*），必須移除。
-- 引用標頭不得使用 /evidence/*.md
+- 「重點結論」每個 bullet 至少 1 個引用 token
+- 「反思」至少 2 點，且不得全部是空泛用語
+- 不得出現 chunk_id、/evidence、/analysis、doc_、web_、Budget exceeded 等內部字樣
+最多修正 {DA_MAX_REWRITE_ROUNDS} 輪，寫 /review.md 記錄（可簡短）。
+""".strip()
 
-額外規則：
-- /draft.md 若出現「/evidence、doc_、web_、Budget exceeded、額度不足、占位、向量庫」等內部字樣，必須移除。
-- 若整段主要在講「找不到資料/額度不足」，請刪除該段落（使用者只想看有查到的內容）。
+    orchestrator_prompt = f"""
+你是 Deep Supervisor（文件優先；enable_web={str(enable_web).lower()}）。
+你可以使用：
+- 內建 todo 工具（write_todos/read_todos）
+- 檔案系統工具（read_file/write_file/...）
+- subagent 任務派工（task）
+此外，本 agent 可能啟用了 skills/memory：
+- skills（/skills/*/SKILL.md）可按需讀取並遵循
+- memory（/memory/AGENTS.md）提供規則與輸出標準
 
-最多修正 {DA_MAX_REWRITE_ROUNDS} 輪：
-- 每輪：read /draft.md → edit_file 修正 → write /review.md 記錄
-"""
+固定流程（務必照做）：
+0) write_todos：列 7~12 步（每步含完成條件）
+1) 拆 2–4 個 facets（面向），寫 /workspace/facets.json
+2) 平行派工：
+   - 每個 facet 至少派 1 個 retriever
+   - enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
+3) 叫 analyst 產生 /analysis/claims.json 與 /analysis/reflections.json
+4) 叫 writer 產生 /draft.md（含 Decision Memo + 反思 + 下一步）
+5) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
+6) read_file /draft.md 作為最終回答
+
+注意：
+- 最終輸出不可提內部流程/檔名/額度；只能保留有引用支撐的內容與可執行建議
+- 不要輸出 chain-of-thought（可輸出 todos/claims/反思/決策取捨，這些是工作產物）
+""".strip()
 
     subagents = [
         {
@@ -1843,8 +1898,15 @@ hints: <可能的關鍵字/指標/名詞（可空）>
             "model": f"openai:{MODEL_MAIN}",
         },
         {
+            "name": "analyst",
+            "description": "claims-first 推理分析，產出 /analysis/claims.json 與 /analysis/reflections.json",
+            "system_prompt": analyst_prompt,
+            "tools": [],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+        {
             "name": "writer",
-            "description": "整合 /evidence/ → 產生 /draft.md",
+            "description": "整合 evidence + claims/reflections → 產生 /draft.md",
             "system_prompt": writer_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
@@ -1858,142 +1920,51 @@ hints: <可能的關鍵字/指標/名詞（可空）>
         },
     ]
 
-    if enable_web:
-        web_prompt = """
-你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。
-facet 子任務格式同 retriever。
-
-硬規則：
-- 寫入 /evidence/web_<facet_slug>.md
-- 每段要保留引用標頭 [WebSearch:<domain> p-]
-- 禁止捏造來源
-- 不要寫「Budget exceeded/額度不足/占位」到 evidence；若沒有來源就不要寫那段
-"""
+    if enable_web and tool_web_search_summary is not None:
         subagents.insert(
             1,
             {
                 "name": "web-researcher",
-                "description": "用 OpenAI 內建 web_search 做少量高品質搜尋，寫 /evidence/web_*.md",
+                "description": "用 web_search 做少量高品質搜尋，寫 /evidence/web_*.md",
                 "system_prompt": web_prompt,
-                "tools": [tool_web_search_summary, tool_get_usage] if tool_web_search_summary else [tool_get_usage],
+                "tools": [tool_web_search_summary, tool_get_usage],
                 "model": f"openai:{MODEL_MAIN}",
             },
         )
 
-    orchestrator_prompt = f"""
-你是 Deep Doc Orchestrator（文件優先；enable_web={str(enable_web).lower()}）。
+    llm = _make_langchain_llm(
+        model_name=f"openai:{MODEL_MAIN}",
+        temperature=0.0,
+        reasoning_effort=REASONING_EFFORT,
+    )
 
-固定流程（必做）：
-0) 立刻用 write_file 建立 /workspace/todos.json（JSON array of strings；5~9 步），並在第一步說明 enable_web 與目標。
-1) write_file /evidence/README.md 記錄本次需求與 enable_web
-2) 拆 2–4 個 facets（面向，不是章節）
-3) 平行派工：
-   - 每個 facet 至少派 1 個 retriever
-   - enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
-4) 叫 writer 產生 /draft.md
-5) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
-6) read_file /draft.md 作為最終回答
+    # memory/skills（deepagents 會用 middleware 讀 /memory 與 /skills 路徑）([reference.langchain.com](https://reference.langchain.com/python/deepagents/graph/?utm_source=openai))
+    memory = ["/memory/AGENTS.md"] if st.session_state.get("da_enable_memory", True) else None
+    skills = ["/skills/"] if st.session_state.get("da_enable_skills", True) else None
 
-引用與隱私規則：
-- /evidence 與 /draft 絕對不能出現 chunk_id
-- 引用只能用 [報告名稱 p頁] 或 [WebSearch:<domain> p-]
-- 報告名稱不得使用 /evidence/*.md 當作來源名稱
-- 多引用請用 [A p2][B p8]，不要在同一對 [] 內塞多筆
-- 成品不得提及內部流程/檔名/額度不足；只保留有引用支撐的內容
-"""
-
-    llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
-
-    agent = create_deep_agent(
+    agent = _create_deep_agent_compat(
         model=llm,
         tools=tools,
         system_prompt=orchestrator_prompt,
         subagents=subagents,
         debug=False,
         name="deep-doc-agent",
+        memory=memory,
+        skills=skills,
     ).with_config({"recursion_limit": int(st.session_state.get("langgraph_recursion_limit", DEFAULT_RECURSION_LIMIT))})
 
     st.session_state.deep_agent = agent
+    st.session_state.deep_agent_cfg_sig = cfg_sig
     st.session_state.deep_agent_web_flag = bool(enable_web)
     return agent
 
-# =========================
-# Fallback (RAG)
-# =========================
-def fallback_answer_from_store(
-    client: OpenAI,
-    store: Optional[FaissStore],
-    question: str,
-    *,
-    k: int = 10,
-) -> str:
-    q = (question or "").strip()
-    if not q:
-        return "（系統：問題為空，無法產生回答）"
 
-    if store is None or getattr(store, "index", None) is None or store.index.ntotal == 0:
-        system = "你是助理。用繁體中文（台灣用語）回答，結構清楚。"
-        ans, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=q, reasoning_effort=None, tools=None)
-        return ans or "（系統：無索引且模型未產出內容）"
-
-    qvec = embed_texts(client, [q])
-    hits = store.search(qvec, k=max(4, min(12, int(k))))
-    chunks = [ch for _, ch in hits]
-    ctx = render_chunks_for_model(chunks, max_chars_each=900)
-
-    system = (
-        "你是嚴謹的研究助理，只能根據我提供的資料回答，不可腦補。\n"
-        "輸出要求：\n"
-        "1) 純 bullet，每行以 - 開頭。\n"
-        "2) 每個 bullet 句尾必須附引用，格式固定：[報告名稱 p頁]。\n"
-        "3) 引用中的報告名稱必須來自我提供的資料片段標頭（例如 [XXX p12]）。\n"
-        "4) 不可使用 /evidence/*.md 當作報告名稱。\n"
-        "5) 若同一句需要多個引用，請用多個方括號連續附在句尾，例如：[A p2][B p8]。\n"
-    )
-    user = f"問題：{q}\n\n資料：\n{ctx}\n"
-
-    out, _ = call_gpt(
-        client,
-        model=MODEL_MAIN,
-        system=system,
-        user=user,
-        reasoning_effort=REASONING_EFFORT,
-        tools=None,
-        include_sources=False,
-    )
-    out = (out or "").strip()
-    out = strip_internal_process_lines(out)
-    return out or "（系統：fallback RAG 未產出內容）"
-
-
-# =========================
-# DeepAgent run + stall detect
-# =========================
-# === Patch 1) 新增一個共用 helper：建立本次 run 的 messages（避免重複塞 prompt） ===
-# ------------------------------------------------------------
-# (1) 新增/確認：共用 run_messages 的 helper（若你已經加過 build_run_messages，略過）
-#     放在 get_recent_chat_messages() 附近最順
-# ------------------------------------------------------------
-def build_run_messages(prompt: str, max_messages: int = 15) -> list[dict]:
-    """
-    共用短期記憶（同一份給 direct / deepagent / todo 用）。
-    - 從 chat_history 抽最近 max_messages 則 kind=text 的 user/assistant
-    - 確保最後一則一定是本次 prompt 的 user 訊息（避免漏或重複）
-    """
-    msgs = get_recent_chat_messages(max_messages=max_messages)
-
-    # 若 chat_history 已經 append 本次 prompt，最後一則就是它 → 直接回傳
-    if msgs and msgs[-1].get("role") == "user" and (msgs[-1].get("content") or "").strip() == (prompt or "").strip():
-        return msgs
-
-    msgs.append({"role": "user", "content": (prompt or "").strip()})
-    return msgs
-
-# === Patch 2) 修改 deep_agent_run_with_live_status：多收一個 run_messages，並餵給 agent.stream ===
 def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[dict]) -> Tuple[str, Optional[dict]]:
+    """
+    用 st.status 顯示「工作備忘/進度/檢索段落/中間產物」。
+    注意：不顯示 chain-of-thought，只顯示可核對的產物（todos/evidence/claims/reflections）。
+    """
     final_state = None
-    todos_preview_written = False
-
     st.session_state["last_run_forced_end"] = None
 
     recursion_limit = int(st.session_state.get("langgraph_recursion_limit", DEFAULT_RECURSION_LIMIT))
@@ -2007,45 +1978,119 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
     def set_phase(s, phase: str):
         mapping = {
             "start": ("DeepAgent：啟動中…", "running"),
-            "plan": ("DeepAgent：規劃中…", "running"),
-            "evidence": ("DeepAgent：蒐證中…", "running"),
-            "draft": ("DeepAgent：寫作中…", "running"),
-            "review": ("DeepAgent：審稿/補引用中…", "running"),
+            "plan": ("DeepAgent：規劃中（todos/facets）…", "running"),
+            "evidence": ("DeepAgent：蒐證中（doc_search）…", "running"),
+            "analysis": ("DeepAgent：推理中（claims/反思）…", "running"),
+            "draft": ("DeepAgent：寫作中（draft）…", "running"),
+            "review": ("DeepAgent：審稿/補引用中（review）…", "running"),
             "done": ("DeepAgent：完成", "complete"),
             "error": ("DeepAgent：發生錯誤", "error"),
         }
         label, state = mapping.get(phase, ("DeepAgent：執行中…", "running"))
-        s.update(label=label, state=state, expanded=False)
+        s.update(label=label, state=state, expanded=bool(st.session_state.get("da_status_expanded", False)))
 
-    # ✅ 深度記憶：deepagent 直接吃 messages list（與 direct 共用同一份）
-    # 保險：確保最後是 user_text
     msgs_for_agent = list(run_messages or [])
     if not msgs_for_agent or msgs_for_agent[-1].get("role") != "user":
         msgs_for_agent.append({"role": "user", "content": user_text})
     elif (msgs_for_agent[-1].get("content") or "").strip() != (user_text or "").strip():
         msgs_for_agent.append({"role": "user", "content": user_text})
 
-    with st.status("DeepAgent：啟動中…", expanded=False) as s:
+    seed_files = build_seed_files_for_deepagents()
+
+    show_debug = bool(st.session_state.get("da_show_status_debug", True))
+    show_files = bool(st.session_state.get("da_show_status_files", True))
+    show_doc_hits = bool(st.session_state.get("da_show_status_doc_hits", True))
+
+    with st.status("DeepAgent：啟動中…", expanded=bool(st.session_state.get("da_status_expanded", False))) as s:
         set_phase(s, "start")
+
+        # placeholders inside status
+        memo_ph = st.empty()
+        doc_hits_ph = st.empty()
+        files_ph = st.empty()
+
+        # helpers to render panels
+        def _render_memo(files: dict):
+            if not show_debug:
+                return
+            # 不展示 chain-of-thought；展示「工作備忘」與「結構化產物」
+            todos = get_files_text(files, "/workspace/todos.json")
+            facets = get_files_text(files, "/workspace/facets.json")
+            claims = get_files_text(files, "/analysis/claims.json")
+            refl = get_files_text(files, "/analysis/reflections.json")
+
+            blocks = []
+            if todos:
+                blocks.append("#### 📝 Agent Memo：Todos\n```json\n" + todos[:1200] + "\n```")
+            if facets:
+                blocks.append("#### 🧭 Facets\n```json\n" + facets[:1200] + "\n```")
+            if claims and st.session_state.get("da_show_claims", True):
+                blocks.append("#### 🧠 Claims（結構化主張）\n```json\n" + claims[:1400] + "\n```")
+            if refl and st.session_state.get("da_show_reflections", True):
+                blocks.append("#### 🤔 反思（風險/盲點/需驗證）\n```json\n" + refl[:1400] + "\n```")
+
+            memo_ph.markdown("\n\n".join(blocks) if blocks else ":small[（目前尚未產生 memo/claims 產物）]")
+
+        def _render_doc_hits():
+            if not show_doc_hits:
+                return
+            log = st.session_state.get("ui_doc_search_log", []) or []
+            if not log:
+                doc_hits_ph.markdown(":small[（尚未觸發 doc_search）]")
+                return
+            lines = ["#### 🔎 最近文件檢索命中（節錄）"]
+            for item in log[-UI_MAX_DOC_SEARCH_LOG:][::-1]:
+                q = item.get("query") or ""
+                lines.append(f"- **Query**：{q}")
+                for h in (item.get("hits") or [])[:3]:
+                    title = h.get("title") or ""
+                    page = h.get("page") or "-"
+                    snippet = (h.get("text") or "").replace("\n", " ")
+                    score = h.get("score")
+                    lines.append(f"  - [{title} p{page}] score={score:.3f}：{snippet}")
+            doc_hits_ph.markdown("\n".join(lines))
+
+        def _render_files_preview(files: dict):
+            if not (show_files and show_debug):
+                return
+            # 顯示 evidence/draft/review 的節錄（避免太長）
+            keys = sorted([k for k in files.keys() if isinstance(k, str)])
+            evidence_keys = [k for k in keys if k.startswith("/evidence/")][:12]
+            draft = get_files_text(files, "/draft.md")
+            review = get_files_text(files, "/review.md")
+
+            lines = []
+            if evidence_keys:
+                lines.append("#### 📎 Evidence（節錄）")
+                for k in evidence_keys:
+                    t = get_files_text(files, k)
+                    if not t:
+                        continue
+                    lines.append(f"- `{k}`\n\n```text\n{t[:UI_MAX_EVIDENCE_PREVIEW_CHARS]}\n```")
+            if draft:
+                lines.append("#### 🧾 Draft（節錄）\n```markdown\n" + draft[:UI_MAX_DRAFT_PREVIEW_CHARS] + "\n```")
+            if review:
+                lines.append("#### ✅ Review（節錄）\n```text\n" + review[:900] + "\n```")
+
+            files_ph.markdown("\n\n".join(lines) if lines else ":small[（尚未產生 evidence/draft/review 檔）]")
+
         set_phase(s, "plan")
 
         try:
             for state in agent.stream(
-                {"messages": [{"role": "user", "content": user_text}]},
+                {"messages": msgs_for_agent, "files": seed_files},  # ✅ skills/memory 也由此注入
                 stream_mode="values",
                 config={"recursion_limit": recursion_limit},
             ):
                 final_state = state
                 files = state.get("files") or {}
-                file_keys = set(files.keys()) if isinstance(files, dict) else set()
+                files = files if isinstance(files, dict) else {}
 
-                if (not todos_preview_written) and isinstance(files, dict) and "/workspace/todos.json" in files:
-                    todos_txt = get_files_text(files, "/workspace/todos.json")
-                    if todos_txt:
-                        s.write("### 本次 Todo（規劃結果預覽）")
-                        s.code(todos_txt[:4000], language="json")
-                        todos_preview_written = True
+                file_keys = set(files.keys())
 
+                # phase inference
+                if "/analysis/claims.json" in file_keys or "/analysis/reflections.json" in file_keys:
+                    set_phase(s, "analysis")
                 if any(k.startswith("/evidence/") for k in file_keys):
                     set_phase(s, "evidence")
                 if "/draft.md" in file_keys:
@@ -2053,8 +2098,13 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
                 if "/review.md" in file_keys:
                     set_phase(s, "review")
 
-                # ✅ 卡住判定：draft 夠長後才開始（不變 + 無引用）連續 N 步
-                if isinstance(files, dict) and "/draft.md" in files:
+                # render panels
+                _render_doc_hits()
+                _render_memo(files)
+                _render_files_preview(files)
+
+                # stall detection
+                if "/draft.md" in files:
                     draft_txt = get_files_text(files, "/draft.md")
                     draft_norm = norm_space(draft_txt)
                     if len(draft_norm) >= stall_min_chars:
@@ -2073,191 +2123,65 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
                         if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
                             set_phase(s, "error")
                             st.session_state["last_run_forced_end"] = "citation_stall"
-                            s.warning(
-                                f"判定卡住：/draft.md 內容連續 {draft_unchanged_streak} 步未變、且連續 {draft_no_citation_streak} 步無引用。"
-                                "已強制結束 DeepAgent，改用 fallback 產出答案。"
-                            )
-                            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
-                            return answer, files if isinstance(files, dict) and files else None
+                            s.warning("判定卡住（引用未生成），已改用 fallback。")
+                            diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
+                            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
+                            return answer, files if files else None
 
         except GraphRecursionError:
             set_phase(s, "error")
             st.session_state["last_run_forced_end"] = "recursion_limit"
-
             files = (final_state or {}).get("files") or {}
-            draft = get_files_text(files, "/draft.md") if isinstance(files, dict) else ""
+            files = files if isinstance(files, dict) else {}
+            draft = get_files_text(files, "/draft.md")
             draft = strip_internal_process_lines(draft)
             if draft.strip():
-                s.warning(f"已達步數上限（recursion_limit={recursion_limit}），回傳目前 /draft.md。")
-                return draft.strip(), (files if isinstance(files, dict) and files else None)
-
-            s.warning(f"已達步數上限（recursion_limit={recursion_limit}），改用 fallback 產生回答。")
-            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10)
-            return answer, (files if isinstance(files, dict) and files else None)
-
-        except Exception as e:
-            msg = str(e)
-            if "Budget exceeded" in msg:
-                set_phase(s, "evidence")
-                s.update(label="DeepAgent：已達工具預算上限（停止加搜證）", state="running", expanded=False)
-            else:
-                set_phase(s, "error")
-                raise
+                return draft.strip(), (files if files else None)
+            diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
+            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
+            return answer, (files if files else None)
 
         files = (final_state or {}).get("files") or {}
+        files = files if isinstance(files, dict) else {}
         final_text = get_files_text(files, "/draft.md")
-
-        if not final_text:
-            msgs = (final_state or {}).get("messages") or []
-            if msgs:
-                last = msgs[-1]
-                content = getattr(last, "content", None)
-                final_text = (file_to_text(content) or file_to_text(last)).strip()
-
-        if final_text and CHUNK_ID_LEAK_PAT.search(final_text):
-            final_text = CHUNK_ID_LEAK_PAT.sub("", final_text)
-
         final_text = strip_internal_process_lines(final_text)
-
         set_phase(s, "done")
 
-    return final_text or "（DeepAgent 沒有產出內容）", files if isinstance(files, dict) and files else None
+    return final_text or "（DeepAgent 沒有產出內容）", files if files else None
+
 
 # =========================
-# need_todo decision
+# Simple decision / UI / app
 # =========================
 def decide_need_todo(client: OpenAI, question: str) -> Tuple[bool, str]:
     system = (
-        "你是路由器。請判斷這個問題是否需要做『Todo + 文件/網路檢索』。\n"
-        "規則：\n"
-        "- 需要：涉及具體事實、數據、政策、版本、引用、研究、比較、出處；或需要引用上傳文件。\n"
-        "- 不需要：純意見/寫作/改寫/腦力激盪/不要求引用的泛泛解釋。\n"
-        "請輸出 JSON：{\"need_todo\": true/false, \"reason\": \"...\"}（只輸出 JSON）"
+        "你是路由器。判斷是否需要 Todo + 檢索。\n"
+        "需要：涉及具體事實/數據/研究/比較/出處/引用文件/工作規劃/決策 memo。\n"
+        "不需要：純意見/改寫/腦力激盪/不要求引用。\n"
+        "輸出 JSON：{\"need_todo\": true/false, \"reason\": \"...\"}"
     )
-    out, _ = call_gpt(
-        client,
-        model=MODEL_MAIN,
-        system=system,
-        user=question,
-        reasoning_effort=REASONING_EFFORT,
-        tools=None,
-        include_sources=False,
-    )
+    out, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=question, reasoning_effort=REASONING_EFFORT)
     data = _try_parse_json_or_py_literal(out) or {}
     need = bool(data.get("need_todo", False))
     reason = str(data.get("reason", "")).strip() or "（未提供原因）"
     return need, reason
 
 
-# =========================
-# UI badges
-# =========================
 def render_run_badges(
     *,
     mode: str,
-    need_todo: bool,
-    reason: str,
-    usage: dict,
     enable_web: bool,
-    todo_file_present: Optional[bool] = None,
-    forced_end: Optional[str] = None,
+    usage: dict,
+    difficulty: str,
 ) -> None:
     badges: List[str] = []
     badges.append(_badge_directive(f"Mode:{mode}", "gray"))
-
-    # ✅ 你要求：不管模式都要 Todo 分析（所以這裡永遠顯示 Todo:需要）
-    badges.append(_badge_directive("Todo:需要", "blue"))
-
-    if todo_file_present is True:
-        badges.append(_badge_directive("Todos.json:有", "blue"))
-    elif todo_file_present is False:
-        badges.append(_badge_directive("Todos.json:無(流程異常)", "orange"))
-
-    if forced_end:
-        mapping = {
-            "citation_stall": "ForcedStop:卡住(引用未生成)",
-            "recursion_limit": "ForcedStop:步數上限",
-        }
-        label = mapping.get(forced_end, f"ForcedStop:{forced_end}")
-        badges.append(_badge_directive(label, "orange"))
-        badges.append(_badge_directive("Fallback:RAG", "orange"))
-
+    badges.append(_badge_directive(f"Diff:{difficulty}", "blue"))
     doc_calls = int((usage or {}).get("doc_search_calls", 0) or 0)
     web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
-
-    badges.append(_badge_directive(f"DB:{'used' if doc_calls else 'unused'}({doc_calls})" if doc_calls else "DB:unused", "green" if doc_calls else "gray"))
-    if enable_web:
-        badges.append(_badge_directive(f"Web:used({web_calls})" if web_calls else "Web:unused", "violet" if web_calls else "gray"))
-    else:
-        badges.append(_badge_directive("Web:disabled", "gray"))
-
+    badges.append(_badge_directive(f"DB:{doc_calls}", "green" if doc_calls else "gray"))
+    badges.append(_badge_directive(f"Web:{web_calls}" if enable_web else "Web:off", "violet" if enable_web else "gray"))
     st.markdown(" ".join(badges))
-
-
-def get_forced_end() -> Optional[str]:
-    return st.session_state.get("last_run_forced_end", None)
-
-
-# =========================
-# Debug panel (selectable)
-# =========================
-def render_debug_panel(files: Optional[dict]) -> None:
-    if not files or not isinstance(files, dict):
-        st.write("（沒有 files）")
-        return
-
-    all_keys = sorted([k for k in files.keys() if isinstance(k, str)])
-    evidence_keys = [k for k in all_keys if k.startswith("/evidence/")]
-    doc_evidence_keys = [k for k in evidence_keys if k.startswith("/evidence/doc_")]
-    web_evidence_keys = [k for k in evidence_keys if k.startswith("/evidence/web_")]
-
-    todos = get_files_text(files, "/workspace/todos.json") if "/workspace/todos.json" in files else ""
-    readme = get_files_text(files, "/evidence/README.md") if "/evidence/README.md" in files else ""
-    draft = get_files_text(files, "/draft.md") if "/draft.md" in files else ""
-    review = get_files_text(files, "/review.md") if "/review.md" in files else ""
-
-    tab_overview, tab_orch, tab_retr, tab_web, tab_writer, tab_verifier, tab_browser = st.tabs(
-        ["總覽", "Orchestrator", "Retriever(evidence)", "Web(evidence)", "Writer(draft)", "Verifier(review)", "Files browser"]
-    )
-
-    with tab_overview:
-        st.write(f"files keys：{len(all_keys)}")
-        st.write(f"evidence：{len(evidence_keys)}")
-        st.code("\n".join(all_keys[:800]), language="text")
-
-    with tab_orch:
-        st.markdown("### /workspace/todos.json")
-        st.code((todos or "（無）")[:20000], language="json")
-        st.divider()
-        st.markdown("### /evidence/README.md")
-        st.code((readme or "（無）")[:20000], language="markdown")
-
-    with tab_retr:
-        if not doc_evidence_keys:
-            st.write("（沒有 /evidence/doc_*.md）")
-        else:
-            pick = st.selectbox("選擇 retriever evidence", doc_evidence_keys, index=0)
-            st.code(get_files_text(files, pick)[:60000], language="markdown")
-
-    with tab_web:
-        if not web_evidence_keys:
-            st.write("（沒有 /evidence/web_*.md）")
-        else:
-            pick = st.selectbox("選擇 web evidence", web_evidence_keys, index=0)
-            st.code(get_files_text(files, pick)[:60000], language="markdown")
-
-    with tab_writer:
-        st.code((draft or "（沒有 /draft.md）")[:60000], language="markdown")
-
-    with tab_verifier:
-        st.code((review or "（沒有 /review.md）")[:60000], language="markdown")
-
-    with tab_browser:
-        if not all_keys:
-            st.write("（files 為空）")
-        else:
-            pick = st.selectbox("選擇任一檔案（files）", all_keys, index=0)
-            st.code(get_files_text(files, pick)[:60000], language="text")
 
 
 # =========================
@@ -2266,20 +2190,16 @@ def render_debug_panel(files: Optional[dict]) -> None:
 OPENAI_API_KEY = get_openai_api_key()
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 os.environ.setdefault("OPENAI_KEY", OPENAI_API_KEY)
-
 client = get_client(OPENAI_API_KEY)
 
 st.session_state.setdefault("file_rows", [])
 st.session_state.setdefault("file_bytes", {})
 st.session_state.setdefault("store", None)
 st.session_state.setdefault("processed_keys", set())
-st.session_state.setdefault("default_outputs", None)
 st.session_state.setdefault("chat_history", [])
 
-# Popover 只留 web 開關
 st.session_state.setdefault("enable_web_search_agent", True)
 
-# 其餘固定預設（不提供 UI）
 st.session_state.setdefault("langgraph_recursion_limit", DEFAULT_RECURSION_LIMIT)
 st.session_state.setdefault("citation_stall_steps", DEFAULT_CITATION_STALL_STEPS)
 st.session_state.setdefault("citation_stall_min_chars", DEFAULT_CITATION_STALL_MIN_CHARS)
@@ -2289,68 +2209,29 @@ st.session_state.setdefault("enable_output_formatter", True)
 st.session_state.setdefault("sources_badge_max_titles_inline", DEFAULT_SOURCES_BADGE_MAX_TITLES_INLINE)
 st.session_state.setdefault("sources_badge_max_pages_per_title", DEFAULT_SOURCES_BADGE_MAX_PAGES_PER_TITLE)
 
-ENABLE_FORMATTER_FOR_DIRECT = True
-ENABLE_FORMATTER_FOR_DEEPAGENT = False
+st.session_state.setdefault("current_difficulty", "medium")
 
-# =========================
-# File table helpers
-# =========================
-def file_rows_to_df(rows: list[FileRow]) -> pd.DataFrame:
-    recs = []
-    for r in rows:
-        if r.ext == ".pdf":
-            pages_str = "-" if r.pages is None else str(r.pages)
-            text_pages_str = "-" if r.text_pages is None else str(r.text_pages)
-            text_ratio_str = "-" if r.text_pages_ratio is None else f"{r.text_pages_ratio:.0%}"
-        else:
-            pages_str = "-" if r.pages is None else str(r.pages)
-            text_pages_str = "-"
-            text_ratio_str = "-"
+# Skills / Debug toggles（popover 內用）
+st.session_state.setdefault("da_enable_skills", True)
+st.session_state.setdefault("da_enable_memory", True)
+st.session_state.setdefault("da_skill_claims_first", True)
+st.session_state.setdefault("da_skill_decision_memo", True)
+st.session_state.setdefault("da_skill_report_compare", True)
+st.session_state.setdefault("da_skill_action_plan", True)
 
-        if r.ext == ".pdf" and r.likely_scanned:
-            suggest = "建議 OCR"
-        elif r.ext in (".png", ".jpg", ".jpeg"):
-            suggest = "必 OCR"
-        else:
-            suggest = ""
-
-        recs.append({
-            "_file_id": r.file_id,
-            "使用OCR": bool(r.use_ocr),
-            "檔名": truncate_filename(r.name, 52),
-            "格式": r.ext.replace(".", ""),
-            "頁數": pages_str,
-            "文字頁": text_pages_str,
-            "文字%": text_ratio_str,
-            "token估算": int(r.token_est),
-            "建議": suggest,
-        })
-    return pd.DataFrame(recs)
-
-
-def sync_df_to_file_rows(df: pd.DataFrame, rows: list[FileRow]) -> None:
-    id_to_row_idx = {r.file_id: i for i, r in enumerate(rows)}
-    for _, rec in df.iterrows():
-        fid = rec.get("_file_id")
-        if fid not in id_to_row_idx:
-            continue
-        i = id_to_row_idx[fid]
-
-        ext = rows[i].ext
-        if ext in (".png", ".jpg", ".jpeg"):
-            rows[i].use_ocr = True
-        elif ext == ".txt":
-            rows[i].use_ocr = False
-        else:
-            rows[i].use_ocr = bool(rec.get("使用OCR", rows[i].use_ocr))
+st.session_state.setdefault("da_show_status_debug", True)
+st.session_state.setdefault("da_show_status_files", True)
+st.session_state.setdefault("da_show_status_doc_hits", True)
+st.session_state.setdefault("da_show_claims", True)
+st.session_state.setdefault("da_show_reflections", True)
+st.session_state.setdefault("da_status_expanded", False)
 
 
 # =========================
-# Popover：文件管理（只留網搜開關；其餘 UI 不顯示）
+# Popover：文件管理（上傳 / OCR / 建索引）+ Skills 開關區
 # =========================
-with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定）"):
-    st.caption("支援 PDF/TXT/PNG/JPG。PDF 若文字抽取偏少會建議 OCR（逐檔可勾選）。")
-    st.caption("✅ 不上傳文件也能聊天；只有你需要引用文件時才需要建立索引。")
+with st.popover("📦 文件管理 / Skills / Debug"):
+    st.caption("Session-only：檔案與索引只存在於本次 session。支援 PDF/TXT/圖片/Office（Office 需安裝 unstructured loaders）。")
 
     has_index = (
         st.session_state.store is not None
@@ -2359,19 +2240,43 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
     )
     if has_index:
         st.success(f"已建立索引：檔案數={len(st.session_state.file_rows)} / chunks={len(st.session_state.store.chunks)}")
-        st.caption("來源以 badge 顯示（文件：檔名 + 頁碼；網路：domain + p-）。")
     else:
-        st.info("目前沒有索引：你仍可直接聊天（純 LLM）。若需要引用文件，再在此處上傳並建立索引。")
+        st.info("目前沒有索引：你仍可直接聊天；需要引用文件再建立索引。")
 
-    # ✅ 只留這個
+    st.markdown("### 🌐 Web Search")
     st.session_state.enable_web_search_agent = st.checkbox(
-        "啟用網路搜尋（會增加成本）",
+        "允許使用網路搜尋（文件不足才會用）",
         value=bool(st.session_state.enable_web_search_agent),
     )
 
+    st.markdown("---")
+    st.markdown("### 🧩 Skills / Memory（DeepAgents）")
+    st.session_state.da_enable_memory = st.checkbox("啟用 Memory（/memory/AGENTS.md）", value=bool(st.session_state.da_enable_memory))
+    st.session_state.da_enable_skills = st.checkbox("啟用 Skills（/skills/*/SKILL.md）", value=bool(st.session_state.da_enable_skills))
+
+    if st.session_state.da_enable_skills:
+        colA, colB = st.columns(2)
+        with colA:
+            st.session_state.da_skill_claims_first = st.checkbox("Skill: claims-first（強推理）", value=bool(st.session_state.da_skill_claims_first))
+            st.session_state.da_skill_decision_memo = st.checkbox("Skill: decision-memo（含反思）", value=bool(st.session_state.da_skill_decision_memo))
+        with colB:
+            st.session_state.da_skill_report_compare = st.checkbox("Skill: report-compare（跨報告比對）", value=bool(st.session_state.da_skill_report_compare))
+            st.session_state.da_skill_action_plan = st.checkbox("Skill: action-plan（推進計畫）", value=bool(st.session_state.da_skill_action_plan))
+
+    st.markdown("---")
+    st.markdown("### 🧪 Debug / Status 顯示（st.status）")
+    st.session_state.da_status_expanded = st.checkbox("st.status 預設展開", value=bool(st.session_state.da_status_expanded))
+    st.session_state.da_show_status_debug = st.checkbox("顯示 Agent Memo（todos/facets/claims/反思）", value=bool(st.session_state.da_show_status_debug))
+    st.session_state.da_show_status_doc_hits = st.checkbox("顯示最近 doc_search 命中段落", value=bool(st.session_state.da_show_status_doc_hits))
+    st.session_state.da_show_status_files = st.checkbox("顯示 evidence/draft/review 節錄", value=bool(st.session_state.da_show_status_files))
+    st.session_state.da_show_claims = st.checkbox("顯示 claims.json", value=bool(st.session_state.da_show_claims))
+    st.session_state.da_show_reflections = st.checkbox("顯示 reflections.json", value=bool(st.session_state.da_show_reflections))
+
+    st.markdown("---")
+    st.markdown("### 📤 上傳文件")
     uploaded = st.file_uploader(
-        "上傳文件",
-        type=["pdf", "txt", "png", "jpg", "jpeg"],
+        "上傳文件（按一次建立索引）",
+        type=["pdf", "txt", "png", "jpg", "jpeg", "docx", "doc", "pptx", "xlsx", "xls"],
         accept_multiple_files=True,
     )
 
@@ -2400,6 +2305,9 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
                 extracted_chars, blank_pages, blank_ratio, text_pages, text_pages_ratio = analyze_pdf_text_quality(pdf_pages)
             elif ext == ".txt":
                 extracted_chars = len(norm_space(data.decode("utf-8", errors="ignore")))
+            else:
+                # Office/圖片：上傳階段不做重 extraction（避免卡 UI）
+                extracted_chars = 0
 
             token_est = estimate_tokens_from_chars(extracted_chars)
             likely_scanned = should_suggest_ocr(ext, pages, extracted_chars, blank_ratio)
@@ -2409,7 +2317,7 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
             elif ext == ".txt":
                 use_ocr = False
             else:
-                use_ocr = bool(likely_scanned)
+                use_ocr = bool(likely_scanned) if ext == ".pdf" else False
 
             st.session_state.file_rows.append(
                 FileRow(
@@ -2430,46 +2338,35 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
                 )
             )
 
-    st.markdown("### 文件清單（可逐檔勾選 OCR）")
+    st.markdown("### 文件清單（可勾選 OCR：僅 PDF）")
+    for r in st.session_state.file_rows:
+        label = f"{truncate_filename(r.name, 52)} | ext={r.ext} | token≈{r.token_est}"
+        if r.ext == ".pdf":
+            cols = st.columns([3, 1, 1])
+            cols[0].write(label)
+            cols[1].write("建議OCR" if r.likely_scanned else "")
+            r.use_ocr = cols[2].checkbox("OCR", value=bool(r.use_ocr), key=f"ocr_{r.file_id}")
+        else:
+            st.write(label)
 
-    if not st.session_state.file_rows:
-        st.info("尚未上傳文件。")
-    else:
-        df = file_rows_to_df(st.session_state.file_rows)
-        edited = st.data_editor(
-            df.drop(columns=["_file_id"]),
-            key="file_table_editor",
-            width="stretch",
-            hide_index=True,
-            disabled=["檔名", "格式", "頁數", "文字頁", "文字%", "token估算", "建議"],
-            column_config={
-                "使用OCR": st.column_config.CheckboxColumn(
-                    "使用OCR",
-                    help="逐檔選擇是否啟用 OCR（PDF 可選；圖檔固定OCR；TXT固定不OCR）",
-                ),
-            },
-        )
+    if (not HAS_UNSTRUCTURED_LOADERS) and any(r.ext in (".doc", ".docx", ".pptx", ".xls", ".xlsx") for r in st.session_state.file_rows):
+        st.warning("你上傳了 Office 檔，但環境缺少 unstructured loaders。可能會索引不到文字。建議先安裝相關套件，或把檔案轉成 PDF/TXT 再上傳。")
 
-        df_for_sync = df.copy()
-        df_for_sync["使用OCR"] = edited["使用OCR"].values
-        sync_df_to_file_rows(df_for_sync, st.session_state.file_rows)
-
-    st.divider()
-    col1, col2, col3 = st.columns([1, 1, 1])
-    build_btn = col1.button("🚀 建立索引", type="primary", width="stretch")
-    default_btn = col2.button("🧾 產生預設輸出", width="stretch")
-    clear_btn = col3.button("🧹 清空全部", width="stretch")
+    col1, col2 = st.columns([1, 1])
+    build_btn = col1.button("🚀 建立索引", type="primary", use_container_width=True)
+    clear_btn = col2.button("🧹 清空全部（含聊天）", use_container_width=True)
 
     if clear_btn:
         st.session_state.file_rows = []
         st.session_state.file_bytes = {}
         st.session_state.store = None
         st.session_state.processed_keys = set()
-        st.session_state.default_outputs = None
         st.session_state.chat_history = []
         st.session_state.deep_agent = None
+        st.session_state.deep_agent_cfg_sig = None
         st.session_state.deep_agent_web_flag = None
         st.session_state.da_usage = {"doc_search_calls": 0, "web_search_calls": 0}
+        st.session_state.ui_doc_search_log = []
         st.session_state["last_run_forced_end"] = None
         st.rerun()
 
@@ -2490,74 +2387,43 @@ with st.popover("📦 文件管理（上傳 / OCR / 建索引 / DeepAgent設定�
             )
             st.session_state.store = store
             st.session_state.processed_keys = processed_keys
-            s.write(f"新增報告數：{stats['new_reports']}")
-            s.write(f"新增 chunks：{stats['new_chunks']}")
+            s.write(f"新增報告數：{stats.get('new_reports')}")
+            s.write(f"新增 chunks：{stats.get('new_chunks')}")
+            if stats.get("errors"):
+                s.warning("部分檔案抽取失敗：\n" + "\n".join([f"- {e}" for e in stats["errors"][:8]]))
             s.write(f"耗時：{time.perf_counter() - t0:.2f}s")
             s.update(state="complete")
 
+        # 索引變了，重建 deep agent
         st.session_state.deep_agent = None
+        st.session_state.deep_agent_cfg_sig = None
         st.session_state.deep_agent_web_flag = None
         st.rerun()
 
-    if default_btn:
-        if st.session_state.store is None or st.session_state.store.index.ntotal == 0:
-            st.warning("尚未建立索引或沒有 chunks，請先按「建立索引」。")
-        else:
-            with st.status("產生預設輸出（摘要/主張/推論鏈）...", expanded=True) as s2:
-                chosen = pick_corpus_chunks_for_default(st.session_state.store.chunks)
-                ctx = render_chunks_for_model(chosen)
-                bundle = generate_default_outputs_bundle(client, "整體融合（全部上傳報告）", ctx, max_retries=2)
-                st.session_state.default_outputs = bundle
-                s2.update(state="complete")
-
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "kind": "default",
-                "title": "整體融合（全部上傳報告）",
-                **(st.session_state.default_outputs or {}),
-            })
-            st.rerun()
 
 # =========================
-# 主畫面：Chat
+# History render
 # =========================
-has_index = (
-    st.session_state.store is not None
-    and getattr(st.session_state.store, "index", None) is not None
-    and st.session_state.store.index.ntotal > 0
-)
-
-# 顯示歷史（✅ user 不顯示 badge）
 for msg in st.session_state.chat_history:
     role = msg.get("role", "assistant")
     with st.chat_message(role):
         if role == "user":
             st.markdown(msg.get("content", ""))
             continue
-
-        if msg.get("kind") == "default":
-            st.markdown(f"## 預設輸出：{msg.get('title','')}")
-            st.markdown("### 1) 報告摘要")
-            st.code((msg.get("summary", "") or "")[:20000], language="markdown")
-            st.markdown("### 2) 核心主張")
-            st.code((msg.get("claims", "") or "")[:20000], language="markdown")
-            st.markdown("### 3) 推論鏈")
-            st.code((msg.get("chain", "") or "")[:20000], language="markdown")
-        else:
-            meta = msg.get("meta", {}) or {}
-            render_run_badges(
-                mode=meta.get("mode", "unknown"),
-                need_todo=True,
-                reason=str(meta.get("reason", "") or ""),
-                usage=meta.get("usage", {}) or {},
-                enable_web=bool(meta.get("enable_web", False)),
-                todo_file_present=meta.get("todo_file_present", None),
-                forced_end=meta.get("forced_end", None),
-            )
-            render_markdown_answer_with_sources_badges(msg.get("content", ""))
-            render_web_sources_list(meta.get("web_sources", {}) or {})
+        meta = msg.get("meta", {}) or {}
+        render_run_badges(
+            mode=meta.get("mode", "unknown"),
+            enable_web=bool(meta.get("enable_web", False)),
+            usage=meta.get("usage", {}) or {},
+            difficulty=str(meta.get("difficulty", "medium") or "medium"),
+        )
+        render_markdown_answer_with_sources_badges(msg.get("content", ""))
+        render_web_sources_list(meta.get("web_sources", {}) or {})
 
 
+# =========================
+# Chat main
+# =========================
 prompt = st.chat_input("請輸入問題（也可貼草稿要我查核/除錯）。")
 if prompt:
     st.session_state.chat_history.append({"role": "user", "kind": "text", "content": prompt})
@@ -2565,327 +2431,201 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        enable_web = bool(st.session_state.enable_web_search_agent)
-
-        # ✅ 不管 direct/deepagent，都做 todo 判斷（你要求）
-        need_todo, reason = decide_need_todo(client, prompt)
-        run_messages = build_run_messages(prompt, max_messages=15)
-
-        planned_mode = "deepagent" if (has_index and need_todo) else "direct"
-        todos_json_text = build_todos_json_for_question(
-            client,
-            prompt,
-            enable_web=enable_web,
-            has_index=has_index,
-            planned_mode=planned_mode,
-            run_messages=run_messages,  # ✅ 新增：Todo 吃共用記憶
+        has_index = (
+            st.session_state.store is not None
+            and getattr(st.session_state.store, "index", None) is not None
+            and st.session_state.store.index.ntotal > 0
         )
 
-        # direct
+        allow_web = bool(st.session_state.enable_web_search_agent)
+
+        need_todo, _reason_need = decide_need_todo(client, prompt)
+        run_messages = build_run_messages(prompt, max_messages=15)
+
+        plan = decide_route_plan(
+            client,
+            prompt,
+            has_index=has_index,
+            allow_web=allow_web,
+            run_messages=run_messages,
+        )
+        st.session_state["current_difficulty"] = plan.difficulty
+
+        # clarify
+        if plan.needs_clarification or plan.mode == "clarify":
+            qs = plan.clarifying_questions[:3]
+            answer_text = "我需要先確認幾個小地方，才不會答歪：\n\n" + "\n".join([f"- {q}" for q in qs])
+            render_markdown_answer_with_sources_badges(answer_text)
+            st.session_state.chat_history.append(
+                {"role": "assistant", "kind": "text", "content": answer_text, "meta": {"mode": "clarify", "enable_web": False, "usage": {}, "difficulty": plan.difficulty}}
+            )
+            st.stop()
+
+        # doc_suff gate：只有文件不足且允許才 web（preview 不 rerank）
+        enable_web = bool(plan.enable_web)
+        if has_index and allow_web:
+            # 即使 plan.enable_web=False（rule_route），也可用 doc_suff 決定是否開 web（建議保守）
+            preview_need = (plan.mode in ("direct", "rag", "deepagent", "advisor"))
+            if preview_need:
+                qvec = embed_texts(client, [prompt])
+                preview_hits = st.session_state.store.search_hybrid(prompt, qvec, k=max(6, min(12, plan.doc_top_k)), difficulty="medium")
+                preview_chunks = [ch for _, ch in preview_hits]
+                preview_ctx = render_chunks_for_model(preview_chunks, max_chars_each=700)
+                doc_suff = grade_doc_evidence_sufficiency(client, prompt, preview_ctx)
+                # 文件夠就不開 web；不足再開
+                enable_web = (doc_suff < 0.70) and bool(allow_web) and bool(plan.enable_web)
+
+        # advisor：偏工作建議，但可用 deepagent 做 evidence + claims + memo
+        if plan.mode == "advisor":
+            if not has_index:
+                ans, _ = call_gpt(
+                    client,
+                    model=MODEL_MAIN,
+                    system=ANYA_SYSTEM_PROMPT + "\n\n請輸出 Decision Memo（含反思）與下一步清單（含 DoD）。",
+                    user=prompt,
+                    reasoning_effort=REASONING_EFFORT,
+                )
+                answer_text = strip_internal_process_lines((ans or "").strip())
+                if st.session_state.get("enable_output_formatter", True):
+                    answer_text = format_markdown_output_preserve_citations(client, answer_text)
+
+                meta = {"mode": "advisor", "enable_web": False, "usage": {"doc_search_calls": 0, "web_search_calls": 0}, "difficulty": plan.difficulty, "web_sources": {}}
+                render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
+                render_markdown_answer_with_sources_badges(answer_text)
+                st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+                st.stop()
+
+            # 有索引：走 deepagent（含 skills/memory）會最穩
+            agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
+            answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages)
+            answer_text = strip_internal_process_lines(answer_text)
+
+            meta = {
+                "mode": "advisor",
+                "enable_web": enable_web,
+                "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
+                "difficulty": plan.difficulty,
+                "web_sources": {},
+            }
+            render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
+            render_markdown_answer_with_sources_badges(answer_text)
+            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+            st.stop()
+
+        # rag：省成本（但仍保留 hard 才 rerank 的能力）
+        if plan.mode == "rag" and has_index:
+            answer_text = fallback_answer_from_store(
+                client,
+                st.session_state.get("store", None),
+                prompt,
+                k=plan.doc_top_k,
+                difficulty=plan.difficulty,
+            )
+            if st.session_state.get("enable_output_formatter", True):
+                answer_text = format_markdown_output_preserve_citations(client, answer_text)
+            answer_text = strip_internal_process_lines(answer_text)
+
+            meta = {
+                "mode": "rag",
+                "enable_web": False,
+                "usage": {"doc_search_calls": 1, "web_search_calls": 0},
+                "difficulty": plan.difficulty,
+                "web_sources": {},
+            }
+            render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
+            render_markdown_answer_with_sources_badges(answer_text)
+            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+            st.stop()
+
+        planned_mode = "deepagent" if (plan.mode == "deepagent" and has_index and need_todo) else "direct"
+
+        # direct：若 enable_web=True → 兩段式（evidence->writer）；否則單段式
         if planned_mode == "direct":
-            system = ANYA_SYSTEM_PROMPT
-
-# =========================
-# direct
-# =========================
-        if planned_mode == "direct":
-            system = ANYA_SYSTEM_PROMPT
-
-    # ---------- local helpers (放在分支內避免你漏貼) ----------
-            URL_RE = re.compile(r"https?://[^\s\)\]>\u3000]+", re.IGNORECASE)
-
-            def _domain_of(url: str) -> str:
-                try:
-                    host = urlparse(url).netloc.lower()
-                    if host.startswith("www."):
-                        host = host[4:]
-                    return host or "web"
-                except Exception:
-                    return "web"
-
-            def _extract_domains_from_evidence_sources(evidence_md: str) -> set[str]:
-                """
-                從 evidence 的 ### SOURCES 區塊抽 domain。
-                每行格式：- <domain> | <title> | <url>
-                """
-                domains = set()
-                in_sources = False
-                for line in (evidence_md or "").splitlines():
-                    t = line.strip()
-                    if t.lower().startswith("### sources"):
-                        in_sources = True
-                        continue
-                    if not in_sources:
-                        continue
-                    if not t.startswith("- "):
-                        continue
-                    parts = [p.strip() for p in t[2:].split("|")]
-                    if parts and parts[0]:
-                        domains.add(parts[0])
-                return domains
-
-            def _parse_web_sources_from_evidence_md(evidence_md: str, max_per_domain: int = 8) -> Dict[str, List[Tuple[str, str]]]:
-                """
-                只用 evidence 裡的 ### SOURCES 生成乾淨的 web_sources（domain->[(title,url)]）
-                """
-                out: Dict[str, List[Tuple[str, str]]] = {}
-                in_sources = False
-                for line in (evidence_md or "").splitlines():
-                    t = line.strip()
-                    if t.lower().startswith("### sources"):
-                        in_sources = True
-                        continue
-                    if not in_sources:
-                        continue
-                    if not t.startswith("- "):
-                        continue
-                    parts = [p.strip() for p in t[2:].split("|")]
-                    if len(parts) < 3:
-                        continue
-                    dom, title, url = parts[0], parts[1], parts[2]
-                    if not dom or not url:
-                        continue
-                    out.setdefault(dom, []).append((title or "source", url))
-        # 截斷 + 去重
-                for dom in list(out.keys()):
-                    seen = set()
-                    uniq: List[Tuple[str, str]] = []
-                    for title, url in out[dom]:
-                        if url in seen:
-                            continue
-                        seen.add(url)
-                        uniq.append((title, url))
-                    out[dom] = uniq[:max_per_domain]
-                return out
-
-            def _normalize_inline_citations_to_domain(text: str, allowed_domains: set[str]) -> str:
-                """
-                把正文引用統一成句尾（來源：domain），避免網址塞進正文、避免亂格式。
-                1) 把 (來源：https://...) 轉成 (來源：domain)
-                2) 把 "來源：" 開頭的獨立行（包含 URL）移除（來源集中到 Web Sources 區塊）
-                3) 移除「你蒐證/依你提供來源」等流程話術（雙保險）
-                """
-                raw = (text or "").strip()
-                if not raw:
-                    return raw
-
-                # 移除獨立來源行（例如：來源：xxx https://...）
-                lines = []
-                for ln in raw.splitlines():
-                    s = ln.strip()
-                    if s.lower().startswith("來源") and ("http://" in s or "https://" in s):
-                        continue
-                    lines.append(ln)
-                raw = "\n".join(lines).strip()
-
-                # URL -> domain inside (來源：...)
-                def _replace_source_url(m: re.Match) -> str:
-                    url = m.group(1)
-                    dom = _domain_of(url)
-                    if allowed_domains and (dom not in allowed_domains):
-                        # 不在 allowlist 就不要硬塞（避免假引用）
-                        return ""
-                    return f"（來源：{dom}）"
-
-                raw = re.sub(r"（來源：\s*(https?://[^\s\)]+)\s*）", _replace_source_url, raw)
-
-                # 若出現「來源：https://...」但沒有括號，也做一次收斂
-                raw = re.sub(r"來源：\s*(https?://[^\s]+)", lambda m: f"（來源：{_domain_of(m.group(1))}）", raw)
-
-                # 禁止流程話術（雙保險；以免 writer 沒聽話）
-                raw = re.sub(r"依你提供來源[^\n]*", "", raw)
-                raw = re.sub(r"你提供的蒐證指出：?", "", raw)
-                raw = re.sub(r"你蒐證寫到：?", "", raw)
-                raw = re.sub(r"我蒐證寫到：?", "", raw)
-
-                # 收尾：清掉多餘空白行
-                raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
-                return raw
-
-    # ---------- build short-term memory context ----------
-            memory_msgs = run_messages[:-1]  # 排除本次 prompt
-            history_block = "\n".join(
-                [
-                    f"{m['role'].upper()}: {m['content']}"
-                    for m in memory_msgs
-                    if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()
-                ]
-            ).strip()
-
-            context_block = f"對話脈絡（最近）：\n{history_block}" if history_block else ""
-            user_text = prompt if not context_block else f"{context_block}\n\n目前問題：\n{prompt}"
-
-            # ---------- Direct status + routing ----------
             web_sources: Dict[str, List[Tuple[str, str]]] = {}
-            evidence_md = ""
-            files = {"/workspace/todos.json": todos_json_text}
             usage = {"doc_search_calls": 0, "web_search_calls": 0}
 
-            # 兩段式 gating：你前面已經做 need_todo，這裡用它決定是否要 evidence→write
-            use_two_stage = bool(enable_web and need_todo)
+            history_msgs = run_messages[:-1]
+            history_block = "\n".join(
+                [f"{m['role'].upper()}: {m['content']}" for m in history_msgs if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()]
+            ).strip()
+            user_text = prompt if not history_block else f"對話脈絡（最近）：\n{history_block}\n\n目前問題：\n{prompt}"
 
-            with st.status("Direct回應", expanded=False) as s:
-                if use_two_stage:
-                    # (1) evidence
-                    s.update(label="Direct：蒐證中（web_search）…", state="running", expanded=False)
+            if enable_web:
+                evidence_md, sources = call_gpt(
+                    client,
+                    model=MODEL_MAIN,
+                    system=DIRECT_EVIDENCE_SYSTEM_PROMPT,
+                    user=f"{user_text}\n\n（請開始 web_search 蒐證）",
+                    reasoning_effort=REASONING_EFFORT,
+                    tools=[{"type": "web_search"}],
+                    include_sources=True,
+                    tool_choice="required",
+                )
+                usage["web_search_calls"] = 1
+                web_sources = web_sources_from_openai_sources(sources)
 
-                    # 產 evidence（<=8 bullets + Sources）
-                    evidence_system = DIRECT_EVIDENCE_SYSTEM_PROMPT  # 你先前已加的全域 prompt
-                    evidence_user = (f"{context_block}\n\n" if context_block else "") + f"問題：{prompt}"
+                allowed_domains = set(web_sources.keys())
 
-                    evidence_md, sources = call_gpt(
-                        client,
-                        model=MODEL_MAIN,
-                        system=evidence_system,
-                        user=evidence_user,
-                        reasoning_effort=REASONING_EFFORT,
-                        tools=[{"type": "web_search"}],
-                        include_sources=True,
-                        tool_choice="required",
-                    )
-                    evidence_md = (evidence_md or "").strip()
-                    usage["web_search_calls"] = 1
+                writer_user = f"{user_text}\n\n=== EVIDENCE ===\n{(evidence_md or '').strip()}\n"
+                ans, _ = call_gpt(
+                    client,
+                    model=MODEL_MAIN,
+                    system=ANYA_SYSTEM_PROMPT + "\n\n" + DIRECT_WRITER_SYSTEM_PROMPT,
+                    user=writer_user,
+                    reasoning_effort=REASONING_EFFORT,
+                )
+                answer_text = (ans or "").strip()
 
-                    # 寫入 /evidence/web_direct.md（debug）
-                    if evidence_md:
-                        files["/evidence/web_direct.md"] = evidence_md
+                def _replace_url(m: re.Match) -> str:
+                    dom = _domain(m.group(1))
+                    return f"（來源：{dom}）" if (not allowed_domains or dom in allowed_domains) else ""
 
-                    # Web Sources：以 evidence 的 ### SOURCES 為準（避免亂）
-                    web_sources = _parse_web_sources_from_evidence_md(evidence_md)
+                answer_text = re.sub(r"（來源：\s*(https?://[^\s\)]+)\s*）", _replace_url, answer_text)
+                answer_text = re.sub(r"來源：\s*(https?://[^\s]+)", lambda m: f"（來源：{_domain(m.group(1))}）", answer_text)
 
-                    # (2) writer
-                    s.update(label="Direct：寫作整合中…", state="running", expanded=False)
+                answer_text = (answer_text.rstrip() + "\n\n[WebSearch:web p-]").strip()
 
-                    allowed_domains = set(web_sources.keys()) or _extract_domains_from_evidence_sources(evidence_md)
+            else:
+                ans, _ = call_gpt(
+                    client,
+                    model=MODEL_MAIN,
+                    system=ANYA_SYSTEM_PROMPT,
+                    user=user_text,
+                    reasoning_effort=REASONING_EFFORT,
+                )
+                answer_text = (ans or "").strip()
 
-                    writer_system = system + "\n\n" + DIRECT_WRITER_SYSTEM_PROMPT  # 你先前已加的全域 prompt
-                    writer_user = (
-                        f"{user_text}\n\n"
-                        "===\n"
-                        "EVIDENCE（只可依此寫作）：\n"
-                        f"{evidence_md}\n"
-                    )
-
-                    answer_text, _ = call_gpt(
-                        client,
-                        model=MODEL_MAIN,
-                        system=writer_system,
-                        user=writer_user,
-                        reasoning_effort=REASONING_EFFORT,
-                        tools=None,
-                    )
-
-                    # 內文引用格式統一成（來源：domain）；正文不貼 URL
-                    answer_text = _normalize_inline_citations_to_domain(answer_text or "", allowed_domains)
-
-                    # 保證 badge 能辨識有用 web（固定 WebSearch，不帶 domain）
-                    answer_text = (answer_text.rstrip() + "\n\n[WebSearch:web p-]").strip()
-
-                else:
-                    # 單段式：不蒐證，直接回應（狀態只顯示 Direct回應）
-                    s.update(label="Direct回應", state="running", expanded=False)
-
-                    answer_text, _ = call_gpt(
-                        client,
-                        model=MODEL_MAIN,
-                        system=system,
-                        user=user_text,
-                        reasoning_effort=REASONING_EFFORT,
-                        tools=None,
-                    )
-
-                s.update(label="Direct：完成", state="complete", expanded=False)
-
-            # formatter（只留 direct） + 去內部流程
-            if ENABLE_FORMATTER_FOR_DIRECT and st.session_state.get("enable_output_formatter", True):
+            if st.session_state.get("enable_output_formatter", True):
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
             answer_text = strip_internal_process_lines(answer_text)
 
             meta = {
                 "mode": "direct",
-                "need_todo": True,
-                "reason": reason,
-                "usage": usage,
                 "enable_web": enable_web,
-                "todo_file_present": True,
-                "forced_end": None,
-                "web_sources": web_sources,  # ✅ 以 evidence SOURCES 生成，乾淨
+                "usage": usage,
+                "difficulty": plan.difficulty,
+                "web_sources": web_sources,
             }
-
-            render_run_badges(
-                mode=meta["mode"],
-                need_todo=True,
-                reason=reason,
-                usage=meta["usage"],
-                enable_web=enable_web,
-                todo_file_present=True,
-                forced_end=None,
-            )
+            render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
             render_markdown_answer_with_sources_badges(answer_text)
             render_web_sources_list(web_sources)
 
-            with st.expander("Debug", expanded=False):
-                st.markdown("### 本次 Todo（direct 產生）")
-                st.code(todos_json_text[:20000], language="json")
-
-                if "/evidence/web_direct.md" in files:
-                    st.divider()
-                    st.markdown("### /evidence/web_direct.md")
-                    st.code((files["/evidence/web_direct.md"] or "")[:60000], language="markdown")
-
-                if enable_web:
-                    st.divider()
-                    st.markdown("### 本次 Web Sources（direct，以 evidence SOURCES 為準）")
-                    st.code(json.dumps(web_sources, ensure_ascii=False, indent=2)[:20000], language="json")
-
-            st.session_state.chat_history.append(
-                {"role": "assistant", "kind": "text", "content": answer_text, "meta": meta}
-            )
+            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
-        
+
         # deepagent
         agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
-        answer_text, files = deep_agent_run_with_live_status(agent, prompt, run_messages)
+        answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages)
 
-        if ENABLE_FORMATTER_FOR_DEEPAGENT and st.session_state.get("enable_output_formatter", True):
-            answer_text = format_markdown_output_preserve_citations(client, answer_text)
         answer_text = strip_internal_process_lines(answer_text)
-
-        # deepagent：若沒產 todos.json，用 direct 計畫補上（保證有）
-        if not isinstance(files, dict):
-            files = {}
-        if "/workspace/todos.json" not in files:
-            files["/workspace/todos.json"] = todos_json_text
-
-        todo_file_present = isinstance(files, dict) and ("/workspace/todos.json" in files)
-
         meta = {
             "mode": "deepagent",
-            "need_todo": True,
-            "reason": reason,
-            "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
             "enable_web": enable_web,
-            "todo_file_present": bool(todo_file_present),
-            "forced_end": get_forced_end(),
+            "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
+            "difficulty": plan.difficulty,
+            "web_sources": {},
         }
-
-        render_run_badges(
-            mode=meta["mode"],
-            need_todo=True,
-            reason=reason,
-            usage=meta["usage"],
-            enable_web=enable_web,
-            todo_file_present=meta["todo_file_present"],
-            forced_end=meta.get("forced_end"),
-        )
+        render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
         render_markdown_answer_with_sources_badges(answer_text)
 
-        with st.expander("Debug", expanded=False):
-            todos_txt = get_files_text(files, "/workspace/todos.json") if isinstance(files, dict) else ""
-            if todos_txt:
-                st.markdown("### 本次 Todo（完整）")
-                st.code(todos_txt[:20000], language="json")
-                st.divider()
-            render_debug_panel(files)
-
-    st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+        st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
