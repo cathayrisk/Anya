@@ -1487,32 +1487,53 @@ def _require_deepagents() -> None:
     st.stop()
 
 
+# ========= [A] 整段替換：_create_deep_agent_compat（用這個版本蓋掉原本的） =========
 def _create_deep_agent_compat(**kwargs):
     """
     兼容不同版本的 create_deep_agent。
-    重要：subagents 的 prompt key 需要叫 `prompt`（不是 system_prompt）。([reference.langchain.com](https://reference.langchain.com/python/deepagents/graph/))
+    目標：
+    - system prompt 參數命名差異相容
+    - subagents 參數命名差異相容（subagents / sub_agents / agents）
     """
     sig = inspect.signature(create_deep_agent)
     allowed = set(sig.parameters.keys())
-    payload = {k: v for k, v in kwargs.items() if k in allowed}
 
-    # system prompt 參數命名差異
-    if "system_prompt" not in allowed and "system_prompt" in kwargs:
+    payload = {}
+
+    # 1) 先處理 subagents 參數命名差異
+    if "subagents" in kwargs:
+        if "subagents" in allowed:
+            payload["subagents"] = kwargs["subagents"]
+        elif "sub_agents" in allowed:
+            payload["sub_agents"] = kwargs["subagents"]
+        elif "agents" in allowed:
+            payload["agents"] = kwargs["subagents"]
+        # 若都不支援，就不塞（至少主 agent 還能回 message）
+
+    # 2) 一般參數：只傳該版本有的
+    for k, v in kwargs.items():
+        if k in ("subagents",):
+            continue
+        if k in allowed:
+            payload[k] = v
+
+    # 3) system prompt 參數命名差異
+    if "system_prompt" in kwargs:
         sp = kwargs["system_prompt"]
-        if "prompt" in allowed:
-            payload["prompt"] = sp
-        elif "system_message" in allowed:
-            payload["system_message"] = sp
-        elif "instructions" in allowed:
-            payload["instructions"] = sp
-        elif "state_modifier" in allowed:
-            payload["state_modifier"] = sp
-        elif "messages_modifier" in allowed:
-            payload["messages_modifier"] = sp
-
-    # 若該版本接受 system_prompt，直接放入
-    if "system_prompt" in allowed and "system_prompt" in kwargs:
-        payload["system_prompt"] = kwargs["system_prompt"]
+        if "system_prompt" in allowed:
+            payload["system_prompt"] = sp
+        else:
+            # 常見替代命名
+            if "prompt" in allowed:
+                payload["prompt"] = sp
+            elif "system_message" in allowed:
+                payload["system_message"] = sp
+            elif "instructions" in allowed:
+                payload["instructions"] = sp
+            elif "state_modifier" in allowed:
+                payload["state_modifier"] = sp
+            elif "messages_modifier" in allowed:
+                payload["messages_modifier"] = sp
 
     return create_deep_agent(**payload)
 
@@ -1911,12 +1932,51 @@ def _coerce_file_text(v: Any) -> str:
     except Exception:
         return ""
 
-# ========= [2/2] 整段替換：deep_agent_run_with_live_status（用這個版本整個蓋掉原本的） =========
+# ========= [B] 新增：放在 deep_agent_run_with_live_status 之前（你之前加的 _coerce_file_text 可以保留；我這裡補一個讀 messages 的 helper） =========
+def _extract_last_assistant_text_from_state(state: Optional[dict]) -> str:
+    """
+    deepagents / langgraph 回傳的 state["messages"] 可能是：
+    - list[dict]  ({"role":"assistant","content":...})
+    - list[BaseMessage]（AIMessage/HumanMessage...）
+    這裡統一抓最後一則 assistant 的文字內容。
+    """
+    if not state or not isinstance(state, dict):
+        return ""
+    msgs = state.get("messages") or []
+    if not isinstance(msgs, list):
+        return ""
+
+    for m in reversed(msgs):
+        # dict 格式
+        if isinstance(m, dict):
+            role = (m.get("role") or "").strip().lower()
+            if role == "assistant":
+                c = m.get("content")
+                return (c if isinstance(c, str) else str(c or "")).strip()
+            continue
+
+        # LangChain message 物件
+        role = ""
+        try:
+            role = (getattr(m, "type", "") or getattr(m, "role", "") or "").strip().lower()
+        except Exception:
+            role = ""
+
+        if role in ("ai", "assistant"):
+            try:
+                c = getattr(m, "content", "")
+                return (c if isinstance(c, str) else str(c or "")).strip()
+            except Exception:
+                return ""
+
+    return ""
+
+# ========= [C] 整段替換：deep_agent_run_with_live_status（用這個版本蓋掉你目前那個） =========
 def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[dict], client: OpenAI, status=None) -> Tuple[str, Optional[dict]]:
     """
-    ✅ 共用同一個 st.status（避免巢狀 status 導致畫面只顯示「路由完成」）
-    - 不顯示 chain-of-thought
-    - 顯示：todos/facets/claims/反思、doc_search 命中段落、evidence/draft/review 節錄
+    ✅ 共用同一個 st.status
+    ✅ 沒有 /draft.md 時：改抓最後 assistant message
+    ✅ 若連 message 都沒有：fallback RAG（避免 UI 出現「沒產出內容」）
     """
     final_state = None
     st.session_state["last_run_forced_end"] = None
@@ -1955,7 +2015,6 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
     show_files = bool(st.session_state.get("da_show_status_files", True))
     show_doc_hits = bool(st.session_state.get("da_show_status_doc_hits", True))
 
-    # ✅ 若外部沒給 status，才自己開一個
     if status is None:
         status_cm = st.status("DeepAgent：啟動中…", expanded=bool(st.session_state.get("da_status_expanded", False)))
         s = status_cm.__enter__()
@@ -1976,7 +2035,6 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
             return s0 if len(s0) <= max_chars else s0[:max_chars] + "…"
 
         def _get_text(files: dict, path: str) -> str:
-            # files[path] 可能不是字串（dict/list），統一轉成字串
             return _coerce_file_text((files or {}).get(path)).strip()
 
         def _render_doc_hits():
@@ -2055,8 +2113,12 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
             config={"recursion_limit": recursion_limit},
         )
 
+        saw_any_state = False
+
         for state in stream_iter:
+            saw_any_state = True
             final_state = state
+
             files = state.get("files") or {}
             files = files if isinstance(files, dict) else {}
             file_keys = set(files.keys())
@@ -2075,45 +2137,76 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
             _render_files_preview(files)
 
             draft_txt = _coerce_file_text(files.get("/draft.md"))
-            if isinstance(draft_txt, str):
-                draft_norm = norm_space(draft_txt)
-                if len(draft_norm) >= stall_min_chars:
-                    h = _hash_norm_text(draft_norm)
-                    if last_draft_hash == h:
-                        draft_unchanged_streak += 1
-                    else:
-                        draft_unchanged_streak = 0
-                        last_draft_hash = h
+            draft_norm = norm_space(draft_txt) if isinstance(draft_txt, str) else ""
+            if draft_norm and len(draft_norm) >= stall_min_chars:
+                h = _hash_norm_text(draft_norm)
+                if last_draft_hash == h:
+                    draft_unchanged_streak += 1
+                else:
+                    draft_unchanged_streak = 0
+                    last_draft_hash = h
 
-                    if has_visible_citations(draft_norm):
-                        draft_no_citation_streak = 0
-                    else:
-                        draft_no_citation_streak += 1
+                if has_visible_citations(draft_norm):
+                    draft_no_citation_streak = 0
+                else:
+                    draft_no_citation_streak += 1
 
-                    if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
-                        set_phase(s, "error")
-                        st.session_state["last_run_forced_end"] = "citation_stall"
-                        s.warning("判定卡住（引用未生成），已改用 fallback。")
-                        diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
-                        answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
-                        return answer, (files if files else None)
+                if (draft_unchanged_streak >= stall_steps) and (draft_no_citation_streak >= stall_steps):
+                    set_phase(s, "error")
+                    st.session_state["last_run_forced_end"] = "citation_stall"
+                    s.warning("判定卡住（引用未生成），已改用 fallback。")
+                    diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
+                    answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
+                    return answer, (files if files else None)
+
+        # stream 沒吐任何 state（少見）：直接 fallback
+        if not saw_any_state:
+            set_phase(s, "error")
+            st.session_state["last_run_forced_end"] = "no_stream"
+            diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
+            answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
+            return answer, None
 
         files = (final_state or {}).get("files") or {}
         files = files if isinstance(files, dict) else {}
-        final_text = _coerce_file_text(files.get("/draft.md"))
-        final_text = strip_internal_process_lines(final_text if isinstance(final_text, str) else "")
-        set_phase(s, "done")
-        return final_text or "（DeepAgent 沒有產出內容）", (files if files else None)
+        draft = _coerce_file_text(files.get("/draft.md"))
+        draft = strip_internal_process_lines(draft if isinstance(draft, str) else "")
+
+        # ✅ 1) 有 draft 就用 draft
+        if draft.strip():
+            set_phase(s, "done")
+            return draft.strip(), (files if files else None)
+
+        # ✅ 2) 沒 draft：改抓最後 assistant message（很常見！）
+        msg_text = _extract_last_assistant_text_from_state(final_state)
+        msg_text = strip_internal_process_lines(msg_text)
+        if msg_text.strip():
+            set_phase(s, "done")
+            return msg_text.strip(), (files if files else None)
+
+        # ✅ 3) 連 message 都沒有：fallback（至少你一定拿得到答案）
+        set_phase(s, "error")
+        st.session_state["last_run_forced_end"] = "empty_output"
+        diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
+        answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
+        return answer, (files if files else None)
 
     except GraphRecursionError:
         set_phase(s, "error")
         st.session_state["last_run_forced_end"] = "recursion_limit"
+
         files = (final_state or {}).get("files") or {}
         files = files if isinstance(files, dict) else {}
         draft = _coerce_file_text(files.get("/draft.md"))
         draft = strip_internal_process_lines(draft if isinstance(draft, str) else "")
         if draft.strip():
             return draft.strip(), (files if files else None)
+
+        msg_text = _extract_last_assistant_text_from_state(final_state)
+        msg_text = strip_internal_process_lines(msg_text)
+        if msg_text.strip():
+            return msg_text.strip(), (files if files else None)
+
         diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
         answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
         return answer, (files if files else None)
