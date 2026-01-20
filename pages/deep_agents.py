@@ -14,12 +14,10 @@ from pypdf import PdfReader, PdfWriter
 from datetime import datetime
 
 import math
-import uuid
 import hashlib
 from dataclasses import dataclass
-from typing import Literal, Optional, List, Any, Dict, Tuple
+from typing import Literal, Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from urllib.parse import urlparse
 
 import requests
@@ -71,7 +69,7 @@ MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024
 
 # DocRAG knobs (default)
 DOC_EMBED_MODEL = "text-embedding-3-small"
-DOC_MODEL_PLANNER = "gpt-4.1-mini"
+DOC_MODEL_PLANNER = "gpt-4.1-mini"   # planner 便宜快
 DOC_MODEL_EVIDENCE = "gpt-5.2"
 DOC_MODEL_WRITER = "gpt-5.2"
 DOC_MODEL_OCR = "gpt-5.2"
@@ -79,6 +77,8 @@ DOC_MODEL_OCR = "gpt-5.2"
 DOC_CHUNK_SIZE = 900
 DOC_CHUNK_OVERLAP = 150
 DOC_EMBED_BATCH = 256
+OCR_MAX_WORKERS = 2
+
 
 # ============================================================
 # 0.1 取得 API Key
@@ -93,13 +93,16 @@ if not OPENAI_API_KEY:
     st.stop()
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
+
 # ============================================================
 # 1. Streamlit 頁面
 # ============================================================
 st.set_page_config(page_title="Anya Multimodal Agent + DocRAG(FAISS/BM25)", page_icon="🥜", layout="wide")
+st.title("Anya Multimodal Agent + DocRAG（FAISS + BM25 + Multi-Query）")
+
 
 # ============================================================
-# 1.a Session 預設值保險
+# 1.a Session 預設值
 # ============================================================
 def get_today_str() -> str:
     now = datetime.now()
@@ -116,12 +119,22 @@ def ensure_session_defaults():
     if "chat_history" not in st.session_state or not isinstance(st.session_state.chat_history, list):
         st.session_state.chat_history = [{
             "role": "assistant",
-            "text": "嗨嗨～安妮亞來了！上傳圖片或PDF，直接問你想知道的內容吧！",
+            "text": "嗨嗨～安妮亞來了！上傳文件後直接問問題就可以～",
             "images": [],
             "docs": []
         }]
 
+def ensure_doc_state():
+    st.session_state.setdefault("doc_files", {})          # sig -> info {name, bytes, ext, ...}
+    st.session_state.setdefault("doc_store", None)        # FaissBM25Store
+    st.session_state.setdefault("doc_processed", set())   # sig set
+    st.session_state.setdefault("doc_mq_n", 5)
+    st.session_state.setdefault("doc_per_query_k", 10)
+    st.session_state.setdefault("doc_fused_k", 10)
+
 ensure_session_defaults()
+ensure_doc_state()
+
 
 # ============================================================
 # 共用：假串流打字效果
@@ -190,6 +203,7 @@ def run_async(coro):
         raise result_container["error"]
     return result_container["value"]
 
+
 # ============================================================
 # 1.1 圖片工具：縮圖 & data URL
 # ============================================================
@@ -222,8 +236,9 @@ def bytes_to_data_url(imgbytes: bytes) -> str:
     b64 = base64.b64encode(imgbytes).decode()
     return f"data:{mime};base64,{b64}"
 
+
 # ============================================================
-# 1.2 檔案工具：data URI（PDF/TXT/MD/JSON/CSV/DOCX/PPTX）
+# 1.2 檔案工具：data URI
 # ============================================================
 DOC_MIME_MAP = {
     ".pdf":  "application/pdf",
@@ -234,7 +249,6 @@ DOC_MIME_MAP = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
-
 def guess_mime_by_ext(filename: str) -> str:
     ext = os.path.splitext(filename.lower())[1]
     return DOC_MIME_MAP.get(ext, "application/octet-stream")
@@ -244,8 +258,9 @@ def file_bytes_to_data_url(filename: str, data: bytes) -> str:
     b64 = base64.b64encode(data).decode()
     return f"data:{mime};base64,{b64}"
 
+
 # ============================================================
-# 1.3 PDF 工具：頁碼解析 / 實際切頁
+# 1.3 PDF：頁碼解析 / 切頁
 # ============================================================
 def parse_page_ranges_from_text(text: str) -> list[int]:
     if not text:
@@ -299,8 +314,9 @@ def slice_pdf_bytes(pdf_bytes: bytes, keep_pages_1based: list[int]) -> bytes:
     out.seek(0)
     return out.getvalue()
 
+
 # ============================================================
-# 1.4 回覆解析：擷取文字 + 來源註解
+# 1.4 回覆解析：擷取文字 + citations
 # ============================================================
 def dedup_by(items, key):
     seen = set()
@@ -370,12 +386,12 @@ def strip_trailing_sources_section(text: str) -> str:
         return text[:last_pos].rstrip()
     return text
 
+
 # ============================================================
-# 讀網頁工具（r.jina.ai）
+# Webpage fetch tool (r.jina.ai) - general 用
 # ============================================================
 import socket
 import ipaddress
-
 URL_REGEX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 
 def extract_first_url(text: str) -> str | None:
@@ -395,10 +411,7 @@ def _requests_session() -> requests.Session:
     s.mount("http://", HTTPAdapter(max_retries=retry))
     s.mount("https://", HTTPAdapter(max_retries=retry))
     s.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (compatible; WebpageFetcher/1.0)",
-            "Accept": "text/plain,text/html,*/*;q=0.8",
-        }
+        {"User-Agent": "Mozilla/5.0 (compatible; WebpageFetcher/1.0)", "Accept": "text/plain,text/html,*/*;q=0.8"}
     )
     return s
 
@@ -424,18 +437,17 @@ def _validate_url(url: str) -> None:
     if not p.netloc:
         raise ValueError("URL 缺少網域")
     if p.username or p.password:
-        raise ValueError("不允許 URL 內含帳密（user:pass@host）")
+        raise ValueError("不允許 URL 內含帳密")
     host = p.hostname or ""
     if host == "localhost":
         raise ValueError("不允許 localhost")
     if _is_private_host(host):
-        raise ValueError("疑似內網/私有 IP 網域，已拒絕（安全防護）")
+        raise ValueError("疑似內網/私有 IP 網域，已拒絕")
 
 def fetch_webpage_impl_via_jina(url: str, max_chars: int = 160_000, timeout_seconds: int = 20) -> dict:
     _validate_url(url)
     jina_url = f"https://r.jina.ai/{url}"
     s = _requests_session()
-
     max_bytes = 2_000_000
     r = s.get(jina_url, stream=True, timeout=timeout_seconds, allow_redirects=True)
     r.raise_for_status()
@@ -456,13 +468,7 @@ def fetch_webpage_impl_via_jina(url: str, max_chars: int = 160_000, timeout_seco
     if len(raw) > max_bytes:
         truncated = True
 
-    return {
-        "requested_url": url,
-        "reader_url": jina_url,
-        "content_type": (r.headers.get("Content-Type") or "").lower(),
-        "truncated": truncated,
-        "text": text,
-    }
+    return {"requested_url": url, "reader_url": jina_url, "content_type": (r.headers.get("Content-Type") or "").lower(), "truncated": truncated, "text": text}
 
 FETCH_WEBPAGE_TOOL = {
     "type": "function",
@@ -471,11 +477,7 @@ FETCH_WEBPAGE_TOOL = {
     "strict": True,
     "parameters": {
         "type": "object",
-        "properties": {
-            "url": {"type": "string"},
-            "max_chars": {"type": "integer"},
-            "timeout_seconds": {"type": "integer"},
-        },
+        "properties": {"url": {"type": "string"}, "max_chars": {"type": "integer"}, "timeout_seconds": {"type": "integer"}},
         "required": ["url", "max_chars", "timeout_seconds"],
         "additionalProperties": False,
     },
@@ -500,7 +502,6 @@ def run_general_with_webpage_tool(
         tool_choice = {"type": "function", "name": "fetch_webpage"}
 
     running_input = list(trimmed_messages)
-
     while True:
         resp = client.responses.create(
             model=model,
@@ -516,10 +517,7 @@ def run_general_with_webpage_tool(
         if getattr(resp, "output", None):
             running_input += resp.output
 
-        function_calls = [
-            item for item in (getattr(resp, "output", None) or [])
-            if getattr(item, "type", None) == "function_call"
-        ]
+        function_calls = [item for item in (getattr(resp, "output", None) or []) if getattr(item, "type", None) == "function_call"]
         if not function_calls:
             return resp
 
@@ -527,7 +525,6 @@ def run_general_with_webpage_tool(
             name = getattr(call, "name", "")
             call_id = getattr(call, "call_id", None)
             args = json.loads(getattr(call, "arguments", "{}") or "{}")
-
             if not call_id:
                 raise RuntimeError("function_call 缺少 call_id")
 
@@ -536,24 +533,17 @@ def run_general_with_webpage_tool(
             else:
                 url = forced_url or args.get("url")
                 try:
-                    output = fetch_webpage_impl_via_jina(
-                        url=url,
-                        max_chars=int(args.get("max_chars", 160_000)),
-                        timeout_seconds=int(args.get("timeout_seconds", 20)),
-                    )
+                    output = fetch_webpage_impl_via_jina(url=url, max_chars=int(args.get("max_chars", 160_000)), timeout_seconds=int(args.get("timeout_seconds", 20)))
                 except Exception as e:
                     output = {"error": str(e), "url": url}
 
-            running_input.append(
-                {"type": "function_call_output", "call_id": call_id, "output": json.dumps(output, ensure_ascii=False)}
-            )
+            running_input.append({"type": "function_call_output", "call_id": call_id, "output": json.dumps(output, ensure_ascii=False)})
 
         tool_choice = "auto"
 
 
 # ============================================================
-# Agents：Planner/Search/Fast/Router（保留你原本結構；prompt 這裡用較短版，避免程式碼爆長）
-# 你如果要原本超長 prompt，可直接把字串換回去，不影響 DocRAG。
+# Agents：Planner/Search/Fast/Router（保留結構）
 # ============================================================
 def with_handoff_prefix(text: str) -> str:
     pref = (RECOMMENDED_PROMPT_PREFIX or "").strip()
@@ -585,20 +575,14 @@ def research_handoff_message_filter(handoff_message_data: HandoffInputData) -> H
     history = filtered.input_history
     if isinstance(history, tuple):
         history = history[-6:]
-    return HandoffInputData(
-        input_history=history,
-        pre_handoff_items=tuple(filtered.pre_handoff_items),
-        new_items=tuple(filtered.new_items),
-    )
+    return HandoffInputData(input_history=history, pre_handoff_items=tuple(filtered.pre_handoff_items), new_items=tuple(filtered.new_items))
 
 async def on_research_handoff(ctx: RunContextWrapper[None], input_data: PlannerHandoffInput):
     print(f"[handoff] research query: {input_data.query}")
 
 planner_agent = Agent(
     name="PlannerAgent",
-    instructions=with_handoff_prefix(
-        "你是研究規劃助理，請產生 5-20 條 web 搜尋 query（含 reason），用正體中文。"
-    ),
+    instructions=with_handoff_prefix("你是研究規劃助理，請產生 5-20 條 web 搜尋 query（含 reason），用正體中文。"),
     model="gpt-5.2",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
@@ -611,24 +595,17 @@ search_agent = Agent(
     tools=[WebSearchTool()],
 )
 
-FAST_AGENT_PROMPT = with_handoff_prefix("你是安妮亞風格快速助理，用正體中文、條列重點、可愛但不囉嗦。")
 fast_agent = Agent(
     name="FastAgent",
     model="gpt-5.2",
-    instructions=FAST_AGENT_PROMPT,
+    instructions=with_handoff_prefix("你是安妮亞風格快速助理，用正體中文回答，先重點後細節。"),
     tools=[WebSearchTool()],
     model_settings=ModelSettings(temperature=0, verbosity="low", tool_choice="auto"),
 )
 
-ROUTER_PROMPT = with_handoff_prefix("""
-你是判斷助理：決定是否交給研究規劃（需要多來源/引文/系統性比較）才轉交。
-否則直接回答。
-回覆正體中文。
-""")
-
 router_agent = Agent(
     name="RouterAgent",
-    instructions=ROUTER_PROMPT,
+    instructions=with_handoff_prefix("你是判斷助理：決定是否交給研究規劃（需要多來源/引文/系統性比較）才轉交。否則直接回答。"),
     model="gpt-5.2",
     tools=[],
     model_settings=ModelSettings(reasoning=Reasoning(effort="low"), verbosity="low"),
@@ -641,13 +618,10 @@ router_agent = Agent(
             input_filter=research_handoff_message_filter,
             on_handoff=on_research_handoff,
         )
-    ]
+    ],
 )
 
-WRITER_PROMPT = (
-    "你是資深研究員，針對原始問題與初步搜尋摘要，撰寫完整正體中文報告。"
-    "輸出 JSON：short_summary、markdown_report、follow_up_questions。只輸出 JSON。"
-)
+WRITER_PROMPT = "你是資深研究員，針對原始問題與初步搜尋摘要，撰寫完整正體中文報告。輸出 JSON：short_summary、markdown_report、follow_up_questions。只輸出 JSON。"
 
 def try_load_json(text: str, fallback=None):
     if fallback is None:
@@ -684,32 +658,12 @@ def run_writer(client: OpenAI, trimmed_messages: list, original_query: str, sear
 
 
 # ============================================================
-# Front Router（保留你原本決策：fast/general/research）
+# Front Router（fast/general/research）
 # ============================================================
-ESCALATE_FAST_TOOL = {
-    "type": "function",
-    "name": "escalate_to_fast",
-    "description": "快速回答",
-    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
-}
-ESCALATE_GENERAL_TOOL = {
-    "type": "function",
-    "name": "escalate_to_general",
-    "description": "一般深思回答（可選 web_search）",
-    "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "query": {"type": "string"}, "need_web": {"type": "boolean"}}, "required": ["reason", "query"]},
-}
-ESCALATE_RESEARCH_TOOL = {
-    "type": "function",
-    "name": "escalate_to_research",
-    "description": "研究流程（規劃→搜尋→寫作）",
-    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
-}
-
-FRONT_ROUTER_PROMPT = """
-你是前置路由器（只決策，不回答）。
-永遠必須呼叫下列工具之一：escalate_to_fast / escalate_to_general / escalate_to_research。
-只輸出工具呼叫。
-"""
+ESCALATE_FAST_TOOL = {"type": "function", "name": "escalate_to_fast", "description": "快速回答", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
+ESCALATE_GENERAL_TOOL = {"type": "function", "name": "escalate_to_general", "description": "一般深思回答（可選 web_search）", "parameters": {"type": "object", "properties": {"reason": {"type": "string"}, "query": {"type": "string"}, "need_web": {"type": "boolean"}}, "required": ["reason", "query"]}}
+ESCALATE_RESEARCH_TOOL = {"type": "function", "name": "escalate_to_research", "description": "研究流程", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
+FRONT_ROUTER_PROMPT = "你是前置路由器（只決策，不回答）。永遠必須呼叫：escalate_to_fast / escalate_to_general / escalate_to_research。只輸出工具呼叫。"
 
 def run_front_router(client: OpenAI, input_messages: list, user_text: str, runtime_messages: Optional[list] = None):
     import json as _json
@@ -758,8 +712,9 @@ def run_front_router(client: OpenAI, input_messages: list, user_text: str, runti
 # ============================================================
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 # ============================================================
-# 6. 將 chat_history 修剪成 Responses API input
+# 6. 修剪歷史成 Responses input
 # ============================================================
 def build_trimmed_input_messages(pending_user_content_blocks):
     hist = st.session_state.get("chat_history", [])
@@ -784,8 +739,7 @@ def build_trimmed_input_messages(pending_user_content_blocks):
                 blocks.append({"type": "input_text", "text": msg["text"]})
             if i == last_user_idx and msg.get("images"):
                 for _fn, _thumb, orig in msg["images"]:
-                    data_url = bytes_to_data_url(orig)
-                    blocks.append({"type": "input_image", "image_url": data_url})
+                    blocks.append({"type": "input_image", "image_url": bytes_to_data_url(orig)})
             if blocks:
                 messages.append({"role": "user", "content": blocks})
         elif role == "assistant":
@@ -795,9 +749,7 @@ def build_trimmed_input_messages(pending_user_content_blocks):
     return messages
 
 def build_fastagent_query_from_history(latest_user_text: str, max_history_messages: int = 12) -> str:
-    ensure_session_defaults()
     hist = st.session_state.get("chat_history", [])
-
     convo_lines = []
     for msg in hist[-max_history_messages:]:
         role = msg.get("role")
@@ -808,41 +760,26 @@ def build_fastagent_query_from_history(latest_user_text: str, max_history_messag
         if not prefix:
             continue
         convo_lines.append(f"{prefix}：{text}")
-
     if not convo_lines and latest_user_text:
         convo_lines.append(f"使用者：{latest_user_text}")
-
     history_block = "\n".join(convo_lines) if convo_lines else "（目前沒有可用的歷史對話。）"
-    final_query = (
+    return (
         "以下是最近的對話紀錄（由舊到新），只用來理解脈絡，不要在回答中提到它：\n"
         f"{history_block}\n\n"
         "【規則】直接回答使用者；用正體中文（台灣用語）。\n\n"
         "【使用者這一輪的內容】\n"
         f"{(latest_user_text or '').strip()}\n"
-    )
-    return final_query.strip()
+    ).strip()
+
 
 # ============================================================
-# DocRAG：FAISS + BM25 + multi-query planner + OCR suggestion
+# DocRAG：FAISS + BM25 + multi-query + OCR suggestion
 # ============================================================
-def norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
-
 def sha1_bytes(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()
 
-@st.cache_data(show_spinner=False, max_entries=64)
-def _cached_pdf_text_quality(sig: str, pdf_bytes: bytes):
-    pages = extract_pdf_text_pages_pypdf(pdf_bytes)
-    extracted_chars, blank_pages, blank_ratio, text_pages, text_pages_ratio = analyze_pdf_text_quality(pages)
-    return {
-        "pages": len(pages),
-        "extracted_chars": extracted_chars,
-        "blank_pages": blank_pages,
-        "blank_ratio": blank_ratio,
-        "text_pages": text_pages,
-        "text_pages_ratio": text_pages_ratio,
-    }
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 def extract_pdf_text_pages_pypdf(pdf_bytes: bytes) -> list[Tuple[int, str]]:
     reader = PdfReader(BytesIO(pdf_bytes))
@@ -874,6 +811,19 @@ def should_suggest_ocr(pages: Optional[int], extracted_chars: int, blank_ratio: 
     avg = extracted_chars / max(1, pages)
     return avg < 120
 
+@st.cache_data(show_spinner=False, max_entries=128)
+def cached_pdf_quality(sig: str, pdf_bytes: bytes):
+    pages = extract_pdf_text_pages_pypdf(pdf_bytes)
+    extracted_chars, blank_pages, blank_ratio, text_pages, text_pages_ratio = analyze_pdf_text_quality(pages)
+    return {
+        "pages": len(pages),
+        "extracted_chars": extracted_chars,
+        "blank_pages": blank_pages,
+        "blank_ratio": blank_ratio,
+        "text_pages": text_pages,
+        "text_pages_ratio": text_pages_ratio,
+    }
+
 def _img_bytes_to_data_url(img_bytes: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(img_bytes).decode()}"
 
@@ -891,7 +841,7 @@ def ocr_image_bytes(client: OpenAI, image_bytes: bytes, mime: str) -> str:
     )
     return norm_space(resp.output_text or "")
 
-def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180, max_workers: int = 2) -> list[Tuple[int, str]]:
+def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180) -> list[Tuple[int, str]]:
     if not HAS_PYMUPDF:
         raise RuntimeError("未安裝 pymupdf（fitz），無法做 PDF OCR。請 pip install pymupdf")
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -912,17 +862,12 @@ def ocr_pdf_pages_parallel(client: OpenAI, pdf_bytes: bytes, dpi: int = 180, max
         except Exception:
             results[page_no] = ""
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as ex:
         futs = [ex.submit(_one, pno, b) for pno, b in page_imgs]
         for fut in as_completed(futs):
             _ = fut
 
     return [(pno, results.get(pno, "")) for pno, _b in page_imgs]
-
-def estimate_tokens_from_chars(n_chars: int) -> int:
-    if n_chars <= 0:
-        return 0
-    return max(1, int(math.ceil(n_chars / 3.6)))
 
 @st.cache_resource(show_spinner=False)
 def get_splitter():
@@ -947,11 +892,7 @@ def chunk_text(text: str) -> list[str]:
     return out
 
 def embed_texts(client: OpenAI, texts: list[str]) -> np.ndarray:
-    resp = client.embeddings.create(
-        model=DOC_EMBED_MODEL,
-        input=texts,
-        encoding_format="float",
-    )
+    resp = client.embeddings.create(model=DOC_EMBED_MODEL, input=texts, encoding_format="float")
     vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
@@ -986,10 +927,7 @@ class FaissBM25Store:
             self.bm25 = None
             return
         docs = [
-            Document(
-                page_content=c.text,
-                metadata={"chunk_id": c.chunk_id, "title": c.title, "page": c.page if c.page is not None else "-"},
-            )
+            Document(page_content=c.text, metadata={"chunk_id": c.chunk_id, "title": c.title, "page": c.page if c.page is not None else "-"})
             for c in self.chunks
         ]
         self.bm25 = BM25Retriever.from_documents(docs, k=24, preprocess_func=bm25_preprocess_zh_en)
@@ -1095,7 +1033,8 @@ def doc_plan_queries(client: OpenAI, question: str, n: int) -> list[dict]:
     n = max(3, min(6, int(n)))
     resp = client.responses.create(
         model=DOC_MODEL_PLANNER,
-        input=[{"role": "system", "content": DOC_PLANNER_PROMPT}, {"role": "user", "content": f"問題：{question}\n請產生約 {n} 條。"}],
+        input=[{"role": "system", "content": DOC_PLANNER_PROMPT},
+               {"role": "user", "content": f"問題：{question}\n請產生約 {n} 條。"}],
         truncation="auto",
     )
     data = try_load_json(resp.output_text or "", fallback={})
@@ -1155,7 +1094,7 @@ def doc_evidence_then_write(client: OpenAI, question: str, fused_hits: list[Tupl
 
     answer = client.responses.create(
         model=DOC_MODEL_WRITER,
-        input=[{"role": "system", "content": "你是嚴謹助理，用正體中文。"},
+        input=[{"role": "system", "content": "你是安妮亞風格可靠助理，用正體中文（台灣用語）。"},
                {"role": "user", "content": f"{DOC_WRITER_PROMPT}\n\n問題：{question}\n\n=== EVIDENCE ===\n{evidence.strip()}\n"}],
         truncation="auto",
     ).output_text or ""
@@ -1168,6 +1107,82 @@ def doc_answer_insufficient(answer_text: str, evidence_text: str) -> bool:
     n_bullets = len(re.findall(r"^\s*-\s+", evidence_text or "", flags=re.M))
     return n_bullets < 2
 
+def doc_has_index() -> bool:
+    store = st.session_state.get("doc_store")
+    try:
+        return bool(store and store.index and store.index.ntotal > 0)
+    except Exception:
+        return False
+
+def doc_build_index_incremental(client: OpenAI):
+    store: Optional[FaissBM25Store] = st.session_state.get("doc_store")
+    processed: set = set(st.session_state.get("doc_processed") or set())
+    files_map: dict = st.session_state.get("doc_files") or {}
+
+    if store is None:
+        dim = embed_texts(client, ["dim_probe"]).shape[1]
+        store = FaissBM25Store(dim)
+        st.session_state["doc_store"] = store
+
+    new_chunks: list[Chunk] = []
+    new_texts: list[str] = []
+
+    for sig, info in files_map.items():
+        if sig in processed:
+            continue
+
+        name = info["name"]
+        data = info["bytes"]
+        ext = info.get("ext") or os.path.splitext(name)[1].lower()
+        use_ocr = bool(info.get("use_ocr", False))
+
+        title = os.path.splitext(name)[0]
+        report_id = sig[:10]
+        pages: list[Tuple[Optional[int], str]] = []
+
+        if ext == ".pdf":
+            if use_ocr and not HAS_PYMUPDF:
+                use_ocr = False
+                info["ocr_error"] = "need_pymupdf"
+            if use_ocr:
+                pdf_pages = ocr_pdf_pages_parallel(client, data, dpi=180)
+            else:
+                pdf_pages = extract_pdf_text_pages_pypdf(data)
+            pages = [(pno, txt) for pno, txt in pdf_pages]
+
+        elif ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            mime = "image/png"
+            if ext in (".jpg", ".jpeg"):
+                mime = "image/jpeg"
+            txt = ocr_image_bytes(client, data, mime=mime)
+            pages = [(None, txt)]
+        else:
+            pages = [(None, "")]
+
+        for page_no, page_text in pages:
+            if not page_text:
+                continue
+            chunks = chunk_text(page_text)
+            for i, ch in enumerate(chunks):
+                cid = f"{report_id}_p{page_no if page_no else 'na'}_c{i}"
+                new_chunks.append(Chunk(chunk_id=cid, title=title, page=page_no if isinstance(page_no, int) else None, text=ch))
+                new_texts.append(ch)
+
+        processed.add(sig)
+
+    if new_texts:
+        vecs_list = []
+        for i in range(0, len(new_texts), DOC_EMBED_BATCH):
+            vecs_list.append(embed_texts(client, new_texts[i:i+DOC_EMBED_BATCH]))
+        vecs = np.vstack(vecs_list)
+        store.add(vecs, new_chunks)
+
+    st.session_state["doc_processed"] = processed
+
+
+# ============================================================
+# UI：Popover 文件管理（你指定不要 sidebar）
+# ============================================================
 def _badge(label: str, color: str) -> str:
     safe = label.replace("[", "(").replace("]", ")")
     return f":{color}-badge[{safe}]"
@@ -1205,88 +1220,104 @@ def render_doc_debug(plan: list[dict], per_query_hits: dict, fused_hits: list[Tu
             snippet = snippet[:300] + ("…" if len(snippet) > 300 else "")
             st.markdown(f"- **[{ch.title} p{ch.page if ch.page is not None else '-'}]** rrf={s:.4f}：{snippet}")
 
-def ensure_doc_state():
-    st.session_state.setdefault("doc_files", {})          # sig -> info
-    st.session_state.setdefault("doc_store", None)        # FaissBM25Store
-    st.session_state.setdefault("doc_processed", set())   # sig set
-    st.session_state.setdefault("doc_mq_n", 5)
-    st.session_state.setdefault("doc_per_query_k", 10)
-    st.session_state.setdefault("doc_fused_k", 10)
 
-def doc_has_index() -> bool:
+# Popover (not sidebar)
+with st.popover("📦 文件管理（上傳/索引/OCR）"):
+    # 索引狀態
     store = st.session_state.get("doc_store")
+    chunks_n = 0
     try:
-        return bool(store and store.index and store.index.ntotal > 0)
+        chunks_n = int(store.index.ntotal) if store else 0
     except Exception:
-        return False
+        chunks_n = 0
 
-def doc_build_index_incremental(client: OpenAI):
-    ensure_doc_state()
-    store: Optional[FaissBM25Store] = st.session_state.get("doc_store")
-    processed: set = set(st.session_state.get("doc_processed") or set())
-    files_map: dict = st.session_state.get("doc_files") or {}
+    if chunks_n > 0:
+        st.success(f"已索引 chunks：{chunks_n}")
+    else:
+        st.info("尚未建立索引（上傳文件後按「建立/更新索引」）。")
 
-    # init store dim
-    if store is None:
-        dim = embed_texts(client, ["dim_probe"]).shape[1]
-        store = FaissBM25Store(dim)
-        st.session_state["doc_store"] = store
+    if HAS_PYMUPDF:
+        st.caption(":green[OCR 可用（pymupdf 已安裝）]")
+    else:
+        st.caption(":orange[OCR 不可用（建議安裝 pymupdf 才能對掃描PDF做OCR）]")
 
-    new_chunks: list[Chunk] = []
-    new_texts: list[str] = []
+    st.markdown("#### 🔧 multi‑query 參數")
+    st.session_state.doc_mq_n = st.slider("multi-query 數量", 3, 6, int(st.session_state.doc_mq_n))
+    st.session_state.doc_per_query_k = st.slider("每條 query 取回段落", 6, 14, int(st.session_state.doc_per_query_k))
+    st.session_state.doc_fused_k = st.slider("融合後取回段落", 6, 14, int(st.session_state.doc_fused_k))
 
-    for sig, info in files_map.items():
-        if sig in processed:
-            continue
+    st.markdown("---")
+    st.markdown("#### 📤 上傳文件（可多選）")
+    uploaded_docs = st.file_uploader(
+        "支援 PDF / 圖片",
+        type=["pdf", "png", "jpg", "jpeg", "webp", "gif"],
+        accept_multiple_files=True,
+    )
 
-        name = info["name"]
-        data = info["bytes"]
-        ext = info.get("ext") or os.path.splitext(name)[1].lower()
-        use_ocr = bool(info.get("use_ocr", False))
-
-        title = os.path.splitext(name)[0]
-        report_id = sig[:10]
-
-        pages: list[Tuple[Optional[int], str]] = []
-
-        if ext == ".pdf":
-            if use_ocr and not HAS_PYMUPDF:
-                # 沒 fitz 不做 OCR
-                use_ocr = False
-                info["ocr_error"] = "need_pymupdf"
-            if use_ocr:
-                pdf_pages = ocr_pdf_pages_parallel(client, data, dpi=180, max_workers=2)
-            else:
-                pdf_pages = extract_pdf_text_pages_pypdf(data)
-            pages = [(pno, txt) for pno, txt in pdf_pages]
-        elif ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-            mime = "image/png"
-            if ext in (".jpg", ".jpeg"):
-                mime = "image/jpeg"
-            txt = ocr_image_bytes(client, data, mime=mime)
-            pages = [(None, txt)]
-        else:
-            pages = [(None, "")]
-
-        for page_no, page_text in pages:
-            if not page_text:
+    if uploaded_docs:
+        for f in uploaded_docs:
+            name = f.name
+            data = f.getvalue()
+            if len(data) > MAX_REQ_TOTAL_BYTES:
+                st.warning(f"檔案過大（{name} > 48MB），先不收進索引 🙏")
                 continue
-            chunks = chunk_text(page_text)
-            for i, ch in enumerate(chunks):
-                cid = f"{report_id}_p{page_no if page_no else 'na'}_c{i}"
-                new_chunks.append(Chunk(chunk_id=cid, title=title, page=page_no if isinstance(page_no, int) else None, text=ch))
-                new_texts.append(ch)
+            ext = os.path.splitext(name)[1].lower()
+            sig = sha1_bytes(data)
 
-        processed.add(sig)
+            if sig not in st.session_state.doc_files:
+                info = {"name": name, "bytes": data, "ext": ext}
 
-    if new_texts:
-        vecs_list = []
-        for i in range(0, len(new_texts), DOC_EMBED_BATCH):
-            vecs_list.append(embed_texts(client, new_texts[i:i+DOC_EMBED_BATCH]))
-        vecs = np.vstack(vecs_list)
-        store.add(vecs, new_chunks)
+                if ext == ".pdf":
+                    q = cached_pdf_quality(sig, data)
+                    pages = q["pages"]
+                    extracted_chars = q["extracted_chars"]
+                    blank_ratio = q["blank_ratio"]
+                    likely_scanned = should_suggest_ocr(pages, extracted_chars, blank_ratio)
+                    info.update({
+                        "pages": pages,
+                        "extracted_chars": extracted_chars,
+                        "blank_ratio": blank_ratio,
+                        "likely_scanned": likely_scanned,
+                        "use_ocr": bool(likely_scanned),  # 預設：疑似掃描就開
+                    })
 
-    st.session_state["doc_processed"] = processed
+                st.session_state.doc_files[sig] = info
+
+    files_map = st.session_state.get("doc_files") or {}
+    if files_map:
+        st.markdown("---")
+        st.markdown("#### 📄 文件清單（最近 12 份）")
+        for sig, info in list(files_map.items())[-12:]:
+            name = info.get("name", "")
+            ext = info.get("ext", "")
+            if ext == ".pdf":
+                blank_ratio = info.get("blank_ratio", None)
+                extracted_chars = int(info.get("extracted_chars", 0) or 0)
+                pages = int(info.get("pages", 0) or 0)
+                likely = bool(info.get("likely_scanned", False))
+                line = f"- {name}"
+                if likely:
+                    line += "  :orange[（可能掃描件，建議OCR）]"
+                if blank_ratio is not None:
+                    avg = extracted_chars / max(1, pages)
+                    line += f"  :small[(blank_ratio={float(blank_ratio):.2f}, avg≈{avg:.0f}/page)]"
+                st.markdown(line)
+                info["use_ocr"] = st.checkbox("OCR 這份 PDF", value=bool(info.get("use_ocr", False)), key=f"ocr_{sig}")
+            else:
+                st.markdown(f"- {name}")
+
+    colA, colB = st.columns(2)
+    if colA.button("🚀 建立/更新索引", use_container_width=True):
+        with st.status("DocRAG 建索引中…", expanded=False) as s:
+            doc_build_index_incremental(client)
+            s.update(label="DocRAG 索引完成", state="complete", expanded=False)
+        st.rerun()
+
+    if colB.button("🧹 清空索引", use_container_width=True):
+        st.session_state.doc_store = None
+        st.session_state.doc_processed = set()
+        st.session_state.doc_files = {}
+        st.rerun()
 
 
 # ============================================================
@@ -1303,73 +1334,16 @@ for msg in st.session_state.get("chat_history", []):
             for fn in msg["docs"]:
                 st.caption(f"📎 {fn}")
 
-# ============================================================
-# Doc sidebar：OCR 建議 + 建索引按鈕 + 參數
-# ============================================================
-ensure_doc_state()
-with st.sidebar:
-    st.markdown("### 📚 DocRAG（FAISS + BM25）")
-    st.session_state.doc_mq_n = st.slider("multi-query 數量", 3, 6, int(st.session_state.doc_mq_n))
-    st.session_state.doc_per_query_k = st.slider("每條 query 取回段落", 6, 14, int(st.session_state.doc_per_query_k))
-    st.session_state.doc_fused_k = st.slider("融合後取回段落", 6, 14, int(st.session_state.doc_fused_k))
-
-    if HAS_PYMUPDF:
-        st.caption(":green[OCR 可用（pymupdf 已安裝）]")
-    else:
-        st.caption(":orange[OCR 不可用（建議安裝 pymupdf 才能對掃描PDF做OCR）]")
-
-    if st.button("🚀 更新/建立文件索引（DocRAG）", use_container_width=True):
-        with st.status("DocRAG 建索引中…", expanded=False) as s:
-            doc_build_index_incremental(client)
-            s.update(label="DocRAG 索引完成", state="complete", expanded=False)
-        st.rerun()
-
-    if st.button("🧹 清空 DocRAG 索引", use_container_width=True):
-        st.session_state.doc_store = None
-        st.session_state.doc_processed = set()
-        st.session_state.doc_files = {}
-        st.rerun()
-
-    store = st.session_state.get("doc_store")
-    chunks_n = 0
-    try:
-        chunks_n = int(store.index.ntotal) if store else 0
-    except Exception:
-        chunks_n = 0
-    st.caption(f":small[已索引 chunks：{chunks_n}]")
-
-    files_map = st.session_state.get("doc_files") or {}
-    if files_map:
-        st.markdown("#### 文件清單（最近 8 份）")
-        for sig, info in list(files_map.items())[-8:]:
-            name = info.get("name", "")
-            ext = info.get("ext", "")
-            if ext == ".pdf":
-                likely = bool(info.get("likely_scanned", False))
-                blank_ratio = info.get("blank_ratio", None)
-                chars = int(info.get("extracted_chars", 0) or 0)
-                line = f"- {name}"
-                if likely:
-                    line += "  :orange[（可能掃描件，建議OCR）]"
-                if blank_ratio is not None:
-                    line += f"  :small[(blank_ratio={float(blank_ratio):.2f}, chars={chars})]"
-                st.markdown(line)
-                key = f"ocr_{sig}"
-                info["use_ocr"] = st.checkbox("OCR 這份 PDF", value=bool(info.get("use_ocr", False)), key=key)
-            else:
-                st.markdown(f"- {name}")
-
 
 # ============================================================
 # 8. 使用者輸入（支援圖片 + 檔案）
 # ============================================================
 prompt = st.chat_input(
-    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
+    "wakuwaku！上傳文件（或用 popover 管理文件），然後輸入你的問題吧～",
     accept_file="multiple",
-    file_type=["jpg","jpeg","png","webp","gif","pdf"],
+    file_type=["jpg", "jpeg", "png", "webp", "gif", "pdf"],
 )
 
-# FastAgent streaming
 async def fast_agent_stream(query: str, placeholder) -> str:
     buf = ""
     result = Runner.run_streamed(fast_agent, input=query)
@@ -1382,8 +1356,9 @@ async def fast_agent_stream(query: str, placeholder) -> str:
             placeholder.markdown(buf)
     return buf or "安妮亞找不到答案～（抱歉啦！）"
 
+
 # ============================================================
-# 9. 主流程：Doc-first（若有文件索引）→ 否則走原始 router
+# 9. 主流程：Doc-first（有索引就先文件）→ 不足才走原始 router
 # ============================================================
 if prompt is not None:
     user_text = (prompt.text or "").strip()
@@ -1396,71 +1371,65 @@ if prompt is not None:
 
     files = getattr(prompt, "files", []) or []
     has_pdf_upload = False
-    total_payload_bytes = 0
 
-    # ---- 收集檔案（同時：送給原始流程 + 加入 DocRAG file pool）
-    ensure_doc_state()
-
+    # ---- 收集本回合附件（同時：送給原始流程 + 加入 DocRAG file pool）
     for f in files:
         name = f.name
         data = f.getvalue()
-        total_payload_bytes += len(data)
 
         if len(data) > MAX_REQ_TOTAL_BYTES:
             st.warning(f"檔案過大（{name} > 48MB），先不送出喔～請拆小再試 🙏")
             continue
 
-        if name.lower().endswith((".jpg",".jpeg",".png",".webp",".gif")):
+        ext = os.path.splitext(name)[1].lower()
+
+        if ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
             thumb = make_thumb(data)
             images_for_history.append((name, thumb, data))
-            data_url = bytes_to_data_url(data)
-            content_blocks.append({"type": "input_image", "image_url": data_url})
+            content_blocks.append({"type": "input_image", "image_url": bytes_to_data_url(data)})
 
             # DocRAG 收檔
             sig = sha1_bytes(data)
-            st.session_state.doc_files[sig] = {"name": name, "bytes": data, "ext": os.path.splitext(name)[1].lower()}
+            if sig not in st.session_state.doc_files:
+                st.session_state.doc_files[sig] = {"name": name, "bytes": data, "ext": ext}
             continue
 
-        is_pdf = name.lower().endswith(".pdf")
-        if is_pdf:
+        if ext == ".pdf":
             has_pdf_upload = True
 
-        original_pdf = data
-        if is_pdf and keep_pages:
-            try:
-                data = slice_pdf_bytes(data, keep_pages)
-                st.info(f"已切出指定頁：{keep_pages}（檔案：{name}）")
-            except Exception as e:
-                st.warning(f"切頁失敗，改送整本：{name}（{e}）")
-                data = original_pdf
+            original_pdf = data
+            if keep_pages:
+                try:
+                    data = slice_pdf_bytes(data, keep_pages)
+                    st.info(f"已切出指定頁：{keep_pages}（檔案：{name}）")
+                except Exception as e:
+                    st.warning(f"切頁失敗，改送整本：{name}（{e}）")
+                    data = original_pdf
 
-        docs_for_history.append(name)
-        file_data_uri = file_bytes_to_data_url(name, data)
-        content_blocks.append({"type": "input_file", "filename": name, "file_data": file_data_uri})
+            docs_for_history.append(name)
+            content_blocks.append({"type": "input_file", "filename": name, "file_data": file_bytes_to_data_url(name, data)})
 
-        # DocRAG 收檔（用切頁後的 data 索引 = 你要「只看指定頁」就會一致）
-        sig = sha1_bytes(data)
-        info = {"name": name, "bytes": data, "ext": ".pdf"}
+            # DocRAG 收檔（切頁後內容索引）
+            sig = sha1_bytes(data)
+            if sig not in st.session_state.doc_files:
+                info = {"name": name, "bytes": data, "ext": ".pdf"}
+                q = cached_pdf_quality(sig, data)
+                pages = q["pages"]
+                extracted_chars = q["extracted_chars"]
+                blank_ratio = q["blank_ratio"]
+                likely_scanned = should_suggest_ocr(pages, extracted_chars, blank_ratio)
+                info.update({
+                    "pages": pages,
+                    "extracted_chars": extracted_chars,
+                    "blank_ratio": blank_ratio,
+                    "likely_scanned": likely_scanned,
+                    "use_ocr": bool(likely_scanned),
+                })
+                st.session_state.doc_files[sig] = info
+                if likely_scanned:
+                    st.info(f"偵測到 PDF 可能是掃描件（blank_ratio={blank_ratio:.2f}）。建議開 OCR（到 popover 勾選）。")
 
-        # 抽字品質偵測 -> 建議OCR
-        q = _cached_pdf_text_quality(sig, data)
-        pages = q["pages"]
-        extracted_chars = q["extracted_chars"]
-        blank_ratio = q["blank_ratio"]
-        likely_scanned = should_suggest_ocr(pages, extracted_chars, blank_ratio)
-
-        info.update({
-            "pages": pages,
-            "extracted_chars": extracted_chars,
-            "blank_ratio": blank_ratio,
-            "likely_scanned": likely_scanned,
-            "use_ocr": bool(likely_scanned),  # ✅ 預設：疑似掃描就開
-        })
-
-        st.session_state.doc_files[sig] = info
-        if likely_scanned:
-            st.info(f"偵測到 PDF 可能是掃描件（blank_ratio={blank_ratio:.2f}, avg≈{extracted_chars/max(1,pages):.0f} chars/page）。建議開 OCR（右側可切換）。")
-
+    # ✅ 若本回合沒 PDF，頁碼就不套用（避免誤判）
     if keep_pages and not has_pdf_upload:
         keep_pages = []
 
@@ -1470,7 +1439,7 @@ if prompt is not None:
             "text": f"請僅根據提供的頁面內容作答（頁碼：{keep_pages}）。若需要其他頁資訊，請先提出需要的頁碼建議。"
         })
 
-    # ---- 立即顯示 user bubble
+    # ---- 顯示 user bubble
     with st.chat_message("user"):
         if user_text:
             st.markdown(user_text)
@@ -1482,13 +1451,7 @@ if prompt is not None:
                 st.caption(f"📎 {fn}")
 
     # ---- 寫入歷史
-    ensure_session_defaults()
-    st.session_state.chat_history.append({
-        "role": "user",
-        "text": user_text,
-        "images": images_for_history,
-        "docs": docs_for_history
-    })
+    st.session_state.chat_history.append({"role": "user", "text": user_text, "images": images_for_history, "docs": docs_for_history})
 
     trimmed_messages = build_trimmed_input_messages(content_blocks)
     today_system_msg = build_today_system_message()
@@ -1504,10 +1467,9 @@ if prompt is not None:
                 placeholder = output_area.empty()
 
                 # =========================================================
-                # ✅ Doc-first：只要 DocRAG 有文件 + 有索引（或可建立索引）就先跑
+                # ✅ Doc-first：有索引就先文件；不足才回退原始流程
                 # =========================================================
-                doc_files_present = bool(st.session_state.get("doc_files"))
-                if doc_files_present:
+                if st.session_state.get("doc_files"):
                     status.update(label="📚 文件模式：更新索引中…", state="running", expanded=False)
                     doc_build_index_incremental(client)
 
@@ -1520,12 +1482,8 @@ if prompt is not None:
                     fused_k = int(st.session_state.get("doc_fused_k", 10))
 
                     plan, per_query_hits, fused_hits = doc_multi_query_fusion(
-                        client,
-                        store,
-                        user_text,
-                        n_queries=n_queries,
-                        per_query_k=per_k,
-                        fused_k=fused_k,
+                        client, store, user_text,
+                        n_queries=n_queries, per_query_k=per_k, fused_k=fused_k
                     )
 
                     render_run_badges(mode="doc", diff="doc", db_calls=len(plan), web_calls=0, enable_web=False)
@@ -1538,11 +1496,9 @@ if prompt is not None:
 
                     final_text = fake_stream_markdown(answer_text, placeholder)
 
-                    ensure_session_defaults()
                     st.session_state.chat_history.append({"role": "assistant", "text": final_text, "images": [], "docs": []})
                     status.update(label="✅ 文件模式完成", state="complete", expanded=False)
 
-                    # 若文件回答夠用，就結束；不夠用才回退原本 router（可 web_search）
                     if not doc_answer_insufficient(answer_text, evidence_text):
                         with sources_container:
                             if docs_for_history:
@@ -1554,7 +1510,7 @@ if prompt is not None:
                         status.info("文件資料不足，改走原始流程補足（可能使用 web_search）。")
 
                 # =========================================================
-                # 原始流程（fast/general/research）— 不改你邏輯
+                # 原始流程（fast/general/research）
                 # =========================================================
                 fr_result = run_front_router(client, trimmed_messages, user_text, runtime_messages=[today_system_msg])
                 kind = fr_result.get("kind")
@@ -1579,7 +1535,6 @@ if prompt is not None:
                             for fn in docs_for_history:
                                 st.markdown(f"- {fn}")
 
-                    ensure_session_defaults()
                     st.session_state.chat_history.append({"role": "assistant", "text": final_text, "images": [], "docs": []})
                     status.update(label="✅ 快速回答完成", state="complete", expanded=False)
                     st.stop()
@@ -1647,11 +1602,10 @@ if prompt is not None:
                             for fn in docs_for_history:
                                 st.markdown(f"- {fn}")
 
-                    ensure_session_defaults()
                     st.session_state.chat_history.append({"role": "assistant", "text": final_text, "images": [], "docs": []})
                     st.stop()
 
-                # RESEARCH
+                # RESEARCH（websearch planner）
                 if kind == "research":
                     status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
                     plan_query = args.get("query") or user_text
@@ -1665,6 +1619,7 @@ if prompt is not None:
                             for i, it in enumerate(search_plan):
                                 st.markdown(f"**{i+1}. {it.query}**\n> {it.reason}")
                             st.markdown("### 各項搜尋摘要")
+
                             body_placeholders = []
                             for i, it in enumerate(search_plan):
                                 sec = st.container()
@@ -1692,10 +1647,7 @@ if prompt is not None:
                                 return results
 
                             search_results = run_async(aparallel_search_stream(search_agent, search_plan, body_placeholders))
-
-                            summary_texts = []
-                            for r in search_results:
-                                summary_texts.append(str(getattr(r, "final_output", "") or r or ""))
+                            summary_texts = [str(getattr(r, "final_output", "") or r or "") for r in search_results]
 
                     trimmed_messages_no_guard = strip_page_guard(trimmed_messages)
                     trimmed_messages_no_guard_with_today = [today_system_msg] + list(trimmed_messages_no_guard)
@@ -1741,7 +1693,6 @@ if prompt is not None:
                         "#### 完整報告\n" + (writer_data.get("markdown_report", "") or "") + "\n\n" +
                         "#### 後續建議問題\n" + "\n".join([f"- {q}" for q in writer_data.get("follow_up_questions", []) or []])
                     )
-                    ensure_session_defaults()
                     st.session_state.chat_history.append({"role": "assistant", "text": ai_reply, "images": [], "docs": []})
                     status.update(label="✅ 研究流程完成", state="complete", expanded=False)
                     st.stop()
