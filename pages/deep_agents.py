@@ -1554,6 +1554,147 @@ def _agent_stream_with_files(agent, input_state: dict, *, files_seed: Optional[d
 
     return agent.stream(input_state, stream_mode=stream_mode, config=config)
 
+# ========= (3) 新增：通用「選文件 + 檢索 + 回答」工具（放在 fallback_answer_from_store() 後面、ensure_deep_agent() 前面） =========
+REPORT_REF_KWS = ["這份報告", "這一份報告", "本報告", "該報告", "此報告", "這篇報告", "這份文件", "本文件", "該文件", "此文件"]
+
+def mentions_report_reference(q: str) -> bool:
+    q = (q or "").strip()
+    return any(k in q for k in REPORT_REF_KWS)
+
+def list_report_titles_from_store(store: Optional[FaissStore]) -> list[str]:
+    if store is None:
+        return []
+    seen = set()
+    titles = []
+    for c in (store.chunks or []):
+        t = (c.title or "").strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        titles.append(t)
+    return sorted(titles)
+
+def guess_target_title(prompt: str, titles: list[str], *, last_title: Optional[str]) -> Optional[str]:
+    """
+    選文件順序：
+    1) 問題文字明確包含 title -> 用最長匹配
+    2) 只有一份 -> 用那份
+    3) 有「這份/本報告」等指涉字 -> 用 last_title（若存在）
+    4) 否則 None（表示跨文件問答，或需要你指定）
+    """
+    titles = [t for t in (titles or []) if (t or "").strip()]
+    q = (prompt or "").strip()
+    if not titles:
+        return None
+
+    q_low = q.lower()
+    matched = [t for t in titles if t.lower() in q_low or norm_space(t).lower() in norm_space(q).lower()]
+    if matched:
+        matched.sort(key=lambda x: len(x), reverse=True)
+        return matched[0]
+
+    if len(titles) == 1:
+        return titles[0]
+
+    if mentions_report_reference(q) and last_title and last_title in titles:
+        return last_title
+
+    return None
+
+def retrieve_hits(
+    client: OpenAI,
+    store: FaissStore,
+    query: str,
+    *,
+    title: Optional[str],
+    k: int,
+    difficulty: str,
+) -> list[tuple[float, Chunk]]:
+    """
+    通用檢索：先全庫搜，再視需要過濾到指定 title。
+    若指定 title 過濾後太少，會再做一次「title + query」的 bias 搜尋補強。
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    k = max(4, min(12, int(k)))
+    qvec = embed_texts(client, [q])
+    hits = store.search_hybrid(q, qvec, k=k, difficulty=difficulty)
+
+    if not title:
+        return hits
+
+    title = (title or "").strip()
+    filtered = [(s, ch) for (s, ch) in hits if (ch.title or "").strip() == title]
+
+    # 不夠就用 title bias 再搜一次補強
+    if len(filtered) < max(2, k // 2):
+        q2 = f"{title}\n{q}"
+        q2vec = embed_texts(client, [q2])
+        hits2 = store.search_hybrid(q2, q2vec, k=k, difficulty=difficulty)
+        filtered2 = [(s, ch) for (s, ch) in hits2 if (ch.title or "").strip() == title]
+
+        # merge（去重 chunk_id）
+        seen = set()
+        merged: list[tuple[float, Chunk]] = []
+        for s, ch in (filtered + filtered2):
+            if ch.chunk_id in seen:
+                continue
+            seen.add(ch.chunk_id)
+            merged.append((s, ch))
+        return merged[:k]
+
+    return filtered[:k]
+
+def render_retriever_hits_expander(hits: list[tuple[float, Chunk]], *, label: str = "🔎 Retriever 命中內容（節錄）") -> None:
+    if not st.session_state.get("show_retriever_hits_expander", True):
+        return
+    expanded = bool(st.session_state.get("retriever_hits_expanded_by_default", False))
+    max_show = int(st.session_state.get("retriever_hits_max_per_query", 6) or 6)
+
+    with st.expander(label, expanded=expanded):
+        if not hits:
+            st.markdown("（沒有命中任何內容）")
+            return
+        for score, ch in hits[:max_show]:
+            head = f"[{ch.title} p{ch.page if ch.page is not None else '-'}]"
+            snippet = (ch.text or "").strip().replace("\n", " ")
+            if len(snippet) > 520:
+                snippet = snippet[:520] + "…"
+            try:
+                s = f"{float(score):.3f}"
+            except Exception:
+                s = str(score)
+            st.markdown(f"- **{head}** score={s}：{snippet}")
+
+def answer_from_hits(
+    client: OpenAI,
+    question: str,
+    hits: list[tuple[float, Chunk]],
+) -> str:
+    """
+    真正的「解問題」：把命中的 chunk 當 Context，要求模型只能依據 Context 回答並附引用。
+    """
+    chunks = [ch for _s, ch in (hits or [])]
+    ctx = render_chunks_for_model(chunks, max_chars_each=900)
+
+    if not ctx.strip():
+        return "資料不足：目前檢索不到可用的文件段落來回答這個問題。你可以：\n- 換個問法（加上關鍵字/章節/頁碼線索）\n- 或指定要看哪一份報告"
+
+    system = (
+        "你是嚴謹的文件問答助理，只能根據「文件摘錄」回答，不可腦補。\n"
+        "用繁體中文（台灣用語）。\n"
+        "輸出規則：\n"
+        "- 先直接回答問題（條列為主）。\n"
+        "- 只要是事實/判斷/引用文件內容的句子，句尾都要有引用 token：[報告名稱 pN]（N 可為 -）。\n"
+        "- 若文件摘錄不足以支持，就明確寫『資料不足』並說需要補什麼（<=3 點）。\n"
+        "- 不要只給大綱；要回答使用者的問句。\n"
+    )
+    user = f"問題：{question}\n\n文件摘錄：\n{ctx}\n"
+    out, _ = call_gpt(client, model=MODEL_MAIN, system=system, user=user, reasoning_effort=REASONING_EFFORT)
+    out = strip_internal_process_lines((out or "").strip())
+    return out or "（系統：模型未產出內容）"
 
 def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     _require_deepagents()
@@ -2293,7 +2434,13 @@ st.session_state.setdefault("da_show_status_doc_hits", True)
 st.session_state.setdefault("da_show_claims", True)
 st.session_state.setdefault("da_show_reflections", True)
 st.session_state.setdefault("da_status_expanded", False)
+# ========= (1) Session init：新增幾個 session_state（放在你現有的 st.session_state.setdefault(...) 那一大段附近） =========
+st.session_state.setdefault("last_report_title", None)
 
+# retriever hits 顯示控制
+st.session_state.setdefault("show_retriever_hits_expander", True)
+st.session_state.setdefault("retriever_hits_expanded_by_default", False)
+st.session_state.setdefault("retriever_hits_max_per_query", 6)
 
 # =========================
 # Popover：文件管理 / Skills / Debug（依你要求重新排版）
@@ -2382,6 +2529,7 @@ with st.popover("📦 文件管理 / Skills / Debug"):
                     use_ocr=use_ocr,
                 )
             )
+            st.session_state["last_report_title"] = os.path.splitext(f.name)[0]
 
     # 表格顯示（pandas）
     df_files = build_files_df(st.session_state.file_rows)
@@ -2550,100 +2698,75 @@ if prompt:
                 enable_web = False
 
         # ✅ advisor（有索引必走）
+# ========= (4) 替換：Chat main 的 advisor 分支（把你目前 if plan.mode == "advisor" and has_index: 那整段換成下面） =========
         if plan.mode == "advisor" and has_index:
-            agent = ensure_deep_agent(client=client, store=st.session_state.store, enable_web=enable_web)
+            store = st.session_state.get("store", None)
+            if store is None or getattr(store, "index", None) is None or store.index.ntotal == 0:
+                answer_text = "（系統：has_index=true 但 store/index 空，請先建立索引）"
+                meta = {
+                    "mode": "advisor",
+                    "enable_web": False,
+                    "usage": {"doc_search_calls": 0, "web_search_calls": 0},
+                    "difficulty": plan.difficulty,
+                    "web_sources": {},
+                }
+                render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
+                render_markdown_answer_with_sources_badges(answer_text)
+                st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+                st.stop()
 
-            # deep_agent_run_with_live_status 內部本來就有 st.status（會顯示 todos/evidence/claims/反思/doc hits）
-            answer_text, _files = deep_agent_run_with_live_status(agent, prompt, run_messages, client=client, status=main_status,)
+            titles = list_report_titles_from_store(store)
+            last_title = st.session_state.get("last_report_title")
+            target_title = guess_target_title(prompt, titles, last_title=last_title)
 
-            answer_text = strip_internal_process_lines(answer_text)
+            # ✅ 只有在「使用者明確指涉某份報告」但我們又無法推斷是哪份時，才請他選
+            if mentions_report_reference(prompt) and (len(titles) > 1) and (target_title is None):
+                answer_text = "你說的「這份報告」我目前無法判斷是哪一份，請選一個檔名（貼上或回覆序號）：\n" + "\n".join(
+                    [f"{i+1}. {t}" for i, t in enumerate(titles[:30])]
+                )
+                meta = {
+                    "mode": "advisor",
+                    "enable_web": False,
+                    "usage": {"doc_search_calls": 0, "web_search_calls": 0},
+                    "difficulty": plan.difficulty,
+                    "web_sources": {},
+                }
+                render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
+                render_markdown_answer_with_sources_badges(answer_text)
+                st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
+                st.stop()
+
+            # ✅ 核心：不管是不是摘要需求，都用檢索命中段落來回答
+            hits = retrieve_hits(
+                client,
+                store,
+                prompt,
+                title=target_title,                 # None 表示跨文件一起找
+                k=plan.doc_top_k,
+                difficulty=plan.difficulty,
+            )
+
+            # ✅ 你要的：在 status 上用 expander 顯示 retriever 命中段落
+            render_retriever_hits_expander(
+                hits,
+                label="🔎 Retriever 命中內容（節錄）",
+            )
+
+            answer_text = answer_from_hits(client, prompt, hits)
+
             if st.session_state.get("enable_output_formatter", True):
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
-            
-            main_status.update(label="完成", state="complete", expanded=False)
+            answer_text = strip_internal_process_lines(answer_text)
 
             meta = {
                 "mode": "advisor",
-                "enable_web": enable_web,
-                "usage": dict(st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0})),
+                "enable_web": False,
+                "usage": {"doc_search_calls": 1, "web_search_calls": 0},
                 "difficulty": plan.difficulty,
                 "web_sources": {},
             }
-            render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
+            render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
             render_markdown_answer_with_sources_badges(answer_text)
-
-            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
-            st.stop()
-
-        # === 沒索引：也要有 st.status ===
-        if not has_index:
-            with main_status.update(label="Direct：生成回答中…", state="running", expanded=False) as s:
-                web_sources: Dict[str, List[Tuple[str, str]]] = {}
-                usage = {"doc_search_calls": 0, "web_search_calls": 0}
-
-                history_msgs = run_messages[:-1]
-                history_block = "\n".join(
-                    [f"{m['role'].upper()}: {m['content']}" for m in history_msgs if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()]
-                ).strip()
-                user_text = prompt if not history_block else f"對話脈絡（最近）：\n{history_block}\n\n目前問題：\n{prompt}"
-
-                if enable_web:
-                    s.update(label="Direct：web_search 蒐證中…", state="running", expanded=False)
-                    evidence_md, sources = call_gpt(
-                        client,
-                        model=MODEL_MAIN,
-                        system=DIRECT_EVIDENCE_SYSTEM_PROMPT,
-                        user=f"{user_text}\n\n（請開始 web_search 蒐證）",
-                        reasoning_effort=REASONING_EFFORT,
-                        tools=[{"type": "web_search"}],
-                        include_sources=True,
-                        tool_choice="required",
-                    )
-                    usage["web_search_calls"] = 1
-                    web_sources = web_sources_from_openai_sources(sources)
-
-                    s.write("#### 蒐證摘要（節錄）")
-                    s.write((evidence_md or "")[:800])
-
-                    s.update(label="Direct：寫作整理中…", state="running", expanded=False)
-                    writer_user = f"{user_text}\n\n=== EVIDENCE ===\n{(evidence_md or '').strip()}\n"
-                    ans, _ = call_gpt(
-                        client,
-                        model=MODEL_MAIN,
-                        system=ANYA_SYSTEM_PROMPT + "\n\n" + DIRECT_WRITER_SYSTEM_PROMPT,
-                        user=writer_user,
-                        reasoning_effort=REASONING_EFFORT,
-                    )
-                    answer_text = (ans or "").strip()
-                    answer_text = (answer_text.rstrip() + "\n\n[WebSearch:web p-]").strip()
-                else:
-                    s.update(label="Direct：生成中…", state="running", expanded=False)
-                    ans, _ = call_gpt(
-                        client,
-                        model=MODEL_MAIN,
-                        system=ANYA_SYSTEM_PROMPT,
-                        user=user_text,
-                        reasoning_effort=REASONING_EFFORT,
-                    )
-                    answer_text = (ans or "").strip()
-
-                if st.session_state.get("enable_output_formatter", True):
-                    answer_text = format_markdown_output_preserve_citations(client, answer_text)
-                answer_text = strip_internal_process_lines(answer_text)
-
-                s.update(label="Direct：完成", state="complete", expanded=False)
-
-            meta = {
-                "mode": "direct",
-                "enable_web": enable_web,
-                "usage": usage,
-                "difficulty": plan.difficulty,
-                "web_sources": web_sources,
-            }
-            render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
-            render_markdown_answer_with_sources_badges(answer_text)
-            render_web_sources_list(web_sources)
-
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
 
