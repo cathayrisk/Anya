@@ -1888,7 +1888,30 @@ def _safe_json_preview(text: str, max_chars: int = 1400) -> str:
         return t[:max_chars] + "…"
     return t
 
+# ========= [1/2] 新增：放在 deep_agent_run_with_live_status 之前（建議放在 _safe_json_preview 後面） =========
+def _coerce_file_text(v: Any) -> str:
+    """
+    deepagents state["files"][path] 可能是：
+    - str（最常見）
+    - dict/list（已解析的 JSON）
+    - 其他型別（少見）
+    統一轉成「可顯示/可 .strip()」的字串，避免 AttributeError。
+    """
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(v)
+    try:
+        return str(v)
+    except Exception:
+        return ""
 
+# ========= [2/2] 整段替換：deep_agent_run_with_live_status（用這個版本整個蓋掉原本的） =========
 def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[dict], client: OpenAI, status=None) -> Tuple[str, Optional[dict]]:
     """
     ✅ 共用同一個 st.status（避免巢狀 status 導致畫面只顯示「路由完成」）
@@ -1952,6 +1975,10 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
             s0 = (s0 or "").strip()
             return s0 if len(s0) <= max_chars else s0[:max_chars] + "…"
 
+        def _get_text(files: dict, path: str) -> str:
+            # files[path] 可能不是字串（dict/list），統一轉成字串
+            return _coerce_file_text((files or {}).get(path)).strip()
+
         def _render_doc_hits():
             if not show_doc_hits:
                 return
@@ -1978,10 +2005,10 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
         def _render_memo(files: dict):
             if not show_debug:
                 return
-            todos = (files.get("/workspace/todos.json") or "").strip()
-            facets = (files.get("/workspace/facets.json") or "").strip()
-            claims = (files.get("/analysis/claims.json") or "").strip()
-            refl = (files.get("/analysis/reflections.json") or "").strip()
+            todos = _get_text(files, "/workspace/todos.json")
+            facets = _get_text(files, "/workspace/facets.json")
+            claims = _get_text(files, "/analysis/claims.json")
+            refl = _get_text(files, "/analysis/reflections.json")
 
             blocks = []
             if todos:
@@ -1998,22 +2025,22 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
         def _render_files_preview(files: dict):
             if not (show_files and show_debug):
                 return
-            keys = sorted([k for k in files.keys() if isinstance(k, str)])
+            keys = sorted([k for k in (files or {}).keys() if isinstance(k, str)])
             evidence_keys = [k for k in keys if k.startswith("/evidence/")][:12]
-            draft = (files.get("/draft.md") or "")
-            review = (files.get("/review.md") or "")
+            draft = _get_text(files, "/draft.md")
+            review = _get_text(files, "/review.md")
 
             lines = []
             if evidence_keys:
                 lines.append("#### 📎 Evidence（節錄）")
                 for k in evidence_keys:
-                    t = (files.get(k) or "")
+                    t = _coerce_file_text((files or {}).get(k))
                     if not isinstance(t, str) or not t.strip():
                         continue
                     lines.append(f"- `{k}`\n\n```text\n{t[:UI_MAX_EVIDENCE_PREVIEW_CHARS]}\n```")
-            if isinstance(draft, str) and draft.strip():
+            if draft.strip():
                 lines.append("#### 🧾 Draft（節錄）\n```markdown\n" + draft[:UI_MAX_DRAFT_PREVIEW_CHARS] + "\n```")
-            if isinstance(review, str) and review.strip():
+            if review.strip():
                 lines.append("#### ✅ Review（節錄）\n```text\n" + review[:900] + "\n```")
 
             files_ph.markdown("\n\n".join(lines) if lines else ":small[（尚未產生 evidence/draft/review）]")
@@ -2036,7 +2063,7 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
 
             if "/analysis/claims.json" in file_keys or "/analysis/reflections.json" in file_keys:
                 set_phase(s, "analysis")
-            if any(k.startswith("/evidence/") for k in file_keys):
+            if any(isinstance(k, str) and k.startswith("/evidence/") for k in file_keys):
                 set_phase(s, "evidence")
             if "/draft.md" in file_keys:
                 set_phase(s, "draft")
@@ -2047,7 +2074,7 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
             _render_memo(files)
             _render_files_preview(files)
 
-            draft_txt = files.get("/draft.md") or ""
+            draft_txt = _coerce_file_text(files.get("/draft.md"))
             if isinstance(draft_txt, str):
                 draft_norm = norm_space(draft_txt)
                 if len(draft_norm) >= stall_min_chars:
@@ -2069,11 +2096,11 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
                         s.warning("判定卡住（引用未生成），已改用 fallback。")
                         diff = str(st.session_state.get("current_difficulty", "medium") or "medium")
                         answer = fallback_answer_from_store(client, st.session_state.get("store", None), user_text, k=10, difficulty=diff)
-                        return answer, files if files else None
+                        return answer, (files if files else None)
 
         files = (final_state or {}).get("files") or {}
         files = files if isinstance(files, dict) else {}
-        final_text = files.get("/draft.md") or ""
+        final_text = _coerce_file_text(files.get("/draft.md"))
         final_text = strip_internal_process_lines(final_text if isinstance(final_text, str) else "")
         set_phase(s, "done")
         return final_text or "（DeepAgent 沒有產出內容）", (files if files else None)
@@ -2083,7 +2110,7 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
         st.session_state["last_run_forced_end"] = "recursion_limit"
         files = (final_state or {}).get("files") or {}
         files = files if isinstance(files, dict) else {}
-        draft = files.get("/draft.md") or ""
+        draft = _coerce_file_text(files.get("/draft.md"))
         draft = strip_internal_process_lines(draft if isinstance(draft, str) else "")
         if draft.strip():
             return draft.strip(), (files if files else None)
