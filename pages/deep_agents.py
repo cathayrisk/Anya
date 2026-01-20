@@ -69,7 +69,7 @@ MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024
 
 # DocRAG knobs (default)
 DOC_EMBED_MODEL = "text-embedding-3-small"
-DOC_MODEL_PLANNER = "gpt-4.1-mini"   # planner 便宜快
+DOC_MODEL_PLANNER = "gpt-5.2"   # planner 便宜快
 DOC_MODEL_EVIDENCE = "gpt-5.2"
 DOC_MODEL_WRITER = "gpt-5.2"
 DOC_MODEL_OCR = "gpt-5.2"
