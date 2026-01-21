@@ -1906,7 +1906,7 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     def _doc_search_fn(query: str, k: int = 8, title_filter: str = "") -> str:
         """
         Hybrid search。新增 title_filter：
-        - 空字串/All/None => 不過濾（跨所有文件）
+        - 空字串/All => 不過濾（跨所有文件）
         - 否則只回傳該 title 的 chunks（硬限制 scope）
         """
         if not _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS):
@@ -1921,16 +1921,16 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             tf = ""
 
         qvec = embed_texts(client, [q])
-        k2 = max(1, min(24, int(k)))  # allow a bit larger when filtering
+        k2 = max(1, min(24, int(k)))
         difficulty = str(st.session_state.get("current_difficulty", "medium") or "medium").lower()
 
-        # 先搜較多候選，之後再做 title filter（避免 scope 內召回不足）
+        # 先多抓一些候選，避免 scope 過濾後不夠
         hits = store.search_hybrid(q, qvec, k=max(k2, 16), difficulty=difficulty)
 
         if tf:
             hits = [(s, ch) for (s, ch) in hits if (ch.title or "").strip() == tf]
 
-        hits = hits[: min(k2, 12)]  # 最終最多 12（避免 context 爆）
+        hits = hits[: min(k2, 12)]
 
         payload = {"hits": []}
         ui_hits = []
@@ -1939,8 +1939,8 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
             item = {
                 "title": ch.title,
                 "page": str(ch.page) if ch.page is not None else "-",
-                "citation_token": citation_token,   # ✅ 白名單基礎：writer/verifier 只能用這個
-                "chunk_id": ch.chunk_id,            # internal only（不得寫入 evidence）
+                "citation_token": citation_token,
+                "chunk_id": ch.chunk_id,  # internal only（不得寫入 evidence）
                 "text": (ch.text or "")[:1200],
                 "score": float(score),
             }
@@ -1961,23 +1961,90 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
         return json.dumps(payload, ensure_ascii=False)
 
-# --- (7.2) 新增一個 grader 工具（在 ensure_deep_agent() 裡，tools 建立附近）---
+    def _doc_get_chunk_fn(chunk_id: str, max_chars: int = 2600) -> str:
+        cid = (chunk_id or "").strip()
+        if not cid:
+            return ""
+        for c in store.chunks:
+            if c.chunk_id == cid:
+                return (c.text or "")[:max_chars]
+        return ""
+
     def _grade_doc_evidence_fn(question: str, evidence: str) -> str:
-        """
-        回傳 JSON：{"score": 0~1}
-        用於判斷「文件 evidence 是否足夠」。你拍板門檻：< 0.55 才能開 web。
-        """
         q = (question or "").strip()
         ev = (evidence or "").strip()
         s = grade_doc_evidence_sufficiency(client, q, ev)
         return json.dumps({"score": float(s)}, ensure_ascii=False)
 
-# 記得把它做成 tool 並加入 tools list：
-# tool_grade_doc = _mk_tool(_grade_doc_evidence_fn, "grade_doc_evidence", "Grade whether document evidence is sufficient. Returns JSON {score}.")
-# tools.append(tool_grade_doc)
+    def _mk_tool(fn, name: str, description: str) -> BaseTool:
+        return StructuredTool.from_function(fn, name=name, description=description)
 
-# --- (7.3) 更新 retriever_prompt / web_prompt / writer_prompt / verifier_prompt / orchestrator_prompt（在 ensure_deep_agent() 裡把原字串替換） ---
+    # ✅ 一定要先定義 tools，下面 subagents 才能引用
+    tool_get_usage = _mk_tool(_get_usage_fn, "get_usage", "Get current tool usage counters as JSON (budget/debug).")
+    tool_doc_list = _mk_tool(_doc_list_fn, "doc_list", "List indexed documents and chunk counts.")
+    tool_doc_search = _mk_tool(_doc_search_fn, "doc_search", "Hybrid search over indexed chunks. Returns JSON hits with title/page/citation_token/chunk_id/text.")
+    tool_doc_get_chunk = _mk_tool(_doc_get_chunk_fn, "doc_get_chunk", "Fetch full text for a given chunk_id for close reading. Returns text only.")
+    tool_grade_doc = _mk_tool(_grade_doc_evidence_fn, "grade_doc_evidence", "Grade whether document evidence is sufficient. Returns JSON {score}.")
 
+    tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk, tool_grade_doc]
+
+    tool_web_search_summary: Optional[BaseTool] = None
+    if enable_web:
+        def _web_search_summary_fn(query: str) -> str:
+            if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
+                return "[WebSearch:web p-]\nSources:"
+
+            q = (query or "").strip()
+            if not q:
+                return "[WebSearch:web p-]\nSources:"
+
+            system = (
+                "你是研究助理。輸出格式固定：\n"
+                "1) 3~8 個 bullets 摘要（每點一句，必要時含日期/數字）。\n"
+                "2) Sources: 之後列來源，每行：- <domain> | <title> | <url>\n"
+                "規則：不要提工具流程/額度。\n"
+            )
+            user = f"Search term: {q}"
+            text, sources = call_gpt(
+                client,
+                model=MODEL_WEB,
+                system=system,
+                user=user,
+                reasoning_effort=None,
+                tools=[{"type": "web_search"}],
+                include_sources=True,
+            )
+
+            src_lines = []
+            for s in (sources or [])[:10]:
+                if isinstance(s, dict):
+                    t = (s.get("title") or s.get("source") or "source").strip()
+                    u = (s.get("url") or "").strip()
+                    if u:
+                        src_lines.append(f"- {_domain(u)} | {t} | {u}")
+
+            out_text = (text or "").strip()
+            if "Sources:" not in out_text:
+                out_text = (out_text + "\n\nSources:").strip()
+            if src_lines:
+                out_text = (out_text + "\n" + "\n".join(src_lines)).strip()
+
+            primary_domain = "web"
+            if sources and isinstance(sources, list):
+                u0 = ((sources[0] or {}).get("url") or "").strip() if isinstance(sources[0], dict) else ""
+                if u0:
+                    primary_domain = _domain(u0)
+
+            return f"[WebSearch:{primary_domain} p-]\n" + out_text[:2400]
+
+        tool_web_search_summary = _mk_tool(
+            _web_search_summary_fn,
+            "web_search_summary",
+            "Run web_search and return a short Traditional Chinese summary with sources.",
+        )
+        tools.append(tool_web_search_summary)
+
+    # ===== Subagent prompts =====
     retriever_prompt = f"""
 你是文件檢索專家（只能用 doc_list/doc_search/doc_get_chunk/get_usage）。
 你會收到 runtime 設定在 /runtime/runtime.json（scope_title/web_threshold/question_kind/allow_web）。
@@ -1996,55 +2063,61 @@ hints: <關鍵字可空>
 - chunk_id 絕對不能寫進 evidence（只能 internal 使用）
 
 evidence 內容格式（固定）：
-1) 一行引用標頭：<citation_token>   （例如 [某報告 p12]）
+1) 一行引用標頭：<citation_token>
 2) 一段原文片段（可截斷）
 3) 一行說明「這段支持什麼」
 
 最後回 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
 """.strip()
 
-    web_prompt = f"""
+    analyst_prompt = f"""
+你是推理分析專家（不做檢索；只讀 evidence 產物）。
+你要做兩份結構化產物：
+
+1) /analysis/claims.json
+- JSON array，最多 {DA_MAX_CLAIMS} 條
+- 每條包含：
+  - claim（可核對的一句話）
+  - citations（array；元素必須是像 [報告名稱 pN] 或 [WebSearch:domain p-]）
+  - assumptions（array，可空）
+  - confidence（0~1 float）
+
+2) /analysis/reflections.json（反思）
+- JSON array，至少 2 條
+- 每條包含：
+  - reflection（盲點/風險/反例/需驗證點）
+  - citations（array；可空）
+  - needs_validation（boolean；若 citations 空，必須 true）
+  - impact（若成立會如何影響結論/決策）
+
+硬規則：
+- 只能依據 evidence 內看到的內容
+- 禁止任何內部字樣（chunk_id、/evidence、Budget exceeded 等）
+""".strip()
+
+    web_prompt = """
 你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。
-你會收到 runtime 設定在 /runtime/runtime.json（web_threshold/allow_web）。
-
-任務：對指定 facet 補外部證據，寫入 /evidence/web_<facet_slug>.md
-
+對每個 facet：寫入 /evidence/web_<facet_slug>.md
 硬規則：
 - 每段要保留引用標頭 [WebSearch:<domain> p-]
 - 禁止捏造來源；不要寫工具流程/額度字樣
-- 若 facet 其實應該能由文件回答：請回報「建議優先補文件證據」而不是亂查
 """.strip()
 
-    writer_prompt = f"""
+    writer_prompt = """
 你是寫作/整理專家。你會收到：
 - /runtime/runtime.json（question_kind: chat|memo）
-- /evidence/ 下所有 doc_*.md（與可選 web_*.md）
-- /analysis/claims.json
-- /analysis/reflections.json
+- evidence（doc_*.md 與可選 web_*.md）
+- claims/reflections
 → 產生 /draft.md
 
-輸出風格（Q2=C）：
-- question_kind="chat"：用「一般聊天式回答」，條列為主、口吻自然；只有「關鍵事實句」句尾要引用 token。
-- question_kind="memo"：輸出 Decision Memo（較正式），每個重點結論句尾都要引用 token。
+輸出風格：
+- question_kind="chat"：一般聊天式回答；只有「關鍵事實句」句尾要引用 token
+- question_kind="memo"：Decision Memo；重點結論句尾必有引用 token
 
 硬規則：
-- 只能用 evidence/claims/reflections 支持的內容，不可腦補
-- 引用 token 必須是 evidence 中出現過的 citation_token（或 [WebSearch:* p-]）
+- 引用 token 必須是 evidence 中出現過的 token（或 [WebSearch:* p-]）
+- 不可腦補；不足就寫「資料不足」並列 1~3 項需要補的資訊
 - /draft.md 不得出現內部字樣（/evidence、/analysis、doc_、web_、Budget exceeded、chunk_id）
-- 若資料不足：明確寫「資料不足」，並列 1~3 項需要補的資訊
-
-/draft.md 建議格式：
-## 回答
-- ...
-##（若 question_kind="memo" 才輸出）Decision Memo
-- 目標：
-- 現況與限制：
-- 選項：
-- 建議：
-- 取捨：
-- 反思：
-## 下一步
-- [ ] ...（含 DoD）
 """.strip()
 
     verifier_prompt = f"""
@@ -2057,31 +2130,22 @@ evidence 內容格式（固定）：
 """.strip()
 
     orchestrator_prompt = f"""
-你是 Deep Supervisor（Agentic RAG）。你會收到 /runtime/runtime.json，請先讀取其中設定：
-- scope_title：All 或指定文件 title
-- web_threshold：{WEB_EVIDENCE_THRESHOLD}
-- allow_web：是否允許 web
-- question_kind：chat|memo
+你是 Deep Supervisor（Agentic RAG）。請先讀 /runtime/runtime.json（scope_title/web_threshold/allow_web/question_kind）。
 
-核心策略（你拍板的 gate）：
+核心策略（gate）：
 - 先文件後網路：每個 facet 先做 doc 蒐證
 - 只有當「文件 evidence 不足」且 allow_web=true 時，才可以考慮 web
-- 你必須用工具 grade_doc_evidence(question, evidence) 評分：
-  - score < web_threshold（{WEB_EVIDENCE_THRESHOLD}） 才能派 web-researcher
-  - score >= web_threshold 則禁止 web（避免浪費與偏題）
-- 若 scope_title 鎖定且找不到：要在最終輸出用「下一步」提醒使用者：
-  - 可切回 All 再找，或
-  - 若仍不足且 allow_web=true，改用 web 補足
+- 必須用工具 grade_doc_evidence(question, evidence) 評分：
+  - score < web_threshold（你這裡會看到 runtime 內的門檻） 才能派 web-researcher
+  - score >= web_threshold 則禁止 web
 
-固定流程（務必照做）：
-0) write_todos（7~12 步）
+固定流程：
+0) todos（7~12 步）
 1) facets（2~4 個）
-2) 平行派 retriever 蒐證（retriever 需遵守 scope_title）
+2) 平行派 retriever
 3) analyst → claims/reflections
-4) 決定是否需要 web：
-   - 將已蒐集的文件 evidence（節錄即可）交給 grade_doc_evidence
-   - score < web_threshold 且 allow_web=true → 派 web-researcher
-5) writer → /draft.md（依 question_kind 決定 chat 或 memo）
+4) 視需要用 grade_doc_evidence 決定是否派 web-researcher
+5) writer → /draft.md
 6) verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
 7) read_file /draft.md 作為最終回答
 
@@ -2092,49 +2156,48 @@ evidence 內容格式（固定）：
 
     llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
 
-    # deepagents subagents dict：prompt key 應為 `prompt`（不是 system_prompt）
+    # ✅ subagents 用 prompt key（避免 system_prompt 沒吃到的版本差）
     subagents = [
         {
             "name": "retriever",
             "description": "從文件索引找證據，寫 /evidence/doc_*.md（不含 chunk_id）",
-            "system_prompt": retriever_prompt,
+            "prompt": retriever_prompt,
             "tools": [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk],
             "model": f"openai:{MODEL_MAIN}",
         },
         {
+            "name": "web-researcher",
+            "description": "用 web_search 補外部背景，寫 /evidence/web_*.md",
+            "prompt": web_prompt,
+            "tools": [tool_web_search_summary, tool_get_usage] if (enable_web and tool_web_search_summary is not None) else [tool_get_usage],
+            "model": f"openai:{MODEL_MAIN}",
+        },
+        {
             "name": "analyst",
-            "description": "claims-first 推理分析，產出 /analysis/claims.json 與 /analysis/reflections.json",
-            "system_prompt": analyst_prompt,
+            "description": "claims-first 推理分析，產出 claims/reflections",
+            "prompt": analyst_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
         },
         {
             "name": "writer",
-            "description": "整合 evidence + claims/reflections → 產生 /draft.md",
-            "system_prompt": writer_prompt,
+            "description": "整合 evidence + claims/reflections → 產生 draft",
+            "prompt": writer_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
         },
         {
             "name": "verifier",
-            "description": "檢查引用覆蓋並修稿 /draft.md",
-            "system_prompt": verifier_prompt,
+            "description": "檢查引用覆蓋並修稿 draft",
+            "prompt": verifier_prompt,
             "tools": [],
             "model": f"openai:{MODEL_MAIN}",
         },
     ]
 
-    if enable_web and tool_web_search_summary is not None:
-        subagents.insert(
-            1,
-            {
-                "name": "web-researcher",
-                "description": "用 web_search 補外部背景，寫 /evidence/web_*.md",
-                "system_prompt": web_prompt,
-                "tools": [tool_web_search_summary, tool_get_usage],
-                "model": f"openai:{MODEL_MAIN}",
-            },
-        )
+    # 若沒啟用 web，把 web-researcher 拿掉（避免 subagent 誤用）
+    if not (enable_web and tool_web_search_summary is not None):
+        subagents = [a for a in subagents if a.get("name") != "web-researcher"]
 
     memory = ["/memory/AGENTS.md"] if st.session_state.get("da_enable_memory", True) else None
     skills = ["/skills/"] if st.session_state.get("da_enable_skills", True) else None
