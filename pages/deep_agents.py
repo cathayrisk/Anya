@@ -2053,7 +2053,17 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
     # ===== Subagent prompts =====
     retriever_prompt = f"""
 你是文件檢索專家（只能用 doc_list/doc_search/doc_get_chunk/get_usage）。
-你會收到 runtime 設定在 /runtime/runtime.json（scope_title/web_threshold/question_kind/allow_web）。
+你必須先用 read_file 讀 /runtime/runtime.json 取得 scope_title。
+你不可說「我沒拿到報告內容」；你必須用工具去拿。
+
+硬規則（必須遵守）：
+1) 一進來先呼叫 doc_list，確認有哪些文件可用。
+2) 接著至少呼叫 doc_search 1 次（通常要 2 次），不可以 0 次就交差。
+3) 若 scope_title != "All"：呼叫 doc_search 時必須帶 title_filter=scope_title（硬限制）。
+4) 若 doc_search 命中為空：
+   - 再換一組 query 重試一次（更短關鍵字 / 英文關鍵字 / 同義詞）。
+   - 若仍為空，才回報「資料不足（檢索無命中）」並說需要什麼線索。
+5) chunk_id 絕對不能寫進 evidence（只能 internal 使用）。
 
 任務：針對 facet 找證據，寫入 /evidence/doc_<facet_slug>.md
 
@@ -2062,16 +2072,11 @@ facet_slug: <英文小寫_底線>
 facet_goal: <要回答什麼>
 hints: <關鍵字可空>
 
-檢索規則（很重要）：
-- 若 scope_title != "All"：doc_search 時要帶 title_filter=scope_title（硬限制只查那份文件）
-- 每個 facet 至少做 2 次 doc_search（multi-query：原句 + 精簡關鍵詞/同義詞）
-- evidence 裡每則引用只能使用 doc_search hits 給的 citation_token（例如 [報告名 p12]）
-- chunk_id 絕對不能寫進 evidence（只能 internal 使用）
-
 evidence 內容格式（固定）：
-1) 一行引用標頭：<citation_token>
-2) 一段原文片段（可截斷）
-3) 一行說明「這段支持什麼」
+- 每則證據三段：
+  1) 一行引用標頭：<citation_token>（必須用 doc_search hits 的 citation_token，例如 [報告名 p12]）
+  2) 原文片段（可截斷）
+  3) 一行說明「這段支持什麼」
 
 最後回 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
 """.strip()
@@ -2136,24 +2141,24 @@ evidence 內容格式（固定）：
 """.strip()
 
     orchestrator_prompt = f"""
-你是 Deep Supervisor（Agentic RAG）。請先讀 /runtime/runtime.json（scope_title/web_threshold/allow_web/question_kind）。
+你是 Deep Supervisor（Agentic RAG）。你必須先用 read_file 讀 /runtime/runtime.json（scope_title/web_threshold/allow_web/question_kind）。
 
-核心策略（gate）：
-- 先文件後網路：每個 facet 先做 doc 蒐證
-- 只有當「文件 evidence 不足」且 allow_web=true 時，才可以考慮 web
-- 必須用工具 grade_doc_evidence(question, evidence) 評分：
-  - score < web_threshold（你這裡會看到 runtime 內的門檻） 才能派 web-researcher
-  - score >= web_threshold 則禁止 web
+硬規則（必須遵守）：
+0) 先 doc_list 確認索引內有哪些文件。若 doc_list 顯示有文件，禁止你說「我沒拿到報告內容」。
+1) 只要使用者在問文件內容（例如摘要/解釋/條款/在哪裡提到），你必須派 retriever，並確保至少發生 1 次 doc_search。
+2) 若 scope_title != "All"：retriever 必須在 doc_search 帶 title_filter=scope_title。
+3) 若 retriever 仍找不到命中，才可以輸出「資料不足」並提出 <=3 個需要補的線索（例如章節/關鍵字/頁碼/更精確範圍）。
+4) enable_web 的 gate：
+   - 先文件後網路；只有在文件 evidence 不足且 allow_web=true 時，才用 grade_doc_evidence 判斷是否派 web-researcher。
 
-固定流程：
-0) todos（7~12 步）
-1) facets（2~4 個）
-2) 平行派 retriever
-3) analyst → claims/reflections
-4) 視需要用 grade_doc_evidence 決定是否派 web-researcher
-5) writer → /draft.md
-6) verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
-7) read_file /draft.md 作為最終回答
+建議流程（可簡化但不可跳過 retriever/doc_search）：
+- 讀 runtime → doc_list
+- facets：摘要任務通常 1~2 個 facets（例如 summary、key_findings）
+- 平行派 retriever
+- analyst → claims/reflections
+- writer → /draft.md（question_kind=chat：聊天式摘要；question_kind=memo：Decision Memo）
+- verifier 修稿
+- read_file /draft.md 作為最終回答
 
 注意：
 - 最終輸出不可提內部流程/檔名/額度
@@ -2936,6 +2941,17 @@ if prompt:
                 )
 
             usage = st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0}) or {}
+            if has_index and int(usage.get("doc_search_calls", 0) or 0) == 0:
+                # DeepAgent 沒用檢索工具 → 直接 fallback 用你現成的檢索回答（至少不會卡住）
+                hits = retrieve_hits(
+                    client,
+                    store,
+                    prompt,
+                    title=scope_title,            # None=All；有 scope 就鎖定
+                    k=10,
+                    difficulty=difficulty,
+                )
+                answer_text = answer_from_hits(client, prompt, hits)
             used_web = bool(enable_web) and int(usage.get("web_search_calls", 0) or 0) > 0
 
             # ✅ 末尾 badges（你要求放回應結束後）
