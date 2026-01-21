@@ -1920,6 +1920,12 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         if tf.lower() == "all":
             tf = ""
 
+        # ✅ 硬保證 scope：若呼叫端沒帶 title_filter，但 UI 已鎖定某份文件，就自動套用
+        if not tf:
+            ui_scope = str(st.session_state.get("selected_report_title", "All") or "All").strip()
+            if ui_scope and ui_scope != "All":
+                tf = ui_scope
+
         qvec = embed_texts(client, [q])
         k2 = max(1, min(24, int(k)))
         difficulty = str(st.session_state.get("current_difficulty", "medium") or "medium").lower()
@@ -2857,6 +2863,7 @@ with st.popover("📦 文件管理 / Skills / Debug"):
 # =========================
 # History render
 # =========================
+# ====== (B) History render：讓上方 badge 也吃到 meta["scope_title"]（可選但推薦） ======
 for msg in st.session_state.chat_history:
     role = msg.get("role", "assistant")
     with st.chat_message(role):
@@ -2869,6 +2876,7 @@ for msg in st.session_state.chat_history:
             enable_web=bool(meta.get("enable_web", False)),
             usage=meta.get("usage", {}) or {},
             difficulty=str(meta.get("difficulty", "medium") or "medium"),
+            scope_title=meta.get("scope_title"),  # ✅ 加這行
         )
         render_markdown_answer_with_sources_badges(msg.get("content", ""))
         render_web_sources_list(meta.get("web_sources", {}) or {})
@@ -2890,32 +2898,17 @@ if prompt:
             and st.session_state.store.index.ntotal > 0
         )
 
-        allow_web = bool(st.session_state.enable_web_search_agent)
-
         run_messages = build_run_messages(prompt, max_messages=15)
-
-        # ========= [B] 修改：Chat main 中「取得 plan 後」到「分支處理」這段（整段替換） =========
-        plan = decide_route_plan(
-            client,
-            prompt,
-            has_index=has_index,
-            allow_web=allow_web,
-            run_messages=run_messages,
-        )
-
-# ========= [替換 8] Chat main（prompt if prompt: 區塊中，從「plan = decide_route_plan(...)」開始到各分支處理）
-# 這段很長，你可以直接用下面這段「完整替換」原本那一大段路由/分支（保留上面的 run_messages/build messages 等前置即可）。 =========
 
         store = st.session_state.get("store", None)
 
-        # 1) scope：同步「文字指定檔名」與 UI 下拉（你要求要同步更新）
-        scope_title = sync_scope_from_prompt_and_ui(prompt, store)  # None 表示 All
+        # ✅ 建議：plan 已經不用了就刪掉（避免混淆）
+        # allow_web = bool(st.session_state.enable_web_search_agent)  # 你後面會再取一次也 OK
 
-        # 2) 判斷題型（Q2=C）
+        scope_title = sync_scope_from_prompt_and_ui(prompt, store)  # None 表示 All
         q_kind = classify_question_kind(prompt)
         st.session_state["current_question_kind"] = q_kind
 
-        # 3) 判斷 doc_intent（敏感版：像在問內容也要開 DeepAgent）
         doc_intent = decide_doc_intent(
             client,
             prompt,
@@ -2924,15 +2917,13 @@ if prompt:
             run_messages=run_messages,
         )
 
-        # 4) difficulty：memo 題偏 hard，其餘 medium
         difficulty = "hard" if q_kind == QUESTION_KIND_MEMO else "medium"
         st.session_state["current_difficulty"] = difficulty
 
         allow_web = bool(st.session_state.enable_web_search_agent)
 
-        # 5) 分支：DeepAgent（主線） vs Direct chat
         if has_index and doc_intent:
-            enable_web = bool(allow_web)  # ✅ web gate 在 DeepAgent 內部用 grade_doc_evidence < 0.55 控制
+            enable_web = bool(allow_web)
             agent = ensure_deep_agent(client, store, enable_web=enable_web)
 
             with st.status("DeepAgent：執行中…", expanded=bool(st.session_state.get("da_status_expanded", False))) as main_status:
