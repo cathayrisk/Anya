@@ -2156,45 +2156,67 @@ evidence 內容格式（固定）：
 
     llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
 
-    # ✅ subagents 用 prompt key（避免 system_prompt 沒吃到的版本差）
+    # ✅ subagents：你的 deepagents 版本「一定要」system_prompt
+    # 同時保留 prompt 欄位做跨版本相容（有些版本可能吃 prompt）
+    def _mk_subagent(
+        *,
+        name: str,
+        description: str,
+        system_prompt: str,
+        tools: list,
+        model: str,
+    ) -> dict:
+        return {
+            "name": name,
+            "description": description,
+            "system_prompt": system_prompt,  # ✅ 你這版 deepagents 會讀這個 key
+            "prompt": system_prompt,         # ✅ 保留給其他可能吃 prompt 的版本（不影響）
+            "tools": tools,
+            "model": model,
+        }
+
     subagents = [
-        {
-            "name": "retriever",
-            "description": "從文件索引找證據，寫 /evidence/doc_*.md（不含 chunk_id）",
-            "prompt": retriever_prompt,
-            "tools": [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk],
-            "model": f"openai:{MODEL_MAIN}",
-        },
-        {
-            "name": "web-researcher",
-            "description": "用 web_search 補外部背景，寫 /evidence/web_*.md",
-            "prompt": web_prompt,
-            "tools": [tool_web_search_summary, tool_get_usage] if (enable_web and tool_web_search_summary is not None) else [tool_get_usage],
-            "model": f"openai:{MODEL_MAIN}",
-        },
-        {
-            "name": "analyst",
-            "description": "claims-first 推理分析，產出 claims/reflections",
-            "prompt": analyst_prompt,
-            "tools": [],
-            "model": f"openai:{MODEL_MAIN}",
-        },
-        {
-            "name": "writer",
-            "description": "整合 evidence + claims/reflections → 產生 draft",
-            "prompt": writer_prompt,
-            "tools": [],
-            "model": f"openai:{MODEL_MAIN}",
-        },
-        {
-            "name": "verifier",
-            "description": "檢查引用覆蓋並修稿 draft",
-            "prompt": verifier_prompt,
-            "tools": [],
-            "model": f"openai:{MODEL_MAIN}",
-        },
+        _mk_subagent(
+            name="retriever",
+            description="從文件索引找證據，寫 /evidence/doc_*.md（不含 chunk_id）",
+            system_prompt=retriever_prompt,
+            tools=[tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk],
+            model=f"openai:{MODEL_MAIN}",
+        ),
+        _mk_subagent(
+            name="analyst",
+            description="claims-first 推理分析，產出 claims/reflections",
+            system_prompt=analyst_prompt,
+            tools=[],
+            model=f"openai:{MODEL_MAIN}",
+        ),
+        _mk_subagent(
+            name="writer",
+            description="整合 evidence + claims/reflections → 產生 draft",
+            system_prompt=writer_prompt,
+            tools=[],
+            model=f"openai:{MODEL_MAIN}",
+        ),
+        _mk_subagent(
+            name="verifier",
+            description="檢查引用覆蓋並修稿 draft",
+            system_prompt=verifier_prompt,
+            tools=[],
+            model=f"openai:{MODEL_MAIN}",
+        ),
     ]
 
+    if enable_web and tool_web_search_summary is not None:
+        subagents.insert(
+            1,
+            _mk_subagent(
+                name="web-researcher",
+                description="用 web_search 補外部背景，寫 /evidence/web_*.md",
+                system_prompt=web_prompt,
+                tools=[tool_web_search_summary, tool_get_usage],
+                model=f"openai:{MODEL_MAIN}",
+            ),
+        )
     # 若沒啟用 web，把 web-researcher 拿掉（避免 subagent 誤用）
     if not (enable_web and tool_web_search_summary is not None):
         subagents = [a for a in subagents if a.get("name") != "web-researcher"]
