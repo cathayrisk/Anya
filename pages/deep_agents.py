@@ -258,8 +258,23 @@ description: Use this skill when turning analysis into a concrete plan with mile
 """.strip()
 
 
+# ========= [替換 3] build_seed_files_for_deepagents：整個函式替換 =========
 def build_seed_files_for_deepagents() -> dict:
+    """
+    DeepAgents 的 files seed（session-only）。
+    除了 memory/skills，也塞入 runtime 設定（scope / threshold / question_kind）。
+    """
     seed: dict[str, str] = {}
+
+    # runtime（每次 run 都可能不同）
+    runtime = {
+        "scope_title": (st.session_state.get("selected_report_title") or "All"),
+        "web_threshold": float(WEB_EVIDENCE_THRESHOLD),
+        "allow_web": bool(st.session_state.get("enable_web_search_agent", True)),
+        "question_kind": str(st.session_state.get("current_question_kind", QUESTION_KIND_CHAT) or QUESTION_KIND_CHAT),
+    }
+    seed["/runtime/runtime.json"] = json.dumps(runtime, ensure_ascii=False, indent=2)
+
     if st.session_state.get("da_enable_memory", True):
         seed["/memory/AGENTS.md"] = AGENTS_MD
 
@@ -272,6 +287,7 @@ def build_seed_files_for_deepagents() -> dict:
             seed["/skills/report-compare/SKILL.md"] = SKILL_REPORT_COMPARE
         if st.session_state.get("da_skill_action_plan", True):
             seed["/skills/action-plan/SKILL.md"] = SKILL_ACTION_PLAN
+
     return seed
 
 
@@ -349,7 +365,13 @@ UI_MAX_EVIDENCE_PREVIEW_CHARS = 900
 UI_MAX_DRAFT_PREVIEW_CHARS = 1200
 UI_MAX_DOC_SEARCH_LOG = 8
 
+# ========= [新增/替換 1] 放在「效能/策略參數」附近（例如 DEFAULT_* 那區） =========
 
+WEB_EVIDENCE_THRESHOLD = 0.55  # 你拍板：grader < 0.55 才允許開 web（保守、成本低）
+
+# question kind（用來決定 Q2=C：聊天式 vs Decision Memo）
+QUESTION_KIND_CHAT = "chat"
+QUESTION_KIND_MEMO = "memo"
 # =========================
 # Regex / 內部洩漏防護
 # =========================
@@ -1059,7 +1081,11 @@ def build_indices_incremental_no_kg(
         ext = (row.ext or "").lower()
         loc_kind = infer_loc_kind_from_ext(ext)
         st.session_state["title_to_loc_kind"][title] = loc_kind
-
+        st.session_state.setdefault("title_to_max_page", {})
+        if isinstance(row.pages, int) and row.pages > 0:
+            st.session_state["title_to_max_page"][title] = int(row.pages)
+        else:
+            st.session_state["title_to_max_page"].setdefault(title, None)
         stats["new_reports"] += 1
 
         pages: list[Tuple[Optional[int], str]] = []
@@ -1292,6 +1318,135 @@ def rule_route_mode(question: str, has_index: bool) -> Optional[str]:
 
     return None
 
+# ========= [新增 5] 新增：doc_intent / question_kind / scope 同步 helper
+# 建議放在 Router 區塊附近（例如 rule_route_mode 之後，decide_route_plan 之前） =========
+
+SMALLTALK_HINTS = [
+    "你好", "嗨", "哈囉", "早安", "午安", "晚安",
+    "謝謝", "感謝", "哈哈", "在嗎",
+    "你是誰", "你會做什麼",
+]
+
+DOC_INTENT_STRONG = [
+    "報告", "文件", "上傳", "附件", "引用", "出處", "根據文件", "根據報告",
+    "第幾頁", "頁碼", "哪一頁", "在哪裡提到", "條款", "定義", "章", "節",
+    "摘要", "彙整", "整理", "對照", "比較",
+]
+
+MEMO_INTENT_HINTS = [
+    "比較", "差異", "對照", "彙整", "交叉驗證", "矛盾",
+    "決策", "選項", "取捨", "風險", "策略", "規劃", "里程碑", "下一步", "roadmap", "memo",
+]
+
+def classify_question_kind(question: str) -> str:
+    q = (question or "").strip()
+    ql = q.lower()
+    if any(k.lower() in ql for k in MEMO_INTENT_HINTS):
+        return QUESTION_KIND_MEMO
+    return QUESTION_KIND_CHAT
+
+def looks_like_smalltalk(question: str) -> bool:
+    q = (question or "").strip()
+    if not q:
+        return True
+    if len(q) <= 8 and any(h in q for h in SMALLTALK_HINTS):
+        return True
+    # 很短、沒有名詞線索的也當閒聊
+    if len(q) <= 12 and not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", q):
+        return True
+    return False
+
+def decide_doc_intent(
+    client: OpenAI,
+    question: str,
+    *,
+    has_index: bool,
+    scope_title: Optional[str],
+    run_messages: Optional[list[dict]] = None,
+) -> bool:
+    """
+    你拍板：敏感版
+    - has_index 且像在問內容（摘要/解釋概念）也要開 DeepAgent
+    - 但要避免把明顯閒聊誤判成 doc 任務
+    """
+    if not has_index:
+        return False
+
+    q = (question or "").strip()
+    if not q:
+        return False
+
+    # 1) scope 被鎖定（非 All）→ 一律視為想用文件
+    if scope_title:
+        return True
+
+    # 2) 明顯閒聊 → 不用文件
+    if looks_like_smalltalk(q):
+        return False
+
+    # 3) 強訊號關鍵字 → 用文件
+    ql = q.lower()
+    if any(k.lower() in ql for k in DOC_INTENT_STRONG):
+        return True
+
+    # 4) 模糊：交給 router LLM 判斷一次（輕量、只要 true/false）
+    hist = ""
+    if run_messages:
+        lines = []
+        for m in run_messages[-8:]:
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                if len(content) > 500:
+                    content = content[:500] + "…"
+                lines.append(f"{role.upper()}: {content}")
+        hist = "\n".join(lines).strip()
+
+    system = (
+        "你是分類器，只輸出 JSON：{\"doc_intent\":true|false,\"reason\":\"...\"}\n"
+        "doc_intent=true 表示：使用者是在問『已上傳文件/報告』的內容（含摘要/解釋概念）。\n"
+        "規則：\n"
+        "- 明顯生活閒聊/社交用語 → false\n"
+        "- 問題像在要你從文件找答案/摘要/解釋 → true\n"
+        "只輸出 JSON，不要多字。"
+    )
+    user = (
+        f"has_index=true\n"
+        + (f"recent_history:\n{hist}\n\n" if hist else "")
+        + f"question:\n{q}\n"
+    )
+    out, _ = call_gpt(client, model=MODEL_GRADER, system=system, user=user, reasoning_effort="low")
+    data = _try_parse_json_or_py_literal(out) or {}
+    return bool(data.get("doc_intent", False))
+
+def get_titles_from_store(store: Optional[FaissStore]) -> list[str]:
+    return list_report_titles_from_store(store)
+
+def sync_scope_from_prompt_and_ui(prompt: str, store: Optional[FaissStore]) -> Optional[str]:
+    """
+    回傳 scope_title：
+    - None 表示 All
+    - "某 title" 表示鎖定該文件
+
+    你要求：若 prompt 明確提到某 title，要「同步更新下拉選單」。
+    """
+    titles = get_titles_from_store(store)
+    ui_sel = str(st.session_state.get("selected_report_title", "All") or "All").strip()
+    last_title = st.session_state.get("last_report_title")
+
+    # prompt 明確匹配 title（最優先）
+    target = guess_target_title(prompt, titles, last_title=last_title)
+
+    if target and target in titles:
+        # ✅ 同步更新 UI
+        st.session_state["selected_report_title"] = target
+        return target
+
+    # UI 選單（持久化）
+    if ui_sel and ui_sel != "All" and ui_sel in titles:
+        return ui_sel
+
+    return None
 
 def decide_route_plan_llm(
     client: OpenAI,
@@ -1748,7 +1903,12 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         st.session_state["ui_last_doc_list"] = out
         return out
 
-    def _doc_search_fn(query: str, k: int = 8) -> str:
+    def _doc_search_fn(query: str, k: int = 8, title_filter: str = "") -> str:
+        """
+        Hybrid search。新增 title_filter：
+        - 空字串/All/None => 不過濾（跨所有文件）
+        - 否則只回傳該 title 的 chunks（硬限制 scope）
+        """
         if not _inc("doc_search_calls", DA_MAX_DOC_SEARCH_CALLS):
             return json.dumps({"hits": [], "error": f"Budget exceeded: doc_search_calls > {DA_MAX_DOC_SEARCH_CALLS}"}, ensure_ascii=False)
 
@@ -1756,19 +1916,31 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
         if not q:
             return json.dumps({"hits": []}, ensure_ascii=False)
 
-        qvec = embed_texts(client, [q])
-        k2 = max(1, min(12, int(k)))
+        tf = (title_filter or "").strip()
+        if tf.lower() == "all":
+            tf = ""
 
+        qvec = embed_texts(client, [q])
+        k2 = max(1, min(24, int(k)))  # allow a bit larger when filtering
         difficulty = str(st.session_state.get("current_difficulty", "medium") or "medium").lower()
-        hits = store.search_hybrid(q, qvec, k=k2, difficulty=difficulty)
+
+        # 先搜較多候選，之後再做 title filter（避免 scope 內召回不足）
+        hits = store.search_hybrid(q, qvec, k=max(k2, 16), difficulty=difficulty)
+
+        if tf:
+            hits = [(s, ch) for (s, ch) in hits if (ch.title or "").strip() == tf]
+
+        hits = hits[: min(k2, 12)]  # 最終最多 12（避免 context 爆）
 
         payload = {"hits": []}
         ui_hits = []
         for score, ch in hits:
+            citation_token = f"[{ch.title} p{ch.page if ch.page is not None else '-'}]"
             item = {
                 "title": ch.title,
                 "page": str(ch.page) if ch.page is not None else "-",
-                "chunk_id": ch.chunk_id,  # internal only
+                "citation_token": citation_token,   # ✅ 白名單基礎：writer/verifier 只能用這個
+                "chunk_id": ch.chunk_id,            # internal only（不得寫入 evidence）
                 "text": (ch.text or "")[:1200],
                 "score": float(score),
             }
@@ -1784,196 +1956,138 @@ def ensure_deep_agent(client: OpenAI, store: FaissStore, enable_web: bool):
 
         with lock:
             log = st.session_state.get("ui_doc_search_log", []) or []
-            log.append({"query": q, "k": k2, "hits": ui_hits[:6]})
+            log.append({"query": q, "k": k2, "hits": ui_hits[:6], "title_filter": tf or "All"})
             st.session_state["ui_doc_search_log"] = log[-UI_MAX_DOC_SEARCH_LOG:]
 
         return json.dumps(payload, ensure_ascii=False)
 
-    def _doc_get_chunk_fn(chunk_id: str, max_chars: int = 2600) -> str:
-        cid = (chunk_id or "").strip()
-        if not cid:
-            return ""
-        for c in store.chunks:
-            if c.chunk_id == cid:
-                return (c.text or "")[:max_chars]
-        return ""
+# --- (7.2) 新增一個 grader 工具（在 ensure_deep_agent() 裡，tools 建立附近）---
+    def _grade_doc_evidence_fn(question: str, evidence: str) -> str:
+        """
+        回傳 JSON：{"score": 0~1}
+        用於判斷「文件 evidence 是否足夠」。你拍板門檻：< 0.55 才能開 web。
+        """
+        q = (question or "").strip()
+        ev = (evidence or "").strip()
+        s = grade_doc_evidence_sufficiency(client, q, ev)
+        return json.dumps({"score": float(s)}, ensure_ascii=False)
 
-    def _mk_tool(fn, name: str, description: str) -> BaseTool:
-        return StructuredTool.from_function(fn, name=name, description=description)
+# 記得把它做成 tool 並加入 tools list：
+# tool_grade_doc = _mk_tool(_grade_doc_evidence_fn, "grade_doc_evidence", "Grade whether document evidence is sufficient. Returns JSON {score}.")
+# tools.append(tool_grade_doc)
 
-    tool_get_usage = _mk_tool(_get_usage_fn, "get_usage", "Get current tool usage counters as JSON (budget/debug).")
-    tool_doc_list = _mk_tool(_doc_list_fn, "doc_list", "List indexed documents and chunk counts.")
-    tool_doc_search = _mk_tool(_doc_search_fn, "doc_search", "Hybrid search over indexed chunks. Returns JSON hits with title/page/chunk_id/text.")
-    tool_doc_get_chunk = _mk_tool(_doc_get_chunk_fn, "doc_get_chunk", "Fetch full text for a given chunk_id for close reading. Returns text only.")
+# --- (7.3) 更新 retriever_prompt / web_prompt / writer_prompt / verifier_prompt / orchestrator_prompt（在 ensure_deep_agent() 裡把原字串替換） ---
 
-    tools: list[BaseTool] = [tool_get_usage, tool_doc_list, tool_doc_search, tool_doc_get_chunk]
-
-    tool_web_search_summary: Optional[BaseTool] = None
-    if enable_web:
-        def _web_search_summary_fn(query: str) -> str:
-            if not _inc("web_search_calls", DA_MAX_WEB_SEARCH_CALLS):
-                return "[WebSearch:web p-]\nSources:"
-
-            q = (query or "").strip()
-            if not q:
-                return "[WebSearch:web p-]\nSources:"
-
-            system = (
-                "你是研究助理。輸出格式固定：\n"
-                "1) 3~8 個 bullets 摘要（每點一句，必要時含日期/數字）。\n"
-                "2) Sources: 之後列來源，每行：- <domain> | <title> | <url>\n"
-                "規則：不要提工具流程/額度。\n"
-            )
-            user = f"Search term: {q}"
-            text, sources = call_gpt(
-                client,
-                model=MODEL_WEB,
-                system=system,
-                user=user,
-                reasoning_effort=None,
-                tools=[{"type": "web_search"}],
-                include_sources=True,
-            )
-
-            src_lines = []
-            for s in (sources or [])[:10]:
-                if isinstance(s, dict):
-                    t = (s.get("title") or s.get("source") or "source").strip()
-                    u = (s.get("url") or "").strip()
-                    if u:
-                        src_lines.append(f"- {_domain(u)} | {t} | {u}")
-
-            out_text = (text or "").strip()
-            if "Sources:" not in out_text:
-                out_text = (out_text + "\n\nSources:").strip()
-            if src_lines:
-                out_text = (out_text + "\n" + "\n".join(src_lines)).strip()
-
-            primary_domain = "web"
-            if sources and isinstance(sources, list):
-                u0 = ((sources[0] or {}).get("url") or "").strip() if isinstance(sources[0], dict) else ""
-                if u0:
-                    primary_domain = _domain(u0)
-
-            return f"[WebSearch:{primary_domain} p-]\n" + out_text[:2400]
-
-        tool_web_search_summary = _mk_tool(
-            _web_search_summary_fn,
-            "web_search_summary",
-            "Run web_search and return a short Traditional Chinese summary with sources.",
-        )
-        tools.append(tool_web_search_summary)
-
-    # ===== Subagent prompts =====
-    retriever_prompt = """
+    retriever_prompt = f"""
 你是文件檢索專家（只能用 doc_list/doc_search/doc_get_chunk/get_usage）。
+你會收到 runtime 設定在 /runtime/runtime.json（scope_title/web_threshold/question_kind/allow_web）。
+
 任務：針對 facet 找證據，寫入 /evidence/doc_<facet_slug>.md
 
-輸入 facet 格式：
+facet 格式：
 facet_slug: <英文小寫_底線>
 facet_goal: <要回答什麼>
 hints: <關鍵字可空>
 
-硬規則：
-- evidence 內容只能包含：
-  1) 引用標頭：[報告名稱 pN]
-  2) 原文片段（可截斷）
-  3) 一行說明「這段支持什麼」
+檢索規則（很重要）：
+- 若 scope_title != "All"：doc_search 時要帶 title_filter=scope_title（硬限制只查那份文件）
+- 每個 facet 至少做 2 次 doc_search（multi-query：原句 + 精簡關鍵詞/同義詞）
+- evidence 裡每則引用只能使用 doc_search hits 給的 citation_token（例如 [報告名 p12]）
 - chunk_id 絕對不能寫進 evidence（只能 internal 使用）
-- 若遇到 Budget exceeded：停止，不要把錯誤字串抄進 evidence
+
+evidence 內容格式（固定）：
+1) 一行引用標頭：<citation_token>   （例如 [某報告 p12]）
+2) 一段原文片段（可截斷）
+3) 一行說明「這段支持什麼」
+
 最後回 orchestrator：≤150 字摘要（找到什麼 + 最大缺口）
 """.strip()
 
-    analyst_prompt = f"""
-你是推理分析專家（不做檢索；只讀 /evidence 產物）。
-你要做「claims-first」與「反思」兩份結構化產物：
-
-1) 寫 /analysis/claims.json
-- JSON array，最多 {DA_MAX_CLAIMS} 條
-- 每條包含：
-  - claim（可核對的一句話）
-  - citations（array；元素必須是像 [報告名稱 pN] 或 [WebSearch:domain p-]）
-  - assumptions（array，可空）
-  - confidence（0~1 float）
-
-2) 寫 /analysis/reflections.json（反思）
-- JSON array，至少 2 條
-- 每條包含：
-  - reflection（盲點/風險/反例/需驗證點）
-  - citations（array；可空）
-  - needs_validation（boolean；若 citations 空，必須 true）
-  - impact（若成立會如何影響結論/決策）
-
-硬規則：
-- 只能依據 /evidence 內看到的內容
-- 禁止任何內部字樣（chunk_id、/evidence、Budget exceeded 等）
-""".strip()
-
-    web_prompt = """
+    web_prompt = f"""
 你是網路搜尋專家（只允許 web_search_summary/get_usage；不允許 doc_*）。
-對每個 facet：寫入 /evidence/web_<facet_slug>.md
+你會收到 runtime 設定在 /runtime/runtime.json（web_threshold/allow_web）。
+
+任務：對指定 facet 補外部證據，寫入 /evidence/web_<facet_slug>.md
+
 硬規則：
 - 每段要保留引用標頭 [WebSearch:<domain> p-]
 - 禁止捏造來源；不要寫工具流程/額度字樣
+- 若 facet 其實應該能由文件回答：請回報「建議優先補文件證據」而不是亂查
 """.strip()
 
     writer_prompt = f"""
-你是寫作/整理專家。你必須整合：
+你是寫作/整理專家。你會收到：
+- /runtime/runtime.json（question_kind: chat|memo）
 - /evidence/ 下所有 doc_*.md（與可選 web_*.md）
 - /analysis/claims.json
 - /analysis/reflections.json
 → 產生 /draft.md
 
-硬規則：
-- 每個「重點結論」bullet 句尾必有引用 token（[... pN] 或 [WebSearch:* p-]）
-- /draft.md 不得出現內部字樣（/evidence、/analysis、doc_、web_、Budget exceeded、chunk_id）
+輸出風格（Q2=C）：
+- question_kind="chat"：用「一般聊天式回答」，條列為主、口吻自然；只有「關鍵事實句」句尾要引用 token。
+- question_kind="memo"：輸出 Decision Memo（較正式），每個重點結論句尾都要引用 token。
 
-/draft.md 格式（固定）：
-## 重點結論
+硬規則：
+- 只能用 evidence/claims/reflections 支持的內容，不可腦補
+- 引用 token 必須是 evidence 中出現過的 citation_token（或 [WebSearch:* p-]）
+- /draft.md 不得出現內部字樣（/evidence、/analysis、doc_、web_、Budget exceeded、chunk_id）
+- 若資料不足：明確寫「資料不足」，並列 1~3 項需要補的資訊
+
+/draft.md 建議格式：
+## 回答
 - ...
-## Decision Memo
+##（若 question_kind="memo" 才輸出）Decision Memo
 - 目標：
 - 現況與限制：
-- 選項（Option A/B/…）：
-- 建議（Recommendation）：
-- 取捨（Trade-offs）：
-- 反思（Reflections）：
-  - ...（可引用；沒引用要標「需驗證」）
-## 下一步（Next Steps）
-- [ ] ...（每項含 DoD）
-## 需要你補的資訊（<=3項）
-- ...
+- 選項：
+- 建議：
+- 取捨：
+- 反思：
+## 下一步
+- [ ] ...（含 DoD）
 """.strip()
 
     verifier_prompt = f"""
 你是審稿查核專家：檢查 /draft.md 是否符合引用覆蓋與禁則，做最少改動修正。
 規則：
-- 「重點結論」每個 bullet 至少 1 個引用 token
-- 「反思」至少 2 點，且不得全部是空泛用語
 - 不得出現 chunk_id、/evidence、/analysis、doc_、web_、Budget exceeded 等內部字樣
+- draft 中的引用 token 必須能在 evidence 裡找到同樣的 token（或是 [WebSearch:* p-]）
+- 若出現不存在的引用：優先刪掉該句或改成「資料不足」，不要亂補頁碼/標題
 最多修正 {DA_MAX_REWRITE_ROUNDS} 輪。
 """.strip()
 
     orchestrator_prompt = f"""
-你是 Deep Supervisor（文件優先；enable_web={str(enable_web).lower()}）。
-你可以使用 todo 工具、檔案系統工具、task（呼叫 subagents）。
-你也可能啟用了 skills/memory（/memory 與 /skills）。
+你是 Deep Supervisor（Agentic RAG）。你會收到 /runtime/runtime.json，請先讀取其中設定：
+- scope_title：All 或指定文件 title
+- web_threshold：{WEB_EVIDENCE_THRESHOLD}
+- allow_web：是否允許 web
+- question_kind：chat|memo
+
+核心策略（你拍板的 gate）：
+- 先文件後網路：每個 facet 先做 doc 蒐證
+- 只有當「文件 evidence 不足」且 allow_web=true 時，才可以考慮 web
+- 你必須用工具 grade_doc_evidence(question, evidence) 評分：
+  - score < web_threshold（{WEB_EVIDENCE_THRESHOLD}） 才能派 web-researcher
+  - score >= web_threshold 則禁止 web（避免浪費與偏題）
+- 若 scope_title 鎖定且找不到：要在最終輸出用「下一步」提醒使用者：
+  - 可切回 All 再找，或
+  - 若仍不足且 allow_web=true，改用 web 補足
 
 固定流程（務必照做）：
-0) write_todos：列 7~12 步（每步含完成條件）
-1) 把 todos 也寫成 /workspace/todos.json（JSON），方便 UI 顯示
-2) 拆 2–4 個 facets（面向），寫 /workspace/facets.json
-3) 平行派工：
-   - 每個 facet 至少派 1 個 retriever
-   - enable_web=true 且需要外部背景時，對同 facet 再派 1 個 web-researcher
-4) 叫 analyst 產生 /analysis/claims.json 與 /analysis/reflections.json
-5) 叫 writer 產生 /draft.md（含 Decision Memo + 反思 + 下一步）
-6) 叫 verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
+0) write_todos（7~12 步）
+1) facets（2~4 個）
+2) 平行派 retriever 蒐證（retriever 需遵守 scope_title）
+3) analyst → claims/reflections
+4) 決定是否需要 web：
+   - 將已蒐集的文件 evidence（節錄即可）交給 grade_doc_evidence
+   - score < web_threshold 且 allow_web=true → 派 web-researcher
+5) writer → /draft.md（依 question_kind 決定 chat 或 memo）
+6) verifier 修稿（最多 {DA_MAX_REWRITE_ROUNDS} 輪）
 7) read_file /draft.md 作為最終回答
 
 注意：
 - 最終輸出不可提內部流程/檔名/額度
-- 不要輸出 chain-of-thought（可輸出 todos/claims/反思/決策取捨，這些是工作產物）
+- 不要輸出 chain-of-thought
 """.strip()
 
     llm = _make_langchain_llm(model_name=f"openai:{MODEL_MAIN}", temperature=0.0, reasoning_effort=REASONING_EFFORT)
@@ -2360,10 +2474,14 @@ def deep_agent_run_with_live_status(agent, user_text: str, run_messages: list[di
 # =========================
 # UI helpers
 # =========================
-def render_run_badges(*, mode: str, enable_web: bool, usage: dict, difficulty: str) -> None:
+def render_run_badges(*, mode: str, enable_web: bool, usage: dict, difficulty: str, scope_title: Optional[str] = None) -> None:
     badges: List[str] = []
     badges.append(_badge_directive(f"Mode:{mode}", "gray"))
     badges.append(_badge_directive(f"Diff:{difficulty}", "blue"))
+
+    scope = (scope_title or st.session_state.get("selected_report_title") or "All")
+    badges.append(_badge_directive(f"Scope:{scope}", "green" if scope != "All" else "gray"))
+
     doc_calls = int((usage or {}).get("doc_search_calls", 0) or 0)
     web_calls = int((usage or {}).get("web_search_calls", 0) or 0)
     badges.append(_badge_directive(f"DB:{doc_calls}", "green" if doc_calls else "gray"))
@@ -2441,6 +2559,11 @@ st.session_state.setdefault("last_report_title", None)
 st.session_state.setdefault("show_retriever_hits_expander", True)
 st.session_state.setdefault("retriever_hits_expanded_by_default", False)
 st.session_state.setdefault("retriever_hits_max_per_query", 6)
+
+# ========= [新增/替換 2] Session init：放在你那串 st.session_state.setdefault(...) 附近 =========
+st.session_state.setdefault("selected_report_title", "All")  # UI 下拉：All / 某份 title（持久化）
+st.session_state.setdefault("title_to_max_page", {})          # title -> max page（PDF 用；Office 多半 1 或 None）
+st.session_state.setdefault("current_question_kind", QUESTION_KIND_CHAT)
 
 # =========================
 # Popover：文件管理 / Skills / Debug（依你要求重新排版）
@@ -2554,6 +2677,26 @@ with st.popover("📦 文件管理 / Skills / Debug"):
     if (not HAS_UNSTRUCTURED_LOADERS) and any(r.ext in (".doc", ".docx", ".pptx", ".xls", ".xlsx") for r in st.session_state.file_rows):
         st.warning("你上傳了 Office 檔，但環境缺少 unstructured loaders，可能索引不到文字。建議安裝或先轉成 PDF/TXT 再上傳。")
 
+    # —— 新增：文件範圍（持久化直到切回 All）——
+    st.markdown("---")
+    st.markdown("### 🎯 文件範圍（回答時要用哪些文件）")
+
+    titles_for_scope = sorted([os.path.splitext(r.name)[0] for r in st.session_state.file_rows if (r.name or "").strip()])
+    titles_for_scope = _dedup_keep_order([t for t in titles_for_scope if t.strip()])
+    scope_options = ["All"] + titles_for_scope
+
+    # 防呆：如果目前選到的 title 不存在（例如清空/重建），就回到 All
+    cur_sel = str(st.session_state.get("selected_report_title", "All") or "All")
+    if cur_sel not in scope_options:
+        cur_sel = "All"
+        st.session_state["selected_report_title"] = "All"
+
+    st.session_state.selected_report_title = st.selectbox(
+        "選擇文件範圍（會持續套用到之後的提問，直到你切回 All）",
+        options=scope_options,
+        index=scope_options.index(cur_sel),
+    )
+    
     col1, col2 = st.columns([1, 1])
     build_btn = col1.button("🚀 建立索引", type="primary", use_container_width=True)
     clear_btn = col2.button("🧹 清空全部（含聊天）", use_container_width=True)
@@ -2675,127 +2818,95 @@ if prompt:
             run_messages=run_messages,
         )
 
-        # ✅ 強制：有索引就一律 advisor
-        plan.mode = force_mode_when_indexed(plan.mode, has_index=has_index)
-        plan.needs_clarification = False  # 有索引不再走 clarify（交給 advisor 自己問/自己整合）
-        st.session_state["current_difficulty"] = plan.difficulty
+# ========= [替換 8] Chat main（prompt if prompt: 區塊中，從「plan = decide_route_plan(...)」開始到各分支處理）
+# 這段很長，你可以直接用下面這段「完整替換」原本那一大段路由/分支（保留上面的 run_messages/build messages 等前置即可）。 =========
 
-        # ✅ 不管走哪個流程，都先顯示一個 status（至少讓你看得到路由結果）
-        with st.status("執行中…", expanded=bool(st.session_state.get("da_status_expanded", False))) as main_status:
-            main_status.write(f"- mode={plan.mode}")
-            main_status.write(f"- difficulty={plan.difficulty}")
-            main_status.write(f"- has_index={str(bool(has_index)).lower()}")
+        store = st.session_state.get("store", None)
 
-        # doc_suff gate（只有文件不足且允許才 web；advisor 也可用，但先保守）
-        enable_web = bool(plan.enable_web)
-        if has_index and allow_web and enable_web:
-            qvec = embed_texts(client, [prompt])
-            preview_hits = st.session_state.store.search_hybrid(prompt, qvec, k=max(6, min(12, plan.doc_top_k)), difficulty="medium")
-            preview_chunks = [ch for _, ch in preview_hits]
-            preview_ctx = render_chunks_for_model(preview_chunks, max_chars_each=700)
-            doc_suff = grade_doc_evidence_sufficiency(client, prompt, preview_ctx)
-            if doc_suff >= 0.70:
-                enable_web = False
+        # 1) scope：同步「文字指定檔名」與 UI 下拉（你要求要同步更新）
+        scope_title = sync_scope_from_prompt_and_ui(prompt, store)  # None 表示 All
 
-        # ✅ advisor（有索引必走）
-# ========= (4) 替換：Chat main 的 advisor 分支（把你目前 if plan.mode == "advisor" and has_index: 那整段換成下面） =========
-        if plan.mode == "advisor" and has_index:
-            store = st.session_state.get("store", None)
-            if store is None or getattr(store, "index", None) is None or store.index.ntotal == 0:
-                answer_text = "（系統：has_index=true 但 store/index 空，請先建立索引）"
-                meta = {
-                    "mode": "advisor",
-                    "enable_web": False,
-                    "usage": {"doc_search_calls": 0, "web_search_calls": 0},
-                    "difficulty": plan.difficulty,
-                    "web_sources": {},
-                }
-                render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
-                render_markdown_answer_with_sources_badges(answer_text)
-                st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
-                st.stop()
+        # 2) 判斷題型（Q2=C）
+        q_kind = classify_question_kind(prompt)
+        st.session_state["current_question_kind"] = q_kind
 
-            titles = list_report_titles_from_store(store)
-            last_title = st.session_state.get("last_report_title")
-            target_title = guess_target_title(prompt, titles, last_title=last_title)
+        # 3) 判斷 doc_intent（敏感版：像在問內容也要開 DeepAgent）
+        doc_intent = decide_doc_intent(
+            client,
+            prompt,
+            has_index=has_index,
+            scope_title=scope_title,
+            run_messages=run_messages,
+        )
 
-            # ✅ 只有在「使用者明確指涉某份報告」但我們又無法推斷是哪份時，才請他選
-            if mentions_report_reference(prompt) and (len(titles) > 1) and (target_title is None):
-                answer_text = "你說的「這份報告」我目前無法判斷是哪一份，請選一個檔名（貼上或回覆序號）：\n" + "\n".join(
-                    [f"{i+1}. {t}" for i, t in enumerate(titles[:30])]
+        # 4) difficulty：memo 題偏 hard，其餘 medium
+        difficulty = "hard" if q_kind == QUESTION_KIND_MEMO else "medium"
+        st.session_state["current_difficulty"] = difficulty
+
+        allow_web = bool(st.session_state.enable_web_search_agent)
+
+        # 5) 分支：DeepAgent（主線） vs Direct chat
+        if has_index and doc_intent:
+            enable_web = bool(allow_web)  # ✅ web gate 在 DeepAgent 內部用 grade_doc_evidence < 0.55 控制
+            agent = ensure_deep_agent(client, store, enable_web=enable_web)
+
+            with st.status("DeepAgent：執行中…", expanded=bool(st.session_state.get("da_status_expanded", False))) as main_status:
+                answer_text, _files = deep_agent_run_with_live_status(
+                    agent,
+                    user_text=prompt,
+                    run_messages=run_messages,
+                    client=client,
+                    status=main_status,
                 )
-                meta = {
-                    "mode": "advisor",
-                    "enable_web": False,
-                    "usage": {"doc_search_calls": 0, "web_search_calls": 0},
-                    "difficulty": plan.difficulty,
-                    "web_sources": {},
-                }
-                render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
-                render_markdown_answer_with_sources_badges(answer_text)
-                st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
-                st.stop()
 
-            # ✅ 核心：不管是不是摘要需求，都用檢索命中段落來回答
-            hits = retrieve_hits(
-                client,
-                store,
-                prompt,
-                title=target_title,                 # None 表示跨文件一起找
-                k=plan.doc_top_k,
-                difficulty=plan.difficulty,
-            )
+            usage = st.session_state.get("da_usage", {"doc_search_calls": 0, "web_search_calls": 0}) or {}
+            used_web = bool(enable_web) and int(usage.get("web_search_calls", 0) or 0) > 0
 
-            # ✅ 你要的：在 status 上用 expander 顯示 retriever 命中段落
-            render_retriever_hits_expander(
-                hits,
-                label="🔎 Retriever 命中內容（節錄）",
-            )
+            # ✅ 末尾 badges（你要求放回應結束後）
+            scope_label = scope_title if scope_title else "All"
+            tail_badges = " ".join([
+                _badge_directive("Mode:DeepAgent", "gray"),
+                _badge_directive(f"Scope:{scope_label}", "green" if scope_label != "All" else "gray"),
+                _badge_directive(f"Docs:{int(usage.get('doc_search_calls', 0) or 0)}", "green"),
+                _badge_directive(f"Web:{int(usage.get('web_search_calls', 0) or 0)}" if enable_web else "Web:off", "violet" if used_web else "gray"),
+            ])
 
-            answer_text = answer_from_hits(client, prompt, hits)
+            # scope 鎖定但文件不足：提醒（你要「要，或提醒改以Web」）
+            # 這句放在 badges 前面，讓使用者看得懂再看 badge
+            reminder = ""
+            if scope_title:
+                # 如果完全沒有引用（很可能證據不足/沒命中），提醒切回 All 或用 Web
+                if not has_visible_citations(answer_text):
+                    if allow_web:
+                        reminder = f"\n\n:small[提示：目前範圍鎖定在「{scope_title}」。若找不到答案，可切回 All 再問，或允許我改用 Web 補足。]\n"
+                    else:
+                        reminder = f"\n\n:small[提示：目前範圍鎖定在「{scope_title}」。若找不到答案，可切回 All 再問。]\n"
+
+            answer_text = (answer_text or "").strip()
+            answer_text = strip_internal_process_lines(answer_text)
+            answer_text = (answer_text + reminder + "\n\n" + tail_badges).strip()
 
             if st.session_state.get("enable_output_formatter", True):
                 answer_text = format_markdown_output_preserve_citations(client, answer_text)
             answer_text = strip_internal_process_lines(answer_text)
 
             meta = {
-                "mode": "advisor",
-                "enable_web": False,
-                "usage": {"doc_search_calls": 1, "web_search_calls": 0},
-                "difficulty": plan.difficulty,
-                "web_sources": {},
+                "mode": "deepagent",
+                "enable_web": bool(enable_web),
+                "usage": usage,
+                "difficulty": difficulty,
+                "web_sources": {},   # deepagent 的 web sources 目前沒集中回傳（先留空）
+                "scope_title": scope_label,
             }
-            render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
+
+            # 既有 UI：仍會在 history render 顯示上方 badges（OK），但你要的尾端 badges 也已經加了
+            render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
             render_markdown_answer_with_sources_badges(answer_text)
+
             st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
             st.stop()
 
-        # rag：省成本
-        if plan.mode == "rag" and has_index:
-            answer_text = fallback_answer_from_store(
-                client,
-                st.session_state.get("store", None),
-                prompt,
-                k=plan.doc_top_k,
-                difficulty=plan.difficulty,
-            )
-            if st.session_state.get("enable_output_formatter", True):
-                answer_text = format_markdown_output_preserve_citations(client, answer_text)
-            answer_text = strip_internal_process_lines(answer_text)
-
-            meta = {
-                "mode": "rag",
-                "enable_web": False,
-                "usage": {"doc_search_calls": 1, "web_search_calls": 0},
-                "difficulty": plan.difficulty,
-                "web_sources": {},
-            }
-            render_run_badges(mode=meta["mode"], enable_web=False, usage=meta["usage"], difficulty=meta["difficulty"])
-            render_markdown_answer_with_sources_badges(answer_text)
-            st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
-            st.stop()
-
-        # direct（可選 web）
+        # 否則：一般聊天（direct）
         web_sources: Dict[str, List[Tuple[str, str]]] = {}
         usage = {"doc_search_calls": 0, "web_search_calls": 0}
 
@@ -2805,48 +2916,23 @@ if prompt:
         ).strip()
         user_text = prompt if not history_block else f"對話脈絡（最近）：\n{history_block}\n\n目前問題：\n{prompt}"
 
-        if enable_web:
-            evidence_md, sources = call_gpt(
-                client,
-                model=MODEL_MAIN,
-                system=DIRECT_EVIDENCE_SYSTEM_PROMPT,
-                user=f"{user_text}\n\n（請開始 web_search 蒐證）",
-                reasoning_effort=REASONING_EFFORT,
-                tools=[{"type": "web_search"}],
-                include_sources=True,
-                tool_choice="required",
-            )
-            usage["web_search_calls"] = 1
-            web_sources = web_sources_from_openai_sources(sources)
+        ans, _ = call_gpt(
+            client,
+            model=MODEL_MAIN,
+            system=ANYA_SYSTEM_PROMPT,
+            user=user_text,
+            reasoning_effort=REASONING_EFFORT,
+        )
+        answer_text = (ans or "").strip()
 
-            allowed_domains = set(web_sources.keys())
-
-            writer_user = f"{user_text}\n\n=== EVIDENCE ===\n{(evidence_md or '').strip()}\n"
-            ans, _ = call_gpt(
-                client,
-                model=MODEL_MAIN,
-                system=ANYA_SYSTEM_PROMPT + "\n\n" + DIRECT_WRITER_SYSTEM_PROMPT,
-                user=writer_user,
-                reasoning_effort=REASONING_EFFORT,
-            )
-            answer_text = (ans or "").strip()
-
-            def _replace_url(m: re.Match) -> str:
-                dom = _domain(m.group(1))
-                return f"（來源：{dom}）" if (not allowed_domains or dom in allowed_domains) else ""
-
-            answer_text = re.sub(r"（來源：\s*(https?://[^\s\)]+)\s*）", _replace_url, answer_text)
-            answer_text = re.sub(r"來源：\s*(https?://[^\s]+)", lambda m: f"（來源：{_domain(m.group(1))}）", answer_text)
-            answer_text = (answer_text.rstrip() + "\n\n[WebSearch:web p-]").strip()
-        else:
-            ans, _ = call_gpt(
-                client,
-                model=MODEL_MAIN,
-                system=ANYA_SYSTEM_PROMPT,
-                user=user_text,
-                reasoning_effort=REASONING_EFFORT,
-            )
-            answer_text = (ans or "").strip()
+        # 尾端 badges（聊天模式也顯示 scope，方便你知道現在 UI 鎖定狀態）
+        scope_label = (scope_title if scope_title else "All")
+        tail_badges = " ".join([
+            _badge_directive("Mode:Chat", "gray"),
+            _badge_directive(f"Scope:{scope_label}", "green" if scope_label != "All" else "gray"),
+            _badge_directive("Web:off", "gray"),
+        ])
+        answer_text = (answer_text + "\n\n" + tail_badges).strip()
 
         if st.session_state.get("enable_output_formatter", True):
             answer_text = format_markdown_output_preserve_citations(client, answer_text)
@@ -2854,13 +2940,13 @@ if prompt:
 
         meta = {
             "mode": "direct",
-            "enable_web": enable_web,
+            "enable_web": False,
             "usage": usage,
-            "difficulty": plan.difficulty,
+            "difficulty": "easy",
             "web_sources": web_sources,
+            "scope_title": scope_label,
         }
         render_run_badges(mode=meta["mode"], enable_web=meta["enable_web"], usage=meta["usage"], difficulty=meta["difficulty"])
         render_markdown_answer_with_sources_badges(answer_text)
-        render_web_sources_list(web_sources)
 
         st.session_state.chat_history.append({"role": "assistant", "kind": "text", "content": answer_text, "meta": meta})
