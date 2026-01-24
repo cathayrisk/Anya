@@ -532,18 +532,38 @@ def render_doc_search_expander(*, run_id: str):
     items = [x for x in log if x.get("run_id") == run_id]
     if not items:
         return
-    with st.expander("🔎 文件檢索命中（節錄）", expanded=False):
+
+    def _fmt(x, fmt=".4f"):
+        if x is None:
+            return "—"
+        try:
+            return format(float(x), fmt)
+        except Exception:
+            return str(x)
+
+    with st.expander("🔎 文件檢索命中（節錄）", expanded=True):
         for rec in items:
             q = rec.get("query") or ""
             k = rec.get("k")
             st.markdown(f"- Query：`{q}`（k={k}）")
+
             hits = (rec.get("hits") or [])[:6]
             for h in hits:
                 title = h.get("title")
                 page = h.get("page")
-                score = h.get("score")
                 snippet = h.get("snippet") or ""
-                st.markdown(f"  - [{title} p{page}] score={score:.3f}：{snippet}")
+
+                # 新增：多分數欄位（docstore.py 會一起回）
+                fused = h.get("score") or h.get("final_score")
+                dense_sim = h.get("dense_sim")
+                dense_dist = h.get("dense_dist")
+                bm25 = h.get("bm25_score")
+
+                st.markdown(
+                    f"  - [{title} p{page}] "
+                    f"final={_fmt(fused,'.4f')} | dense_sim={_fmt(dense_sim,'.4f')} | "
+                    f"dist={_fmt(dense_dist,'.2f')} | bm25={_fmt(bm25,'.2f')}：{snippet}"
+                )
 
 # ====== (1) 貼在 helpers 區：建議放在 extract_doc_citations / render_doc_search_expander 附近 ======
 
