@@ -830,7 +830,7 @@ def run_general_with_webpage_tool(
     reasoning_effort: str,
     need_web: bool,
     forced_url: str | None,
-    doc_fulltext_token_budget_hint: int,
+    doc_fulltext_token_budget_hint: int = 20000
 ):
     """
     General 分支 runner：
@@ -1434,6 +1434,13 @@ def run_front_router(
 
     return {"kind": "general", "args": {"reason": "uncertain", "query": user_text, "need_web": True}}
 
+def has_docstore_index() -> bool:
+    store = st.session_state.get("ds_store", None)
+    try:
+        return bool(store is not None and getattr(store, "index", None) is not None and store.index.ntotal > 0)
+    except Exception:
+        return False
+
 # === 3. 並行搜尋（完成即顯示） ===
 async def aparallel_search_stream(
     search_agent,
@@ -1913,24 +1920,59 @@ with st.popover("📦 文件庫（Session-only）"):
             st.session_state.ds_file_bytes[row.file_id] = data
 
     rows = st.session_state.ds_file_rows
+    store = st.session_state.get("ds_store", None)
+    has_index = bool(store is not None and getattr(store, "index", None) is not None and store.index.ntotal > 0)
+
+    # 索引狀態 badge
+    if has_index:
+        st.success(f"已建立索引：chunks={len(store.chunks)}")
+    else:
+        st.info("尚未建立索引（或索引為空）。")
+
+    # ---- 文件清單（表格）----
     if rows:
-        st.markdown("### 文件清單（OCR 建議）")
+        payload = doc_list_payload(rows, store)
+        items = payload.get("items", [])
+
+        # 用 DataFrame 顯示更清楚
+        import pandas as pd
+        def _fmt_bool(v: bool, yes="✅", no=""):
+            return yes if bool(v) else no
+
+        df = pd.DataFrame([{
+            "檔名": f"{it.get('title')}{it.get('ext')}",
+            "類型": (it.get("ext") or "").lstrip(".").upper(),
+            "大小(MB)": round((it.get("size_bytes") or 0) / 1024 / 1024, 2),
+            "頁數": it.get("pages"),
+            "估計tokens": it.get("token_est"),
+            "建議OCR": _fmt_bool(it.get("likely_scanned")),
+            "已勾OCR": _fmt_bool(it.get("use_ocr")),
+            "chunks": it.get("chunks"),
+        } for it in items])
+
+        st.markdown("### 📄 文件清單")
+        st.dataframe(df, width="stretch", hide_index=True)
+
+        # OCR 勾選區（只對 PDF 顯示）
+        st.markdown("### 🔎 PDF OCR（疑似掃描件才建議開）")
         for r in rows:
-            cols = st.columns([3, 2, 2, 2])
-            cols[0].write(f"{r.name}  :small[(約 {r.token_est} tokens)]")
-            hint = "建議 OCR（疑似掃描件）" if (r.ext == ".pdf" and r.likely_scanned) else ""
-            cols[1].write(hint)
+            if r.ext != ".pdf":
+                continue
+            cols = st.columns([3, 2, 2, 3])
+            cols[0].write(r.name)
+            cols[1].write("建議OCR ✅" if r.likely_scanned else "（通常不需）")
+            r.use_ocr = cols[2].checkbox("OCR", value=bool(r.use_ocr), key=f"ds_ocr_{r.file_id}")
+            if r.use_ocr and not HAS_PYMUPDF:
+                cols[3].warning("缺 pymupdf，PDF OCR 會失敗")
 
-            if r.ext == ".pdf":
-                r.use_ocr = cols[2].checkbox("OCR", value=bool(r.use_ocr), key=f"ds_ocr_{r.file_id}")
-                if r.use_ocr and not HAS_PYMUPDF:
-                    cols[3].warning("缺 pymupdf，PDF OCR 會失敗")
-            else:
-                cols[2].write("")
+        # 依賴提示（Office）
+        if (not HAS_UNSTRUCTURED_LOADERS) and any(r.ext in (".doc", ".docx", ".pptx", ".xls", ".xlsx") for r in rows):
+            st.warning("你上傳了 Office 檔，但環境缺少 unstructured loaders，可能抽不到文字。建議安裝或先轉成 PDF/TXT。")
 
-    if (not HAS_UNSTRUCTURED_LOADERS) and any(r.ext in (".doc", ".docx", ".pptx", ".xls", ".xlsx") for r in rows):
-        st.warning("你上傳了 Office 檔，但環境缺少 unstructured loaders，可能抽不到文字。建議安裝或先轉成 PDF/TXT。")
+    else:
+        st.markdown(":small[（尚未上傳任何文件）]")
 
+    # ---- 操作按鈕 ----
     c1, c2 = st.columns([1, 1])
     build_btn = c1.button("🚀 建立/更新索引", type="primary", use_container_width=True)
     clear_btn = c2.button("🧹 清空文件庫", use_container_width=True)
@@ -1957,11 +1999,13 @@ with st.popover("📦 文件庫（Session-only）"):
             st.session_state.ds_store = store
             st.session_state.ds_processed_keys = processed_keys
             st.session_state.ds_last_index_stats = stats
-            s.write(f"新增報告數：{stats.get('new_reports')}")
+
+            s.write(f"新增文件數：{stats.get('new_reports')}")
             s.write(f"新增 chunks：{stats.get('new_chunks')}")
             if stats.get("errors"):
                 s.warning("部分檔案抽取失敗：\n" + "\n".join([f"- {e}" for e in stats["errors"][:8]]))
             s.update(state="complete")
+
         st.rerun()
 
     has_index = bool(st.session_state.ds_store is not None and st.session_state.ds_store.index.ntotal > 0)
@@ -2140,6 +2184,7 @@ if prompt is not None:
 
         try:
             with status_area:
+                badges_ph = st.empty()
                 with st.status("⚡ 思考中...", expanded=False) as status:
                     placeholder = output_area.empty()
 
@@ -2162,6 +2207,11 @@ if prompt is not None:
                             "need_web": False,
                         }
 
+                    # ✅ prefer general when indexed（放這裡！）
+                    if has_docstore_index() and kind == "fast":
+                        kind = "general"
+                        args = {"reason": "docstore_indexed_prefer_general", "query": user_text or args.get("query") or "", "need_web": False}
+
                     # ====== (3) ✅ Fast 分支：在 kind == "fast" 區塊內，整段替換你目前的 fast 分支內容 ======
                     # 目的：在 assistant bubble 最上方先畫 badges，再跑 fast 串流，跑完更新 badges
                     
@@ -2169,7 +2219,6 @@ if prompt is not None:
                         status.update(label="⚡ 使用快速回答模式", state="running", expanded=False)
                     
                         # badges 最上面（先預設 Web off）
-                        badges_ph = st.empty()
                         badges_ph.markdown(badges_markdown(mode="fast", db_used=False, web_used=False, doc_calls=0, web_calls=0))
                     
                         raw_fast_query = user_text or args.get("query") or "請根據對話內容回答。"
@@ -2240,7 +2289,6 @@ if prompt is not None:
                         st.session_state.ds_doc_search_log = []
                     
                         # ✅ badges 最上面：先畫「預設 off」，跑完再更新
-                        badges_ph = st.empty()
                         badges_ph.markdown(
                             badges_markdown(mode="general", db_used=False, web_used=False, doc_calls=0, web_calls=0)
                         )
@@ -2330,6 +2378,8 @@ if prompt is not None:
                     
                         # ✅ badges 最上面：research 一定會做 web（search_plan 有幾條就算幾次嘗試）
                         badges_ph = st.empty()
+                        doc_calls = 0
+                        web_calls = 0
                         badges_ph.markdown(badges_markdown(mode="research", db_used=False, web_used=True, doc_calls=0, web_calls=0))
                     
                         plan_query = args.get("query") or user_text
@@ -2338,19 +2388,75 @@ if prompt is not None:
                         plan_res = run_async(Runner.run(planner_agent, plan_query_runtime))
                         search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
                     
-                        # ✅ 更新 badges：用 search_plan 長度當作 web_calls（概略值）
-                        try:
-                            badges_ph.markdown(
-                                badges_markdown(
-                                    mode="research",
-                                    db_used=False,
-                                    web_used=True,
-                                    doc_calls=0,
-                                    web_calls=len(search_plan) if search_plan else 0,
-                                )
+                        # 先估 web_calls（概略值）
+                        web_calls = len(search_plan) if search_plan else 0
+                        
+                        # ✅ 新增：文件檢索（只要有 index 就做）
+                        doc_summaries = []  # list[dict] 會塞給 writer
+                        if has_docstore_index():
+                            # 1) 先用原始問題做一次 doc_search（高價值）
+                            payload0 = doc_search_payload(
+                                client,
+                                st.session_state.get("ds_store", None),
+                                plan_query,
+                                k=8,
+                                difficulty="hard",
                             )
-                        except Exception:
-                            pass
+                            doc_calls += 1
+                        
+                            hits0 = (payload0.get("hits") or [])[:8]
+                            if hits0:
+                                # 串成 evidence（帶 citation_token，讓 writer 直接引用）
+                                ev_lines = []
+                                for h in hits0:
+                                    ev_lines.append(f"{h.get('citation_token')}\n{h.get('snippet')}")
+                                doc_summaries.append({
+                                    "query": f"DocSearch: {plan_query}",
+                                    "summary": "\n\n".join(ev_lines)
+                                })
+                        
+                            # 2) 可選：對 planner 前 3 個 query 再補 doc_search（避免太慢）
+                            for it in (search_plan or [])[:3]:
+                                q = (it.query or "").strip()
+                                if not q:
+                                    continue
+                                payload = doc_search_payload(
+                                    client,
+                                    st.session_state.get("ds_store", None),
+                                    q,
+                                    k=6,
+                                    difficulty="hard",
+                                )
+                                doc_calls += 1
+                                hits = (payload.get("hits") or [])[:6]
+                                if not hits:
+                                    continue
+                                ev_lines = []
+                                for h in hits:
+                                    ev_lines.append(f"{h.get('citation_token')}\n{h.get('snippet')}")
+                                doc_summaries.append({
+                                    "query": f"DocSearch: {q}",
+                                    "summary": "\n\n".join(ev_lines)
+                                })
+                        
+                        # 更新 badges（research 會同時有 DB / Web）
+                        badges_ph.markdown(
+                            badges_markdown(
+                                mode="research",
+                                db_used=(doc_calls > 0),
+                                web_used=True,
+                                doc_calls=doc_calls,
+                                web_calls=web_calls,
+                            )
+                        )
+                        
+                        # ✅ UI：把 doc_summaries 顯示在 expander（可選但我推薦）
+                        if doc_summaries:
+                            with output_area:
+                                with st.expander("📚 文件檢索摘要（DocStore）", expanded=False):
+                                    for d in doc_summaries[:6]:
+                                        st.markdown(f"**{d['query']}**")
+                                        st.markdown(d["summary"][:1500] + ("…" if len(d["summary"]) > 1500 else ""))
                     
                         with output_area:
                             with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
@@ -2385,13 +2491,22 @@ if prompt is not None:
                         trimmed_messages_no_guard = strip_page_guard(trimmed_messages)
                         trimmed_messages_no_guard_with_today = [today_system_msg] + list(trimmed_messages_no_guard)
                     
-                        search_for_writer = [
+                        search_for_writer = []
+                        
+                        # 先放文件 evidence（如果有）
+                        search_for_writer.extend(doc_summaries)
+                        
+                        # 再放 web 搜尋摘要（你原本的）
+                        search_for_writer.extend([
                             {"query": search_plan[i].query, "summary": summary_texts[i]}
                             for i in range(len(search_plan))
-                        ]
-                    
+                        ])
+                        
                         writer_data, writer_url_cits, writer_file_cits = run_writer(
-                            client, trimmed_messages_no_guard_with_today, plan_query, search_for_writer
+                            client,
+                            trimmed_messages_no_guard_with_today,
+                            plan_query,
+                            search_for_writer,
                         )
                     
                         with output_area:
