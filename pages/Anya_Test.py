@@ -54,8 +54,8 @@ from docstore import (
     HAS_UNSTRUCTURED_LOADERS,
     HAS_PYMUPDF,
     estimate_tokens_from_chars as _ds_est_tokens_from_chars,
+    badges_markdown,
 )
-from badges import badges_markdown
 import uuid as _uuid
 
 # === 0. Trimming / 大小限制（可調） ===
