@@ -656,43 +656,146 @@ def doc_list_payload(file_rows: list[FileRow], store: Optional[DocStore]) -> dic
     }
 
 
-def doc_search_payload(
-    client: OpenAI,
-    store: Optional[DocStore],
-    query: str,
-    k: int = 8,
-    *,
-    difficulty: str = "medium",
-    snippet_chars: int = 420,
-) -> dict:
-    q = (query or "").strip()
-    if not q:
-        return {"hits": []}
+def _minmax_norm(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    vmin = min(values)
+    vmax = max(values)
+    if math.isclose(vmin, vmax):
+        return [0.0 for _ in values]
+    return [(v - vmin) / (vmax - vmin) for v in values]
 
-    if store is None or store.index.ntotal == 0:
-        return {"hits": [], "error": "no_index"}
+def _safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-    qvec = embed_texts(client, [q])
-    hits = store.search_hybrid(q, qvec, k=max(1, min(12, int(k))), difficulty=difficulty)
+def doc_search_payload(client, store, query: str, k: int = 8, difficulty: str = "medium") -> dict[str, Any]:
+    """
+    回傳 hits 內含：
+    - score (final_score): 融合後分數（越大越好）
+    - dense_dist: FAISS 距離（L2 越小越好；IP/ cosine 則可能是 -score 或 None，依你的 index）
+    - dense_sim: 轉成 similarity（越大越好）
+    - bm25_score: BM25 原始分數（越大越好）
+    """
+    if store is None or getattr(store, "index", None) is None or getattr(store.index, "ntotal", 0) <= 0:
+        return {"ok": True, "query": query, "hits": [], "note": "empty_index"}
 
-    out_hits = []
-    for score, ch in hits:
-        token = f"[{ch.title} p{ch.page if ch.page is not None else '-'}]"
-        snippet = (ch.text or "").strip().replace("\n", " ")
-        if len(snippet) > snippet_chars:
-            snippet = snippet[:snippet_chars] + "…"
-        out_hits.append(
-            {
-                "title": ch.title,
-                "page": ch.page if ch.page is not None else "-",
-                "score": float(score),
-                "citation_token": token,
-                "snippet": snippet,
-                "chunk_id": ch.chunk_id,  # internal only
-            }
-        )
+    query = (query or "").strip()
+    if not query:
+        return {"ok": True, "query": query, "hits": [], "note": "empty_query"}
 
-    return {"hits": out_hits}
+    # ===== 1) Dense：取向量 =====
+    # 你 docstore 建索引時應該有用 embeddings；這裡假設你用 OpenAI embedding
+    # 若你有包成 store.embed_query(...)，就改成那個
+    emb = client.embeddings.create(
+        model=getattr(store, "embedding_model", "text-embedding-3-large"),
+        input=query,
+    )
+    qvec = emb.data[0].embedding  # list[float]
+
+    # FAISS 需要 float32 array（若你 docstore.py 已處理過，就用你自己的）
+    import numpy as np
+    q = np.array([qvec], dtype="float32")
+
+    # ===== 2) Dense search =====
+    # 注意：IndexFlatL2 -> 回來的是「距離」（越小越好）
+    #       IndexFlatIP -> 回來的是「內積」（越大越好）
+    D, I = store.index.search(q, max(k * 4, 20))
+    dense_ids = I[0].tolist()
+    dense_raw = D[0].tolist()
+
+    # 建出 dense candidates: id -> (dist_or_ip, sim)
+    dense_by_id: dict[int, dict[str, float]] = {}
+    for idx, raw in zip(dense_ids, dense_raw):
+        if idx < 0:
+            continue
+
+        # 嘗試辨識 metric：L2(距離) vs IP(相似度)
+        # faiss index 有些沒有 metric_type，保守用「如果 raw >= 0 且值偏大」仍可能是 L2
+        metric = getattr(getattr(store, "faiss_metric", None), "name", None)  # 你若有存可用
+        metric_type = getattr(store.index, "metric_type", None)  # 有些 index 有
+
+        dense_dist = None
+        dense_sim = None
+
+        if metric_type is not None:
+            import faiss
+            if metric_type == faiss.METRIC_L2:
+                dense_dist = float(raw)
+                dense_sim = 1.0 / (1.0 + dense_dist)
+            elif metric_type == faiss.METRIC_INNER_PRODUCT:
+                dense_sim = float(raw)  # 越大越好
+            else:
+                # fallback
+                dense_dist = float(raw)
+                dense_sim = 1.0 / (1.0 + dense_dist)
+        else:
+            # fallback：把它當 L2 distance（保守）
+            dense_dist = float(raw)
+            dense_sim = 1.0 / (1.0 + dense_dist)
+
+        dense_by_id[idx] = {"dense_dist": dense_dist, "dense_sim": dense_sim}
+
+    # ===== 3) BM25 =====
+    # 你如果用 rank_bm25：通常會有 store.bm25.get_scores(tokens)
+    # 這裡假設你有 store.bm25 和 store.tokenize()
+    bm25_by_id: dict[int, float] = {}
+    if getattr(store, "bm25", None) is not None and getattr(store, "tokenize", None) is not None:
+        toks = store.tokenize(query)
+        bm25_scores = store.bm25.get_scores(toks)  # numpy array
+        # 取 top 4k 做候選
+        topn = max(k * 4, 20)
+        bm25_top_ids = np.argsort(-bm25_scores)[:topn].tolist()
+        for idx in bm25_top_ids:
+            bm25_by_id[int(idx)] = float(bm25_scores[idx])
+
+    # ===== 4) union candidates =====
+    cand_ids = list({*dense_by_id.keys(), *bm25_by_id.keys()})
+    if not cand_ids:
+        return {"ok": True, "query": query, "hits": [], "note": "no_candidates"}
+
+    # ===== 5) normalize + fuse =====
+    dense_sims = [_safe_float(dense_by_id.get(i, {}).get("dense_sim"), 0.0) or 0.0 for i in cand_ids]
+    bm25_scores = [_safe_float(bm25_by_id.get(i), 0.0) or 0.0 for i in cand_ids]
+
+    dense_norm = _minmax_norm(dense_sims)
+    bm25_norm = _minmax_norm(bm25_scores)
+
+    alpha = 0.6  # dense 權重；你可調 0.5~0.7
+    fused = [alpha * d + (1 - alpha) * b for d, b in zip(dense_norm, bm25_norm)]
+
+    # ===== 6) 排序、取 top-k =====
+    order = sorted(range(len(cand_ids)), key=lambda j: fused[j], reverse=True)[:k]
+
+    hits = []
+    for j in order:
+        idx = cand_ids[j]
+        chunk = store.chunks[idx]  # 你 docstore 若不是 list，用你自己的取法
+
+        title = chunk.get("title") or chunk.get("source") or "Document"
+        page = chunk.get("page")
+        text = chunk.get("text") or chunk.get("content") or chunk.get("page_content") or ""
+
+        snippet = (text[:420] + "…") if len(text) > 420 else text
+        citation_token = f"[{title} p{page if page is not None else '-'}]"
+
+        hits.append({
+            "title": title,
+            "page": page if page is not None else "-",
+            "snippet": snippet,
+            "citation_token": citation_token,
+
+            # === 分數（debug + UI）===
+            "score": float(fused[j]),          # 最終排序分（0..1）
+            "final_score": float(fused[j]),
+            "dense_sim": _safe_float(dense_by_id.get(idx, {}).get("dense_sim")),
+            "dense_dist": _safe_float(dense_by_id.get(idx, {}).get("dense_dist")),
+            "bm25_score": _safe_float(bm25_by_id.get(idx)),
+        })
+
+    return {"ok": True, "query": query, "hits": hits}
 
 
 def doc_get_fulltext_payload(
