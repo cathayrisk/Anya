@@ -76,6 +76,27 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # 讓 Agents SDK 可以讀到
 # === 1. Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
 
+# =========================
+# 1) ✅ 在主程式 imports 附近（有 os / streamlit 後）新增：DEV_MODE
+# 建議放在 st.set_page_config() 後面或 session defaults 附近
+# =========================
+
+def _get_query_param(name: str) -> str:
+    """
+    Streamlit 新舊 query params 兼容：
+    - st.query_params[name] 可能是 str 或 list[str]
+    """
+    try:
+        qp = st.query_params  # new API
+        v = qp.get(name, "")
+        if isinstance(v, list):
+            return v[0] if v else ""
+        return str(v or "")
+    except Exception:
+        return ""
+
+DEV_MODE = (_get_query_param("dev").strip() == "1")
+
 # === 1.a Session 預設值保險（務必在任何使用 chat_history 前） ===
 def get_today_str() -> str:
     """Get current date string like 'Sun Dec 14, 2025' (cross-platform)."""
@@ -739,6 +760,11 @@ def build_doc_sources_footer(*, run_id: str, max_docs: int = 4) -> str:
     return "\n\n---\n" + f":small[:gray[引用文件：{'；'.join(parts)}{more}]]"
 
 
+# =========================
+# 4) ✅ Linear issue list：替換 render_evidence_panel_expander_in() 的 Evidence 分頁渲染
+# 只要替換「with tab_evidence:」裡面那段即可（我把整個 function 給你，直接整段替換也行）
+# =========================
+
 def render_evidence_panel_expander_in(
     *,
     container,
@@ -748,9 +774,6 @@ def render_evidence_panel_expander_in(
     docs_for_history: list[str] | None,
     expanded: bool = False,
 ):
-    """
-    把『📚 證據 / 檢索 / 來源』渲染到指定 container（讓你可以放到 status 區）
-    """
     agg = aggregate_doc_evidence_from_log(run_id=run_id)
     sources: dict[str, list[str]] = agg.get("sources") or {}
     evidence: dict[str, list[dict]] = agg.get("evidence") or {}
@@ -764,10 +787,17 @@ def render_evidence_panel_expander_in(
         s = (s or "").strip()
         return s if len(s) <= n else (s[:n] + "…")
 
+    def _short_snip(s: str, n: int = 120) -> str:
+        s = re.sub(r"\s+", " ", (s or "").strip())
+        return s if len(s) <= n else (s[:n] + "…")
+
     with container:
         with st.expander("📚 證據 / 檢索 / 來源", expanded=expanded):
             tab_sources, tab_evidence, tab_search = st.tabs(["Sources", "Evidence", "Search"])
 
+            # -------------------------
+            # Sources（維持你原本風格）
+            # -------------------------
             with tab_sources:
                 if sources:
                     st.markdown("**文件來源（本回合命中）**")
@@ -778,7 +808,6 @@ def render_evidence_panel_expander_in(
                 else:
                     st.markdown(":small[:gray[（本回合沒有文件命中）]]")
 
-                # URL sources（精簡）
                 urls = []
                 if url_in_text:
                     urls.append({"title": "使用者提供網址", "url": url_in_text})
@@ -805,29 +834,50 @@ def render_evidence_panel_expander_in(
                     for fn in docs_for_history:
                         st.markdown(f"- {fn}")
 
+            # -------------------------
+            # Evidence（✅ Linear issue list：短、密、可展開）
+            # -------------------------
             with tab_evidence:
                 if not evidence:
                     st.markdown(":small[:gray[（沒有可顯示的 evidence）]]")
                 else:
+                    # 一份文件一個區塊（可收）
                     for title in sorted(evidence.keys(), key=lambda x: x.lower()):
                         with st.expander(f"📄 {_short(title, 46)}", expanded=False):
-                            for h in (evidence[title] or [])[:6]:
-                                page = h.get("page", "-")
+                            hits = (evidence[title] or [])[:6]
+                            if not hits:
+                                st.markdown(":small[:gray[（無）]]")
+                                continue
+
+                            # ✅ 每個 hit 一行 + 可展開（像 Linear issue list）
+                            for idx, h in enumerate(hits, start=1):
+                                page = str(h.get("page", "-"))
                                 snippet = (h.get("snippet") or "").strip()
-                                score = h.get("score") or h.get("final_score")
-                                dense_rank = h.get("dense_rank")
-                                bm25_rank = h.get("bm25_rank")
-                                rrf = h.get("rrf_score")
+                                line = _short_snip(snippet, 140)
 
-                                st.markdown(
-                                    f"- :blue-badge[p{page}] "
-                                    f":small[:gray[score={score if score is not None else '—'} · "
-                                    f"dense_rank={dense_rank if dense_rank is not None else '—'} · "
-                                    f"bm25_rank={bm25_rank if bm25_rank is not None else '—'} · "
-                                    f"rrf={rrf if rrf is not None else '—'}]]\n\n"
-                                    f"  {snippet}"
-                                )
+                                # 展開標題：pX + 精簡一句
+                                header = f"p{page} · {line}"
 
+                                with st.expander(header, expanded=False):
+                                    # 內文：完整 snippet（或你想改成全文 chunk）
+                                    st.markdown(snippet or ":small[:gray[（空）]]")
+
+                                    # ✅ Debug 只在 dev=1 才顯示
+                                    if DEV_MODE:
+                                        score = h.get("score") or h.get("final_score")
+                                        dense_rank = h.get("dense_rank")
+                                        bm25_rank = h.get("bm25_rank")
+                                        rrf = h.get("rrf_score")
+                                        st.caption(
+                                            f"score={score if score is not None else '—'} · "
+                                            f"dense_rank={dense_rank if dense_rank is not None else '—'} · "
+                                            f"bm25_rank={bm25_rank if bm25_rank is not None else '—'} · "
+                                            f"rrf={rrf if rrf is not None else '—'}"
+                                        )
+
+            # -------------------------
+            # Search（維持）
+            # -------------------------
             with tab_search:
                 if not queries:
                     st.markdown(":small[:gray[（本回合沒有 doc_search query）]]")
@@ -1387,6 +1437,11 @@ def run_general_with_webpage_tool(
                 q = (args.get("query") or "").strip()
                 k = int(args.get("k", 8))
                 diff = str(args.get("difficulty", "medium") or "medium")
+
+                # ✅ 沒有 FlashRank 就不要 hard：避免全部 score=0
+                if diff == "hard" and not HAS_FLASHRANK:
+                    diff = "medium"
+                
                 output = doc_search_payload(client, st.session_state.get("ds_store", None), q, k=k, difficulty=diff)
 
                 # 記錄給 expander 用（只記必要資訊）
@@ -2377,11 +2432,13 @@ def build_fastagent_query_from_history(
 # ========= 4) st.popover UI：照 U1 放在主程式（建議放在「顯示歷史」之前） =========
 with st.popover("📚 引用資料夾"):
     st.caption("檔案只存在本次 session。建索引後，General 回答可用 doc_search 工具查文件。")
-
+    # ✅ 用你自己的文字，隱藏 uploader 原生 label（避免「沒有選擇檔案」）
+    st.caption(":small[:gray[拖曳檔案到這裡，或點一下選取（session-only）。]]")
     uploaded = st.file_uploader(
         "上傳文件",
         type=["pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
+        label_visibility="collapsed",
     )
 
     if uploaded:
@@ -2885,11 +2942,13 @@ if prompt is not None:
                             expanded=False,
                         )
                         
-                        render_retrieval_hits_expander_in(
-                            container=retrieval_hits_ph,
-                            run_id=run_id,
-                            expanded=False,
-                        )
+                        # ✅ 只有 dev=1 才顯示「🔎 文件檢索命中（節錄）」(debug)
+                        if DEV_MODE:
+                            render_retrieval_hits_expander_in(
+                                container=retrieval_hits_ph,
+                                run_id=run_id,
+                                expanded=False,
+                            )
                         
                         # ✅ 4) 右側 sources_container：如果你已經在 status 區顯示 sources，
                         #    這裡就建議簡化（或乾脆不顯示文件來源，只保留 URL / 上傳檔案）
