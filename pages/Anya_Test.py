@@ -649,6 +649,53 @@ _EMPTY_SOURCE_LINE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+def strip_trailing_model_doc_sources_block(text: str) -> str:
+    """
+    移除模型在尾端自己寫的「來源（文件）」區塊（避免和 UI / footer 重複）。
+    只砍尾巴（<= 2500 chars），避免誤砍正文。
+    """
+    if not text:
+        return text
+
+    patterns = [
+        r"\n來源（文件）\n",
+        r"\n來源\s*\(文件\)\s*\n",
+        r"\nSources\s*\(docs?\)\s*\n",
+    ]
+
+    last_pos = -1
+    for pat in patterns:
+        m = list(re.finditer(pat, text, flags=re.IGNORECASE))
+        if m:
+            last_pos = max(last_pos, m[-1].start())
+
+    if last_pos == -1:
+        return text
+
+    tail = text[last_pos:]
+    if len(tail) <= 2500:
+        return text[:last_pos].rstrip()
+    return text
+
+
+def strip_trailing_model_citation_footer(text: str) -> str:
+    """
+    移除模型自己寫的「引用文件：...」footer（你會用 build_doc_sources_footer 自己補一份）。
+    """
+    if not text:
+        return text
+
+    # 找最後一個「引用文件」出現位置（只砍尾巴）
+    m = list(re.finditer(r"\n引用文件\s*[:：]\s*", text))
+    if not m:
+        return text
+
+    last_pos = m[-1].start()
+    tail = text[last_pos:]
+    if len(tail) <= 2500:
+        return text[:last_pos].rstrip()
+    return text
+
 def cleanup_report_markdown(text: str) -> str:
     """
     讓正文更像『報告』：
@@ -939,8 +986,9 @@ def render_evidence_panel_expander(
 # ====== (1) 貼在 helpers 區：建議放在 extract_doc_citations / render_doc_search_expander 附近 ======
 
 # =========================
-# ✅ 2) 直接替換你的 render_sources_container_full（整個函式貼回去）
-# 目的：支援 run_id 參數，解掉 TypeError；並保持舊呼叫也能用
+# ✅ 2) render_sources_container_full：加一個參數控制是否顯示「文件來源」
+# 你目前 sources_container 右側會再列一次文件來源，造成「引用文件」重複
+# 這版向後相容：預設 show_doc_sources=True；但你 general 分支會改成 False
 # =========================
 
 def render_sources_container_full(
@@ -951,15 +999,9 @@ def render_sources_container_full(
     url_cits: list[dict] | None,
     file_cits: list[dict] | None,
     docs_for_history: list[str] | None,
-    run_id: str | None = None,  # ✅ 新增（向後相容）
+    run_id: str | None = None,
+    show_doc_sources: bool = True,  # ✅ 新增
 ):
-    """
-    右側 sources 區塊：整合
-    - URL 來源（使用者提供 + web_search citations）
-    - 文件來源（若提供 run_id，優先用 ds_doc_search_log 聚合；否則從 ai_text 擷取 [title pN]）
-    - 引用檔案（Responses file_citation）
-    - 本回合上傳檔案（docs_for_history）
-    """
     with sources_container:
         # ---- 1) URL sources ----
         urls = []
@@ -970,14 +1012,12 @@ def render_sources_container_full(
             if u:
                 urls.append({"title": (c.get("title") or u).strip(), "url": u})
 
-        # 去重
         seen = set()
         urls_dedup = []
         for it in urls:
-            u = it["url"]
-            if not u or u in seen:
+            if it["url"] in seen:
                 continue
-            seen.add(u)
+            seen.add(it["url"])
             urls_dedup.append(it)
 
         if urls_dedup:
@@ -985,29 +1025,29 @@ def render_sources_container_full(
             for it in urls_dedup:
                 st.markdown(f"- [{it['title']}]({it['url']})")
 
-        # ---- 2) 文件來源：優先用 run_id 聚合（更穩）----
-        doc_sources: dict[str, list[str]] = {}
-        if run_id:
-            try:
-                agg = aggregate_doc_evidence_from_log(run_id=run_id)
-                doc_sources = agg.get("sources") or {}
-            except Exception:
-                doc_sources = {}
+        # ---- 2) 文件來源（可關閉，避免重複）----
+        if show_doc_sources:
+            doc_sources: dict[str, list[str]] = {}
+            if run_id:
+                try:
+                    agg = aggregate_doc_evidence_from_log(run_id=run_id)
+                    doc_sources = agg.get("sources") or {}
+                except Exception:
+                    doc_sources = {}
 
-        # 沒 run_id 或聚合不到，退回舊方式：從答案文字抓 [title pN]
-        if not doc_sources:
-            doc_sources = extract_doc_citations(ai_text or "")
+            if not doc_sources:
+                doc_sources = extract_doc_citations(ai_text or "")
 
-        if doc_sources:
-            st.markdown("**來源（文件）**")
+            if doc_sources:
+                st.markdown("**來源（文件）**")
 
-            def _short(s: str, n: int = 30) -> str:
-                s = (s or "").strip()
-                return s if len(s) <= n else (s[:n] + "…")
+                def _short(s: str, n: int = 30) -> str:
+                    s = (s or "").strip()
+                    return s if len(s) <= n else (s[:n] + "…")
 
-            for title, pages in sorted(doc_sources.items(), key=lambda kv: kv[0].lower()):
-                pages_str = ",".join(pages[:20]) + ("…" if len(pages) > 20 else "")
-                st.markdown(f"- :blue-badge[{_short(title)}] :small[:gray[p{pages_str}]]")
+                for title, pages in sorted(doc_sources.items(), key=lambda kv: kv[0].lower()):
+                    pages_str = ",".join(pages[:20]) + ("…" if len(pages) > 20 else "")
+                    st.markdown(f"- :blue-badge[{_short(title)}] :small[:gray[p{pages_str}]]")
 
         # ---- 3) Responses file citations（如果模型有回 file_citation）----
         if file_cits:
@@ -1016,11 +1056,12 @@ def render_sources_container_full(
                 fname = c.get("filename") or c.get("file_id") or "(未知檔名)"
                 st.markdown(f"- {fname}")
 
-        # ---- 4) 本回合上傳檔案（chat_input 的 docs）----
+        # ---- 4) 本回合上傳檔案 ----
         if (not file_cits) and (docs_for_history or []):
             st.markdown("**本回合上傳檔案**")
             for fn in (docs_for_history or []):
                 st.markdown(f"- {fn}")
+                
 # =========================
 # 1) [新增] 放在 parse_response_text_and_citations 下面（任意位置）
 #    用來把模型回覆最後的「來源/## 來源」區塊切掉（避免與 UI sources_container 重複）
@@ -2757,10 +2798,10 @@ if prompt is not None:
                         st.session_state["ds_active_run_id"] = str(_uuid.uuid4())
                         st.session_state.ds_doc_search_log = []
 
-                        # 在 general 分支一開始（你建立 ds_active_run_id / 清 log 之後）加這幾行：
-                        status_panels = status_area.container()          # ✅ 放在 status 區塊裡
-                        evidence_panel_ph = status_panels.empty()        # ✅ 之後把「證據/來源」放這
-                        retrieval_hits_ph = status_panels.empty()        # ✅ 之後把「檢索命中」放這
+                        # ✅ 改成：在 status 裡建立 placeholders（這樣 expander 才會「收在 status 裡」）
+                        with status:
+                            evidence_panel_ph = st.empty()
+                            retrieval_hits_ph = st.empty()
                         
                         # ✅ badges 最上面：先畫「預設 off」，跑完再更新
                         badges_ph.markdown(
@@ -2818,6 +2859,12 @@ if prompt is not None:
                     
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)  # 避免模型自己再列一次來源
+                        # ✅ 移除模型自己寫的「來源（文件）」/「引用文件」尾巴（避免跟你自己的 footer 重複）
+                        ai_text = strip_trailing_model_doc_sources_block(ai_text)
+                        ai_text = strip_trailing_model_citation_footer(ai_text)
+                        
+                        # ✅ 移除每句後面的 [Title pN] token（閱讀變乾淨）
+                        ai_text = strip_doc_citation_tokens(ai_text)
                         # ✅ 1) 把模型吐的「來源：」空行清掉（避免你截圖那種 來源：、）
                         ai_text = cleanup_report_markdown(ai_text)
                         
@@ -2854,6 +2901,7 @@ if prompt is not None:
                             file_cits=file_cits,
                             docs_for_history=docs_for_history,
                             run_id=run_id,
+                            show_doc_sources=False,  # ✅ 關掉文件來源，避免與 footer / status 重複
                         )
                         
                         # ✅ 文件檢索命中 expander（只有有 doc_search log 才會顯示）
