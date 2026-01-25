@@ -695,35 +695,114 @@ def doc_search_payload(client: OpenAI, store: Optional[DocStore], query: str, k:
             "debug": {"index_dim": index_dim, "query_dim": int(qvec.shape[1]), "embedding_model": model_name},
         }
 
-    # ✅ 走你已實作的 hybrid（dense + bm25 + optional rerank）
+    # ---------------------------------------------------------
+    # ✅ 1) 先做「同 search_hybrid() 一樣」的候選召回，用來做 debug 分解（rank + RRF）
+    # ---------------------------------------------------------
+    k = max(1, int(k))
+    sem_k = max(12, k)
+    bm_k = max(16, k * 2)
+
+    sem_hits = store.search_dense(qvec, k=sem_k)      # [(dense_sim, Chunk)]
+    bm_chunks = store.search_bm25(query, k=bm_k)      # [Chunk]（注意：BM25Retriever 不會給 raw 分數，只有排序）
+
+    RRF_K = 60
+
+    dense_rank: dict[str, int] = {}
+    dense_sim: dict[str, float] = {}
+    for r, (sim, ch) in enumerate(sem_hits, start=1):
+        dense_rank[ch.chunk_id] = r
+        dense_sim[ch.chunk_id] = float(sim)
+
+    bm_rank: dict[str, int] = {}
+    for r, ch in enumerate(bm_chunks, start=1):
+        bm_rank[ch.chunk_id] = r
+
+    def _rrf(rank: Optional[int], K: int = RRF_K) -> float:
+        if not rank or rank <= 0:
+            return 0.0
+        return 1.0 / float(K + rank)
+
+    debug_map: dict[str, dict[str, Any]] = {}
+    all_cids = set(dense_rank.keys()) | set(bm_rank.keys())
+    for cid in all_cids:
+        dr = dense_rank.get(cid)
+        br = bm_rank.get(cid)
+        d_rrf = _rrf(dr)
+        b_rrf = _rrf(br)
+        debug_map[cid] = {
+            "dense_sim": dense_sim.get(cid),     # IndexFlatIP + normalized vec => cosine similarity
+            "dense_dist": None,                  # 這裡不是 distance
+            "dense_rank": dr,
+            "bm25_rank": br,
+            "rrf_dense": d_rrf,
+            "rrf_bm25": b_rrf,
+            "rrf_score": d_rrf + b_rrf,
+        }
+
+    # ---------------------------------------------------------
+    # ✅ 2) 跑你原本的 hybrid（RRF / hard 時可能 rerank）
+    # ---------------------------------------------------------
     results = store.search_hybrid(query, qvec, k=int(k), difficulty=difficulty)  # [(score_raw, Chunk)]
-
     if not results:
-        return {"ok": True, "query": query, "hits": [], "note": "no_hits"}
+        return {"ok": True, "query": query, "hits": [], "note": "no_hits", "meta": {"embedding_model": model_name}}
 
-    # 做一個「顯示用」分數：把 top 的 raw 當 1.0
     raw_scores = [float(s) for s, _ in results]
     top_raw = max(raw_scores) if raw_scores else 1.0
     if top_raw <= 0:
         top_raw = 1.0
 
+    diff = (difficulty or "medium").lower().strip()
+    stage = "flashrank" if diff == "hard" else "rrf"
+
     hits = []
     for score_raw, ch in results:
         snippet = (ch.text[:420] + "…") if len(ch.text) > 420 else ch.text
         page = ch.page if ch.page is not None else "-"
+        cid = ch.chunk_id
+
+        dbg = debug_map.get(cid, {})
+        score_norm = float(score_raw) / float(top_raw)
+
         hits.append({
             "title": ch.title,
             "page": page,
             "snippet": snippet,
             "citation_token": f"[{ch.title} p{page}]",
 
-            # ✅ UI 顯示：0~1（不會全部 0.000）
-            "score": float(score_raw) / float(top_raw),
+            # ✅ UI 顯示用分數（0~1）
+            "score": score_norm,
+            "final_score": score_norm,
             "score_raw": float(score_raw),
+
+            # ✅ 讓 expander 顯示得到的欄位
+            "dense_sim": dbg.get("dense_sim"),
+            "dense_dist": dbg.get("dense_dist"),
+
+            # ⚠️ bm25_score 這裡回的是「bm25 在 RRF 的貢獻」，不是 raw bm25 分數
+            "bm25_score": dbg.get("rrf_bm25"),
+
+            # ✅ 解釋用：名次 + RRF 拆分
+            "dense_rank": dbg.get("dense_rank"),
+            "bm25_rank": dbg.get("bm25_rank"),
+            "rrf_dense": dbg.get("rrf_dense"),
+            "rrf_bm25": dbg.get("rrf_bm25"),
+            "rrf_score": dbg.get("rrf_score"),
+
+            "stage": stage,
         })
 
-    return {"ok": True, "query": query, "hits": hits, "meta": {"embedding_model": model_name}}
-
+    return {
+        "ok": True,
+        "query": query,
+        "hits": hits,
+        "meta": {
+            "embedding_model": model_name,
+            "stage": stage,
+            "rrf_K": RRF_K,
+            "sem_k": sem_k,
+            "bm25_k": bm_k,
+        },
+    }
 
 def doc_get_fulltext_payload(
     store: Optional[DocStore],
