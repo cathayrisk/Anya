@@ -1975,13 +1975,6 @@ with st.popover("📦 文件庫（Session-only）"):
 
     rows = st.session_state.ds_file_rows
     store = st.session_state.get("ds_store", None)
-    has_index = bool(store is not None and getattr(store, "index", None) is not None and store.index.ntotal > 0)
-
-    # 索引狀態 badge
-    if has_index:
-        st.success(f"已建立索引：chunks={len(store.chunks)}")
-    else:
-        st.info("尚未建立索引（或索引為空）。")
 
     # ---- 文件清單（表格）----
     if rows:
