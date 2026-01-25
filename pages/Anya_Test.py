@@ -938,6 +938,11 @@ def render_evidence_panel_expander(
 
 # ====== (1) 貼在 helpers 區：建議放在 extract_doc_citations / render_doc_search_expander 附近 ======
 
+# =========================
+# ✅ 2) 直接替換你的 render_sources_container_full（整個函式貼回去）
+# 目的：支援 run_id 參數，解掉 TypeError；並保持舊呼叫也能用
+# =========================
+
 def render_sources_container_full(
     *,
     sources_container,
@@ -946,21 +951,20 @@ def render_sources_container_full(
     url_cits: list[dict] | None,
     file_cits: list[dict] | None,
     docs_for_history: list[str] | None,
+    run_id: str | None = None,  # ✅ 新增（向後相容）
 ):
     """
     右側 sources 區塊：整合
     - URL 來源（使用者提供 + web_search citations）
-    - 文件引用 token（從 ai_text 擷取 [title pN]）
+    - 文件來源（若提供 run_id，優先用 ds_doc_search_log 聚合；否則從 ai_text 擷取 [title pN]）
     - 引用檔案（Responses file_citation）
     - 本回合上傳檔案（docs_for_history）
     """
     with sources_container:
         # ---- 1) URL sources ----
         urls = []
-
         if url_in_text:
             urls.append({"title": "使用者提供網址", "url": url_in_text})
-
         for c in (url_cits or []):
             u = (c.get("url") or "").strip()
             if u:
@@ -981,13 +985,29 @@ def render_sources_container_full(
             for it in urls_dedup:
                 st.markdown(f"- [{it['title']}]({it['url']})")
 
-        # ---- 2) 文件引用（從答案文字抓 [title pN]）----
-        doc_cits = extract_doc_citations(ai_text or "")
-        if doc_cits:
-            st.markdown("**來源（文件引用）**")
-            for title, pages in sorted(doc_cits.items(), key=lambda kv: kv[0].lower()):
+        # ---- 2) 文件來源：優先用 run_id 聚合（更穩）----
+        doc_sources: dict[str, list[str]] = {}
+        if run_id:
+            try:
+                agg = aggregate_doc_evidence_from_log(run_id=run_id)
+                doc_sources = agg.get("sources") or {}
+            except Exception:
+                doc_sources = {}
+
+        # 沒 run_id 或聚合不到，退回舊方式：從答案文字抓 [title pN]
+        if not doc_sources:
+            doc_sources = extract_doc_citations(ai_text or "")
+
+        if doc_sources:
+            st.markdown("**來源（文件）**")
+
+            def _short(s: str, n: int = 30) -> str:
+                s = (s or "").strip()
+                return s if len(s) <= n else (s[:n] + "…")
+
+            for title, pages in sorted(doc_sources.items(), key=lambda kv: kv[0].lower()):
                 pages_str = ",".join(pages[:20]) + ("…" if len(pages) > 20 else "")
-                st.markdown(f"- {title}：p{pages_str}")
+                st.markdown(f"- :blue-badge[{_short(title)}] :small[:gray[p{pages_str}]]")
 
         # ---- 3) Responses file citations（如果模型有回 file_citation）----
         if file_cits:
@@ -1001,7 +1021,6 @@ def render_sources_container_full(
             st.markdown("**本回合上傳檔案**")
             for fn in (docs_for_history or []):
                 st.markdown(f"- {fn}")
-
 # =========================
 # 1) [新增] 放在 parse_response_text_and_citations 下面（任意位置）
 #    用來把模型回覆最後的「來源/## 來源」區塊切掉（避免與 UI sources_container 重複）
@@ -2381,7 +2400,7 @@ with st.popover("📚 引用資料夾"):
         edited = st.data_editor(
             df,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             key="ds_file_list_editor",
             column_config={
                 "_file_id": st.column_config.TextColumn("_file_id", disabled=True, width="small"),
@@ -2424,8 +2443,8 @@ with st.popover("📚 引用資料夾"):
 
     # ---- 操作按鈕 ----
     c1, c2 = st.columns([1, 1])
-    build_btn = c1.button("🚀 建立/更新索引", type="primary", use_container_width=True)
-    clear_btn = c2.button("🧹 清空文件庫", use_container_width=True)
+    build_btn = c1.button("🚀 建立/更新索引", type="primary", width="stretch")
+    clear_btn = c2.button("🧹 清空文件庫", width="stretch")
 
     if clear_btn:
         st.session_state.ds_file_rows = []
