@@ -559,10 +559,20 @@ def render_doc_search_expander(*, run_id: str):
                 dense_dist = h.get("dense_dist")
                 bm25 = h.get("bm25_score")
 
+                dense_rank = h.get("dense_rank")
+                bm25_rank = h.get("bm25_rank")
+                rrf_dense = h.get("rrf_dense")
+                rrf_bm25 = h.get("rrf_bm25")
+                rrf_score = h.get("rrf_score")
+                stage = h.get("stage")
+
                 st.markdown(
                     f"  - [{title} p{page}] "
-                    f"final={_fmt(fused,'.4f')} | dense_sim={_fmt(dense_sim,'.4f')} | "
-                    f"dist={_fmt(dense_dist,'.2f')} | bm25={_fmt(bm25,'.2f')}：{snippet}"
+                    f"final={_fmt(fused,'.4f')} | "
+                    f"dense_sim={_fmt(dense_sim,'.4f')} (rank={_fmt(dense_rank,'.0f')}, rrf={_fmt(rrf_dense,'.4f')}) | "
+                    f"bm25_rrf={_fmt(bm25,'.4f')} (rank={_fmt(bm25_rank,'.0f')}) | "
+                    f"rrf_total={_fmt(rrf_score,'.4f')} | stage={stage or '—'}："
+                    f"{snippet}"
                 )
 
 # ====== (1) 貼在 helpers 區：建議放在 extract_doc_citations / render_doc_search_expander 附近 ======
