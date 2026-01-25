@@ -575,6 +575,170 @@ def render_doc_search_expander(*, run_id: str):
                     f"{snippet}"
                 )
 
+_DOC_CIT_TOKEN_RE = re.compile(r"\[([^\]]+?)\s+p(\d+|-)\]")
+
+def strip_doc_citation_tokens(text: str) -> str:
+    """
+    把正文裡的 [Title pN] 引用 token 拿掉，讓報告正文更像 Notion/Linear：
+    - 來源與證據改由 UI（expander）呈現
+    """
+    if not text:
+        return text
+    t = _DOC_CIT_TOKEN_RE.sub("", text)
+    # 清掉多餘空白（避免 "句子  :small[]" 之類）
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+def aggregate_doc_evidence_from_log(*, run_id: str) -> dict[str, Any]:
+    """
+    從 st.session_state.ds_doc_search_log 聚合：
+    - sources: title -> pages(list[str])  # 去重保序排序
+    - evidence: title -> hits(list[dict]) # 每份文件最多保留前 6 筆
+    - queries: 本回合 doc_search 用過的 query（去重保序）
+    """
+    log = st.session_state.get("ds_doc_search_log", []) or []
+    items = [x for x in log if x.get("run_id") == run_id]
+
+    sources: dict[str, list[str]] = {}
+    evidence: dict[str, list[dict]] = {}
+    queries: list[str] = []
+
+    def add_page(title: str, page: str):
+        arr = sources.setdefault(title, [])
+        if page not in arr:
+            arr.append(page)
+
+    def add_query(q: str):
+        if q and q not in queries:
+            queries.append(q)
+
+    for rec in items:
+        add_query((rec.get("query") or "").strip())
+        for h in (rec.get("hits") or [])[:10]:
+            title = (h.get("title") or "").strip()
+            page = str(h.get("page") if h.get("page") is not None else "-").strip()
+            if not title:
+                continue
+            add_page(title, page)
+            evidence.setdefault(title, []).append(h)
+
+    # 每份文件最多 6 筆
+    for t in list(evidence.keys()):
+        evidence[t] = (evidence[t] or [])[:6]
+
+    # pages 排序：數字在前，'-' 在後
+    def _sort_pages(pages: list[str]) -> list[str]:
+        def _key(p: str):
+            return (p == "-", int(p) if p.isdigit() else 10**9)
+        # 去重保序已做，這裡只排序不會太亂；若你想保留原始順序就移掉 sort
+        return sorted(pages, key=_key)
+
+    for t in list(sources.keys()):
+        sources[t] = _sort_pages(sources[t])
+
+    return {"sources": sources, "evidence": evidence, "queries": queries}
+
+# =========================
+# 【3】UI：新增一個「Notion/Linear 風」的證據面板（expander 內 tabs）
+# 放在 helpers 區任意位置（建議放 render_doc_search_expander 附近）
+# =========================
+
+def render_evidence_panel_expander(
+    *,
+    run_id: str,
+    url_in_text: str | None,
+    url_cits: list[dict] | None,
+    docs_for_history: list[str] | None,
+):
+    agg = aggregate_doc_evidence_from_log(run_id=run_id)
+    sources: dict[str, list[str]] = agg.get("sources") or {}
+    evidence: dict[str, list[dict]] = agg.get("evidence") or {}
+    queries: list[str] = agg.get("queries") or []
+
+    # 沒任何東西就不畫（保持乾淨）
+    has_any = bool(sources or url_in_text or (url_cits or []) or (docs_for_history or []) or queries)
+    if not has_any:
+        return
+
+    with st.expander("📚 證據 / 檢索 / 來源", expanded=False):
+        tab_sources, tab_evidence, tab_search = st.tabs(["Sources", "Evidence", "Search"])
+
+        # ---- Sources：badge + 小字（Notion/Linear 感）
+        with tab_sources:
+            if sources:
+                st.markdown("**文件來源（本回合命中）**")
+                for title in sorted(sources.keys(), key=lambda x: x.lower()):
+                    pages = sources[title]
+                    pages_str = ",".join(pages[:24]) + ("…" if len(pages) > 24 else "")
+                    short = title if len(title) <= 32 else (title[:32] + "…")
+                    st.markdown(f"- :blue-badge[{short}] :small[:gray[p{pages_str}]]")
+            else:
+                st.markdown(":small[:gray[（本回合沒有文件命中）]]")
+
+            # URLs（保持簡潔）
+            urls = []
+            if url_in_text:
+                urls.append({"title": "使用者提供網址", "url": url_in_text})
+            for c in (url_cits or []):
+                u = (c.get("url") or "").strip()
+                if u:
+                    urls.append({"title": (c.get("title") or u).strip(), "url": u})
+
+            # 去重
+            seen = set()
+            urls_dedup = []
+            for it in urls:
+                if it["url"] in seen:
+                    continue
+                seen.add(it["url"])
+                urls_dedup.append(it)
+
+            if urls_dedup:
+                st.markdown("\n**URL 來源**")
+                for it in urls_dedup[:12]:
+                    st.markdown(f"- [{it['title']}]({it['url']})")
+
+            if docs_for_history:
+                st.markdown("\n**本回合上傳檔案**")
+                for fn in docs_for_history:
+                    st.markdown(f"- {fn}")
+
+        # ---- Evidence：每份文件一個 expander，內容像卡片
+        with tab_evidence:
+            if not evidence:
+                st.markdown(":small[:gray[（沒有可顯示的 evidence）]]")
+            else:
+                for title in sorted(evidence.keys(), key=lambda x: x.lower()):
+                    short = title if len(title) <= 40 else (title[:40] + "…")
+                    with st.expander(f"📄 {short}", expanded=False):
+                        for h in evidence[title]:
+                            page = h.get("page", "-")
+                            snippet = (h.get("snippet") or "").strip()
+                            score = h.get("score") or h.get("final_score")
+                            dense_rank = h.get("dense_rank")
+                            bm25_rank = h.get("bm25_rank")
+                            rrf = h.get("rrf_score")
+
+                            st.markdown(
+                                f"- :blue-badge[p{page}] "
+                                f":small[:gray[score={score if score is not None else '—'} | "
+                                f"dense_rank={dense_rank if dense_rank is not None else '—'} | "
+                                f"bm25_rank={bm25_rank if bm25_rank is not None else '—'} | "
+                                f"rrf={rrf if rrf is not None else '—'}]]\n\n"
+                                f"  {snippet}"
+                            )
+
+        # ---- Search：把本回合 doc_search 的 query 列出來（像操作紀錄）
+        with tab_search:
+            if not queries:
+                st.markdown(":small[:gray[（本回合沒有 doc_search query）]]")
+            else:
+                st.markdown("**本回合 doc_search 查詢**")
+                for q in queries[:30]:
+                    st.markdown(f"- `{q}`")
+
 # ====== (1) 貼在 helpers 區：建議放在 extract_doc_citations / render_doc_search_expander 附近 ======
 
 def render_sources_container_full(
@@ -2231,8 +2395,8 @@ if prompt is not None:
 
         try:
             with status_area:
-                badges_ph = st.empty()
-                with st.status("⚡ 思考中...", expanded=False) as status:
+                    status = st.status("⚡ 思考中...", expanded=False)  # ✅ 先 status
+                    badges_ph = st.empty()
                     placeholder = output_area.empty()
 
                     # 前置 Router：決定 fast / general / research
@@ -2392,6 +2556,7 @@ if prompt is not None:
                     
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)  # 避免模型自己再列一次來源
+                        ai_text = strip_doc_citation_tokens(ai_text)
                         final_text = fake_stream_markdown(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
                     
@@ -2404,10 +2569,19 @@ if prompt is not None:
                             file_cits=file_cits,
                             docs_for_history=docs_for_history,
                         )
-                    
+
+                        # ✅ 右側來源摘要（你原本 render_sources_container_full 也可以留著，但我建議簡化成只顯示 URL/檔案）
+                        # ✅ 再加一個「證據面板」expander（tabs 放這裡，符合你不要在正文區放 tabs）
+                        render_evidence_panel_expander(
+                            run_id=st.session_state.get("ds_active_run_id") or "",
+                            url_in_text=url_in_text,
+                            url_cits=url_cits,
+                            docs_for_history=docs_for_history,
+                        )
+                        
                         # ✅ 文件檢索命中 expander（只有有 doc_search log 才會顯示）
                         render_doc_search_expander(run_id=st.session_state.get("ds_active_run_id") or "")
-                    
+
                         ensure_session_defaults()
                         st.session_state.chat_history.append({
                             "role": "assistant",
