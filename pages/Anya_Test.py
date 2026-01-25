@@ -2163,17 +2163,17 @@ with st.popover("📦 文件庫（Session-only）"):
         # ✅ 精簡欄位：檔名 / 類型 / 頁數 / chunks / OCR
         df = pd.DataFrame([
             {
-                "_file_id": key_to_file_id.get((it.get("title"), it.get("ext"))),
-                "檔名": _short(f"{it.get('title')}{it.get('ext')}"),
-                "類型": (it.get("ext") or "").lstrip(".").upper(),
-                "頁數": it.get("pages"),
-                "chunks": int(it.get("chunks") or 0),
                 # 只讓 PDF 可勾，其他類型一律顯示 False（且等下會 disabled）
                 "OCR": bool(id_to_row.get(key_to_file_id.get((it.get("title"), it.get("ext"))), FileRow(
                     file_id="", file_sig="", name="", ext="", bytes_len=0, pages=None, extracted_chars=0, token_est=0,
                     blank_pages=None, blank_ratio=None, text_pages=None, text_pages_ratio=None,
                     likely_scanned=False, use_ocr=False
                 )).use_ocr) if (it.get("ext") == ".pdf") else False,
+                "檔名": _short(f"{it.get('title')}{it.get('ext')}"),
+                "類型": (it.get("ext") or "").lstrip(".").upper(),
+                "頁數": it.get("pages"),
+                "chunks": int(it.get("chunks") or 0),
+                "_file_id": key_to_file_id.get((it.get("title"), it.get("ext"))),
             }
             for it in items
         ])
