@@ -2118,7 +2118,7 @@ def build_fastagent_query_from_history(
     return final_query.strip()
 
 # ========= 4) st.popover UI：照 U1 放在主程式（建議放在「顯示歷史」之前） =========
-with st.popover("📦 文件庫（Session-only）"):
+with st.popover("📦 文件庫"):
     st.caption("檔案只存在本次 session。建索引後，General 回答可用 doc_search 工具查文件。")
 
     uploaded = st.file_uploader(
@@ -2164,17 +2164,99 @@ with st.popover("📦 文件庫（Session-only）"):
         st.markdown("### 📄 文件清單")
         st.dataframe(df, width="stretch", hide_index=True)
 
-        # OCR 勾選區（只對 PDF 顯示）
-        st.markdown("### 🔎 PDF OCR（疑似掃描件才建議開）")
-        for r in rows:
-            if r.ext != ".pdf":
-                continue
-            cols = st.columns([3, 2, 2, 3])
-            cols[0].write(r.name)
-            cols[1].write("建議OCR ✅" if r.likely_scanned else "（通常不需）")
-            r.use_ocr = cols[2].checkbox("OCR", value=bool(r.use_ocr), key=f"ds_ocr_{r.file_id}")
-            if r.use_ocr and not HAS_PYMUPDF:
-                cols[3].warning("缺 pymupdf，PDF OCR 會失敗")
+        # ✅ 直接貼回去：替換你 popover 裡這段「PDF OCR 勾選區（只對 PDF 顯示）」整段
+        # 位置：with st.popover("📦 文件庫（Session-only）"): 裡面
+        # 你目前是：
+        #   st.markdown("### 🔎 PDF OCR（疑似掃描件才建議開）")
+        #   for r in rows: ... cols = st.columns(...) ... checkbox ...
+        # 請用下面整段取代
+        
+        st.markdown("### 🔎 PDF OCR")
+        st.caption("只有疑似掃描件才建議開；OCR 會變慢、也可能增加 token / 成本。")
+        
+        pdf_rows = [r for r in rows if r.ext == ".pdf"]
+        if not pdf_rows:
+            st.markdown(":small[（目前沒有 PDF）]")
+        else:
+            # 缺依賴提示：只顯示一次，乾淨
+            if not HAS_PYMUPDF:
+                st.warning("缺少 pymupdf（fitz），PDF OCR 會失敗。請先安裝：pip install pymupdf")
+        
+            # ---- 控制列：Notion/Linear 風的小工具列 ----
+            cL, cM, cR = st.columns([2, 3, 5])
+        
+            only_suggested = cL.toggle("只顯示建議 OCR", value=True, key="ds_ocr_only_suggested")
+        
+            # 一鍵操作（對目前顯示範圍生效）
+            apply_suggested = cM.button("✅ 套用建議", use_container_width=True)
+            clear_all = cM.button("🧼 全部關閉", use_container_width=True)
+        
+            # ---- 準備 DataFrame（用 data_editor 顯示更整齊）----
+            import pandas as pd
+        
+            view_rows = pdf_rows
+            if only_suggested:
+                view_rows = [r for r in pdf_rows if bool(r.likely_scanned)]
+        
+            # 一鍵套用/關閉
+            if apply_suggested:
+                for r in view_rows:
+                    r.use_ocr = bool(r.likely_scanned)
+            if clear_all:
+                for r in view_rows:
+                    r.use_ocr = False
+        
+            # 檔名顯示：避免太長把 UI 撐爆（更像 Linear）
+            def _short_name(name: str, n: int = 42) -> str:
+                name = (name or "").strip()
+                return name if len(name) <= n else (name[:n] + "…")
+        
+            df_ocr = pd.DataFrame(
+                [
+                    {
+                        "_file_id": r.file_id,  # 用來回寫
+                        "檔名": _short_name(r.name),
+                        "建議": "✅" if bool(r.likely_scanned) else "",
+                        "頁數": r.pages,
+                        "OCR": bool(r.use_ocr),
+                    }
+                    for r in view_rows
+                ]
+            )
+        
+            edited = st.data_editor(
+                df_ocr,
+                hide_index=True,
+                use_container_width=True,
+                key="ds_pdf_ocr_editor",
+                column_config={
+                    "_file_id": st.column_config.TextColumn("_file_id", disabled=True, width="small"),
+                    "檔名": st.column_config.TextColumn("檔名", disabled=True, width="large"),
+                    "建議": st.column_config.TextColumn("建議", disabled=True, width="small"),
+                    "頁數": st.column_config.NumberColumn("頁數", disabled=True, width="small"),
+                    "OCR": st.column_config.CheckboxColumn("OCR", help="勾選後會用 OCR 抽取 PDF 文字再建索引", width="small"),
+                },
+                disabled=["_file_id", "檔名", "建議", "頁數"],
+            )
+        
+            # ---- 回寫 use_ocr ----
+            # 只更新畫面中顯示的那些（view_rows），避免意外改到沒顯示的
+            id_to_row = {r.file_id: r for r in pdf_rows}
+            try:
+                for rec in edited.to_dict(orient="records"):
+                    fid = rec.get("_file_id")
+                    if fid in id_to_row:
+                        id_to_row[fid].use_ocr = bool(rec.get("OCR"))
+            except Exception:
+                pass
+        
+            # ---- 小結：更像 Notion/Linear 的狀態摘要 ----
+            total_pdf = len(pdf_rows)
+            on_cnt = sum(1 for r in pdf_rows if bool(r.use_ocr))
+            sug_cnt = sum(1 for r in pdf_rows if bool(r.likely_scanned))
+            cR.markdown(
+                f":small[:gray[PDF：{total_pdf}｜建議 OCR：{sug_cnt}｜已開 OCR：{on_cnt}]]"
+            )
 
         # 依賴提示（Office）
         if (not HAS_UNSTRUCTURED_LOADERS) and any(r.ext in (".doc", ".docx", ".pptx", ".xls", ".xlsx") for r in rows):
