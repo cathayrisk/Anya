@@ -641,6 +641,203 @@ def aggregate_doc_evidence_from_log(*, run_id: str) -> dict[str, Any]:
     return {"sources": sources, "evidence": evidence, "queries": queries}
 
 # =========================
+# ✅【A】helpers：新增「從 doc_search log 產生來源摘要」+「在指定 container 內渲染 expander」
+# 建議放在 helpers 區（靠近 render_doc_search_expander / extract_doc_citations 旁邊）
+# =========================
+_EMPTY_SOURCE_LINE_RE = re.compile(
+    r"^\s*(?:[-•．]\s*)?來源\s*[:：]\s*[,，、\\]*\s*$",
+    flags=re.IGNORECASE,
+)
+
+def cleanup_report_markdown(text: str) -> str:
+    """
+    讓正文更像『報告』：
+    - 移除空的「來源：」佔位行（避免你截圖那種 來源：、）
+    -（可選）你若有 strip_doc_citation_tokens，也可以在外層先處理 token
+    """
+    if not text:
+        return text
+    lines = []
+    for ln in text.splitlines():
+        if _EMPTY_SOURCE_LINE_RE.match(ln):
+            continue
+        lines.append(ln)
+    t = "\n".join(lines)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+def build_doc_sources_footer(*, run_id: str, max_docs: int = 4) -> str:
+    """
+    從本回合 ds_doc_search_log 聚合出『來源摘要』，塞到正文最後一小行（Notion/Linear 風）。
+    例：
+      引用文件：AI IN A BUBBLE（p1,p3,p5）；Another Doc（p2）
+    """
+    agg = aggregate_doc_evidence_from_log(run_id=run_id)
+    sources: dict[str, list[str]] = agg.get("sources") or {}
+    if not sources:
+        return ""
+
+    parts = []
+    for title in sorted(sources.keys(), key=lambda x: x.lower())[:max_docs]:
+        pages = sources[title]
+        pages_str = ",".join(pages[:12]) + ("…" if len(pages) > 12 else "")
+        short = title if len(title) <= 28 else (title[:28] + "…")
+        parts.append(f"{short}（p{pages_str}）")
+
+    more = ""
+    if len(sources) > max_docs:
+        more = f"；另有 {len(sources) - max_docs} 份文件"
+
+    return "\n\n---\n" + f":small[:gray[引用文件：{'；'.join(parts)}{more}]]"
+
+
+def render_evidence_panel_expander_in(
+    *,
+    container,
+    run_id: str,
+    url_in_text: str | None,
+    url_cits: list[dict] | None,
+    docs_for_history: list[str] | None,
+    expanded: bool = False,
+):
+    """
+    把『📚 證據 / 檢索 / 來源』渲染到指定 container（讓你可以放到 status 區）
+    """
+    agg = aggregate_doc_evidence_from_log(run_id=run_id)
+    sources: dict[str, list[str]] = agg.get("sources") or {}
+    evidence: dict[str, list[dict]] = agg.get("evidence") or {}
+    queries: list[str] = agg.get("queries") or []
+
+    has_any = bool(sources or evidence or queries or url_in_text or (url_cits or []) or (docs_for_history or []))
+    if not has_any:
+        return
+
+    def _short(s: str, n: int = 34) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else (s[:n] + "…")
+
+    with container:
+        with st.expander("📚 證據 / 檢索 / 來源", expanded=expanded):
+            tab_sources, tab_evidence, tab_search = st.tabs(["Sources", "Evidence", "Search"])
+
+            with tab_sources:
+                if sources:
+                    st.markdown("**文件來源（本回合命中）**")
+                    for title in sorted(sources.keys(), key=lambda x: x.lower()):
+                        pages = sources[title]
+                        pages_str = ",".join(pages[:24]) + ("…" if len(pages) > 24 else "")
+                        st.markdown(f"- :blue-badge[{_short(title)}] :small[:gray[p{pages_str}]]")
+                else:
+                    st.markdown(":small[:gray[（本回合沒有文件命中）]]")
+
+                # URL sources（精簡）
+                urls = []
+                if url_in_text:
+                    urls.append({"title": "使用者提供網址", "url": url_in_text})
+                for c in (url_cits or []):
+                    u = (c.get("url") or "").strip()
+                    if u:
+                        urls.append({"title": (c.get("title") or u).strip(), "url": u})
+
+                seen = set()
+                urls_dedup = []
+                for it in urls:
+                    if it["url"] in seen:
+                        continue
+                    seen.add(it["url"])
+                    urls_dedup.append(it)
+
+                if urls_dedup:
+                    st.markdown("\n**URL 來源**")
+                    for it in urls_dedup[:10]:
+                        st.markdown(f"- [{it['title']}]({it['url']})")
+
+                if docs_for_history:
+                    st.markdown("\n**本回合上傳檔案**")
+                    for fn in docs_for_history:
+                        st.markdown(f"- {fn}")
+
+            with tab_evidence:
+                if not evidence:
+                    st.markdown(":small[:gray[（沒有可顯示的 evidence）]]")
+                else:
+                    for title in sorted(evidence.keys(), key=lambda x: x.lower()):
+                        with st.expander(f"📄 {_short(title, 46)}", expanded=False):
+                            for h in (evidence[title] or [])[:6]:
+                                page = h.get("page", "-")
+                                snippet = (h.get("snippet") or "").strip()
+                                score = h.get("score") or h.get("final_score")
+                                dense_rank = h.get("dense_rank")
+                                bm25_rank = h.get("bm25_rank")
+                                rrf = h.get("rrf_score")
+
+                                st.markdown(
+                                    f"- :blue-badge[p{page}] "
+                                    f":small[:gray[score={score if score is not None else '—'} · "
+                                    f"dense_rank={dense_rank if dense_rank is not None else '—'} · "
+                                    f"bm25_rank={bm25_rank if bm25_rank is not None else '—'} · "
+                                    f"rrf={rrf if rrf is not None else '—'}]]\n\n"
+                                    f"  {snippet}"
+                                )
+
+            with tab_search:
+                if not queries:
+                    st.markdown(":small[:gray[（本回合沒有 doc_search query）]]")
+                else:
+                    st.markdown("**本回合 doc_search 查詢**")
+                    for q in queries[:30]:
+                        st.markdown(f"- `{q}`")
+
+
+def render_retrieval_hits_expander_in(*, container, run_id: str, expanded: bool = False):
+    """
+    把你原本的『🔎 文件檢索命中（節錄）』放進指定 container（status 區）
+    """
+    log = st.session_state.get("ds_doc_search_log", []) or []
+    items = [x for x in log if x.get("run_id") == run_id]
+    if not items:
+        return
+
+    def _fmt(x, fmt=".4f"):
+        if x is None:
+            return "—"
+        try:
+            return format(float(x), fmt)
+        except Exception:
+            return str(x)
+
+    with container:
+        with st.expander("🔎 文件檢索命中（節錄）", expanded=expanded):
+            for rec in items:
+                q = rec.get("query") or ""
+                k = rec.get("k")
+                st.markdown(f"- Query：`{q}`（k={k}）")
+
+                hits = (rec.get("hits") or [])[:6]
+                for h in hits:
+                    title = h.get("title")
+                    page = h.get("page")
+                    snippet = h.get("snippet") or ""
+
+                    fused = h.get("score") or h.get("final_score")
+                    dense_sim = h.get("dense_sim")
+                    dense_dist = h.get("dense_dist")
+                    bm25 = h.get("bm25_score")
+
+                    dense_rank = h.get("dense_rank")
+                    bm25_rank = h.get("bm25_rank")
+                    rrf_score = h.get("rrf_score")
+
+                    st.markdown(
+                        f"  - :blue-badge[{title}] :blue-badge[p{page}] "
+                        f":small[:gray[final={_fmt(fused)} · dense_sim={_fmt(dense_sim)} · "
+                        f"bm25_rrf={_fmt(bm25)} · dense_rank={_fmt(dense_rank,'.0f')} · "
+                        f"bm25_rank={_fmt(bm25_rank,'.0f')} · rrf={_fmt(rrf_score)}]]\n\n"
+                        f"    {snippet}"
+                    )
+
+# =========================
 # 【3】UI：新增一個「Notion/Linear 風」的證據面板（expander 內 tabs）
 # 放在 helpers 區任意位置（建議放 render_doc_search_expander 附近）
 # =========================
@@ -2118,7 +2315,7 @@ def build_fastagent_query_from_history(
     return final_query.strip()
 
 # ========= 4) st.popover UI：照 U1 放在主程式（建議放在「顯示歷史」之前） =========
-with st.popover("📦 文件庫（Session-only）"):
+with st.popover("📚 引用資料夾"):
     st.caption("檔案只存在本次 session。建索引後，General 回答可用 doc_search 工具查文件。")
 
     uploaded = st.file_uploader(
@@ -2540,7 +2737,12 @@ if prompt is not None:
                         # ✅ 本回合 run_id（給 doc_search expander 分組 & 清理 log）
                         st.session_state["ds_active_run_id"] = str(_uuid.uuid4())
                         st.session_state.ds_doc_search_log = []
-                    
+
+                        # 在 general 分支一開始（你建立 ds_active_run_id / 清 log 之後）加這幾行：
+                        status_panels = status_area.container()          # ✅ 放在 status 區塊裡
+                        evidence_panel_ph = status_panels.empty()        # ✅ 之後把「證據/來源」放這
+                        retrieval_hits_ph = status_panels.empty()        # ✅ 之後把「檢索命中」放這
+                        
                         # ✅ badges 最上面：先畫「預設 off」，跑完再更新
                         badges_ph.markdown(
                             badges_markdown(mode="general", db_used=False, web_used=False, doc_calls=0, web_calls=0)
@@ -2566,9 +2768,8 @@ if prompt is not None:
                             "\n\n"
                             "【文件庫工具使用規則（重要）】\n"
                             "- 若使用者問題需要依據已上傳文件，請先使用 doc_search 再回答。\n"
-                            "- 只有當使用者明確要求『整份摘要/逐段整理/整份改寫/整份翻譯』時，才允許呼叫 doc_get_fulltext。\n"
-                            f"- 若要呼叫 doc_get_fulltext，token_budget 請不要超過 {doc_fulltext_budget_hint}。\n"
                             "- 回答引用格式：請用 [文件標題 pN]（N 可為 -）。\n"
+                            "- ✅ 不要在正文輸出『來源：』這種佔位空行；若要列來源，請用引用 token 或交給 UI 顯示即可。\n"
                             "- 不要把 chunk_id 寫進答案。\n"
                         )
                         effective_instructions = ANYA_SYSTEM_PROMPT + DOCSTORE_RULES
@@ -2598,31 +2799,46 @@ if prompt is not None:
                     
                         ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
                         ai_text = strip_trailing_sources_section(ai_text)  # 避免模型自己再列一次來源
-                        ai_text = strip_doc_citation_tokens(ai_text)
+                        # ✅ 1) 把模型吐的「來源：」空行清掉（避免你截圖那種 來源：、）
+                        ai_text = cleanup_report_markdown(ai_text)
+                        
+                        # ✅ 2) 不靠模型寫來源：用 log 自動附一段「引用文件摘要」到正文末尾（永遠不會空）
+                        run_id = st.session_state.get("ds_active_run_id") or ""
+                        ai_text = (ai_text + build_doc_sources_footer(run_id=run_id)).strip()
                         final_text = fake_stream_markdown(ai_text, placeholder)
                         status.update(label="✅ 深思模式完成", state="complete", expanded=False)
                     
-                        # ✅ 右側來源區塊（整合 URL + 文件引用 + 檔案）
+                        # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
+                        # 建議預設不展開，乾淨；如果你想強制讓使用者看到來源，可把 expanded=True
+                        render_evidence_panel_expander_in(
+                            container=evidence_panel_ph,
+                            run_id=run_id,
+                            url_in_text=url_in_text,
+                            url_cits=url_cits,
+                            docs_for_history=docs_for_history,
+                            expanded=False,
+                        )
+                        
+                        render_retrieval_hits_expander_in(
+                            container=retrieval_hits_ph,
+                            run_id=run_id,
+                            expanded=False,
+                        )
+                        
+                        # ✅ 4) 右側 sources_container：如果你已經在 status 區顯示 sources，
+                        #    這裡就建議簡化（或乾脆不顯示文件來源，只保留 URL / 上傳檔案）
                         render_sources_container_full(
                             sources_container=sources_container,
-                            ai_text=ai_text,
+                            ai_text="",  # ✅ 不再從 ai_text 抓文件 token（避免重複/醜）
                             url_in_text=url_in_text,
                             url_cits=url_cits,
                             file_cits=file_cits,
                             docs_for_history=docs_for_history,
-                        )
-
-                        # ✅ 右側來源摘要（你原本 render_sources_container_full 也可以留著，但我建議簡化成只顯示 URL/檔案）
-                        # ✅ 再加一個「證據面板」expander（tabs 放這裡，符合你不要在正文區放 tabs）
-                        render_evidence_panel_expander(
-                            run_id=st.session_state.get("ds_active_run_id") or "",
-                            url_in_text=url_in_text,
-                            url_cits=url_cits,
-                            docs_for_history=docs_for_history,
+                            run_id=run_id,
                         )
                         
                         # ✅ 文件檢索命中 expander（只有有 doc_search log 才會顯示）
-                        render_doc_search_expander(run_id=st.session_state.get("ds_active_run_id") or "")
+                        #render_doc_search_expander(run_id=st.session_state.get("ds_active_run_id") or "")
 
                         ensure_session_defaults()
                         st.session_state.chat_history.append({
