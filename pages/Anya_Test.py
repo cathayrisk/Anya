@@ -53,6 +53,7 @@ from docstore import (
     doc_get_fulltext_payload,
     HAS_UNSTRUCTURED_LOADERS,
     HAS_PYMUPDF,
+    HAS_FLASHRANK,
     estimate_tokens_from_chars as _ds_est_tokens_from_chars,
     badges_markdown,
 )
