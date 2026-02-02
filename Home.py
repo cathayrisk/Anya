@@ -2931,7 +2931,7 @@ if prompt is not None:
                         run_id = st.session_state.get("ds_active_run_id") or ""
                         ai_text = (ai_text + build_doc_sources_footer(run_id=run_id)).strip()
                         final_text = fake_stream_markdown(ai_text, placeholder)
-                        status.update(label="✅ 深思模式完成", state="complete", expanded=False)
+                        
                     
                         # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
                         # 建議預設不展開，乾淨；如果你想強制讓使用者看到來源，可把 expanded=True
@@ -2975,6 +2975,7 @@ if prompt is not None:
                             "images": [],
                             "docs": []
                         })
+                        status.update(label="✅ 深思模式完成", state="complete", expanded=False)
                         st.stop()
 
                     # =========================
