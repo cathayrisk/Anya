@@ -2433,7 +2433,7 @@ def build_fastagent_query_from_history(
 
 # ========= 4) st.popover UI：照 U1 放在主程式（建議放在「顯示歷史」之前） =========
 with st.popover("📚 引用資料夾"):
-    st.caption("檔案只存在本次 session。建索引後，General 回答可用 doc_search 工具查文件。")
+    st.caption("檔案只存在本次對話 (session)。建索引後，會以深思模式回答文件內容。")
     # ✅ 用你自己的文字，隱藏 uploader 原生 label（避免「沒有選擇檔案」）
     st.caption(":small[:gray[拖曳檔案到這裡，或點一下選取（session-only）。]]")
     uploaded = st.file_uploader(
@@ -2599,7 +2599,7 @@ for msg in st.session_state.get("chat_history", []):
 prompt = st.chat_input(
     "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
     accept_file="multiple",
-    file_type=["jpg","jpeg","png","webp","gif","pdf"],
+    file_type=["jpg","jpeg","png","webp","gif"],
 )
 
 # === FastAgent 串流輔助：使用 Runner.run_streamed ===
@@ -2857,10 +2857,9 @@ if prompt is not None:
                         st.session_state["ds_active_run_id"] = str(_uuid.uuid4())
                         st.session_state.ds_doc_search_log = []
 
-                        # ✅ 改成：在 status 裡建立 placeholders（這樣 expander 才會「收在 status 裡」）
-                        with status:
-                            evidence_panel_ph = st.empty()
-                            retrieval_hits_ph = st.empty()
+                        # ✅ 改成：用 status_area（或直接 st.container）建立 placeholders
+                        evidence_panel_ph = status_area.empty()
+                        retrieval_hits_ph = status_area.empty()
                         
                         # ✅ badges 最上面：先畫「預設 off」，跑完再更新
                         badges_ph.markdown(
@@ -2931,7 +2930,7 @@ if prompt is not None:
                         run_id = st.session_state.get("ds_active_run_id") or ""
                         ai_text = (ai_text + build_doc_sources_footer(run_id=run_id)).strip()
                         final_text = fake_stream_markdown(ai_text, placeholder)
-                        status.update(label="✅ 深思模式完成", state="complete", expanded=False)
+                        
                     
                         # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
                         # 建議預設不展開，乾淨；如果你想強制讓使用者看到來源，可把 expanded=True
@@ -2975,6 +2974,7 @@ if prompt is not None:
                             "images": [],
                             "docs": []
                         })
+                        status.update(label="✅ 深思模式完成", state="complete", expanded=False)
                         st.stop()
 
                     # =========================
