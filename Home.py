@@ -2857,10 +2857,9 @@ if prompt is not None:
                         st.session_state["ds_active_run_id"] = str(_uuid.uuid4())
                         st.session_state.ds_doc_search_log = []
 
-                        # ✅ 改成：在 status 裡建立 placeholders（這樣 expander 才會「收在 status 裡」）
-                        with status:
-                            evidence_panel_ph = st.empty()
-                            retrieval_hits_ph = st.empty()
+                        # ✅ 改成：用 status_area（或直接 st.container）建立 placeholders
+                        evidence_panel_ph = status_area.empty()
+                        retrieval_hits_ph = status_area.empty()
                         
                         # ✅ badges 最上面：先畫「預設 off」，跑完再更新
                         badges_ph.markdown(
