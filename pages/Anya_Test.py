@@ -1304,7 +1304,7 @@ def _kb_get_namespaces() -> list[str]:
         data = (
             _kb_supabase.table("knowledge_chunks")
             .select("namespace")
-            .limit(500)
+            # 不加 .limit()：只選 namespace 文字欄，不含 embedding，即使萬列也只幾 MB，有 10 分鐘快取
             .execute()
             .data
         )
@@ -2984,7 +2984,7 @@ if prompt is not None:
                         status.update(label="⚡ 使用快速回答模式", state="running", expanded=False)
                     
                         # badges 最上面（先預設 Web off）
-                        badges_ph.markdown(badges_markdown(mode="Fast", db_used=False, web_used=False, doc_calls=0, web_calls=0))
+                        badges_ph.markdown(badges_markdown(mode="fast", db_used=False, web_used=False, doc_calls=0, web_calls=0))
                     
                         raw_fast_query = user_text or args.get("query") or "請根據對話內容回答。"
                         fast_query_with_history = build_fastagent_query_from_history(
@@ -2998,7 +2998,7 @@ if prompt is not None:
                         # 更新 badges（fast 沒有 DB；web 看 best-effort meta）
                         badges_ph.markdown(
                             badges_markdown(
-                                mode="Fast",
+                                mode="fast",
                                 db_used=False,
                                 web_used=bool(fast_meta.get("web_used")),
                                 doc_calls=0,
@@ -3061,7 +3061,7 @@ if prompt is not None:
                         
                         # ✅ badges 最上面：先畫「預設 off」，跑完再更新
                         badges_ph.markdown(
-                            badges_markdown(mode="General", db_used=False, web_used=False, doc_calls=0, web_calls=0)
+                            badges_markdown(mode="general", db_used=False, web_used=False, doc_calls=0, web_calls=0)
                         )
                     
                         # ✅ Full-doc 動態 token budget（M：輸出預留 3000）
@@ -3117,7 +3117,7 @@ if prompt is not None:
                         # ✅ 更新 badges（放最上面）
                         badges_ph.markdown(
                             badges_markdown(
-                                mode="General",
+                                mode="general",
                                 db_used=bool(meta.get("db_used")),
                                 web_used=bool(meta.get("web_used")),
                                 doc_calls=int(meta.get("doc_calls") or 0),
@@ -3197,7 +3197,7 @@ if prompt is not None:
                         badges_ph = st.empty()
                         doc_calls = 0
                         web_calls = 0
-                        badges_ph.markdown(badges_markdown(mode="Research", db_used=False, web_used=True, doc_calls=0, web_calls=0))
+                        badges_ph.markdown(badges_markdown(mode="research", db_used=False, web_used=True, doc_calls=0, web_calls=0))
                     
                         plan_query = args.get("query") or user_text
                         plan_query_runtime = f"{today_line}\n\n{plan_query}".strip()
@@ -3259,7 +3259,7 @@ if prompt is not None:
                         # 更新 badges（research 會同時有 DB / Web）
                         badges_ph.markdown(
                             badges_markdown(
-                                mode="Research",
+                                mode="research",
                                 db_used=(doc_calls > 0),
                                 web_used=True,
                                 doc_calls=doc_calls,
