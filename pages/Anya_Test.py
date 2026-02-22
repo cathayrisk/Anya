@@ -59,6 +59,16 @@ from docstore import (
 )
 import uuid as _uuid
 
+# === 知識庫 imports（Supabase + embedding，選用） ===
+try:
+    from supabase import create_client as _sb_create_client
+    from langchain_openai import OpenAIEmbeddings as _OAIEmb
+    _KB_DEPS_OK = True
+except ImportError:
+    _KB_DEPS_OK = False
+
+HAS_KB = False  # 初始值，init 區段再確認
+
 # === 0. Trimming / 大小限制（可調） ===
 TRIM_LAST_N_USER_TURNS = 18                 # 短期記憶：最近 N 個 user 回合
 MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024      # 單次請求總量預警（48MB）
@@ -73,6 +83,19 @@ if not OPENAI_API_KEY:
     st.error("找不到 OpenAI API Key，請在 .streamlit/secrets.toml 設定 OPENAI_API_KEY 或 OPENAI_KEY。")
     st.stop()
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # 讓 Agents SDK 可以讀到
+
+# === 知識庫初始化（需在 OPENAI_API_KEY 設定後執行）===
+if _KB_DEPS_OK and st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_KEY"):
+    try:
+        _kb_supabase = _sb_create_client(
+            st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
+        )
+        _kb_embeddings = _OAIEmb(
+            openai_api_key=OPENAI_API_KEY, model="text-embedding-3-small"
+        )
+        HAS_KB = True
+    except Exception:
+        HAS_KB = False
 
 # === 1. Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
@@ -626,6 +649,7 @@ def aggregate_doc_evidence_from_log(*, run_id: str) -> dict[str, Any]:
     sources: dict[str, list[str]] = {}
     evidence: dict[str, list[dict]] = {}
     queries: list[str] = []
+    source_map: dict[str, str] = {}  # title -> "knowledge_base" | "session"
 
     def add_page(title: str, page: str):
         arr = sources.setdefault(title, [])
@@ -645,6 +669,11 @@ def aggregate_doc_evidence_from_log(*, run_id: str) -> dict[str, Any]:
                 continue
             add_page(title, page)
             evidence.setdefault(title, []).append(h)
+            # 記錄來源類型（knowledge_base 優先，一旦標記不覆蓋）
+            if h.get("source") == "knowledge_base":
+                source_map[title] = "knowledge_base"
+            else:
+                source_map.setdefault(title, "session")
 
     # 每份文件最多 6 筆
     for t in list(evidence.keys()):
@@ -660,7 +689,7 @@ def aggregate_doc_evidence_from_log(*, run_id: str) -> dict[str, Any]:
     for t in list(sources.keys()):
         sources[t] = _sort_pages(sources[t])
 
-    return {"sources": sources, "evidence": evidence, "queries": queries}
+    return {"sources": sources, "evidence": evidence, "queries": queries, "source_map": source_map}
 
 # =========================
 # ✅【A】helpers：新增「從 doc_search log 產生來源摘要」+「在指定 container 內渲染 expander」
@@ -779,6 +808,7 @@ def render_evidence_panel_expander_in(
     sources: dict[str, list[str]] = agg.get("sources") or {}
     evidence: dict[str, list[dict]] = agg.get("evidence") or {}
     queries: list[str] = agg.get("queries") or []
+    source_map: dict[str, str] = agg.get("source_map") or {}
 
     has_any = bool(sources or evidence or queries or url_in_text or (url_cits or []) or (docs_for_history or []))
     if not has_any:
@@ -805,7 +835,9 @@ def render_evidence_panel_expander_in(
                     for title in sorted(sources.keys(), key=lambda x: x.lower()):
                         pages = sources[title]
                         pages_str = ",".join(pages[:24]) + ("…" if len(pages) > 24 else "")
-                        st.markdown(f"- :blue-badge[{_short(title)}] :small[:gray[p{pages_str}]]")
+                        is_kb = source_map.get(title) == "knowledge_base"
+                        kb_prefix = ":green-badge[知識庫] " if is_kb else ""
+                        st.markdown(f"- {kb_prefix}:blue-badge[{_short(title)}] :small[:gray[p{pages_str}]]")
                 else:
                     st.markdown(":small[:gray[（本回合沒有文件命中）]]")
 
@@ -1263,6 +1295,118 @@ def fetch_webpage_impl_via_jina(url: str, max_chars: int = 160_000, timeout_seco
         "truncated": truncated,
         "text": text,
     }
+# ========= 知識庫搜尋輔助（HAS_KB=True 才生效）=========
+
+@st.cache_data(ttl=600)
+def _kb_get_namespaces() -> list[str]:
+    """撈所有知識空間名稱，快取 10 分鐘。"""
+    try:
+        data = (
+            _kb_supabase.table("knowledge_chunks")
+            .select("namespace")
+            .limit(500)
+            .execute()
+            .data
+        )
+        return list({r["namespace"] for r in (data or [])})
+    except Exception:
+        return []
+
+
+def supabase_knowledge_search(query: str, top_k: int = 8) -> dict:
+    """
+    對全部 Supabase 知識空間做 Hybrid Search（向量 + FTS + RRF）。
+    不需要指定 namespace，由 RRF 分數自動決定最相關內容。
+    """
+    if not HAS_KB:
+        return {"hits": [], "total": 0, "error": "知識庫未啟用"}
+    if not query:
+        return {"hits": [], "total": 0}
+    try:
+        qvec = _kb_embeddings.embed_query(query)
+        namespaces = _kb_get_namespaces()
+        if not namespaces:
+            return {"hits": [], "total": 0, "namespaces_searched": []}
+
+        all_hits: list[dict] = []
+        for ns in namespaces:
+            try:
+                result = _kb_supabase.rpc(
+                    "hybrid_search_knowledge_chunks",
+                    {
+                        "query_text": query,
+                        "query_embedding": qvec,
+                        "match_count": top_k,
+                        "namespace_filter": ns,
+                        "full_text_weight": 1,
+                        "semantic_weight": 1,
+                        "rrf_k": 50,
+                    },
+                ).execute()
+                for row in (result.data or []):
+                    fname = row.get("filename") or ns
+                    cidx = row.get("chunk_index", "-")
+                    all_hits.append({
+                        "title": fname,
+                        "page": cidx,
+                        "snippet": (row.get("content") or "")[:600],
+                        "score": row.get("similarity", 0),
+                        "citation_token": f"[KB:{fname} p{cidx}]",
+                        "namespace": ns,
+                        "source": "knowledge_base",
+                    })
+            except Exception:
+                continue
+
+        all_hits.sort(key=lambda x: x["score"], reverse=True)
+        top_hits = all_hits[:top_k]
+        return {
+            "hits": top_hits,
+            "total": len(top_hits),
+            "namespaces_searched": namespaces,
+        }
+    except Exception as e:
+        return {"hits": [], "total": 0, "error": str(e)}
+
+
+KNOWLEDGE_SEARCH_TOOL = {
+    "type": "function",
+    "name": "knowledge_search",
+    "description": (
+        "在長期金融/總經/ESG 知識庫做 Hybrid Search（向量語意 + 全文檢索 + RRF 融合排名）。\n"
+        "不需要知道知識空間名稱，直接輸入問題或關鍵字，系統會自動找到最相關的內容。\n"
+        "\n"
+        "【主動查詢原則（重要）】\n"
+        "- 只要問題與金融、總體經濟、ESG、法規、產業分析、風險評估等主題有關，\n"
+        "  就應主動呼叫，不必等 doc_search 結果不足後才補查。\n"
+        "- 有上傳文件也應呼叫：doc_search 查本次上傳，knowledge_search 查長期背景知識，兩者互補。\n"
+        "\n"
+        "【不需要使用】\n"
+        "- 純常識問答、程式碼問題、與金融/ESG 完全無關的問題。\n"
+        "\n"
+        "【與 doc_search 的差異】\n"
+        "- doc_search：本次 session 上傳的臨時文件（FAISS 本地索引）\n"
+        "- knowledge_search：跨 session 持久知識庫（Supabase），含金融/總經/ESG 長期知識\n"
+        "引用格式：[KB:文件名 pN]"
+    ),
+    "strict": True,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "搜尋查詢字串（用問題或關鍵字，不需要填知識空間名稱）",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "回傳筆數（建議 5-8）",
+            },
+        },
+        "required": ["query", "top_k"],
+        "additionalProperties": False,
+    },
+} if HAS_KB else None
+
 # ========= 5) tools 定義：放在 FETCH_WEBPAGE_TOOL 附近（完整貼上） =========
 DOC_LIST_TOOL = {
     "type": "function",
@@ -1356,16 +1500,28 @@ def run_general_with_webpage_tool(
     reasoning_effort: str,
     need_web: bool,
     forced_url: str | None,
-    doc_fulltext_token_budget_hint: int = 20000
+    doc_fulltext_token_budget_hint: int = 20000,
+    status=None,  # Streamlit st.status 物件，None 時靜默（向後相容）
+    use_kb: bool = True,  # False 時完全移除 knowledge_search（使用者明確限制只看上傳文件）
 ):
     """
     General 分支 runner：
     - 支援 function tools：fetch_webpage + doc_list/doc_search/doc_get_fulltext
     - 支援 web_search（可選）
+    - use_kb=False 時，knowledge_search 不加入 tools（程式碼層硬性排除，不靠 prompt）
     - 回傳：(resp, meta)
       meta = {doc_calls, web_calls, db_used, web_used}
     """
+    def _status(msg: str, *, write: str | None = None):
+        """即時更新 st.status 標題；status=None 時完全靜默。"""
+        if status is not None:
+            status.update(label=msg, state="running", expanded=True)
+            if write:
+                status.write(write)
+
     tools = [DOC_LIST_TOOL, DOC_SEARCH_TOOL, DOC_GET_FULLTEXT_TOOL, FETCH_WEBPAGE_TOOL]
+    if use_kb and HAS_KB and KNOWLEDGE_SEARCH_TOOL:
+        tools.append(KNOWLEDGE_SEARCH_TOOL)
     if need_web:
         tools.insert(0, {"type": "web_search"})
 
@@ -1378,6 +1534,7 @@ def run_general_with_webpage_tool(
     meta = {"doc_calls": 0, "web_calls": 0, "db_used": False, "web_used": False}
 
     while True:
+        _status("🥜 安妮亞在認真想了！（わくわく）")
         resp = client.responses.create(
             model=model,
             input=running_input,
@@ -1418,6 +1575,10 @@ def run_general_with_webpage_tool(
 
             if name == "fetch_webpage":
                 url = forced_url or args.get("url")
+                _status(
+                    f"🌐 安妮亞去把那個網頁讀過來！→ {(url or '')[:60]}{'...' if len(url or '') > 60 else ''}",
+                    write=f"🌐 安妮亞讀網頁 → {(url or '')[:80]}",
+                )
                 try:
                     output = fetch_webpage_impl_via_jina(
                         url=url,
@@ -1428,6 +1589,7 @@ def run_general_with_webpage_tool(
                     output = {"error": str(e), "url": url}
 
             elif name == "doc_list":
+                _status("📋 安妮亞數數看有幾個檔案～")
                 meta["doc_calls"] += 1
                 meta["db_used"] = True
                 output = doc_list_payload(st.session_state.get("ds_file_rows", []), st.session_state.get("ds_store", None))
@@ -1436,6 +1598,7 @@ def run_general_with_webpage_tool(
                 meta["doc_calls"] += 1
                 meta["db_used"] = True
                 q = (args.get("query") or "").strip()
+                _status(f"🔎 安妮亞去找找你上傳的文件！（{q}）", write=f"🔎 安妮亞找文件：{q}")
                 k = int(args.get("k", 8))
                 diff = str(args.get("difficulty", "medium") or "medium")
 
@@ -1463,6 +1626,7 @@ def run_general_with_webpage_tool(
                 meta["db_used"] = True
 
                 title = (args.get("title") or "").strip()
+                _status(f"📄 安妮亞把整份文件都讀一遍！（{title}）", write=f"📄 安妮亞讀全文：{title}")
                 asked_budget = int(args.get("token_budget", 20000))
 
                 # ✅ 後端 cap：避免模型亂塞爆 context
@@ -1477,6 +1641,26 @@ def run_general_with_webpage_tool(
                 )
                 output["asked_token_budget"] = asked_budget
                 output["capped_token_budget"] = token_budget
+
+            elif name == "knowledge_search":
+                meta["doc_calls"] += 1
+                meta["db_used"] = True
+                q = (args.get("query") or "").strip()
+                _status(f"📚 安妮亞去知識庫找找看！（{q}）", write=f"📚 安妮亞查知識庫：{q}")
+                k = int(args.get("top_k", 8))
+                output = supabase_knowledge_search(q, top_k=k)
+                # 記錄給 evidence panel 用（hits 帶 source="knowledge_base"）
+                try:
+                    st.session_state.ds_doc_search_log.append(
+                        {
+                            "run_id": st.session_state.get("ds_active_run_id"),
+                            "query": q,
+                            "k": k,
+                            "hits": (output.get("hits") or [])[:6],
+                        }
+                    )
+                except Exception:
+                    pass
 
             else:
                 output = {"error": f"Unknown function: {name}"}
@@ -1849,7 +2033,14 @@ ESCALATE_GENERAL_TOOL = {
         "properties": {
             "reason": {"type": "string", "description": "為何需要升級。"},
             "query": {"type": "string", "description": "歸一化後的使用者需求。"},
-            "need_web": {"type": "boolean", "description": "是否需要上網搜尋。"}
+            "need_web": {"type": "boolean", "description": "是否需要上網搜尋。"},
+            "restrict_kb": {
+                "type": "boolean",
+                "description": (
+                    "使用者明確說「只看上傳文件」「只用這份」「不要查知識庫/資料庫」時設為 true；"
+                    "其他情況預設 false（讓 knowledge_search 正常開放）。"
+                )
+            },
         },
         "required": ["reason", "query"]
     }
@@ -1903,6 +2094,11 @@ FRONT_ROUTER_PROMPT = """
 - 只要使用者明確說要『報告』且主題是風險/分析/評估，就一律走 RESEARCH
 - 或問題高度時效性/會變動，且需要可靠來源支撐（例如政策/價格/法規/公告/數據）
 - 或需要 5+ 條搜尋與彙整（規劃→多次搜尋→綜合）
+
+## restrict_kb 判斷（只在走 GENERAL 時填，選填）
+- 使用者明確說「只看這份/這個文件」「只用上傳的」「不要查知識庫/資料庫」「別查 KB」
+  → restrict_kb=true
+- 其他情況（包括沒提、不確定）→ 省略此欄位（預設 false，讓知識庫正常開放）
 
 # 輸出要求
 - 你只輸出一個工具呼叫，並在 args.query 中放入「可直接交給下游 agent」的歸一化需求。
@@ -2753,7 +2949,7 @@ if prompt is not None:
 
         try:
             with status_area:
-                    status = st.status("⚡ 思考中...", expanded=False)  # ✅ 先 status
+                    status = st.status("🥜 安妮亞收到了！思考思考中...", expanded=False)  # ✅ 先 status
                     badges_ph = st.empty()
                     placeholder = output_area.empty()
 
@@ -2788,7 +2984,7 @@ if prompt is not None:
                         status.update(label="⚡ 使用快速回答模式", state="running", expanded=False)
                     
                         # badges 最上面（先預設 Web off）
-                        badges_ph.markdown(badges_markdown(mode="fast", db_used=False, web_used=False, doc_calls=0, web_calls=0))
+                        badges_ph.markdown(badges_markdown(mode="Fast", db_used=False, web_used=False, doc_calls=0, web_calls=0))
                     
                         raw_fast_query = user_text or args.get("query") or "請根據對話內容回答。"
                         fast_query_with_history = build_fastagent_query_from_history(
@@ -2802,7 +2998,7 @@ if prompt is not None:
                         # 更新 badges（fast 沒有 DB；web 看 best-effort meta）
                         badges_ph.markdown(
                             badges_markdown(
-                                mode="fast",
+                                mode="Fast",
                                 db_used=False,
                                 web_used=bool(fast_meta.get("web_used")),
                                 doc_calls=0,
@@ -2823,7 +3019,7 @@ if prompt is not None:
                             "images": [],
                             "docs": []
                         })
-                        status.update(label="✅ 快速回答完成", state="complete", expanded=False)
+                        status.update(label="✅ 安妮亞回答完了！", state="complete", expanded=False)
                         st.stop()
                     
                     # =========================
@@ -2831,8 +3027,10 @@ if prompt is not None:
                     # =========================
                     if kind == "general":
                         status.update(label="↗️ 切換到深思模式（gpt‑5.2）", state="running", expanded=False)
-                    
+
                         need_web = bool(args.get("need_web"))
+                        # restrict_kb=True → 使用者明確要求「只看上傳文件」，程式碼層硬切排除知識庫
+                        use_kb = not bool(args.get("restrict_kb", False))
                     
                         # ✅ URL 偵測 + 規則：有 URL 就禁用 web_search，改用 fetch_webpage
                         url_in_text = extract_first_url(user_text)
@@ -2863,7 +3061,7 @@ if prompt is not None:
                         
                         # ✅ badges 最上面：先畫「預設 off」，跑完再更新
                         badges_ph.markdown(
-                            badges_markdown(mode="general", db_used=False, web_used=False, doc_calls=0, web_calls=0)
+                            badges_markdown(mode="General", db_used=False, web_used=False, doc_calls=0, web_calls=0)
                         )
                     
                         # ✅ Full-doc 動態 token budget（M：輸出預留 3000）
@@ -2887,8 +3085,18 @@ if prompt is not None:
                             "【文件庫工具使用規則（重要）】\n"
                             "- 若使用者問題需要依據已上傳文件，請先使用 doc_search 再回答。\n"
                             "- 回答引用格式：請用 [文件標題 pN]（N 可為 -）。\n"
-                            "- ✅ 不要在正文輸出『來源：』這種佔位空行；若要列來源，請用引用 token 或交給 UI 顯示即可。\n"
+                            "- 不要在正文輸出『來源：』這種佔位空行；若要列來源，請用引用 token 或交給 UI 顯示即可。\n"
                             "- 不要把 chunk_id 寫進答案。\n"
+                            + (
+                                "\n【長期知識庫（knowledge_search）主動使用原則】\n"
+                                "- doc_search：本次 session 上傳的臨時文件（FAISS 本地索引）。\n"
+                                "- knowledge_search：跨 session 持久知識庫（Supabase），含金融/總經/ESG/法規等長期知識。\n"
+                                "- 【主動查詢】只要問題涉及金融、總經、ESG、法規、產業分析等背景知識，\n"
+                                "  knowledge_search 應主動呼叫，不必等 doc_search 結果不足才補查。\n"
+                                "- 兩者互補，可同時使用；知識庫引用格式：[KB:文件名 pN]。\n"
+                                "- 若 knowledge_search 工具不在清單中，代表使用者已限制只看上傳文件，請勿強行查詢。\n"
+                                if HAS_KB else ""
+                            )
                         )
                         effective_instructions = ANYA_SYSTEM_PROMPT + DOCSTORE_RULES
                     
@@ -2902,12 +3110,14 @@ if prompt is not None:
                             need_web=effective_need_web,
                             forced_url=url_in_text,
                             doc_fulltext_token_budget_hint=doc_fulltext_budget_hint,
+                            status=status,
+                            use_kb=use_kb,
                         )
                     
                         # ✅ 更新 badges（放最上面）
                         badges_ph.markdown(
                             badges_markdown(
-                                mode="general",
+                                mode="General",
                                 db_used=bool(meta.get("db_used")),
                                 web_used=bool(meta.get("web_used")),
                                 doc_calls=int(meta.get("doc_calls") or 0),
@@ -2974,7 +3184,7 @@ if prompt is not None:
                             "images": [],
                             "docs": []
                         })
-                        status.update(label="✅ 深思模式完成", state="complete", expanded=False)
+                        status.update(label="✅ 安妮亞想好了！", state="complete", expanded=False)
                         st.stop()
 
                     # =========================
@@ -2987,7 +3197,7 @@ if prompt is not None:
                         badges_ph = st.empty()
                         doc_calls = 0
                         web_calls = 0
-                        badges_ph.markdown(badges_markdown(mode="research", db_used=False, web_used=True, doc_calls=0, web_calls=0))
+                        badges_ph.markdown(badges_markdown(mode="Research", db_used=False, web_used=True, doc_calls=0, web_calls=0))
                     
                         plan_query = args.get("query") or user_text
                         plan_query_runtime = f"{today_line}\n\n{plan_query}".strip()
@@ -3049,7 +3259,7 @@ if prompt is not None:
                         # 更新 badges（research 會同時有 DB / Web）
                         badges_ph.markdown(
                             badges_markdown(
-                                mode="research",
+                                mode="Research",
                                 db_used=(doc_calls > 0),
                                 web_used=True,
                                 doc_calls=doc_calls,
@@ -3167,7 +3377,7 @@ if prompt is not None:
                             "images": [],
                             "docs": []
                         })
-                        status.update(label="✅ 研究流程完成", state="complete", expanded=False)
+                        status.update(label="✅ 安妮亞研究好了！", state="complete", expanded=False)
                         st.stop()
 
                     # === 若 Router 沒給出 kind（極少數），回退舊 Router 流程 ===
