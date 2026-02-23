@@ -1304,7 +1304,7 @@ def _kb_get_namespaces() -> list[str]:
         data = (
             _kb_supabase.table("knowledge_chunks")
             .select("namespace")
-            # 不加 .limit()：只選 namespace 文字欄，不含 embedding，即使萬列也只幾 MB，有 10 分鐘快取
+            .limit(500)
             .execute()
             .data
         )
@@ -1332,15 +1332,12 @@ def supabase_knowledge_search(query: str, top_k: int = 8) -> dict:
         for ns in namespaces:
             try:
                 result = _kb_supabase.rpc(
-                    "hybrid_search_knowledge_chunks",
+                    "match_knowledge_chunks",
                     {
-                        "query_text": query,
                         "query_embedding": qvec,
+                        "match_threshold": 0.30,
                         "match_count": top_k,
                         "namespace_filter": ns,
-                        "full_text_weight": 1,
-                        "semantic_weight": 1,
-                        "rrf_k": 50,
                     },
                 ).execute()
                 for row in (result.data or []):
