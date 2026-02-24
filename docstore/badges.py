@@ -26,7 +26,7 @@ def badges_markdown(
         mode_norm = "general"
 
     items = [
-        _MODE_DISPLAY.get(mode_norm, f"{mode_norm.title()}"),
+        st.caption(_MODE_DISPLAY.get(mode_norm, f"{mode_norm.title()}")),
         _badge(f"DB:{doc_calls}" if db_used else "DB:off", "green" if db_used else "gray"),
         _badge(f"Web:{web_calls}" if web_used else "Web:off", "violet" if web_used else "gray"),
     ]
