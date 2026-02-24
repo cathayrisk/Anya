@@ -6,10 +6,15 @@ def _badge(label: str, color: str) -> str:
     safe = (label or "").replace("[", "(").replace("]", ")")
     return f":{color}-badge[{safe}]"
 
-_MODE_DISPLAY = {
-    "fast":     "⚡ **Fast Route**",
-    "general":  "💬 **General Route**",
-    "research": "🔬 **Research Route**",
+_MODE_LABEL = {
+    "fast":     "⚡ Fast",
+    "general":  "💬 General",
+    "research": "🔬 Research",
+}
+_MODE_COLOR = {
+    "fast":     "violet",
+    "general":  "blue",
+    "research": "orange",
 }
 
 def badges_markdown(
@@ -26,7 +31,7 @@ def badges_markdown(
         mode_norm = "general"
 
     items = [
-        _MODE_DISPLAY.get(mode_norm, f"{mode_norm.title()}"),
+        _badge(_MODE_LABEL.get(mode_norm, mode_norm.title()), _MODE_COLOR.get(mode_norm, "blue")),
         _badge(f"DB:{doc_calls}" if db_used else "DB:off", "green" if db_used else "gray"),
         _badge(f"Web:{web_calls}" if web_used else "Web:off", "violet" if web_used else "gray"),
     ]
