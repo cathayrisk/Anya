@@ -3194,6 +3194,16 @@ if prompt is not None:
                                 doc_calls=0, web_calls=0,
                             )
                         )
+
+                        # ✅ V2：無文件可用時提示使用者（contextual info）
+                        _no_doc = not has_docstore_index()
+                        _no_kb  = not (HAS_KB and use_kb)
+                        if _no_doc and _no_kb and not effective_need_web:
+                            with status_area:
+                                st.info("💡 本回合沒有上傳文件，也沒有啟用知識庫或網路搜尋，安妮亞只靠本身知識回答。", icon="ℹ️")
+                        elif _no_doc and _no_kb and effective_need_web:
+                            with status_area:
+                                st.info("💡 本回合沒有文件庫，安妮亞會透過網路搜尋來回答。", icon="🌐")
                     
                         # ✅ Full-doc 動態 token budget（M：輸出預留 3000）
                         MAX_CONTEXT_TOKENS = 128_000
@@ -3309,10 +3319,20 @@ if prompt is not None:
                         # ✅ 文件檢索命中 expander（只有有 doc_search log 才會顯示）
                         #render_doc_search_expander(run_id=st.session_state.get("ds_active_run_id") or "")
 
+                        # ✅ M1：工具使用摘要 → 附在 stored text 尾部供下一輪模型讀取
+                        _tool_tags = []
+                        if meta.get("doc_calls", 0) > 0:
+                            _tool_tags.append(f"doc_search×{meta['doc_calls']}")
+                        if meta.get("web_calls", 0) > 0:
+                            _tool_tags.append(f"web_search×{meta['web_calls']}")
+                        _stored_text = final_text
+                        if _tool_tags:
+                            _stored_text += f"\n\n<!-- tools:{', '.join(_tool_tags)} -->"
+
                         ensure_session_defaults()
                         st.session_state.chat_history.append({
                             "role": "assistant",
-                            "text": final_text,
+                            "text": _stored_text,
                             "images": [],
                             "docs": []
                         })
@@ -3336,13 +3356,33 @@ if prompt is not None:
                         badges_ph.markdown(badges_markdown(mode="Research", db_used=False, web_used=True, doc_calls=0, web_calls=0))
                     
                         plan_query = args.get("query") or user_text
-                        plan_query_runtime = f"{today_line}\n\n{plan_query}".strip()
-                    
+
+                        # ✅ M2：把最近 3 輪對話摘要前置給 Planner，讓它知道「他們/這個」的指稱對象
+                        _recent_hist = (st.session_state.get("chat_history", []) or [])[-6:]
+                        _ctx_lines = []
+                        for _m in _recent_hist:
+                            _role = "使用者" if _m.get("role") == "user" else "安妮亞"
+                            _txt = (_m.get("text") or "").strip()[:200]
+                            if _txt:
+                                _ctx_lines.append(f"{_role}：{_txt}")
+                        _recent_ctx = "\n".join(_ctx_lines)
+
+                        plan_query_runtime = (
+                            f"{today_line}\n\n"
+                            + (f"【近期對話摘要（供參考，理解使用者意圖用）】\n{_recent_ctx}\n\n" if _recent_ctx else "")
+                            + f"【本次研究主題】\n{plan_query}"
+                        ).strip()
+
+                        # ✅ U2：Planner 執行前後顯示進度
+                        with status:
+                            status.write("🧠 Planner 規劃搜尋策略中...")
                         plan_res = run_async(Runner.run(planner_agent, plan_query_runtime))
                         search_plan = plan_res.final_output.searches if hasattr(plan_res, "final_output") else []
-                    
+
                         # 先估 web_calls（概略值）
                         web_calls = len(search_plan) if search_plan else 0
+                        with status:
+                            status.write(f"✅ 規劃完成：{web_calls} 個搜尋方向")
                         
                         # ✅ 新增：文件檢索（只要有 index 就做）
                         doc_summaries = []  # list[dict] 會塞給 writer
@@ -3410,6 +3450,10 @@ if prompt is not None:
                                     for d in doc_summaries[:6]:
                                         st.markdown(f"**{d['query']}**")
                                         st.markdown(d["summary"][:1500] + ("…" if len(d["summary"]) > 1500 else ""))
+                        else:
+                            # ✅ V2：Research 沒有文件可用時提示
+                            with status_area:
+                                st.caption(":gray[💡 本回合無上傳文件，研究報告將以網路搜尋為主要來源。]")
                     
                         with output_area:
                             with st.expander("🔎 搜尋規劃與各項搜尋摘要", expanded=True):
@@ -3424,6 +3468,9 @@ if prompt is not None:
                                     sec.markdown(f"**{it.query}**")
                                     body_placeholders.append(sec.empty())
                     
+                                # ✅ U2：搜尋前後進度提示
+                                with status:
+                                    status.write(f"🌐 並行搜尋 {len(search_plan)} 個方向（最多 4 條同步）...")
                                 search_results = run_async(aparallel_search_stream(
                                     search_agent,
                                     search_plan,
@@ -3433,7 +3480,10 @@ if prompt is not None:
                                     retries=1,
                                     retry_delay=1.0,
                                 ))
-                    
+                                _ok_count = sum(1 for r in search_results if not isinstance(r, Exception))
+                                with status:
+                                    status.write(f"✅ 搜尋完成：{_ok_count}/{len(search_plan)} 筆成功")
+
                                 summary_texts = []
                                 for r in search_results:
                                     if isinstance(r, Exception):
@@ -3455,26 +3505,43 @@ if prompt is not None:
                             for i in range(len(search_plan))
                         ])
                         
+                        # ✅ U3：Writer 執行前後進度提示
+                        with status:
+                            status.write("✍️ Writer 合成報告中（摘要 → 完整報告 → 建議問題）...")
                         writer_data, writer_url_cits, writer_file_cits = run_writer(
                             client,
                             trimmed_messages_no_guard_with_today,
                             plan_query,
                             search_for_writer,
                         )
-                    
+                        with status:
+                            status.write("✅ 報告完成，輸出中...")
+
+                        # ✅ U3：優化輸出佈局 — Summary 用 expander，完整報告直接串流，最後列建議問題
                         with output_area:
-                            summary_sec = st.container()
-                            summary_sec.markdown("### 📋 Executive Summary")
-                            fake_stream_markdown(writer_data.get("short_summary", ""), summary_sec.empty())
-                    
-                            report_sec = st.container()
-                            report_sec.markdown("### 📖 完整報告")
-                            fake_stream_markdown(writer_data.get("markdown_report", ""), report_sec.empty())
-                    
-                            q_sec = st.container()
-                            q_sec.markdown("### ❓ 後續建議問題")
-                            for q in writer_data.get("follow_up_questions", []) or []:
-                                q_sec.markdown(f"- {q}")
+                            _short_summary = (writer_data.get("short_summary") or "").strip()
+                            _full_report   = (writer_data.get("markdown_report") or "").strip()
+                            _follow_ups    = writer_data.get("follow_up_questions") or []
+
+                            # ① Executive Summary — 可展開/收起，預設展開
+                            with st.expander("📋 Executive Summary", expanded=True):
+                                if _short_summary:
+                                    fake_stream_markdown(_short_summary, st.empty())
+                                else:
+                                    st.caption(":gray[（無摘要）]")
+
+                            # ② 完整報告 — 直接輸出（完整閱讀體驗）
+                            if _full_report:
+                                st.markdown("### 📖 完整報告")
+                                st.divider()
+                                fake_stream_markdown(_full_report, st.empty())
+
+                            # ③ 後續建議問題 — divider 分隔，清單顯示
+                            if _follow_ups:
+                                st.divider()
+                                st.markdown("**❓ 後續建議問題**")
+                                for q in _follow_ups:
+                                    st.markdown(f"- {q}")
                     
                         # ✅ 右側 sources：Research 主要是 URL citations + 檔案
                         with sources_container:
