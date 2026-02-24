@@ -162,6 +162,7 @@ st.session_state.setdefault("ds_last_index_stats", None) # dict | None
 
 # 本回合 doc_search debug log（expander 用）
 st.session_state.setdefault("ds_doc_search_log", [])     # list[dict]
+st.session_state.setdefault("ds_web_search_log", [])     # list[dict] — web_search_call log
 st.session_state.setdefault("ds_active_run_id", None)    # str | None
 
 # === 共用：假串流打字效果 ===
@@ -810,7 +811,13 @@ def render_evidence_panel_expander_in(
     queries: list[str] = agg.get("queries") or []
     source_map: dict[str, str] = agg.get("source_map") or {}
 
-    has_any = bool(sources or evidence or queries or url_in_text or (url_cits or []) or (docs_for_history or []))
+    # 讀取本 run 的 web_search log
+    web_log = [
+        x for x in (st.session_state.get("ds_web_search_log", []) or [])
+        if x.get("run_id") == run_id
+    ]
+
+    has_any = bool(sources or evidence or queries or url_in_text or (url_cits or []) or (docs_for_history or []) or web_log)
     if not has_any:
         return
 
@@ -908,6 +915,29 @@ def render_evidence_panel_expander_in(
                                             f"rrf={rrf if rrf is not None else '—'}"
                                         )
 
+                # 🌐 網頁搜尋結果（補在 doc evidence 後面）
+                if web_log:
+                    if evidence:
+                        st.markdown("---")
+                    st.markdown("**🌐 網頁搜尋結果**")
+                    for rec in web_log:
+                        q = rec.get("query") or ""
+                        srcs = rec.get("sources") or []
+                        with st.expander(f"🔍 `{_short(q, 50)}`", expanded=False):
+                            if not srcs:
+                                st.markdown(":small[:gray[（無 snippet）]]")
+                            else:
+                                for s in srcs[:6]:
+                                    url   = (s.get("url") or "").strip()
+                                    title = (s.get("title") or url or "（無標題）").strip()
+                                    snip  = (s.get("snippet") or "").strip()
+                                    if url:
+                                        st.markdown(f"**[{_short(title, 50)}]({url})**")
+                                    else:
+                                        st.markdown(f"**{_short(title, 50)}**")
+                                    if snip:
+                                        st.caption(_short_snip(snip, 200))
+
             # -------------------------
             # Search（維持）
             # -------------------------
@@ -918,6 +948,13 @@ def render_evidence_panel_expander_in(
                     st.markdown("**本回合 doc_search 查詢**")
                     for q in queries[:30]:
                         st.markdown(f"- `{q}`")
+
+                if web_log:
+                    st.markdown("\n**🌐 本回合網頁搜尋**")
+                    for rec in web_log:
+                        q = rec.get("query") or ""
+                        if q:
+                            st.markdown(f"- `{q}`")
 
 
 def render_retrieval_hits_expander_in(*, container, run_id: str, expanded: bool = False):
@@ -1552,12 +1589,38 @@ def run_general_with_webpage_tool(
             include=["web_search_call.action.sources"] if need_web else [],
         )
 
-        # 統計 web_search
+        # 統計 web_search + 記錄查詢與 snippet（供 Evidence/Search tab 顯示）
         try:
             for item in getattr(resp, "output", []) or []:
                 if getattr(item, "type", None) == "web_search_call":
                     meta["web_calls"] += 1
                     meta["web_used"] = True
+                    try:
+                        action = getattr(item, "action", None)
+                        if action:
+                            q = getattr(action, "query", "") or ""
+                            raw_sources = getattr(action, "sources", []) or []
+                            ws_sources = []
+                            for s in raw_sources:
+                                if isinstance(s, dict):
+                                    ws_sources.append({
+                                        "url":     s.get("url", ""),
+                                        "title":   s.get("title", ""),
+                                        "snippet": s.get("snippet", ""),
+                                    })
+                                else:
+                                    ws_sources.append({
+                                        "url":     getattr(s, "url", "") or "",
+                                        "title":   getattr(s, "title", "") or "",
+                                        "snippet": getattr(s, "snippet", "") or "",
+                                    })
+                            st.session_state.ds_web_search_log.append({
+                                "run_id":  st.session_state.get("ds_active_run_id"),
+                                "query":   q,
+                                "sources": ws_sources[:6],
+                            })
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -3117,6 +3180,7 @@ if prompt is not None:
                         # ✅ 本回合 run_id（給 doc_search expander 分組 & 清理 log）
                         st.session_state["ds_active_run_id"] = str(_uuid.uuid4())
                         st.session_state.ds_doc_search_log = []
+                        st.session_state.ds_web_search_log = []
 
                         # ✅ 改成：用 status_area（或直接 st.container）建立 placeholders
                         evidence_panel_ph = status_area.empty()
