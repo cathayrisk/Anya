@@ -3128,7 +3128,6 @@ if prompt is not None:
                             badges_markdown(
                                 mode="General", db_used=False, web_used=False,
                                 doc_calls=0, web_calls=0,
-                                reasoning_effort=reasoning_effort,
                             )
                         )
                     
@@ -3190,7 +3189,6 @@ if prompt is not None:
                                 web_used=bool(meta.get("web_used")),
                                 doc_calls=int(meta.get("doc_calls") or 0),
                                 web_calls=int(meta.get("web_calls") or 0),
-                                reasoning_effort=reasoning_effort,
                                 elapsed_s=round(time.time() - t_start, 1),
                             )
                         )
