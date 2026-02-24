@@ -1,7 +1,6 @@
 # badges.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import streamlit as st
 
 def _badge(label: str, color: str) -> str:
     safe = (label or "").replace("[", "(").replace("]", ")")
@@ -27,7 +26,7 @@ def badges_markdown(
         mode_norm = "general"
 
     items = [
-        st.caption(_MODE_DISPLAY.get(mode_norm, f"{mode_norm.title()}")),
+        _MODE_DISPLAY.get(mode_norm, f"{mode_norm.title()}"),
         _badge(f"DB:{doc_calls}" if db_used else "DB:off", "green" if db_used else "gray"),
         _badge(f"Web:{web_calls}" if web_used else "Web:off", "violet" if web_used else "gray"),
     ]
