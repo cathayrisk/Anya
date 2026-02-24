@@ -1,6 +1,7 @@
 # badges.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import streamlit as st
 
 def _badge(label: str, color: str) -> str:
     safe = (label or "").replace("[", "(").replace("]", ")")
