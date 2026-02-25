@@ -12,7 +12,7 @@ _MODE_LABEL = {
     "research": "🔬 Research",
 }
 _MODE_COLOR = {
-    "fast":     "primary",
+    "fast":     "green",
     "general":  "blue",
     "research": "orange",
 }
