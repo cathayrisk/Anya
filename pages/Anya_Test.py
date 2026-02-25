@@ -3149,9 +3149,9 @@ if prompt is not None:
                     if kind == "general":
                         status.update(label="↗️ 切換到深思模式（gpt‑5.2）", state="running", expanded=False)
                         try:
-                            st.toast("深思模式", icon=":material/psychology:", duration="long")
+                            st.toast("**深思模式**", icon=":material/psychology:", duration="long")
                         except TypeError:
-                            st.toast("深思模式", icon=":material/psychology:")
+                            st.toast("**深思模式**", icon=":material/psychology:")
                         t_start = time.time()
 
                         need_web = bool(args.get("need_web"))
