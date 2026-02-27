@@ -3250,7 +3250,7 @@ if prompt is not None:
                             use_kb=use_kb,
                         )
 
-                        gif_ph.empty()   # ✅ 搜尋完成，移除 gif
+                        gif_in_status_ph.empty()   # ✅ 搜尋完成，移除 gif
                         
                         # ✅ 更新 badges（放最上面）
                         badges_ph.markdown(
