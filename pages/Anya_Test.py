@@ -3232,7 +3232,9 @@ if prompt is not None:
                         # ✅ 網路搜尋中顯示 gif（搜尋完成後清除）
                         gif_ph = status_area.empty()
                         if effective_need_web:
-                            gif_ph.image("lord-anya.gif")
+                            with gif_ph.container():
+                                with st.expander("🔍 安妮亞搜尋中…", expanded=True):
+                                    st.image("lord-anya.gif")
                             
                         # ✅ 使用 tool-calling 迴圈（含 fetch_webpage + doc tools）
                         resp, meta = run_general_with_webpage_tool(
