@@ -3228,7 +3228,12 @@ if prompt is not None:
                             )
                         )
                         effective_instructions = ANYA_SYSTEM_PROMPT + DOCSTORE_RULES
-                    
+                        
+                        # ✅ 網路搜尋中顯示 gif（搜尋完成後清除）
+                        gif_ph = status_area.empty()
+                        if effective_need_web:
+                            gif_ph.image("lord-anya.gif")
+                            
                         # ✅ 使用 tool-calling 迴圈（含 fetch_webpage + doc tools）
                         resp, meta = run_general_with_webpage_tool(
                             client=client,
@@ -3243,6 +3248,8 @@ if prompt is not None:
                             use_kb=use_kb,
                         )
 
+                        gif_ph.empty()   # ✅ 搜尋完成，移除 gif
+                        
                         # ✅ 更新 badges（放最上面）
                         badges_ph.markdown(
                             badges_markdown(
