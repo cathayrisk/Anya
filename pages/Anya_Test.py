@@ -1516,7 +1516,7 @@ FETCH_WEBPAGE_TOOL = {
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "要轉讀的 http(s) 網址"},
-            "max_chars": {"type": "integer", "description": "回傳文字最大字元數（超過會截斷）"},
+            "max_chars": {"type": "integer", "description": "回傳文字最大字元數（建議 40000～80000，上限 80000）"},
             "timeout_seconds": {"type": "integer", "description": "HTTP timeout 秒數"},
         },
         "required": ["url", "max_chars", "timeout_seconds"],
@@ -1653,7 +1653,7 @@ def run_general_with_webpage_tool(
                 try:
                     output = fetch_webpage_impl_via_jina(
                         url=url,
-                        max_chars=int(args.get("max_chars", 160_000)),
+                        max_chars=min(int(args.get("max_chars", 80_000)), 80_000),
                         timeout_seconds=int(args.get("timeout_seconds", 20)),
                     )
                 except Exception as e:
