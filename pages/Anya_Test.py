@@ -1524,6 +1524,46 @@ FETCH_WEBPAGE_TOOL = {
     },
 }
 
+THINK_TOOL = {
+    "type": "function",
+    "name": "think",
+    "description": (
+        "用於在工具呼叫之間進行策略性反思，幫助你有系統地分析進度、評估資訊品質並規劃下一步。\n"
+        "此工具不會取得新資訊，只將你的思考記錄在 log 中。\n"
+        "\n"
+        "【何時必須使用】\n"
+        "- 每次 doc_search / knowledge_search / fetch_webpage / web_search 之後：分析剛取得的資訊\n"
+        "- 決定是否繼續搜尋之前：評估現有資訊是否已足夠回答問題\n"
+        "- 準備作答之前：確認沒有遺漏關鍵資訊缺口\n"
+        "\n"
+        "【反思應涵蓋的四個面向】\n"
+        "1. 發現摘要 — 這次工具呼叫取得了哪些具體、可用的資訊？\n"
+        "2. 資訊缺口 — 還缺少哪些內容才能完整、有根據地回答？\n"
+        "3. 品質評估 — 來源是否可信？結果是否與問題直接相關？搜尋結果不一定正確，要主動核實。\n"
+        "4. 策略決定 — 下一步應該：(a) 再搜一次（用哪個工具、搜什麼關鍵字）？(b) 換工具？(c) 直接作答？\n"
+        "\n"
+        "【停止原則（避免過度搜尋）】\n"
+        "- 已可完整回答問題 → 立即停止，直接作答\n"
+        "- doc_search / knowledge_search 累計 3 次仍無相關內容 → 停止，告知使用者\n"
+        "- 連續兩次搜尋結果高度重疊 → 停止，避免無效迴圈\n"
+    ),
+    "strict": True,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reflection": {
+                "type": "string",
+                "description": (
+                    "你對研究進度、發現、資訊缺口與下一步策略的詳細反思。"
+                    "請依照四個面向逐一說明。"
+                ),
+            }
+        },
+        "required": ["reflection"],
+        "additionalProperties": False,
+    },
+}
+
 # ========= 6) ✅ 整段替換：run_general_with_webpage_tool（改成同時支援 doc tools + 統計） =========
 def run_general_with_webpage_tool(
     *,
@@ -1558,7 +1598,7 @@ def run_general_with_webpage_tool(
         if status is not None:
             status.write(summary)
 
-    tools = [DOC_LIST_TOOL, DOC_SEARCH_TOOL, DOC_GET_FULLTEXT_TOOL, FETCH_WEBPAGE_TOOL]
+    tools = [DOC_LIST_TOOL, DOC_SEARCH_TOOL, DOC_GET_FULLTEXT_TOOL, FETCH_WEBPAGE_TOOL, THINK_TOOL]
     if use_kb and HAS_KB and KNOWLEDGE_SEARCH_TOOL:
         tools.append(KNOWLEDGE_SEARCH_TOOL)
     if need_web:
@@ -1752,6 +1792,14 @@ def run_general_with_webpage_tool(
                     )
                 except Exception:
                     pass
+
+            elif name == "think":
+                thought = args.get("reflection", "")
+                _status(
+                    f"💭 安妮亞在思考下一步⋯（{thought[:40]}{'...' if len(thought) > 40 else ''}）",
+                    write=f"💭 {thought[:80]}{'...' if len(thought) > 80 else ''}",
+                )
+                output = {"ok": True}
 
             else:
                 output = {"error": f"Unknown function: {name}"}
