@@ -163,6 +163,7 @@ st.session_state.setdefault("ds_last_index_stats", None) # dict | None
 # 本回合 doc_search debug log（expander 用）
 st.session_state.setdefault("ds_doc_search_log", [])     # list[dict]
 st.session_state.setdefault("ds_web_search_log", [])     # list[dict] — web_search_call log
+st.session_state.setdefault("ds_think_log", [])          # list[dict] — think_tool log
 st.session_state.setdefault("ds_active_run_id", None)    # str | None
 
 # === 共用：假串流打字效果 ===
@@ -831,7 +832,7 @@ def render_evidence_panel_expander_in(
 
     with container:
         with st.expander("📚 證據 / 檢索 / 來源", expanded=expanded):
-            tab_sources, tab_evidence, tab_search = st.tabs(["Sources", "Evidence", "Search"])
+            tab_sources, tab_evidence, tab_search, tab_think = st.tabs(["Sources", "Evidence", "Search", "Think"])
 
             # -------------------------
             # Sources（維持你原本風格）
@@ -955,6 +956,24 @@ def render_evidence_panel_expander_in(
                         q = rec.get("query") or ""
                         if q:
                             st.markdown(f"- `{q}`")
+
+            # -------------------------
+            # Think（think_tool 反思 log）
+            # -------------------------
+            with tab_think:
+                think_log = st.session_state.get("ds_think_log") or []
+                run_think = [x for x in think_log if x.get("run_id") == run_id]
+                if not run_think:
+                    st.markdown(":small[:gray[（本回合 think_tool 未被呼叫）]]")
+                else:
+                    st.markdown(f"**本回合共反思 {len(run_think)} 次**")
+                    for idx, rec in enumerate(run_think, start=1):
+                        reflection = (rec.get("reflection") or "").strip()
+                        with st.expander(
+                            f"💭 第 {idx} 次反思・{reflection[:50]}{'…' if len(reflection) > 50 else ''}",
+                            expanded=False,
+                        ):
+                            st.markdown(reflection or ":small[:gray[（空）]]")
 
 
 def render_retrieval_hits_expander_in(*, container, run_id: str, expanded: bool = False):
@@ -1799,6 +1818,10 @@ def run_general_with_webpage_tool(
                     f"💭 安妮亞在思考下一步⋯（{thought[:40]}{'...' if len(thought) > 40 else ''}）",
                     write=f"💭 {thought[:80]}{'...' if len(thought) > 80 else ''}",
                 )
+                st.session_state.ds_think_log.append({
+                    "run_id": st.session_state.get("ds_active_run_id"),
+                    "reflection": thought,
+                })
                 output = {"ok": True}
 
             else:
@@ -2906,6 +2929,8 @@ with st.popover("📚 引用資料夾"):
         st.session_state.ds_processed_keys = set()
         st.session_state.ds_last_index_stats = None
         st.session_state.ds_doc_search_log = []
+        st.session_state.ds_web_search_log = []
+        st.session_state.ds_think_log = []
         st.session_state.ds_active_run_id = None
         st.rerun()
 
@@ -3217,6 +3242,7 @@ if prompt is not None:
                         st.session_state["ds_active_run_id"] = str(_uuid.uuid4())
                         st.session_state.ds_doc_search_log = []
                         st.session_state.ds_web_search_log = []
+                        st.session_state.ds_think_log = []
 
                         # ✅ 改成：用 status_area（或直接 st.container）建立 placeholders
                         evidence_panel_ph = status_area.empty()
