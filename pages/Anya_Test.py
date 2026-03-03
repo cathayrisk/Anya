@@ -1814,14 +1814,19 @@ def run_general_with_webpage_tool(
 
             elif name == "think":
                 thought = args.get("reflection", "")
+                think_count = len([
+                    x for x in (st.session_state.get("ds_think_log") or [])
+                    if x.get("run_id") == st.session_state.get("ds_active_run_id")
+                ]) + 1
                 _status(
-                    f"💭 安妮亞在思考下一步⋯（{thought[:40]}{'...' if len(thought) > 40 else ''}）",
-                    write=f"💭 {thought[:80]}{'...' if len(thought) > 80 else ''}",
+                    f"💭 安妮亞在想一想⋯（第 {think_count} 次反思）",
+                    write=f"💭 第 {think_count} 次反思：{thought[:80]}{'...' if len(thought) > 80 else ''}",
                 )
                 st.session_state.ds_think_log.append({
                     "run_id": st.session_state.get("ds_active_run_id"),
                     "reflection": thought,
                 })
+                _step_done(f"💭 think #{think_count} → {thought[:60]}{'…' if len(thought) > 60 else ''}")
                 output = {"ok": True}
 
             else:
@@ -3301,7 +3306,27 @@ if prompt is not None:
                                 if HAS_KB else ""
                             )
                         )
-                        effective_instructions = ANYA_SYSTEM_PROMPT + DOCSTORE_RULES
+                        THINK_TOOL_RULES = (
+                            "\n\n"
+                            "【think 工具使用規則（必須遵守）】\n"
+                            "每次呼叫以下任何工具之後，你必須緊接著呼叫 `think` 工具進行反思，再決定下一步：\n"
+                            "- doc_search、doc_get_fulltext、doc_list\n"
+                            "- knowledge_search\n"
+                            "- fetch_webpage\n"
+                            "- web_search\n"
+                            "\n"
+                            "反思時請涵蓋四個面向：\n"
+                            "1. 發現摘要：這次工具呼叫取得了哪些具體可用資訊？\n"
+                            "2. 資訊缺口：還缺少哪些內容才能完整回答？\n"
+                            "3. 品質評估：結果是否可信且與問題直接相關？\n"
+                            "4. 策略決定：下一步要做什麼（繼續搜尋 / 換工具 / 直接作答）？\n"
+                            "\n"
+                            "停止搜尋的條件（滿足任一即停止，直接作答）：\n"
+                            "- 已可完整、有根據地回答使用者問題\n"
+                            "- doc_search / knowledge_search 累計 3 次仍無相關內容\n"
+                            "- 連續兩次搜尋結果高度重疊\n"
+                        )
+                        effective_instructions = ANYA_SYSTEM_PROMPT + DOCSTORE_RULES + THINK_TOOL_RULES
                         
                         # ✅ 網路搜尋中：展開 status 並在其內顯示 gif（完成後清除）
                         if effective_need_web:
