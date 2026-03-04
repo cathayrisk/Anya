@@ -1690,7 +1690,11 @@ def run_general_with_webpage_tool(
             item for item in (getattr(resp, "output", None) or [])
             if getattr(item, "type", None) == "function_call"
         ]
-        if not function_calls or _round >= _MAX_ROUNDS:
+        web_search_calls = [
+            item for item in (getattr(resp, "output", None) or [])
+            if getattr(item, "type", None) == "web_search_call"
+        ]
+        if (not function_calls and not web_search_calls) or _round >= _MAX_ROUNDS:
             return resp, meta
 
         for call in function_calls:
@@ -1840,7 +1844,17 @@ def run_general_with_webpage_tool(
                 }
             )
 
-        tool_choice = "auto"
+        # 本輪是否有搜尋行為（web_search 或 doc/knowledge/fetch 類）
+        _search_tool_names = {"doc_search", "knowledge_search", "fetch_webpage", "doc_list", "doc_get_fulltext"}
+        _any_search = bool(web_search_calls) or any(
+            getattr(c, "name", "") in _search_tool_names for c in function_calls
+        )
+        _think_called = any(getattr(c, "name", "") == "think" for c in function_calls)
+
+        if _any_search and not _think_called:
+            tool_choice = {"type": "function", "name": "think"}
+        else:
+            tool_choice = "auto"
 
 # === 1.5 Planner / Router / Search（Agents） ===
 class WebSearchItem(BaseModel):
