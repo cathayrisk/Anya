@@ -2902,7 +2902,7 @@ for msg in st.session_state.get("chat_history", []):
 
 # === 8. 使用者輸入（支援圖片 + 檔案） ===
 prompt = st.chat_input(
-    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
+    "wakuwaku！可以上傳圖片F，輸入你的問題吧～",
     accept_file="multiple",
     file_type=["jpg","jpeg","png","webp","gif"],
 )
