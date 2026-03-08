@@ -966,13 +966,37 @@ def render_evidence_panel_expander_in(
                 if not run_think:
                     st.markdown(":small[:gray[（本回合 think_tool 未被呼叫）]]")
                 else:
-                    st.markdown(f"**本回合共反思 {len(run_think)} 次**")
+                    final_conf   = run_think[-1].get("confidence", 0)
+                    final_action = run_think[-1].get("next_action", "")
+                    final_badge  = (
+                        f":green-badge[{final_conf}%]" if final_conf >= 80
+                        else f":orange-badge[{final_conf}%]" if final_conf >= 50
+                        else f":red-badge[{final_conf}%]"
+                    )
+                    st.markdown(
+                        f"**本回合共反思 {len(run_think)} 次**　｜　"
+                        f"最終完整度 {final_badge}　｜　最終決定：**{final_action}**"
+                    )
                     for idx, rec in enumerate(run_think, start=1):
-                        reflection = (rec.get("reflection") or "").strip()
-                        with st.expander(
-                            f"💭 第 {idx} 次反思・{reflection[:50]}{'…' if len(reflection) > 50 else ''}",
-                            expanded=False,
-                        ):
+                        reflection  = (rec.get("reflection")  or "").strip()
+                        key_finding = (rec.get("key_finding") or "").strip()
+                        next_action = (rec.get("next_action") or "").strip()
+                        conf        = rec.get("confidence", 0)
+                        conf_label  = (
+                            f":green-badge[{conf}%]" if conf >= 80
+                            else f":orange-badge[{conf}%]" if conf >= 50
+                            else f":red-badge[{conf}%]"
+                        )
+                        action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
+                        header = (
+                            f"💭 第 {idx} 次　{conf_label}　"
+                            f"{action_emoji} {next_action}　·　"
+                            f"{key_finding[:45]}{'…' if len(key_finding) > 45 else ''}"
+                        )
+                        with st.expander(header, expanded=False):
+                            if key_finding:
+                                st.markdown(f"**💡 關鍵發現**：{key_finding}")
+                                st.markdown("---")
                             st.markdown(reflection or ":small[:gray[（空）]]")
 
 
@@ -1553,16 +1577,26 @@ THINK_TOOL = {
         "【何時必須使用】\n"
         "- 每次 doc_search / knowledge_search / fetch_webpage / web_search 之後：分析剛取得的資訊\n"
         "- 決定是否繼續搜尋之前：評估現有資訊是否已足夠回答問題\n"
-        "- 準備作答之前：確認沒有遺漏關鍵資訊缺口\n"
         "\n"
-        "【反思應涵蓋的四個面向】\n"
+        "【reflection 欄位：完整反思，請涵蓋五個面向】\n"
         "1. 發現摘要 — 這次工具呼叫取得了哪些具體、可用的資訊？\n"
-        "2. 資訊缺口 — 還缺少哪些內容才能完整、有根據地回答？\n"
-        "3. 品質評估 — 來源是否可信？結果是否與問題直接相關？搜尋結果不一定正確，要主動核實。\n"
-        "4. 策略決定 — 下一步應該：(a) 再搜一次（用哪個工具、搜什麼關鍵字）？(b) 換工具？(c) 直接作答？\n"
+        "2. 假設對比 — 搜尋前我預期找到什麼？實際結果是否符合預期？有無出乎意料的發現？\n"
+        "3. 矛盾偵測 — 不同來源之間是否有衝突或不一致？可能原因是什麼（時效/定義/地區差異）？\n"
+        "4. 資訊缺口 — 還缺少哪些內容才能完整、有根據地回答？\n"
+        "5. 策略決定 — 下一步應該如何行動？\n"
+        "\n"
+        "【key_finding 欄位】\n"
+        "用 1–2 句話點出本輪最重要的發現或結論（供即時進度顯示用，要具體有用）。\n"
+        "\n"
+        "【next_action 欄位】\n"
+        "從三個選項中選一個：'繼續搜尋'、'換工具'、'直接作答'。\n"
+        "\n"
+        "【confidence 欄位】\n"
+        "目前能完整回答使用者問題的程度（0–100）：\n"
+        "- 0：完全無法回答　50：有部分資訊但關鍵缺口存在　80+：可作答　100：完整有根據\n"
         "\n"
         "【停止原則（避免過度搜尋）】\n"
-        "- 已可完整回答問題 → 立即停止，直接作答\n"
+        "- confidence ≥ 80 或 next_action = '直接作答' → 立即作答\n"
         "- doc_search / knowledge_search 累計 3 次仍無相關內容 → 停止，告知使用者\n"
         "- 連續兩次搜尋結果高度重疊 → 停止，避免無效迴圈\n"
     ),
@@ -1572,13 +1606,23 @@ THINK_TOOL = {
         "properties": {
             "reflection": {
                 "type": "string",
-                "description": (
-                    "你對研究進度、發現、資訊缺口與下一步策略的詳細反思。"
-                    "請依照四個面向逐一說明。"
-                ),
-            }
+                "description": "完整五面向反思（發現摘要、假設對比、矛盾偵測、資訊缺口、策略決定）。",
+            },
+            "key_finding": {
+                "type": "string",
+                "description": "本輪最重要的一個發現，用 1–2 句具體說明。",
+            },
+            "next_action": {
+                "type": "string",
+                "enum": ["繼續搜尋", "換工具", "直接作答"],
+                "description": "策略決定：下一步要做什麼。",
+            },
+            "confidence": {
+                "type": "integer",
+                "description": "目前能完整回答使用者問題的程度（0–100）。",
+            },
         },
-        "required": ["reflection"],
+        "required": ["reflection", "key_finding", "next_action", "confidence"],
         "additionalProperties": False,
     },
 }
@@ -1817,20 +1861,40 @@ def run_general_with_webpage_tool(
                     pass
 
             elif name == "think":
-                thought = args.get("reflection", "")
-                think_count = len([
+                thought      = args.get("reflection", "")
+                key_finding  = (args.get("key_finding") or "").strip()
+                next_action  = (args.get("next_action") or "繼續搜尋").strip()
+                confidence   = int(args.get("confidence", 0))
+                think_count  = len([
                     x for x in (st.session_state.get("ds_think_log") or [])
                     if x.get("run_id") == st.session_state.get("ds_active_run_id")
                 ]) + 1
+
+                # 完整度顏色標記
+                if confidence >= 80:
+                    conf_badge = f":green[{confidence}%]"
+                elif confidence >= 50:
+                    conf_badge = f":orange[{confidence}%]"
+                else:
+                    conf_badge = f":red[{confidence}%]"
+
+                # 策略決定 emoji
+                action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
+
                 _status(
-                    f"💭 安妮亞在想一想⋯（第 {think_count} 次反思）",
-                    write=f"💭 第 {think_count} 次反思：{thought[:80]}{'...' if len(thought) > 80 else ''}",
+                    f"💭 安妮亞在想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
+                    write=f"💭 **第 {think_count} 次反思**",
                 )
+                _step_done(f"💡 **發現**：{key_finding[:80]}{'…' if len(key_finding) > 80 else ''}")
+                _step_done(f"{action_emoji} **決定**：{next_action}　｜　完整度 {conf_badge}")
+
                 st.session_state.ds_think_log.append({
-                    "run_id": st.session_state.get("ds_active_run_id"),
-                    "reflection": thought,
+                    "run_id":      st.session_state.get("ds_active_run_id"),
+                    "reflection":  thought,
+                    "key_finding": key_finding,
+                    "next_action": next_action,
+                    "confidence":  confidence,
                 })
-                _step_done(f"💭 think #{think_count} → {thought[:60]}{'…' if len(thought) > 60 else ''}")
                 output = {"ok": True}
 
             else:
@@ -3329,14 +3393,17 @@ if prompt is not None:
                             "- fetch_webpage\n"
                             "- web_search\n"
                             "\n"
-                            "反思時請涵蓋四個面向：\n"
+                            "reflection 欄位請涵蓋五個面向：\n"
                             "1. 發現摘要：這次工具呼叫取得了哪些具體可用資訊？\n"
-                            "2. 資訊缺口：還缺少哪些內容才能完整回答？\n"
-                            "3. 品質評估：結果是否可信且與問題直接相關？\n"
-                            "4. 策略決定：下一步要做什麼（繼續搜尋 / 換工具 / 直接作答）？\n"
+                            "2. 假設對比：搜尋前你預期找到什麼？實際結果是否符合預期？有無出乎意料的發現？\n"
+                            "3. 矛盾偵測：不同來源之間是否有衝突？可能原因是什麼？\n"
+                            "4. 資訊缺口：還缺少哪些內容才能完整回答？\n"
+                            "5. 策略決定：下一步要做什麼（繼續搜尋 / 換工具 / 直接作答）？\n"
+                            "\n"
+                            "confidence 欄位請填寫 0–100 的整數，評估目前能完整回答問題的程度。\n"
                             "\n"
                             "停止搜尋的條件（滿足任一即停止，直接作答）：\n"
-                            "- 已可完整、有根據地回答使用者問題\n"
+                            "- confidence ≥ 80\n"
                             "- doc_search / knowledge_search 累計 3 次仍無相關內容\n"
                             "- 連續兩次搜尋結果高度重疊\n"
                         )
