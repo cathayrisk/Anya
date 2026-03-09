@@ -1673,6 +1673,19 @@ def run_general_with_webpage_tool(
 
     running_input = list(trimmed_messages)
 
+    def _resp_has_text(r) -> bool:
+        """判斷 resp 是否包含非空文字答案（web_search round 可能同輪輸出 message）。"""
+        if getattr(r, "output_text", None):
+            return True
+        for item in getattr(r, "output", []) or []:
+            if getattr(item, "type", "") == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") == "output_text" and getattr(c, "text", ""):
+                        return True
+        return False
+
+    last_text_resp = None  # 追蹤最近一個含文字答案的 resp（web_search round 可能先有答案）
+
     meta = {"doc_calls": 0, "web_calls": 0, "db_used": False, "web_used": False, "tool_step": 0}
 
     _MAX_ROUNDS = 12
@@ -1689,8 +1702,12 @@ def run_general_with_webpage_tool(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=False,
+            text={"verbosity": "high"},
             include=["web_search_call.action.sources"] if need_web else [],
         )
+
+        if _resp_has_text(resp):
+            last_text_resp = resp  # 保留最新有文字的 resp，供 web_search round 後作 fallback
 
         # 統計 web_search + 記錄查詢與 snippet（供 Evidence/Search tab 顯示）
         try:
@@ -1739,6 +1756,10 @@ def run_general_with_webpage_tool(
             if getattr(item, "type", None) == "web_search_call"
         ]
         if (not function_calls and not web_search_calls) or _round >= _MAX_ROUNDS:
+            # web_search round 中模型可能同輪就輸出答案；強制 think 後下一輪可能無文字。
+            # 此時改回傳最近有文字的 resp，避免「找不到答案」fallback。
+            if not _resp_has_text(resp) and last_text_resp is not None:
+                return last_text_resp, meta
             return resp, meta
 
         for call in function_calls:
@@ -1966,7 +1987,7 @@ planner_agent_PROMPT = with_handoff_prefix(
 planner_agent = Agent(
     name="PlannerAgent",
     instructions=planner_agent_PROMPT,
-    model="gpt-5.2",
+    model="gpt-5.4",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
 )
@@ -1981,7 +2002,7 @@ search_INSTRUCTIONS = with_handoff_prefix(
 
 search_agent = Agent(
     name="SearchAgent",
-    model="gpt-5.2",
+    model="gpt-5.4",
     instructions=search_INSTRUCTIONS,
     tools=[WebSearchTool()],
     #model_settings=ModelSettings(tool_choice="required"),
@@ -2213,7 +2234,7 @@ FastAgent 的簡潔度與長度規則
 
 fast_agent = Agent(
     name="FastAgent",
-    model="gpt-5.2",
+    model="gpt-5.4",
     instructions=FAST_AGENT_PROMPT,
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
@@ -2237,7 +2258,7 @@ ROUTER_PROMPT = with_handoff_prefix("""
 router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
-    model="gpt-5.2",
+    model="gpt-5.4",
     tools=[],
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
@@ -2533,6 +2554,13 @@ async def aparallel_search_stream(
 ANYA_SYSTEM_PROMPT = r"""
 Developer: 你是安妮亞（Anya Forger，《SPY×FAMILY》）風格的「可靠小幫手」。
 
+## Output Contract（輸出規範，每次回答必須遵守）
+- **結構**：結論 → 依據 → 行動建議（省略不需要的層次）
+- **引用格式**：已上傳文件用 [文件標題 pN]；網路搜尋結果用 〔N〕（inline）
+- **長度**：簡單問 1–3 句；研究型 500–1500 字；文件摘要依文件長度決定
+- **禁止**：不輸出空行佔位符「來源：」；不重複前一輪已說的事；不在沒有資訊時猜測
+
+---
 ## 你的主要工作
 - 整理文件與資料，協助使用者更清晰理解內容。
 - 網路研究與查證。
@@ -2836,7 +2864,7 @@ def build_trimmed_input_messages(pending_user_content_blocks):
             if i == last_user_idx and msg.get("images"):
                 for _fn, _thumb, orig in msg["images"]:
                     data_url = bytes_to_data_url(orig)
-                    blocks.append({"type": "input_image", "image_url": data_url})
+                    blocks.append({"type": "input_image", "image_url": data_url, "detail": "high"})
             if blocks:
                 messages.append({"role": "user", "content": blocks})
         elif role == "assistant":
@@ -3144,7 +3172,7 @@ if prompt is not None:
             thumb = make_thumb(data)
             images_for_history.append((name, thumb, data))
             data_url = bytes_to_data_url(data)
-            content_blocks.append({"type": "input_image", "image_url": data_url})
+            content_blocks.append({"type": "input_image", "image_url": data_url, "detail": "high"})
             continue
 
         is_pdf = name.lower().endswith(".pdf")
@@ -3350,8 +3378,8 @@ if prompt is not None:
                             with status_area:
                                 st.info("💡 本回合沒有文件庫，安妮亞會透過網路搜尋來回答。", icon="🌐")
                     
-                        # ✅ Full-doc 動態 token budget（M：輸出預留 3000）
-                        MAX_CONTEXT_TOKENS = 128_000
+                        # ✅ Full-doc 動態 token budget（gpt-5.4 支援 1M，保守設 256K 避免超量計費）
+                        MAX_CONTEXT_TOKENS = 256_000
                         OUTPUT_BUDGET = 3_000
                         SAFETY_MARGIN = 4_000
                     
@@ -3362,8 +3390,8 @@ if prompt is not None:
                         doc_fulltext_budget = MAX_CONTEXT_TOKENS - OUTPUT_BUDGET - SAFETY_MARGIN - base_tokens
                         doc_fulltext_budget = max(0, int(doc_fulltext_budget))
                     
-                        # ✅ 額外硬 cap（避免過大導致回覆品質下降/延遲）
-                        doc_fulltext_budget_hint = max(0, min(doc_fulltext_budget, 60_000))
+                        # ✅ 額外硬 cap（gpt-5.4 放寬至 120K，避免過大導致延遲）
+                        doc_fulltext_budget_hint = max(0, min(doc_fulltext_budget, 120_000))
                     
                         # ✅ 在 instructions 補規則：full-doc 只有「明確全篇任務」才允許
                         DOCSTORE_RULES = (
@@ -3421,7 +3449,7 @@ if prompt is not None:
                             client=client,
                             trimmed_messages=trimmed_messages_with_today,
                             instructions=effective_instructions,
-                            model="gpt-5.2",
+                            model="gpt-5.4",
                             reasoning_effort=reasoning_effort,
                             need_web=effective_need_web,
                             forced_url=url_in_text,
@@ -3793,7 +3821,7 @@ if prompt is not None:
                             client=client,
                             trimmed_messages=trimmed_messages,
                             instructions=ANYA_SYSTEM_PROMPT,
-                            model="gpt-5.2",
+                            model="gpt-5.4",
                             reasoning_effort="medium",
                             need_web=effective_need_web,
                             forced_url=url_in_text,
