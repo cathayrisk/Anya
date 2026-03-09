@@ -997,7 +997,46 @@ def render_evidence_panel_expander_in(
                             if key_finding:
                                 st.markdown(f"**💡 關鍵發現**：{key_finding}")
                                 st.markdown("---")
-                            st.markdown(reflection or ":small[:gray[（空）]]")
+                            formatted = _fmt_reflection(reflection)
+                            st.markdown(formatted or ":small[:gray[（空）]]")
+
+
+def _fmt_reflection(text: str) -> str:
+    """
+    將反思文字的 5 個面向（發現摘要、假設對比、矛盾偵測、資訊缺口、策略決定）
+    拆成分段 markdown：emoji 粗體標題 + 獨立段落。
+    若偵測不到結構化面向則原文回傳。
+    """
+    if not text:
+        return ""
+    DIMS = [
+        ("發現摘要", "📋"),
+        ("假設對比", "🔮"),
+        ("矛盾偵測", "⚡"),
+        ("資訊缺口", "🕳️"),
+        ("策略決定", "🎯"),
+    ]
+    dim_names = "|".join(d[0] for d in DIMS)
+    pattern = re.compile(
+        rf"(?:^|(?<=\s))(\d)[\.、]\s*({dim_names})[：:]\s*",
+        re.MULTILINE,
+    )
+    parts = pattern.split(text)
+    # split 後結構：[pre, num, name, content, num, name, content, ...]
+    if len(parts) <= 1:
+        return text  # 無符合格式，原文返回
+    emoji_map = {name: emoji for name, emoji in DIMS}
+    result = []
+    if parts[0].strip():
+        result.append(parts[0].strip())
+    i = 1
+    while i + 2 < len(parts):
+        name    = parts[i + 1]
+        content = (parts[i + 2] or "").strip()
+        emoji   = emoji_map.get(name, "▪️")
+        result.append(f"{emoji} **{name}**\n{content}")
+        i += 3
+    return "\n\n".join(result)
 
 
 def render_retrieval_hits_expander_in(*, container, run_id: str, expanded: bool = False):
