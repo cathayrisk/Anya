@@ -1012,8 +1012,6 @@ def render_evidence_panel_expander_in(
                                         f":{s_color}-background[{s_emoji} **{s_name}**]"
                                     )
                                     st.markdown(s_content or ":small[:gray[（空）]]")
-                                    if s_idx < len(sections) - 1:
-                                        st.markdown("---")
                             else:
                                 # 未能解析結構時原文顯示
                                 st.markdown(reflection or ":small[:gray[（空）]]")
