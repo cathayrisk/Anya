@@ -923,6 +923,8 @@ def render_evidence_panel_expander_in(
                     st.markdown("**🌐 網頁搜尋結果**")
                     for rec in web_log:
                         q = rec.get("query") or ""
+                        if not q.strip():   # 跳過空查詢（避免顯示 `` ）
+                            continue
                         srcs = rec.get("sources") or []
                         with st.expander(f"🔍 `{_short(q, 50)}`", expanded=False):
                             if not srcs:
@@ -994,49 +996,63 @@ def render_evidence_panel_expander_in(
                             f"{key_finding[:45]}{'…' if len(key_finding) > 45 else ''}"
                         )
                         with st.expander(header, expanded=False):
+                            # ── 關鍵發現 ──
                             if key_finding:
-                                st.markdown(f"**💡 關鍵發現**：{key_finding}")
+                                st.markdown(
+                                    f":material/lightbulb: **關鍵發現**　"
+                                    f"{key_finding}"
+                                )
                                 st.markdown("---")
-                            formatted = _fmt_reflection(reflection)
-                            st.markdown(formatted or ":small[:gray[（空）]]")
+                            # ── 五面向反思（結構化渲染）──
+                            sections = _parse_reflection_sections(reflection)
+                            if sections:
+                                for s_idx, (s_name, s_emoji, s_content) in enumerate(sections):
+                                    s_color = _REFLECTION_COLOR_MAP.get(s_name, "gray")
+                                    st.markdown(
+                                        f":{s_color}-background[{s_emoji} **{s_name}**]"
+                                    )
+                                    st.markdown(s_content or ":small[:gray[（空）]]")
+                                    if s_idx < len(sections) - 1:
+                                        st.markdown("---")
+                            else:
+                                # 未能解析結構時原文顯示
+                                st.markdown(reflection or ":small[:gray[（空）]]")
 
 
-def _fmt_reflection(text: str) -> str:
+_REFLECTION_DIMS = [
+    ("發現摘要", "📋", "blue"),
+    ("假設對比", "🔮", "violet"),
+    ("矛盾偵測", "⚡", "orange"),
+    ("資訊缺口", "🕳️", "red"),
+    ("策略決定", "🎯", "green"),
+]
+_REFLECTION_EMOJI_MAP = {name: emoji for name, emoji, _ in _REFLECTION_DIMS}
+_REFLECTION_COLOR_MAP = {name: color for name, _, color in _REFLECTION_DIMS}
+_REFLECTION_PATTERN   = re.compile(
+    r'\d[\.、]\s*(' + "|".join(re.escape(d[0]) for d in _REFLECTION_DIMS) + r')[：:]\s*'
+)
+
+
+def _parse_reflection_sections(text: str) -> list[tuple[str, str, str]]:
     """
-    將反思文字的 5 個面向（發現摘要、假設對比、矛盾偵測、資訊缺口、策略決定）
-    拆成分段 markdown：emoji 粗體標題 + 獨立段落。
-    若偵測不到結構化面向則原文回傳。
+    將反思文字拆成 (name, emoji, content) tuple 清單。
+    依 '1. 發現摘要：' 等結構化標記分割；偵測不到時回傳空 list。
     """
     if not text:
-        return ""
-    DIMS = [
-        ("發現摘要", "📋"),
-        ("假設對比", "🔮"),
-        ("矛盾偵測", "⚡"),
-        ("資訊缺口", "🕳️"),
-        ("策略決定", "🎯"),
-    ]
-    dim_names = "|".join(d[0] for d in DIMS)
-    pattern = re.compile(
-        rf"(?:^|(?<=\s))(\d)[\.、]\s*({dim_names})[：:]\s*",
-        re.MULTILINE,
-    )
-    parts = pattern.split(text)
-    # split 後結構：[pre, num, name, content, num, name, content, ...]
+        return []
+    parts = _REFLECTION_PATTERN.split(text)
+    # 1 個 capturing group → [pre, name1, content1, name2, content2, ...]
     if len(parts) <= 1:
-        return text  # 無符合格式，原文返回
-    emoji_map = {name: emoji for name, emoji in DIMS}
+        return []
     result = []
-    if parts[0].strip():
-        result.append(parts[0].strip())
     i = 1
-    while i + 2 < len(parts):
-        name    = parts[i + 1]
-        content = (parts[i + 2] or "").strip()
-        emoji   = emoji_map.get(name, "▪️")
-        result.append(f"{emoji} **{name}**\n{content}")
-        i += 3
-    return "\n\n".join(result)
+    while i + 1 <= len(parts) - 1:
+        name    = parts[i]
+        content = (parts[i + 1] or "").strip()
+        emoji   = _REFLECTION_EMOJI_MAP.get(name, "▪️")
+        result.append((name, emoji, content))
+        i += 2
+    return result
 
 
 def render_retrieval_hits_expander_in(*, container, run_id: str, expanded: bool = False):
