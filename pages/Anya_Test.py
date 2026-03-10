@@ -1015,6 +1015,11 @@ def render_evidence_panel_expander_in(
                             else:
                                 # 未能解析結構時原文顯示
                                 st.markdown(reflection or ":small[:gray[（空）]]")
+                            # ── 策略警告（若系統在此輪觸發低信心 feedback）──
+                            hint = (rec.get("strategy_hint") or "").strip()
+                            if hint:
+                                st.markdown("---")
+                                st.warning(hint, icon="⚠️")
 
 
 # 用於剝除 chat_history 裡 <!-- tools:... --> 標記（只影響顯示，儲存內容不變）
@@ -1646,10 +1651,13 @@ THINK_TOOL = {
         "\n"
         "【next_action 欄位】\n"
         "從三個選項中選一個：'繼續搜尋'、'換工具'、'直接作答'。\n"
+        "⚠️ 若 confidence < 55 且已搜尋 2 次以上：必須選 '換工具'，或在 reflection 第 5 項明確寫出改變策略的理由（換詞、換語言、換角度）。\n"
         "\n"
         "【confidence 欄位】\n"
         "目前能完整回答使用者問題的程度（0–100）：\n"
         "- 0：完全無法回答　50：有部分資訊但關鍵缺口存在　80+：可作答　100：完整有根據\n"
+        "⚠️ 若連續 2 次 confidence 仍 ≤ 55，代表搜尋策略本身有問題，必須在第 5 項『策略決定』診斷：\n"
+        "  是關鍵字錯誤？語言問題（改英文）？角度問題（換同義詞/換概念框架）？工具問題（改用 fetch_webpage）？\n"
         "\n"
         "【停止原則（避免過度搜尋）】\n"
         "- confidence ≥ 80 或 next_action = '直接作答' → 立即作答\n"
@@ -1819,6 +1827,23 @@ def run_general_with_webpage_tool(
             # 此時改回傳最近有文字的 resp，避免「找不到答案」fallback。
             if not _resp_has_text(resp) and last_text_resp is not None:
                 return last_text_resp, meta
+            # ↓ 搜尋上限觸發但完全無文字（模型一直在搜尋未曾生成答案）→ 補一輪強制出答案
+            if not _resp_has_text(resp) and last_text_resp is None:
+                _status("📝 安妮亞整理答案中…")
+                _synthesis_resp = client.responses.create(
+                    model=model,
+                    input=running_input,
+                    reasoning={"effort": reasoning_effort},
+                    instructions=(
+                        instructions
+                        + "\n\n【強制作答】搜尋已達上限，請直接用已取得的所有資料"
+                        "給出最完整的答案，禁止呼叫任何工具。"
+                    ),
+                    tools=[],
+                    parallel_tool_calls=False,
+                    text={"verbosity": "high"},
+                )
+                return _synthesis_resp, meta
             return resp, meta
 
         for call in function_calls:
@@ -1968,14 +1993,63 @@ def run_general_with_webpage_tool(
                 _step_done(f"💡 **發現**：{key_finding[:80]}{'…' if len(key_finding) > 80 else ''}")
                 _step_done(f"{action_emoji} **決定**：{next_action}　｜　完整度 {conf_badge}")
 
+                # ── 低信心策略診斷：檢查最近幾次 think 的 confidence，必要時注入 feedback ──
+                run_id_now  = st.session_state.get("ds_active_run_id")
+                run_thinks  = [
+                    x for x in (st.session_state.get("ds_think_log") or [])
+                    if x.get("run_id") == run_id_now
+                ]
+                recent_confs = [x.get("confidence", 0) for x in run_thinks[-2:]]
+
+                strategy_hint = None
+
+                if confidence < 30:
+                    # 單次 confidence 極低 → 方向可能完全錯誤
+                    strategy_hint = (
+                        "⚠️ 策略警告（系統注入）：本次 confidence < 30，搜尋方向可能完全錯誤。"
+                        "請立刻重新審視問題本身：\n"
+                        "1. 嘗試用英文關鍵字重新搜尋\n"
+                        "2. 拆解問題為更小的子問題\n"
+                        "3. 換用 fetch_webpage 工具直接讀相關官方頁面\n"
+                        "禁止用相似關鍵字再次搜尋。"
+                    )
+                elif len(recent_confs) >= 2 and all(c <= 55 for c in recent_confs):
+                    # 連續兩次都 ≤ 55 → 策略卡住
+                    if len(run_thinks) >= 3 and all(
+                        x.get("confidence", 0) <= 55 for x in run_thinks[-3:]
+                    ):
+                        # 三次都 ≤ 55 → 強化警告
+                        strategy_hint = (
+                            "🚨 強化策略警告（系統注入）：連續 3 次 confidence ≤ 55，搜尋策略已完全卡住。"
+                            "必須立即執行以下其中一個行動：\n"
+                            "1. 換用英文關鍵字搜尋\n"
+                            "2. 換一個完全不同的概念框架或同義詞\n"
+                            "3. 用 fetch_webpage 直接讀已知相關網址\n"
+                            "4. 若以上都無法做到，直接用現有資料作答（next_action='直接作答'）\n"
+                            "禁止：繼續用中文相似關鍵字搜尋。"
+                        )
+                    else:
+                        # 兩次都 ≤ 55 → 標準警告
+                        strategy_hint = (
+                            "⚠️ 策略警告（系統注入）：連續 2 次 confidence ≤ 55，關鍵字策略無效。"
+                            "下一步必須診斷並改變策略：\n"
+                            "- 關鍵字是否太專門或太模糊？\n"
+                            "- 是否應改用英文搜尋？\n"
+                            "- 是否應換一個角度或同義詞？\n"
+                            "請在下次 think 的 reflection 第 5 項明確說明你改變了什麼。"
+                        )
+
                 st.session_state.ds_think_log.append({
-                    "run_id":      st.session_state.get("ds_active_run_id"),
-                    "reflection":  thought,
-                    "key_finding": key_finding,
-                    "next_action": next_action,
-                    "confidence":  confidence,
+                    "run_id":        run_id_now,
+                    "reflection":    thought,
+                    "key_finding":   key_finding,
+                    "next_action":   next_action,
+                    "confidence":    confidence,
+                    "strategy_hint": strategy_hint,
                 })
                 output = {"ok": True}
+                if strategy_hint:
+                    output["strategy_hint"] = strategy_hint  # 注入 feedback 給模型，下輪作為 function_call_output 讀取
 
             else:
                 output = {"error": f"Unknown function: {name}"}
@@ -3511,6 +3585,16 @@ if prompt is not None:
                             "5. 策略決定：下一步要做什麼（繼續搜尋 / 換工具 / 直接作答）？\n"
                             "\n"
                             "confidence 欄位請填寫 0–100 的整數，評估目前能完整回答問題的程度。\n"
+                            "\n"
+                            "【低信心搜尋診斷（連續搜尋無進展時必須執行）】\n"
+                            "若連續 2 次 think 的 confidence 皆 ≤ 55，代表搜尋策略本身有問題，不是搜尋次數不足。\n"
+                            "此時必須在 reflection 第 5 項寫出明確診斷，回答以下問題：\n"
+                            "- 【關鍵字診斷】我用的詞是否太專門、太模糊、或在這個領域不常用？\n"
+                            "- 【語言診斷】這個主題的主要資料是否用其他語言寫的（英文）？\n"
+                            "- 【角度診斷】我的搜尋角度是否錯誤？是否應該換一個概念框架或同義詞？\n"
+                            "- 【工具診斷】是否應改用 fetch_webpage 直接讀特定已知網址？\n"
+                            "診斷後，下一次搜尋必須使用與之前完全不同的關鍵字或工具。\n"
+                            "禁止：在 confidence ≤ 55 的情況下，使用與前一次高度相似的關鍵字繼續搜尋。\n"
                             "\n"
                             "停止搜尋的條件（滿足任一即停止，直接作答）：\n"
                             "- confidence ≥ 80\n"
