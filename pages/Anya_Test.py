@@ -868,7 +868,8 @@ def render_evidence_panel_expander_in(
                 if urls_dedup:
                     st.markdown("\n**URL 來源**")
                     for it in urls_dedup[:10]:
-                        st.markdown(f"- [{it['title']}]({it['url']})")
+                        _lbl = " ".join((it.get("title") or it.get("url") or "（來源）").split())
+                        st.markdown(f"- [{_lbl}]({it['url']})")
 
                 if docs_for_history:
                     st.markdown("\n**本回合上傳檔案**")
@@ -1166,7 +1167,8 @@ def render_evidence_panel_expander(
             if urls_dedup:
                 st.markdown("\n**URL 來源**")
                 for it in urls_dedup[:12]:
-                    st.markdown(f"- [{it['title']}]({it['url']})")
+                    _lbl = " ".join((it.get("title") or it.get("url") or "（來源）").split())
+                    st.markdown(f"- [{_lbl}]({it['url']})")
 
             if docs_for_history:
                 st.markdown("\n**本回合上傳檔案**")
@@ -1247,7 +1249,8 @@ def render_sources_container_full(
         if urls_dedup:
             st.markdown("**來源（URL）**")
             for it in urls_dedup:
-                st.markdown(f"- [{it['title']}]({it['url']})")
+                _lbl = " ".join((it.get("title") or it.get("url") or "（來源）").split())
+                st.markdown(f"- [{_lbl}]({it['url']})")
 
         # ---- 2) 文件來源（可關閉，避免重複）----
         if show_doc_sources:
@@ -1791,15 +1794,15 @@ def run_general_with_webpage_tool(
                             for s in raw_sources:
                                 if isinstance(s, dict):
                                     ws_sources.append({
-                                        "url":     s.get("url", ""),
-                                        "title":   s.get("title", ""),
-                                        "snippet": s.get("snippet", ""),
+                                        "url":     (s.get("url", "") or "").strip(),
+                                        "title":   " ".join((s.get("title", "") or "").split()),
+                                        "snippet": (s.get("snippet", "") or "").strip(),
                                     })
                                 else:
                                     ws_sources.append({
-                                        "url":     getattr(s, "url", "") or "",
-                                        "title":   getattr(s, "title", "") or "",
-                                        "snippet": getattr(s, "snippet", "") or "",
+                                        "url":     (getattr(s, "url", "") or "").strip(),
+                                        "title":   " ".join((getattr(s, "title", "") or "").split()),
+                                        "snippet": (getattr(s, "snippet", "") or "").strip(),
                                     })
                             st.session_state.ds_web_search_log.append({
                                 "run_id":  st.session_state.get("ds_active_run_id"),
