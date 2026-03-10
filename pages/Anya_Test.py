@@ -2292,7 +2292,7 @@ FastAgent 的簡潔度與長度規則
 
 fast_agent = Agent(
     name="FastAgent",
-    model="gpt-5.4",
+    model="gpt-5.2",
     instructions=FAST_AGENT_PROMPT,
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
