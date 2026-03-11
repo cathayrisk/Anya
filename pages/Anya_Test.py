@@ -1756,7 +1756,7 @@ def run_general_with_webpage_tool(
     meta = {"doc_calls": 0, "web_calls": 0, "db_used": False, "web_used": False, "tool_step": 0}
 
     _MAX_ROUNDS    = 12
-    _MAX_WEB_CALLS = 15   # 防止 web search 爆量（無上限時曾出現 72 次 / 643s）
+    _MAX_WEB_CALLS = 25   # 防止 web search 爆量（無上限時曾出現 72 次 / 643s）
     _round = 0
 
     while True:
