@@ -23,6 +23,7 @@ python-docx
 pymupdf4llm
 rank_bm25
 cocoindex
+nltk
 
 # Web tools and research
 wikipedia
