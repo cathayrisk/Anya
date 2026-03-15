@@ -163,6 +163,7 @@ st.session_state.setdefault("ds_last_index_stats", None) # dict | None
 # 本回合 doc_search debug log（expander 用）
 st.session_state.setdefault("ds_doc_search_log", [])     # list[dict]
 st.session_state.setdefault("ds_web_search_log", [])     # list[dict] — web_search_call log
+st.session_state.setdefault("ds_think_log", [])          # list[dict] — think_tool log
 st.session_state.setdefault("ds_active_run_id", None)    # str | None
 
 # === 共用：假串流打字效果 ===
@@ -831,7 +832,7 @@ def render_evidence_panel_expander_in(
 
     with container:
         with st.expander("📚 證據 / 檢索 / 來源", expanded=expanded):
-            tab_sources, tab_evidence, tab_search = st.tabs(["Sources", "Evidence", "Search"])
+            tab_sources, tab_evidence, tab_search, tab_think = st.tabs(["Sources", "Evidence", "Search", "Think"])
 
             # -------------------------
             # Sources（維持你原本風格）
@@ -867,7 +868,8 @@ def render_evidence_panel_expander_in(
                 if urls_dedup:
                     st.markdown("\n**URL 來源**")
                     for it in urls_dedup[:10]:
-                        st.markdown(f"- [{it['title']}]({it['url']})")
+                        _lbl = " ".join((it.get("title") or it.get("url") or "（來源）").split())
+                        st.markdown(f"- [{_lbl}]({it['url']})")
 
                 if docs_for_history:
                     st.markdown("\n**本回合上傳檔案**")
@@ -922,6 +924,8 @@ def render_evidence_panel_expander_in(
                     st.markdown("**🌐 網頁搜尋結果**")
                     for rec in web_log:
                         q = rec.get("query") or ""
+                        if not q.strip():   # 跳過空查詢（避免顯示 `` ）
+                            continue
                         srcs = rec.get("sources") or []
                         with st.expander(f"🔍 `{_short(q, 50)}`", expanded=False):
                             if not srcs:
@@ -955,6 +959,107 @@ def render_evidence_panel_expander_in(
                         q = rec.get("query") or ""
                         if q:
                             st.markdown(f"- `{q}`")
+
+            # -------------------------
+            # Think（think_tool 反思 log）
+            # -------------------------
+            with tab_think:
+                think_log = st.session_state.get("ds_think_log") or []
+                run_think = [x for x in think_log if x.get("run_id") == run_id]
+                if not run_think:
+                    st.markdown(":small[:gray[（本回合 think_tool 未被呼叫）]]")
+                else:
+                    final_conf   = run_think[-1].get("confidence", 0)
+                    final_action = run_think[-1].get("next_action", "")
+                    final_badge  = (
+                        f":green-badge[{final_conf}%]" if final_conf >= 80
+                        else f":orange-badge[{final_conf}%]" if final_conf >= 50
+                        else f":red-badge[{final_conf}%]"
+                    )
+                    st.markdown(
+                        f"**本回合共反思 {len(run_think)} 次**　｜　"
+                        f"最終完整度 {final_badge}　｜　最終決定：**{final_action}**"
+                    )
+                    for idx, rec in enumerate(run_think, start=1):
+                        reflection  = (rec.get("reflection")  or "").strip()
+                        key_finding = (rec.get("key_finding") or "").strip()
+                        next_action = (rec.get("next_action") or "").strip()
+                        conf        = rec.get("confidence", 0)
+                        conf_label  = (
+                            f":green-badge[{conf}%]" if conf >= 80
+                            else f":orange-badge[{conf}%]" if conf >= 50
+                            else f":red-badge[{conf}%]"
+                        )
+                        action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
+                        header = (
+                            f"💭 第 {idx} 次　{conf_label}　"
+                            f"{action_emoji} {next_action}　·　"
+                            f"{key_finding[:45]}{'…' if len(key_finding) > 45 else ''}"
+                        )
+                        with st.expander(header, expanded=False):
+                            # ── 關鍵發現 ──
+                            if key_finding:
+                                st.markdown(
+                                    f":material/lightbulb: **關鍵發現**　"
+                                    f"{key_finding}"
+                                )
+                                st.markdown("---")
+                            # ── 五面向反思（結構化渲染）──
+                            sections = _parse_reflection_sections(reflection)
+                            if sections:
+                                for s_idx, (s_name, s_emoji, s_content) in enumerate(sections):
+                                    s_color = _REFLECTION_COLOR_MAP.get(s_name, "gray")
+                                    st.markdown(
+                                        f":{s_color}-background[{s_emoji} **{s_name}**]"
+                                    )
+                                    st.markdown(s_content or ":small[:gray[（空）]]")
+                            else:
+                                # 未能解析結構時原文顯示
+                                st.markdown(reflection or ":small[:gray[（空）]]")
+                            # ── 策略警告（若系統在此輪觸發低信心 feedback）──
+                            hint = (rec.get("strategy_hint") or "").strip()
+                            if hint:
+                                st.markdown("---")
+                                st.warning(hint, icon="⚠️")
+
+
+# 用於剝除 chat_history 裡 <!-- tools:... --> 標記（只影響顯示，儲存內容不變）
+_RE_HTML_COMMENT = re.compile(r'\n*<!--.*?-->', re.DOTALL)
+
+_REFLECTION_DIMS = [
+    ("發現摘要", "📋", "blue"),
+    ("假設對比", "🔮", "violet"),
+    ("矛盾偵測", "⚡", "orange"),
+    ("資訊缺口", "🕳️", "red"),
+    ("策略決定", "🎯", "green"),
+]
+_REFLECTION_EMOJI_MAP = {name: emoji for name, emoji, _ in _REFLECTION_DIMS}
+_REFLECTION_COLOR_MAP = {name: color for name, _, color in _REFLECTION_DIMS}
+_REFLECTION_PATTERN   = re.compile(
+    r'\d[\.、]\s*(' + "|".join(re.escape(d[0]) for d in _REFLECTION_DIMS) + r')[：:]\s*'
+)
+
+
+def _parse_reflection_sections(text: str) -> list[tuple[str, str, str]]:
+    """
+    將反思文字拆成 (name, emoji, content) tuple 清單。
+    依 '1. 發現摘要：' 等結構化標記分割；偵測不到時回傳空 list。
+    """
+    if not text:
+        return []
+    parts = _REFLECTION_PATTERN.split(text)
+    # 1 個 capturing group → [pre, name1, content1, name2, content2, ...]
+    if len(parts) <= 1:
+        return []
+    result = []
+    i = 1
+    while i + 1 <= len(parts) - 1:
+        name    = parts[i]
+        content = (parts[i + 1] or "").strip()
+        emoji   = _REFLECTION_EMOJI_MAP.get(name, "▪️")
+        result.append((name, emoji, content))
+        i += 2
+    return result
 
 
 def render_retrieval_hits_expander_in(*, container, run_id: str, expanded: bool = False):
@@ -1062,7 +1167,8 @@ def render_evidence_panel_expander(
             if urls_dedup:
                 st.markdown("\n**URL 來源**")
                 for it in urls_dedup[:12]:
-                    st.markdown(f"- [{it['title']}]({it['url']})")
+                    _lbl = " ".join((it.get("title") or it.get("url") or "（來源）").split())
+                    st.markdown(f"- [{_lbl}]({it['url']})")
 
             if docs_for_history:
                 st.markdown("\n**本回合上傳檔案**")
@@ -1143,7 +1249,8 @@ def render_sources_container_full(
         if urls_dedup:
             st.markdown("**來源（URL）**")
             for it in urls_dedup:
-                st.markdown(f"- [{it['title']}]({it['url']})")
+                _lbl = " ".join((it.get("title") or it.get("url") or "（來源）").split())
+                st.markdown(f"- [{_lbl}]({it['url']})")
 
         # ---- 2) 文件來源（可關閉，避免重複）----
         if show_doc_sources:
@@ -1524,6 +1631,69 @@ FETCH_WEBPAGE_TOOL = {
     },
 }
 
+THINK_TOOL = {
+    "type": "function",
+    "name": "think",
+    "description": (
+        "用於在工具呼叫之間進行策略性反思，幫助你有系統地分析進度、評估資訊品質並規劃下一步。\n"
+        "此工具不會取得新資訊，只將你的思考記錄在 log 中。\n"
+        "\n"
+        "【何時必須使用】\n"
+        "- 每次 doc_search / knowledge_search / fetch_webpage / web_search 之後：分析剛取得的資訊\n"
+        "- 決定是否繼續搜尋之前：評估現有資訊是否已足夠回答問題\n"
+        "\n"
+        "【reflection 欄位：完整反思，請涵蓋五個面向】\n"
+        "1. 發現摘要 — 這次工具呼叫取得了哪些具體、可用的資訊？\n"
+        "2. 假設對比 — 搜尋前我預期找到什麼？實際結果是否符合預期？有無出乎意料的發現？\n"
+        "3. 矛盾偵測 — 不同來源之間是否有衝突或不一致？可能原因是什麼（時效/定義/地區差異）？\n"
+        "4. 資訊缺口 — 還缺少哪些內容才能完整、有根據地回答？\n"
+        "5. 策略決定 — 下一步應該如何行動？\n"
+        "\n"
+        "【key_finding 欄位】\n"
+        "用 1–2 句話點出本輪最重要的發現或結論（供即時進度顯示用，要具體有用）。\n"
+        "\n"
+        "【next_action 欄位】\n"
+        "從三個選項中選一個：'繼續搜尋'、'換工具'、'直接作答'。\n"
+        "⚠️ 若 confidence < 55 且已搜尋 2 次以上：必須選 '換工具'，或在 reflection 第 5 項明確寫出改變策略的理由（換詞、換語言、換角度）。\n"
+        "\n"
+        "【confidence 欄位】\n"
+        "目前能完整回答使用者問題的程度（0–100）：\n"
+        "- 0：完全無法回答　50：有部分資訊但關鍵缺口存在　80+：可作答　100：完整有根據\n"
+        "⚠️ 若連續 2 次 confidence 仍 ≤ 55，代表搜尋策略本身有問題，必須在第 5 項『策略決定』診斷：\n"
+        "  是關鍵字錯誤？語言問題（改英文）？角度問題（換同義詞/換概念框架）？工具問題（改用 fetch_webpage）？\n"
+        "\n"
+        "【停止原則（避免過度搜尋）】\n"
+        "- confidence ≥ 80 或 next_action = '直接作答' → 立即作答\n"
+        "- doc_search / knowledge_search 累計 3 次仍無相關內容 → 停止，告知使用者\n"
+        "- 連續兩次搜尋結果高度重疊 → 停止，避免無效迴圈\n"
+    ),
+    "strict": True,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reflection": {
+                "type": "string",
+                "description": "完整五面向反思（發現摘要、假設對比、矛盾偵測、資訊缺口、策略決定）。",
+            },
+            "key_finding": {
+                "type": "string",
+                "description": "本輪最重要的一個發現，用 1–2 句具體說明。",
+            },
+            "next_action": {
+                "type": "string",
+                "enum": ["繼續搜尋", "換工具", "直接作答"],
+                "description": "策略決定：下一步要做什麼。",
+            },
+            "confidence": {
+                "type": "integer",
+                "description": "目前能完整回答使用者問題的程度（0–100）。",
+            },
+        },
+        "required": ["reflection", "key_finding", "next_action", "confidence"],
+        "additionalProperties": False,
+    },
+}
+
 # ========= 6) ✅ 整段替換：run_general_with_webpage_tool（改成同時支援 doc tools + 統計） =========
 def run_general_with_webpage_tool(
     *,
@@ -1558,7 +1728,7 @@ def run_general_with_webpage_tool(
         if status is not None:
             status.write(summary)
 
-    tools = [DOC_LIST_TOOL, DOC_SEARCH_TOOL, DOC_GET_FULLTEXT_TOOL, FETCH_WEBPAGE_TOOL]
+    tools = [DOC_LIST_TOOL, DOC_SEARCH_TOOL, DOC_GET_FULLTEXT_TOOL, FETCH_WEBPAGE_TOOL, THINK_TOOL]
     if use_kb and HAS_KB and KNOWLEDGE_SEARCH_TOOL:
         tools.append(KNOWLEDGE_SEARCH_TOOL)
     if need_web:
@@ -1570,9 +1740,23 @@ def run_general_with_webpage_tool(
 
     running_input = list(trimmed_messages)
 
+    def _resp_has_text(r) -> bool:
+        """判斷 resp 是否包含非空文字答案（web_search round 可能同輪輸出 message）。"""
+        if getattr(r, "output_text", None):
+            return True
+        for item in getattr(r, "output", []) or []:
+            if getattr(item, "type", "") == "message":
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") == "output_text" and getattr(c, "text", ""):
+                        return True
+        return False
+
+    last_text_resp = None  # 追蹤最近一個含文字答案的 resp（web_search round 可能先有答案）
+
     meta = {"doc_calls": 0, "web_calls": 0, "db_used": False, "web_used": False, "tool_step": 0}
 
-    _MAX_ROUNDS = 12
+    _MAX_ROUNDS    = 12
+    _MAX_WEB_CALLS = 25   # 防止 web search 爆量（無上限時曾出現 72 次 / 643s）
     _round = 0
 
     while True:
@@ -1586,8 +1770,12 @@ def run_general_with_webpage_tool(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=False,
+            text={"verbosity": "high"},
             include=["web_search_call.action.sources"] if need_web else [],
         )
+
+        if _resp_has_text(resp):
+            last_text_resp = resp  # 保留最新有文字的 resp，供 web_search round 後作 fallback
 
         # 統計 web_search + 記錄查詢與 snippet（供 Evidence/Search tab 顯示）
         try:
@@ -1595,6 +1783,8 @@ def run_general_with_webpage_tool(
                 if getattr(item, "type", None) == "web_search_call":
                     meta["web_calls"] += 1
                     meta["web_used"] = True
+                    if meta["web_calls"] >= _MAX_WEB_CALLS:
+                        break   # web search 超過上限 → 跳出 for loop，後續退出 while
                     try:
                         action = getattr(item, "action", None)
                         if action:
@@ -1604,15 +1794,15 @@ def run_general_with_webpage_tool(
                             for s in raw_sources:
                                 if isinstance(s, dict):
                                     ws_sources.append({
-                                        "url":     s.get("url", ""),
-                                        "title":   s.get("title", ""),
-                                        "snippet": s.get("snippet", ""),
+                                        "url":     (s.get("url", "") or "").strip(),
+                                        "title":   " ".join((s.get("title", "") or "").split()),
+                                        "snippet": (s.get("snippet", "") or "").strip(),
                                     })
                                 else:
                                     ws_sources.append({
-                                        "url":     getattr(s, "url", "") or "",
-                                        "title":   getattr(s, "title", "") or "",
-                                        "snippet": getattr(s, "snippet", "") or "",
+                                        "url":     (getattr(s, "url", "") or "").strip(),
+                                        "title":   " ".join((getattr(s, "title", "") or "").split()),
+                                        "snippet": (getattr(s, "snippet", "") or "").strip(),
                                     })
                             st.session_state.ds_web_search_log.append({
                                 "run_id":  st.session_state.get("ds_active_run_id"),
@@ -1631,7 +1821,32 @@ def run_general_with_webpage_tool(
             item for item in (getattr(resp, "output", None) or [])
             if getattr(item, "type", None) == "function_call"
         ]
-        if not function_calls or _round >= _MAX_ROUNDS:
+        web_search_calls = [
+            item for item in (getattr(resp, "output", None) or [])
+            if getattr(item, "type", None) == "web_search_call"
+        ]
+        if (not function_calls and not web_search_calls) or _round >= _MAX_ROUNDS or meta["web_calls"] >= _MAX_WEB_CALLS:
+            # web_search round 中模型可能同輪就輸出答案；強制 think 後下一輪可能無文字。
+            # 此時改回傳最近有文字的 resp，避免「找不到答案」fallback。
+            if not _resp_has_text(resp) and last_text_resp is not None:
+                return last_text_resp, meta
+            # ↓ 搜尋上限觸發但完全無文字（模型一直在搜尋未曾生成答案）→ 補一輪強制出答案
+            if not _resp_has_text(resp) and last_text_resp is None:
+                _status("📝 安妮亞整理答案中…")
+                _synthesis_resp = client.responses.create(
+                    model=model,
+                    input=running_input,
+                    reasoning={"effort": reasoning_effort},
+                    instructions=(
+                        instructions
+                        + "\n\n【強制作答】搜尋已達上限，請直接用已取得的所有資料"
+                        "給出最完整的答案，禁止呼叫任何工具。"
+                    ),
+                    tools=[],
+                    parallel_tool_calls=False,
+                    text={"verbosity": "high"},
+                )
+                return _synthesis_resp, meta
             return resp, meta
 
         for call in function_calls:
@@ -1753,6 +1968,92 @@ def run_general_with_webpage_tool(
                 except Exception:
                     pass
 
+            elif name == "think":
+                thought      = args.get("reflection", "")
+                key_finding  = (args.get("key_finding") or "").strip()
+                next_action  = (args.get("next_action") or "繼續搜尋").strip()
+                confidence   = int(args.get("confidence", 0))
+                think_count  = len([
+                    x for x in (st.session_state.get("ds_think_log") or [])
+                    if x.get("run_id") == st.session_state.get("ds_active_run_id")
+                ]) + 1
+
+                # 完整度顏色標記
+                if confidence >= 80:
+                    conf_badge = f":green[{confidence}%]"
+                elif confidence >= 50:
+                    conf_badge = f":orange[{confidence}%]"
+                else:
+                    conf_badge = f":red[{confidence}%]"
+
+                # 策略決定 emoji
+                action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
+
+                _status(
+                    f"💭 安妮亞在想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
+                    write=f"💭 **第 {think_count} 次反思**",
+                )
+                _step_done(f"💡 **發現**：{key_finding[:80]}{'…' if len(key_finding) > 80 else ''}")
+                _step_done(f"{action_emoji} **決定**：{next_action}　｜　完整度 {conf_badge}")
+
+                # ── 低信心策略診斷：檢查最近幾次 think 的 confidence，必要時注入 feedback ──
+                run_id_now  = st.session_state.get("ds_active_run_id")
+                run_thinks  = [
+                    x for x in (st.session_state.get("ds_think_log") or [])
+                    if x.get("run_id") == run_id_now
+                ]
+                recent_confs = [x.get("confidence", 0) for x in run_thinks[-2:]]
+
+                strategy_hint = None
+
+                if confidence < 30:
+                    # 單次 confidence 極低 → 方向可能完全錯誤
+                    strategy_hint = (
+                        "⚠️ 策略警告（系統注入）：本次 confidence < 30，搜尋方向可能完全錯誤。"
+                        "請立刻重新審視問題本身：\n"
+                        "1. 嘗試用英文關鍵字重新搜尋\n"
+                        "2. 拆解問題為更小的子問題\n"
+                        "3. 換用 fetch_webpage 工具直接讀相關官方頁面\n"
+                        "禁止用相似關鍵字再次搜尋。"
+                    )
+                elif len(recent_confs) >= 2 and all(c <= 55 for c in recent_confs):
+                    # 連續兩次都 ≤ 55 → 策略卡住
+                    if len(run_thinks) >= 3 and all(
+                        x.get("confidence", 0) <= 55 for x in run_thinks[-3:]
+                    ):
+                        # 三次都 ≤ 55 → 強化警告
+                        strategy_hint = (
+                            "🚨 強化策略警告（系統注入）：連續 3 次 confidence ≤ 55，搜尋策略已完全卡住。"
+                            "必須立即執行以下其中一個行動：\n"
+                            "1. 換用英文關鍵字搜尋\n"
+                            "2. 換一個完全不同的概念框架或同義詞\n"
+                            "3. 用 fetch_webpage 直接讀已知相關網址\n"
+                            "4. 若以上都無法做到，直接用現有資料作答（next_action='直接作答'）\n"
+                            "禁止：繼續用中文相似關鍵字搜尋。"
+                        )
+                    else:
+                        # 兩次都 ≤ 55 → 標準警告
+                        strategy_hint = (
+                            "⚠️ 策略警告（系統注入）：連續 2 次 confidence ≤ 55，關鍵字策略無效。"
+                            "下一步必須診斷並改變策略：\n"
+                            "- 關鍵字是否太專門或太模糊？\n"
+                            "- 是否應改用英文搜尋？\n"
+                            "- 是否應換一個角度或同義詞？\n"
+                            "請在下次 think 的 reflection 第 5 項明確說明你改變了什麼。"
+                        )
+
+                st.session_state.ds_think_log.append({
+                    "run_id":        run_id_now,
+                    "reflection":    thought,
+                    "key_finding":   key_finding,
+                    "next_action":   next_action,
+                    "confidence":    confidence,
+                    "strategy_hint": strategy_hint,
+                })
+                output = {"ok": True}
+                if strategy_hint:
+                    output["strategy_hint"] = strategy_hint  # 注入 feedback 給模型，下輪作為 function_call_output 讀取
+
             else:
                 output = {"error": f"Unknown function: {name}"}
 
@@ -1764,7 +2065,17 @@ def run_general_with_webpage_tool(
                 }
             )
 
-        tool_choice = "auto"
+        # 本輪是否有搜尋行為（web_search 或 doc/knowledge/fetch 類）
+        _search_tool_names = {"doc_search", "knowledge_search", "fetch_webpage", "doc_list", "doc_get_fulltext"}
+        _any_search = bool(web_search_calls) or any(
+            getattr(c, "name", "") in _search_tool_names for c in function_calls
+        )
+        _think_called = any(getattr(c, "name", "") == "think" for c in function_calls)
+
+        if _any_search and not _think_called:
+            tool_choice = {"type": "function", "name": "think"}
+        else:
+            tool_choice = "auto"
 
 # === 1.5 Planner / Router / Search（Agents） ===
 class WebSearchItem(BaseModel):
@@ -1812,7 +2123,7 @@ planner_agent_PROMPT = with_handoff_prefix(
 planner_agent = Agent(
     name="PlannerAgent",
     instructions=planner_agent_PROMPT,
-    model="gpt-5.2",
+    model="gpt-5.4",
     model_settings=ModelSettings(reasoning=Reasoning(effort="medium")),
     output_type=WebSearchPlan,
 )
@@ -1827,7 +2138,7 @@ search_INSTRUCTIONS = with_handoff_prefix(
 
 search_agent = Agent(
     name="SearchAgent",
-    model="gpt-5.2",
+    model="gpt-5.4",
     instructions=search_INSTRUCTIONS,
     tools=[WebSearchTool()],
     #model_settings=ModelSettings(tool_choice="required"),
@@ -2023,7 +2334,9 @@ FastAgent 是一個低延遲、快速回應的子代理，僅負責「可以一�
 若問題稍微複雜但仍在你範圍內：
 - 先用 3–5 個條列整理「你會怎麼幫他處理」，接著給出具體作法或範例，而不是只分析不下結論。
 遇到需求很模糊時：
-- 儘量用 1–3 個精簡問題釐清關鍵（如「你比較想要長一點還是短一點的版本？」），然後主動做出一個合理的版本，不要把所有選擇丟回給使用者。
+- **先猜最可能的意圖，直接給出完整答案**（如需假設條件，在開頭一句話說明，如「假設你需要的是 X 版本：」）。
+- 若仍有合理的替代方向，在答案**最後**附上 1–2 句簡短問句（如「如需其他格式或調整角度，告訴我哪點不符合就好」）。
+- **不在給答案之前先問問題**。
 
 <solution_persistence>
 
@@ -2083,7 +2396,7 @@ ROUTER_PROMPT = with_handoff_prefix("""
 router_agent = Agent(
     name="RouterAgent",
     instructions=ROUTER_PROMPT,
-    model="gpt-5.2",
+    model="gpt-5.4",
     tools=[],
     model_settings=ModelSettings(
         reasoning=Reasoning(effort="low"),
@@ -2170,7 +2483,16 @@ ESCALATE_GENERAL_TOOL = {
         "properties": {
             "reason": {"type": "string", "description": "為何需要升級。"},
             "query": {"type": "string", "description": "歸一化後的使用者需求。"},
-            "need_web": {"type": "boolean", "description": "是否需要上網搜尋。"},
+            "need_web": {
+                "type": "boolean",
+                "description": (
+                    "是否需要上網搜尋。"
+                    "以下情況設為 true：問題涉及最新市場行情、當前產業現況、近期新聞事件、"
+                    "最新數據、現在的價格/政策/人事/排名，或任何在過去一年內可能已改變的資訊。"
+                    "以下情況設為 false：概念解釋、文件摘要分析、通用知識、歷史背景。"
+                    "不確定時，若問題包含『現在』『最新』『近期』『現況』『行情』等詞，設為 true。"
+                ),
+            },
             "restrict_kb": {
                 "type": "boolean",
                 "description": (
@@ -2241,6 +2563,12 @@ FRONT_ROUTER_PROMPT = """
 - 只要使用者明確說要『報告』且主題是風險/分析/評估，就一律走 RESEARCH
 - 或問題高度時效性/會變動，且需要可靠來源支撐（例如政策/價格/法規/公告/數據）
 - 或需要 5+ 條搜尋與彙整（規劃→多次搜尋→綜合）
+
+## need_web 判斷（走 GENERAL 時必填）
+- **true**：問題涉及最新市場行情、當前產業/公司現況、近期新聞、最新數據、現在的價格/法規/政策排名，或任何在過去一年內可能已變動的資訊
+  - 關鍵詞：「現在」「最新」「近期」「現況」「行情」「2025/2026」「目前」「最近」
+- **false**：純概念解釋、文件摘要、通用知識、歷史背景
+- 不確定時 → **預設 true**（讓模型自行決定是否真的要查）
 
 ## restrict_kb 判斷（只在走 GENERAL 時填，選填）
 - 使用者明確說「只看這份/這個文件」「只用上傳的」「不要查知識庫/資料庫」「別查 KB」
@@ -2379,6 +2707,14 @@ async def aparallel_search_stream(
 ANYA_SYSTEM_PROMPT = r"""
 Developer: 你是安妮亞（Anya Forger，《SPY×FAMILY》）風格的「可靠小幫手」。
 
+## Output Contract（輸出規範，每次回答必須遵守）
+- **結構**：結論 → 依據 → 行動建議（省略不需要的層次）
+- **引用格式**：已上傳文件用 [文件標題 pN]；網路搜尋結果用 〔N〕（inline）
+- **長度**：簡單問 1–3 句；研究型 500–1500 字；文件摘要依文件長度決定
+- **禁止**：不輸出空行佔位符「來源：」；不重複前一輪已說的事；不在沒有資訊時猜測；工具呼叫期間不輸出「下一步要補查…」「接下來要讀…」等進度說明文字（進度只寫在 think 工具的 key_finding）
+- **回答策略**：收到模糊需求時，自行推斷最可能的意圖並直接給出完整答案；若有替代方向，在答案最後附一句話邀請調整，不得列條列選項讓使用者選版本
+
+---
 ## 你的主要工作
 - 整理文件與資料，協助使用者更清晰理解內容。
 - 網路研究與查證。
@@ -2682,7 +3018,7 @@ def build_trimmed_input_messages(pending_user_content_blocks):
             if i == last_user_idx and msg.get("images"):
                 for _fn, _thumb, orig in msg["images"]:
                     data_url = bytes_to_data_url(orig)
-                    blocks.append({"type": "input_image", "image_url": data_url})
+                    blocks.append({"type": "input_image", "image_url": data_url, "detail": "high"})
             if blocks:
                 messages.append({"role": "user", "content": blocks})
         elif role == "assistant":
@@ -2858,6 +3194,8 @@ with st.popover("📚 引用資料夾"):
         st.session_state.ds_processed_keys = set()
         st.session_state.ds_last_index_stats = None
         st.session_state.ds_doc_search_log = []
+        st.session_state.ds_web_search_log = []
+        st.session_state.ds_think_log = []
         st.session_state.ds_active_run_id = None
         st.rerun()
 
@@ -2892,7 +3230,8 @@ with st.popover("📚 引用資料夾"):
 for msg in st.session_state.get("chat_history", []):
     with st.chat_message(msg.get("role", "assistant")):
         if msg.get("text"):
-            st.markdown(normalize_markdown_for_streamlit(msg["text"]))
+            _display_text = _RE_HTML_COMMENT.sub("", msg["text"]).strip()
+            st.markdown(normalize_markdown_for_streamlit(_display_text))
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
@@ -2902,7 +3241,7 @@ for msg in st.session_state.get("chat_history", []):
 
 # === 8. 使用者輸入（支援圖片 + 檔案） ===
 prompt = st.chat_input(
-    "wakuwaku！Anya可能胡說八道，請自行確認內容喔～",
+    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
     accept_file="multiple",
     file_type=["jpg","jpeg","png","webp","gif"],
 )
@@ -2988,7 +3327,7 @@ if prompt is not None:
             thumb = make_thumb(data)
             images_for_history.append((name, thumb, data))
             data_url = bytes_to_data_url(data)
-            content_blocks.append({"type": "input_image", "image_url": data_url})
+            content_blocks.append({"type": "input_image", "image_url": data_url, "detail": "high"})
             continue
 
         is_pdf = name.lower().endswith(".pdf")
@@ -3135,7 +3474,7 @@ if prompt is not None:
                     # ✅ if kind == "general":（整段替換）
                     # =========================
                     if kind == "general":
-                        status.update(label="↗️ 切換到深思模式（gpt‑5.2）", state="running", expanded=False)
+                        status.update(label="↗️ 切換到深思模式（gpt‑5.4）", state="running", expanded=False)
                         try:
                             st.toast("**深思模式**", icon=":material/psychology:", duration="long")
                         except TypeError:
@@ -3169,6 +3508,7 @@ if prompt is not None:
                         st.session_state["ds_active_run_id"] = str(_uuid.uuid4())
                         st.session_state.ds_doc_search_log = []
                         st.session_state.ds_web_search_log = []
+                        st.session_state.ds_think_log = []
 
                         # ✅ 改成：用 status_area（或直接 st.container）建立 placeholders
                         evidence_panel_ph = status_area.empty()
@@ -3193,8 +3533,8 @@ if prompt is not None:
                             with status_area:
                                 st.info("💡 本回合沒有文件庫，安妮亞會透過網路搜尋來回答。", icon="🌐")
                     
-                        # ✅ Full-doc 動態 token budget（M：輸出預留 3000）
-                        MAX_CONTEXT_TOKENS = 128_000
+                        # ✅ Full-doc 動態 token budget（gpt-5.4 支援 1M，保守設 256K 避免超量計費）
+                        MAX_CONTEXT_TOKENS = 256_000
                         OUTPUT_BUDGET = 3_000
                         SAFETY_MARGIN = 4_000
                     
@@ -3205,14 +3545,16 @@ if prompt is not None:
                         doc_fulltext_budget = MAX_CONTEXT_TOKENS - OUTPUT_BUDGET - SAFETY_MARGIN - base_tokens
                         doc_fulltext_budget = max(0, int(doc_fulltext_budget))
                     
-                        # ✅ 額外硬 cap（避免過大導致回覆品質下降/延遲）
-                        doc_fulltext_budget_hint = max(0, min(doc_fulltext_budget, 60_000))
+                        # ✅ 額外硬 cap（gpt-5.4 放寬至 120K，避免過大導致延遲）
+                        doc_fulltext_budget_hint = max(0, min(doc_fulltext_budget, 120_000))
                     
                         # ✅ 在 instructions 補規則：full-doc 只有「明確全篇任務」才允許
                         DOCSTORE_RULES = (
                             "\n\n"
                             "【文件庫工具使用規則（重要）】\n"
                             "- 若使用者問題需要依據已上傳文件，請先使用 doc_search 再回答。\n"
+                            "- fetch_webpage：僅用於讀取「使用者在對話中明確提供的 URL」；"
+                            "不得自行決定要抓取哪個外部網站（若需主動搜尋，請使用 web_search 而非 fetch_webpage）。\n"
                             "- 回答引用格式：請用 [文件標題 pN]（N 可為 -）。\n"
                             "- 不要在正文輸出『來源：』這種佔位空行；若要列來源，請用引用 token 或交給 UI 顯示即可。\n"
                             "- 不要把 chunk_id 寫進答案。\n"
@@ -3222,12 +3564,48 @@ if prompt is not None:
                                 "- knowledge_search：跨 session 持久知識庫（Supabase），含金融/總經/ESG/法規等長期知識。\n"
                                 "- 【主動查詢】只要問題涉及金融、總經、ESG、法規、產業分析等背景知識，\n"
                                 "  knowledge_search 應主動呼叫，不必等 doc_search 結果不足才補查。\n"
+                                "- 【時效性優先】若問題涉及最新市場行情、當前產業現況、近期新聞等時效性資訊，\n"
+                                "  直接使用 web_search；knowledge_search 僅用於補充背景脈絡，不做為主要來源。\n"
                                 "- 兩者互補，可同時使用；知識庫引用格式：[KB:文件名 pN]。\n"
                                 "- 若 knowledge_search 工具不在清單中，代表使用者已限制只看上傳文件，請勿強行查詢。\n"
                                 if HAS_KB else ""
                             )
                         )
-                        effective_instructions = ANYA_SYSTEM_PROMPT + DOCSTORE_RULES
+                        THINK_TOOL_RULES = (
+                            "\n\n"
+                            "【think 工具使用規則（必須遵守）】\n"
+                            "每次呼叫以下任何工具之後，你必須緊接著呼叫 `think` 工具進行反思，再決定下一步：\n"
+                            "- doc_search、doc_get_fulltext、doc_list\n"
+                            "- knowledge_search\n"
+                            "- fetch_webpage\n"
+                            "- web_search\n"
+                            "\n"
+                            "reflection 欄位請涵蓋五個面向：\n"
+                            "1. 發現摘要：這次工具呼叫取得了哪些具體可用資訊？\n"
+                            "2. 假設對比：搜尋前你預期找到什麼？實際結果是否符合預期？有無出乎意料的發現？\n"
+                            "3. 矛盾偵測：不同來源之間是否有衝突？可能原因是什麼？\n"
+                            "4. 資訊缺口：還缺少哪些內容才能完整回答？\n"
+                            "5. 策略決定：下一步要做什麼（繼續搜尋 / 換工具 / 直接作答）？\n"
+                            "\n"
+                            "confidence 欄位請填寫 0–100 的整數，評估目前能完整回答問題的程度。\n"
+                            "\n"
+                            "【低信心搜尋診斷（連續搜尋無進展時必須執行）】\n"
+                            "若連續 2 次 think 的 confidence 皆 ≤ 55，代表搜尋策略本身有問題，不是搜尋次數不足。\n"
+                            "此時必須在 reflection 第 5 項寫出明確診斷，回答以下問題：\n"
+                            "- 【關鍵字診斷】我用的詞是否太專門、太模糊、或在這個領域不常用？\n"
+                            "- 【語言診斷】這個主題的主要資料是否用其他語言寫的（英文）？\n"
+                            "- 【角度診斷】我的搜尋角度是否錯誤？是否應該換一個概念框架或同義詞？\n"
+                            "- 【工具診斷】是否應改用 fetch_webpage 直接讀特定已知網址？\n"
+                            "診斷後，下一次搜尋必須使用與之前完全不同的關鍵字或工具。\n"
+                            "禁止：在 confidence ≤ 55 的情況下，使用與前一次高度相似的關鍵字繼續搜尋。\n"
+                            "\n"
+                            "停止搜尋的條件（滿足任一即停止，直接作答）：\n"
+                            "- confidence ≥ 80\n"
+                            "- knowledge_search / doc_search 已使用 ≥ 2 次且 confidence ≤ 45% → 停止使用這些工具，改用 web_search\n"
+                            "- web_search 已使用 ≥ 10 次 → 停止搜尋，以現有資料作答\n"
+                            "- 連續兩次搜尋結果高度重疊\n"
+                        )
+                        effective_instructions = ANYA_SYSTEM_PROMPT + DOCSTORE_RULES + THINK_TOOL_RULES
                         
                         # ✅ 網路搜尋中：展開 status 並在其內顯示 gif（完成後清除）
                         if effective_need_web:
@@ -3241,7 +3619,7 @@ if prompt is not None:
                             client=client,
                             trimmed_messages=trimmed_messages_with_today,
                             instructions=effective_instructions,
-                            model="gpt-5.2",
+                            model="gpt-5.4",
                             reasoning_effort=reasoning_effort,
                             need_web=effective_need_web,
                             forced_url=url_in_text,
@@ -3613,7 +3991,7 @@ if prompt is not None:
                             client=client,
                             trimmed_messages=trimmed_messages,
                             instructions=ANYA_SYSTEM_PROMPT,
-                            model="gpt-5.2",
+                            model="gpt-5.4",
                             reasoning_effort="medium",
                             need_web=effective_need_web,
                             forced_url=url_in_text,
