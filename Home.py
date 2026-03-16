@@ -3720,9 +3720,9 @@ if prompt is not None:
                     if kind == "research":
                         status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
                         try:
-                            st.toast("🔬 研究模式", icon=":material/science:", duration="short")
+                            st.toast("研究模式", icon=":material/science:", duration="short")
                         except TypeError:
-                            st.toast("🔬 研究模式", icon=":material/science:")
+                            st.toast("研究模式", icon=":material/science:")
 
                         # ✅ badges 最上面：research 一定會做 web（search_plan 有幾條就算幾次嘗試）
                         badges_ph = st.empty()
