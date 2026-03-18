@@ -3,6 +3,13 @@
 """
 Anya 富文本輸出美化工具
 靈感來自 Compose Richtext（https://halilibo.com/compose-richtext/）
+色彩主題：Anya Forger（Spy x Family）
+
+  珊瑚粉  #D97B72 — 主標題、清單符號
+  金邊黃  #C8A43A — blockquote 邊框
+  深褐色  #4A2F1A — 表格標頭底色（制服色）
+  淡珊瑚  #FFF5F2 — 背景色調
+  淡金色  #FFF8E8 — 行內程式碼底色
 
 公開函式：
   inject_rich_styles()                       — 全域 CSS 注入（冪等）
@@ -18,66 +25,78 @@ from urllib.parse import urlparse
 
 import streamlit as st
 
+# ── Anya Forger 色彩常數
+# 取自 Spy x Family Anya Forger 海報
+_CORAL   = "#D97B72"   # 珊瑚粉（海報背景）
+_GOLD    = "#C8A43A"   # 金邊黃（制服金邊）
+_BROWN   = "#4A2F1A"   # 深褐色（制服底色）
+_LIGHT   = "#FFF5F2"   # 淡珊瑚（背景色調）
+_STRIPE  = "#FDF0ED"   # 斑馬紋偶數列
+_BORDER  = "#F2D5CF"   # 表格分隔線
+_CODE_BG = "#FFF8E8"   # 行內程式碼底色（淡金）
+
 # ── CSS（只套用在 .stMarkdown 範圍，不影響 widget）
-_RICH_CSS = """
+_RICH_CSS = f"""
 <style>
-/* ── 標題 — 品牌紅色 ── */
-.stMarkdown h1 {
-    color: #AD4746;
-    border-bottom: 2px solid #FFDFE0;
+/* ── 標題 — Anya 珊瑚粉 ── */
+.stMarkdown h1 {{
+    color: {_CORAL};
+    border-bottom: 2px solid {_BORDER};
     padding-bottom: .3em;
     margin-top: 1.2em;
-}
-.stMarkdown h2 {
-    color: #AD4746;
+}}
+.stMarkdown h2 {{
+    color: {_CORAL};
     margin-top: 1em;
-}
+}}
 .stMarkdown h3,
-.stMarkdown h4 {
-    color: #8B3130;
-}
+.stMarkdown h4 {{
+    color: {_BROWN};
+}}
 
-/* ── Blockquote — 左邊框 + 粉色背景 ── */
+/* ── Blockquote — 金邊框 + 淡珊瑚背景 ── */
 /* 靈感自 Compose Richtext BlockQuote 元件 */
-.stMarkdown blockquote {
-    border-left: 4px solid #AD4746;
-    background: #FFF6F7;
+.stMarkdown blockquote {{
+    border-left: 4px solid {_GOLD};
+    background: {_LIGHT};
     padding: .7em 1.2em;
     border-radius: 0 8px 8px 0;
     margin: .8em 0;
-    color: #4B3832;
-}
+    color: {_BROWN};
+}}
 
-/* ── 表格 — 斑馬紋 ── */
-.stMarkdown table {
+/* ── 表格 — 深褐色標頭 + 斑馬紋 ── */
+.stMarkdown table {{
     border-collapse: collapse;
     width: 100%;
-}
-.stMarkdown th {
-    background: #AD4746;
-    color: #fff;
+}}
+.stMarkdown th {{
+    background: {_BROWN};
+    color: {_GOLD};          /* 金色文字搭深褐底，如制服金邊 */
     padding: 8px 12px;
     text-align: left;
-}
-.stMarkdown td {
+    letter-spacing: .03em;
+}}
+.stMarkdown td {{
     padding: 8px 12px;
-    border-bottom: 1px solid #FFDFE0;
-}
-.stMarkdown tr:nth-child(even) td {
-    background: #FFF6F7;
-}
+    border-bottom: 1px solid {_BORDER};
+}}
+.stMarkdown tr:nth-child(even) td {{
+    background: {_STRIPE};
+}}
 
-/* ── 行內程式碼 ── */
-.stMarkdown code:not(pre > code) {
-    background: #FFF2CC;
+/* ── 行內程式碼 — 淡金底色 ── */
+.stMarkdown code:not(pre > code) {{
+    background: {_CODE_BG};
     padding: 2px 6px;
     border-radius: 4px;
     font-size: .88em;
-}
+    color: {_BROWN};
+}}
 
-/* ── 清單項目符號 ── */
-.stMarkdown ul li::marker { color: #AD4746; }
-.stMarkdown ol li::marker { color: #AD4746; font-weight: bold; }
+/* ── 清單項目符號 — 珊瑚粉 ── */
+.stMarkdown ul li::marker {{ color: {_CORAL}; }}
+.stMarkdown ol li::marker {{ color: {_CORAL}; font-weight: bold; }}
 </style>
 """
 
@@ -88,12 +107,13 @@ def inject_rich_styles() -> None:
     """將品牌富文本 CSS 注入頁面（冪等：只注入一次）。
 
     在每個頁面的 set_page_config() 之後呼叫即可。
-    效果：
-      - h1/h2/h3/h4 顯示品牌紅色
-      - blockquote 顯示左紅邊框 + 粉色背景
-      - table 標題列紅底白字 + 斑馬紋
-      - 行內 `code` 顯示黃底圓角
-      - 清單項目符號為品牌紅色
+    效果（Anya Forger 主題）：
+      - h1/h2 顯示珊瑚粉 #D97B72
+      - h3/h4 顯示深褐色 #4A2F1A
+      - blockquote 顯示金色左邊框 + 淡珊瑚背景
+      - table 標頭為深褐底金色字（制服配色）+ 斑馬紋
+      - 行內 `code` 顯示淡金底圓角
+      - 清單項目符號為珊瑚粉
     """
     if st.session_state.get(_INJECTED_KEY):
         return
