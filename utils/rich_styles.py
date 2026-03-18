@@ -100,13 +100,12 @@ _RICH_CSS = f"""
 </style>
 """
 
-_INJECTED_KEY = "_rich_styles_injected"
-
-
 def inject_rich_styles() -> None:
-    """將品牌富文本 CSS 注入頁面（冪等：只注入一次）。
+    """將 Anya Forger 主題 CSS 注入頁面。
 
     在每個頁面的 set_page_config() 之後呼叫即可。
+    Streamlit 每次 rerun 都會重建 DOM，所以 CSS 每次都需要重新注入。
+
     效果（Anya Forger 主題）：
       - h1/h2 顯示珊瑚粉 #D97B72
       - h3/h4 顯示深褐色 #4A2F1A
@@ -115,10 +114,7 @@ def inject_rich_styles() -> None:
       - 行內 `code` 顯示淡金底圓角
       - 清單項目符號為珊瑚粉
     """
-    if st.session_state.get(_INJECTED_KEY):
-        return
     st.markdown(_RICH_CSS, unsafe_allow_html=True)
-    st.session_state[_INJECTED_KEY] = True
 
 
 def render_report_header(
