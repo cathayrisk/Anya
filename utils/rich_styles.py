@@ -60,10 +60,16 @@ _RICH_CSS = f"""
 .stMarkdown blockquote {{
     border-left: 4px solid {_GOLD};
     background: {_LIGHT};
-    padding: .7em 1.2em;
+    padding: .6em 1.2em;
     border-radius: 0 8px 8px 0;
-    margin: .8em 0;
+    margin-top: .6em;
+    margin-bottom: .3em;   /* 縮小下方間距，避免與後續段落缺口過大 */
     color: {_BROWN};
+}}
+/* blockquote 內的 p 標籤不加額外間距 */
+.stMarkdown blockquote p {{
+    margin: 0;
+    padding: 0;
 }}
 
 /* ── 表格 — 深褐色標頭 + 斑馬紋 ── */
