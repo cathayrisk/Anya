@@ -58,7 +58,6 @@ langextract[openai]
 streamlit-agraph
 plotly
 streamlit-extras
-protobuf>=3.20,<4.0
 
 
 # Web page processing tools
