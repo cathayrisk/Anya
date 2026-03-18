@@ -39,6 +39,7 @@ markdown
 markdownify
 
 # Utility
+protobuf>=5.29.6
 tqdm
 uuid
 aiohttp
