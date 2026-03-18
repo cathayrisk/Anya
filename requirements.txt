@@ -1,5 +1,5 @@
 # Core dependencies
-streamlit
+streamlit>=1.40.0          # 1.40+ 的 pb2 檔案與 protobuf 5.x 相容
 langgraph
 langchain
 langchain-community
@@ -39,7 +39,7 @@ markdown
 markdownify
 
 # Utility
-protobuf>=5.29.6
+protobuf>=5.29.6          # 修復 CVE DoS 漏洞；現代 Streamlit 1.35+ 相容 protobuf 5.x
 tqdm
 uuid
 aiohttp
