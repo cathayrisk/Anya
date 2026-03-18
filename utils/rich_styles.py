@@ -47,8 +47,6 @@ _RICH_CSS = f"""
 }}
 .stMarkdown h2 {{
     color: {_CORAL};
-    border-bottom: 1px solid {_BORDER};
-    padding-bottom: .2em;
     margin-top: 1.5em;
 }}
 .stMarkdown h3,
