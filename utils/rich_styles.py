@@ -27,7 +27,7 @@ import streamlit as st
 
 # ── Anya Forger 色彩常數
 # 取自 Spy x Family Anya Forger 海報
-_CORAL   = "#D97B72"   # 珊瑚粉（海報背景）
+_CORAL   = "#C05A50"   # 珊瑚深紅（海報背景加深）
 _GOLD    = "#C8A43A"   # 金邊黃（制服金邊）
 _BROWN   = "#4A2F1A"   # 深褐色（制服底色）
 _LIGHT   = "#FFF5F2"   # 淡珊瑚（背景色調）
@@ -47,11 +47,14 @@ _RICH_CSS = f"""
 }}
 .stMarkdown h2 {{
     color: {_CORAL};
-    margin-top: 1em;
+    border-bottom: 1px solid {_BORDER};
+    padding-bottom: .2em;
+    margin-top: 1.5em;
 }}
 .stMarkdown h3,
 .stMarkdown h4 {{
-    color: {_BROWN};
+    color: #7A4030;   /* 暖褐色：比 h1/h2 深但比正文有層次感 */
+    margin-top: .9em;
 }}
 
 /* ── Blockquote — 金邊框 + 淡珊瑚背景 ── */
