@@ -59,6 +59,9 @@ from docstore import (
 )
 import uuid as _uuid
 
+# === Rich Styles（輸出美化）===
+from utils.rich_styles import inject_rich_styles, render_report_header, render_source_chips
+
 # === 知識庫 imports（Supabase + embedding，選用） ===
 try:
     from supabase import create_client as _sb_create_client
@@ -99,6 +102,7 @@ if _KB_DEPS_OK and st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_K
 
 # === 1. Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
+inject_rich_styles()  # 注入富文本 CSS（品牌紅色標題、blockquote、表格斑馬紋）
 
 # =========================
 # 1) ✅ 在主程式 imports 附近（有 os / streamlit 後）新增：DEV_MODE
@@ -165,6 +169,50 @@ st.session_state.setdefault("ds_doc_search_log", [])     # list[dict]
 st.session_state.setdefault("ds_web_search_log", [])     # list[dict] — web_search_call log
 st.session_state.setdefault("ds_think_log", [])          # list[dict] — think_tool log
 st.session_state.setdefault("ds_active_run_id", None)    # str | None
+
+# ── Rich Styles 預覽沙盒（開發測試用，折疊預設不展開）──
+with st.expander(":material/palette: Rich Styles 預覽", expanded=False):
+    render_report_header(
+        query="AI 在醫療影像診斷的最新進展",
+        mode_label="🌲 深度模式（5–10 分鐘）",
+        source_count=12,
+        word_count=2400,
+    )
+    st.markdown("""
+## 一、研究背景
+
+近年來 AI 技術在醫療領域快速發展，從影像辨識到病理分析，正在重塑現代醫療流程。
+
+> :material/lightbulb: **關鍵發現**：多項研究顯示 AI 輔助診斷可將準確率提升 **30%**，誤診率降低 **15%**。
+
+### 1.1 主要技術比較
+
+| 技術 | 應用場景 | 準確率 | 備註 |
+|------|----------|--------|------|
+| CNN  | 影像診斷 | 94%    | 最成熟 |
+| ViT  | 病理切片 | 91%    | 需大量資料 |
+| GAN  | 資料增強 | —      | 提升訓練品質 |
+
+### 1.2 程式碼範例
+
+使用 `torch.nn.Conv2d` 建立卷積層，搭配 `BatchNorm2d` 提升訓練穩定性。
+
+---
+
+**主要優勢：**
+
+- :material/speed: 推論速度快，可達到即時診斷
+- :material/verified: 準確度高，已通過 FDA 認證
+- :material/groups: 可協助基層醫療缺乏專科醫師的地區
+""")
+    render_source_chips([
+        "https://www.nature.com/articles/s41591-021-01462-y",
+        "https://arxiv.org/abs/2301.00001",
+        "https://www.who.int/news/item/example",
+        "https://pubmed.ncbi.nlm.nih.gov/12345678/",
+        "https://jamanetwork.com/journals/jama/fullarticle/example",
+        "https://www.thelancet.com/journals/lancet/article/example",
+    ])
 
 # === 共用：假串流打字效果 ===
 def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
@@ -1756,7 +1804,7 @@ def run_general_with_webpage_tool(
     meta = {"doc_calls": 0, "web_calls": 0, "db_used": False, "web_used": False, "tool_step": 0}
 
     _MAX_ROUNDS    = 12
-    _MAX_WEB_CALLS = 25   # 防止 web search 爆量（無上限時曾出現 72 次 / 643s）
+    _MAX_WEB_CALLS = 15   # 防止 web search 爆量（無上限時曾出現 72 次 / 643s）
     _round = 0
 
     while True:
@@ -2372,7 +2420,7 @@ FastAgent 的簡潔度與長度規則
 
 fast_agent = Agent(
     name="FastAgent",
-    model="gpt-5.2",
+    model="gpt-5.4",
     instructions=FAST_AGENT_PROMPT,
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
