@@ -33,7 +33,7 @@ _BROWN   = "#4A2F1A"   # 深褐色（制服底色）
 _LIGHT   = "#FFF5F2"   # 淡珊瑚（背景色調）
 _STRIPE  = "#FDF0ED"   # 斑馬紋偶數列
 _BORDER  = "#F2D5CF"   # 表格分隔線
-_CODE_BG = "#FFF8E8"   # 行內程式碼底色（淡金）
+_CODE_BG = "#EDE8E6"   # 行內程式碼底色（淡暖灰，不搶眼）
 
 # ── CSS（只套用在 .stMarkdown 範圍，不影響 widget）
 _RICH_CSS = f"""
@@ -41,20 +41,41 @@ _RICH_CSS = f"""
 /* ── 標題 — Anya 珊瑚粉 ── */
 .stMarkdown h1 {{
     color: {_CORAL};
-    border-bottom: 2px solid {_BORDER};
-    padding-bottom: .3em;
+    border-bottom: 1px solid {_BORDER};   /* 改細：1px 比 2px 輕盈 */
+    padding-bottom: .25em;
     margin-top: 0.9em;
     margin-bottom: 0.2em;
 }}
 .stMarkdown h2 {{
     color: {_CORAL};
-    margin-top: 0.8em;    /* 縮小：避免連續 h2 之間空格過大 */
+    margin-top: 0.8em;
     margin-bottom: 0.2em;
 }}
 .stMarkdown h3,
 .stMarkdown h4 {{
     color: #7A4030;   /* 暖褐色：比 h1/h2 深但比正文有層次感 */
-    margin-top: .9em;
+    margin-top: .7em;
+    margin-bottom: 0.1em;
+}}
+/* Tab / container 內第一個標題不需要上方空白 */
+.stMarkdown h1:first-child,
+.stMarkdown h2:first-child,
+.stMarkdown h3:first-child {{
+    margin-top: 0.2em;
+}}
+
+/* ── 有序清單 — 層級縮排加強 ── */
+.stMarkdown ol {{
+    padding-left: 1.6em;
+    line-height: 1.7;
+}}
+.stMarkdown ol li {{
+    margin-bottom: 0.35em;
+}}
+.stMarkdown ol li ul,
+.stMarkdown ol li ol {{
+    margin-top: 0.25em;
+    padding-left: 1.4em;
 }}
 
 /* ── Blockquote — 金邊框 + 淡珊瑚背景 ── */
