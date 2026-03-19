@@ -172,54 +172,146 @@ st.session_state.setdefault("ds_active_run_id", None)    # str | None
 
 # ── Rich Styles 預覽沙盒（開發測試用，折疊預設不展開）──
 with st.expander(":material/palette: Rich Styles 預覽", expanded=False):
-    render_report_header(
-        query="AI 在醫療影像診斷的最新進展",
-        mode_label="🌲 深度模式（5–10 分鐘）",
-        source_count=12,
-        word_count=2400,
-    )
-    st.markdown("""
-> **TL;DR** 伊朗供應風險推高國際油價，布蘭特與WTI價差明顯擴大。
-
-- **油價大漲**：布蘭特原油約 108.40 美元/桶，WTI 約 98.50 美元/桶，兩者價差擴大到約 10 美元。
-- **價差異常放大**：Brent-WTI spread 平常大約在 2～5 美元，現在拉大很多，代表國際海運原油供應壓力升高。
-- **核心原因**：市場擔心**伊朗衝突**影響波斯灣與荷姆茲海峽的原油運輸，連帶推高海上輪保險與運費。
-- **後續觀察重點**：如果布蘭特與 WTI 的價差繼續擴大，就表示這場衝突不只是區域風險，而是真的在擠壓全球可交易原油供應。
-
----
-
-## 一、深度分析
-
-近年來 AI 技術在醫療領域快速發展，從影像辨識到病理分析，正在重塑現代醫療流程。
-
-> :material/lightbulb: **關鍵發現**：多項研究顯示 AI 輔助診斷可將準確率提升 **30%**，誤診率降低 **15%**。
-
-### 1.1 主要技術比較
-
-| 技術 | 應用場景 | 準確率 | 備註 |
-|------|----------|--------|------|
-| CNN  | 影像診斷 | 94%    | 最成熟 |
-| ViT  | 病理切片 | 91%    | 需大量資料 |
-| GAN  | 資料增強 | —      | 提升訓練品質 |
-
-### 1.2 程式碼範例
-
-使用 `torch.nn.Conv2d` 建立卷積層，搭配 `BatchNorm2d` 提升訓練穩定性。
-
-**主要優勢：**
-
-- :material/speed: 推論速度快，可達到即時診斷
-- :material/verified: 準確度高，已通過 FDA 認證
-- :material/groups: 可協助基層醫療缺乏專科醫師的地區
-""")
-    render_source_chips([
-        "https://www.nature.com/articles/s41591-021-01462-y",
-        "https://arxiv.org/abs/2301.00001",
-        "https://www.who.int/news/item/example",
-        "https://pubmed.ncbi.nlm.nih.gov/12345678/",
-        "https://jamanetwork.com/journals/jama/fullarticle/example",
-        "https://www.thelancet.com/journals/lancet/article/example",
+    _tab_market, _tab_tech, _tab_report, _tab_qa = st.tabs([
+        "📈 市場分析", "💻 技術比較", "📄 深度報告", "💬 對話回答"
     ])
+
+    # ── Tab 1：市場分析（TL;DR → bullet → table）
+    with _tab_market:
+        st.markdown("""
+> **TL;DR** 伊朗供應風險推高國際油價，布蘭特與 WTI 價差明顯擴大，短期宜觀察荷姆茲海峽動態。
+
+- **油價大漲**：布蘭特原油約 108.40 美元/桶，WTI 約 98.50 美元/桶，兩者價差約 10 美元。
+- **價差異常放大**：Brent-WTI spread 平常在 2～5 美元，現在大幅拉開，代表國際海運供應壓力升高。
+- **核心原因**：市場擔心**伊朗衝突**影響波斯灣與荷姆茲海峽原油運輸，連帶推高輪保險與運費。
+- **現貨市場也緊了**：與 Dubai、Oman 基準掛鉤的中東原油已出現較高溢價，買家正在搶近期貨源。
+- **後續觀察重點**：若布蘭特與 WTI 價差持續擴大，表示衝突正在實質擠壓全球可交易原油供應。
+
+## 主要商品價格一覽
+
+| 商品 | 現價 | 週漲跌 | 主要驅動因素 |
+|------|------|--------|------------|
+| 布蘭特原油 | $108.40 | +6.2% | 地緣風險、荷姆茲緊張 |
+| WTI 原油 | $98.50 | +4.1% | 美國庫存略增緩衝 |
+| 天然氣（歐） | €42.80 | +3.5% | 替代需求升溫 |
+| 黃金 | $2,340 | +1.8% | 避險買盤流入 |
+
+> :material/warning: **風險提示**：以上為示範數據，不構成投資建議。實際交易前請參閱最新市場資訊。
+""")
+        render_source_chips([
+            "https://www.bloomberg.com/energy",
+            "https://www.reuters.com/business/energy/",
+            "https://oilprice.com/",
+            "https://www.eia.gov/petroleum/",
+        ])
+
+    # ── Tab 2：技術比較（h2/h3 層級 + inline code + 有序清單）
+    with _tab_tech:
+        st.markdown("""
+## 分類模型選擇指南
+
+做分類任務最常用的模型通常是：**Logistic Regression**、**Random Forest**、**XGBoost**、**SVM**、**Neural Network**。
+
+> :material/lightbulb: **選型原則**：先看資料型態（表格 / 影像 / 文字），再看資料量，再看可解釋性需求。
+
+### 各模型特性比較
+
+| 模型 | 適合資料 | 訓練速度 | 可解釋性 | 備註 |
+|------|----------|----------|----------|------|
+| Logistic Regression | 表格 | ⚡ 快 | ✅ 高 | 首選 baseline |
+| Random Forest | 表格 | 🟡 中 | 🟡 中 | 抗噪能力強 |
+| XGBoost / LightGBM | 表格 | 🟡 中 | 🟡 中 | 競賽常勝將軍 |
+| SVM | 小型 / 特徵清晰 | 🔴 慢 | 🟡 中 | 高維效果好 |
+| Neural Network | 影像 / 文字 / 語音 | 🔴 慢 | ❌ 低 | 非結構化資料首選 |
+
+### 推薦起手順序
+
+1. 先跑 `LogisticRegression(max_iter=1000)` 建立 baseline
+2. 試 `RandomForestClassifier(n_estimators=100)`，看特徵重要性
+3. 用 `XGBClassifier` 或 `LGBMClassifier` 調參衝分數
+4. 若資料是影像／文字，改用 `torchvision` 或 `transformers` 框架
+
+### 常見陷阱
+
+- **類別不平衡**：記得加 `class_weight='balanced'` 或做 SMOTE 過採樣
+- **資料洩漏**：特徵工程必須在 `Pipeline` 內，不能先 fit 整個資料集
+- `StandardScaler` 對 tree-based 模型無效，但對 `SVM` 和 `LogisticRegression` 很重要
+""")
+
+    # ── Tab 3：深度報告（完整 h1/h2/h3 + report header + source chips）
+    with _tab_report:
+        render_report_header(
+            query="AI 是否正在形成新一輪科技泡沫？",
+            mode_label="🌲 深度模式（5–10 分鐘）",
+            source_count=18,
+            word_count=3200,
+        )
+        st.markdown("""
+# 執行摘要
+
+> **TL;DR** AI 熱潮有泡沫訊號，但整體還不到 2000 年網路泡沫那種全面失真；比較像是「真需求 + 真獲利 + 真風險」同時存在的階段。
+
+## 結論
+
+### 這份文件的核心判斷
+
+1. Goldman Sachs 主軸偏向「還不是全面泡沫，但已經有泡沫前兆」。他們認為，美國科技股目前估值雖高、集中度也高，但和 Dot-Com 時代相比，今天的大型科技公司有更強的現金流、獲利能力、資產負債表與股東回饋能力，所以不能直接類比為典型泡沫。
+
+2. 真正最需要擔心的，不是「AI 完全沒價值」，而是「**資本支出、融資結構、私募估值、供應鏈循環交易**」可能跑太快。
+
+3. 報告內部其實是「多空並陳」：
+   - **偏樂觀派**：AI 最終會創造巨大生產力與經濟價值，足以支撐當前 capex
+   - **偏保守派**：基礎建設投資可能過頭，尤其資料中心擴張若沒有足夠營收接棒，會先出現報酬壓力
+   - **偏悲觀派**：LLM 技術本身仍不可靠，若技術沒有真正突破，現在的高估值與巨額投資最後可能站不住腳
+
+## 依據
+
+### 一、為什麼報告說「還不是泡沫」？
+
+因為這波上漲有真實基本面支撐。
+
+- 報告指出，現在大型科技公司不是像 1999 年那樣靠想像力炒作；它們很多已經有**很強的自由現金流、回購、配息、強勁 EPS 成長**，這和當年大量尚未盈利的網路公司不同。
+- Oppenheimer 進一步比較估值後認為，Magnificent 7 的遠期本益比雖高，但大致是 1990 年代末泡沫高峰同類公司的約一半，PEG 也低於當時極端水準。
+
+> :material/format_quote: **翻成白話**：這不是「空氣炒作」，而是「有真東西，但市場可能先把未來很多年都提前反映了」。
+
+### 二、報告最擔心的風險在哪裡？
+
+#### 1) 資料中心與 AI 基建 capex 太大
+
+微軟、Google、Meta、Amazon 四家合計 2025 年 capex 預估超過 **3,000 億美元**，比 2023 年幾乎翻倍。
+
+| 公司 | 2023 capex | 2025E capex | 成長率 |
+|------|-----------|-------------|--------|
+| Microsoft | $280 億 | $530 億 | +89% |
+| Google | $320 億 | $620 億 | +94% |
+| Meta | $280 億 | $500 億 | +79% |
+| Amazon | $530 億 | $1,000 億 | +89% |
+""")
+        render_source_chips([
+            "https://www.goldmansachs.com/intelligence/pages/ai-bubble.html",
+            "https://www.bloomberg.com/news/articles/ai-capex",
+            "https://arxiv.org/abs/2401.00001",
+            "https://www.ft.com/content/ai-investment-bubble",
+            "https://www.wsj.com/tech/ai/artificial-intelligence-bubble-2024",
+            "https://www.economist.com/finance-and-economics/ai-valuations",
+        ])
+
+    # ── Tab 4：對話回答（一般 Q&A 風格，無 report header）
+    with _tab_qa:
+        st.markdown("""
+哇，這題安妮亞會！做分類最常用、也最實用的模型，通常是：**Logistic Regression**、**Decision Tree**、**Random Forest**、**XGBoost/LightGBM**、**SVM**、**k-NN**、**Naive Bayes**、**Neural Network**；如果是**表格資料**，通常先從 `Logistic Regression → Random Forest → XGBoost/LightGBM` 開始最穩，若是影像/文字/語音，多半改用深度學習模型。
+
+依據是它們各自擅長的資料型態不同：
+
+- **Logistic Regression**：快、可解釋，適合當 baseline
+- **Tree / Random Forest / XGBoost**：很適合表格型資料，常有不錯表現
+- **SVM**：中小型資料、特徵清楚時不錯
+- **Naive Bayes**：文字分類常見，簡單又快
+- **Neural Network**：適合影像、文字、語音這種高維非結構化資料
+
+**行動建議**：如果你現在是一般商業資料分類任務，先試 `Logistic Regression → Random Forest → XGBoost/LightGBM`；如果你告訴安妮亞你的資料型態（表格、文字、圖片）和資料量，我可以直接幫你縮成**最適合的 3 個模型清單**。
+""")
 
 # === 共用：假串流打字效果 ===
 def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
