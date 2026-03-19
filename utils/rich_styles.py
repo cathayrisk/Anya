@@ -43,11 +43,13 @@ _RICH_CSS = f"""
     color: {_CORAL};
     border-bottom: 2px solid {_BORDER};
     padding-bottom: .3em;
-    margin-top: 1.2em;
+    margin-top: 0.9em;
+    margin-bottom: 0.2em;
 }}
 .stMarkdown h2 {{
     color: {_CORAL};
-    margin-top: 1.5em;
+    margin-top: 0.8em;    /* 縮小：避免連續 h2 之間空格過大 */
+    margin-bottom: 0.2em;
 }}
 .stMarkdown h3,
 .stMarkdown h4 {{
