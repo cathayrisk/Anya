@@ -41,7 +41,9 @@ _RICH_CSS = f"""
 /* ── 標題 — Anya 珊瑚粉 ── */
 .stMarkdown h1 {{
     color: {_CORAL};
-    border-bottom: 1px solid {_BORDER};   /* 改細：1px 比 2px 輕盈 */
+    #border-bottom: 1px solid {_BORDER};   /* 改細：1px 比 2px 輕盈 */
+    # rich_styles.py 只改這一行
+    border-bottom: 1px solid {_GOLD};   # 原本是 {_BORDER}
     padding-bottom: .25em;
     margin-top: 0.9em;
     margin-bottom: 0.2em;
