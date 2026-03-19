@@ -17,5 +17,30 @@ showWidgetBorder = true
 baseFontSize = 16
 showSidebarBorder = true
 
+# SF Pro Display — Regular
+[[theme.fontFaces]]
+url = "app/static/SF-Pro-Display-Regular.otf"
+family = "SF Pro Display"
+weight = 400
+
+# SF Pro Display — Medium
+[[theme.fontFaces]]
+url = "app/static/SF-Pro-Display-Medium.otf"
+family = "SF Pro Display"
+weight = 500
+
+# SF Pro Display — Semibold（用於標題）
+[[theme.fontFaces]]
+url = "app/static/SF-Pro-Display-Semibold.otf"
+family = "SF Pro Display"
+weight = 600
+
+# SF Pro Display — Bold
+[[theme.fontFaces]]
+url = "app/static/SF-Pro-Display-Bold.otf"
+family = "SF Pro Display"
+weight = 700
+
 [server]
 maxUploadSize = 300
+enableStaticServing = true
