@@ -23,6 +23,7 @@ from __future__ import annotations
 from datetime import datetime
 from urllib.parse import urlparse
 
+import markdown as _md_lib
 import streamlit as st
 
 # ── Anya Forger 色彩常數
@@ -41,9 +42,7 @@ _RICH_CSS = f"""
 /* ── 標題 — Anya 珊瑚粉 ── */
 .stMarkdown h1 {{
     color: {_CORAL};
-    #border-bottom: 1px solid {_BORDER};   /* 改細：1px 比 2px 輕盈 */
-    # rich_styles.py 只改這一行
-    border-bottom: 1px solid {_GOLD};   # 原本是 {_BORDER}
+    border-bottom: 1px solid {_BORDER};   /* 改細：1px 比 2px 輕盈 */
     padding-bottom: .25em;
     margin-top: 0.9em;
     margin-bottom: 0.2em;
@@ -211,3 +210,47 @@ def render_source_chips(sources: list[str], max_show: int = 20) -> None:
         f":material/link: **參考來源：** {chip_line}",
         help="點擊連結開啟原始頁面",
     )
+
+
+def copy_html_button(text: str, key: str = "copy") -> None:
+    """一鍵複製帶格式 HTML：貼入 Word 保留標題 / 粗體 / 清單 / 表格。
+
+    把 markdown 轉成含 inline style 的 HTML 放入剪貼簿（text/html MIME）。
+    Word 貼上時讀 inline style → 標題大字、粗體、清單符號、表格格線皆保留。
+
+    st.html() 直接插入頁面主 DOM（非 iframe），可存取 Clipboard API。
+    """
+    # 1. markdown → HTML（tables/extra extension 支援表格與巢狀格式）
+    html = _md_lib.markdown(text, extensions=["tables", "extra"])
+
+    # 2. 補 inline style — Word 只讀 inline style，不讀 CSS class
+    html = (
+        html
+        .replace("<h1>", '<h1 style="color:#C05A50;font-size:20pt;font-weight:bold;margin-top:1em;">')
+        .replace("<h2>", '<h2 style="color:#C05A50;font-size:16pt;font-weight:bold;margin-top:.8em;">')
+        .replace("<h3>", '<h3 style="color:#7A4030;font-size:13pt;font-weight:bold;margin-top:.6em;">')
+        .replace("<h4>", '<h4 style="color:#7A4030;font-size:12pt;font-weight:bold;">')
+        .replace("<th>", '<th style="background:#4A2F1A;color:#C8A43A;padding:6px 10px;text-align:left;">')
+        .replace("<td>", '<td style="padding:6px 10px;border-bottom:1px solid #F2D5CF;">')
+        .replace("<table>", '<table style="border-collapse:collapse;width:100%;">')
+        .replace("<blockquote>", '<blockquote style="border-left:4px solid #C8A43A;padding:.5em 1em;background:#FFF5F2;color:#4A2F1A;margin:.5em 0;">')
+    )
+
+    # 3. 用 st.html() 注入 JS 按鈕（在主 DOM，無 same-origin iframe 限制）
+    escaped = html.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    st.html(f"""
+    <button id="cpbtn-{key}"
+        style="font-size:13px;padding:4px 14px;border:1px solid #C05A50;border-radius:6px;
+               background:#fff;color:#C05A50;cursor:pointer;margin-top:8px;"
+        onclick="
+            navigator.clipboard.write([
+                new ClipboardItem({{'text/html': new Blob([`{escaped}`], {{type:'text/html'}})}})
+            ]).then(function() {{
+                var b = document.getElementById('cpbtn-{key}');
+                b.textContent = '✓ 已複製';
+                setTimeout(function() {{ b.textContent = '複製'; }}, 2000);
+            }}).catch(function(e) {{
+                alert('複製失敗：' + e.message);
+            }});
+        ">複製</button>
+    """)
