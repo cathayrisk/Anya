@@ -1,12 +1,17 @@
 """
-Cowork — 任務型 Agent
-類 Claude Code 的多步驟任務 Agent，使用 deepagents。
+Cowork — 任務型 Agent（對話式介面）
+多步驟自主 Agent，以聊天方式輸入任務，自動規劃、研究、整合並產出報告。
 """
+from __future__ import annotations
 
 import os
+import re
 import tempfile
 import uuid
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -14,7 +19,28 @@ import streamlit as st
 from langchain_core.tools import tool
 from openai import OpenAI
 
-# ── DocStore imports ──────────────────────────────────────────────────────────
+# ── Context Engineering middleware（deepagents / langchain）────────────────────
+# @dynamic_prompt：每次 LLM 呼叫前動態注入 system prompt 補充
+# @wrap_model_call：每次 LLM 呼叫前過濾工具清單
+_HAS_CE_MW = False
+try:
+    from langchain.agents.middleware import (
+        dynamic_prompt as _dynamic_prompt_deco,
+        wrap_model_call as _wrap_model_call_deco,
+        ModelRequest as _ModelRequest,
+    )
+    _HAS_CE_MW = True
+except ImportError:
+    try:
+        from deepagents.middleware import (
+            dynamic_prompt as _dynamic_prompt_deco,
+            wrap_model_call as _wrap_model_call_deco,
+            ModelRequest as _ModelRequest,
+        )
+        _HAS_CE_MW = True
+    except ImportError:
+        _HAS_CE_MW = False
+
 from docstore import (
     FileRow,
     build_file_row_from_bytes,
@@ -22,20 +48,10 @@ from docstore import (
     doc_list_payload,
 )
 
-# ── 頁面設定 ──────────────────────────────────────────────────────────────────
+# ── 頁面設定 ───────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Cowork", page_icon="🥜", layout="wide")
 
-# ── Session State 初始化 ───────────────────────────────────────────────────────
-if "cowork_file_rows" not in st.session_state:
-    st.session_state.cowork_file_rows = []
-if "cowork_file_bytes" not in st.session_state:
-    st.session_state.cowork_file_bytes = {}
-if "cowork_ds_store" not in st.session_state:
-    st.session_state.cowork_ds_store = None
-if "cowork_ds_processed_keys" not in st.session_state:
-    st.session_state.cowork_ds_processed_keys = set()
-
-# ── API Key ───────────────────────────────────────────────────────────────────
+# ── API Key ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = (
     st.secrets.get("OPENAI_API_KEY")
     or st.secrets.get("OPENAI_KEY")
@@ -46,10 +62,8 @@ if not OPENAI_API_KEY:
     st.stop()
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
 _oai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ── LangChain LLM（gpt-5.2 + Responses API，主 Agent 使用）────────────────────
 from langchain_openai import ChatOpenAI as _ChatOpenAI
 
 _main_llm = _ChatOpenAI(
@@ -58,15 +72,13 @@ _main_llm = _ChatOpenAI(
     use_responses_api=True,
 )
 
-# ── Supabase 知識庫初始化（選用）────────────────────────────────────────────
+# ── Supabase 知識庫（選用）────────────────────────────────────────────────────
 _HAS_KB = False
 _kb_supabase = None
 _kb_embeddings = None
-
 try:
     from supabase import create_client as _sb_create_client
     from langchain_openai import OpenAIEmbeddings as _OAIEmb
-
     if st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_KEY"):
         _kb_supabase = _sb_create_client(
             st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
@@ -78,54 +90,142 @@ try:
 except Exception:
     _HAS_KB = False
 
-# ── Cowork 路徑 ───────────────────────────────────────────────────────────────
 COWORK_DIR = Path(__file__).parent.parent / "cowork"
 
-# ── Module-level DocStore 參考（避免 deepagents 在子執行緒中讀不到 st.session_state）
+# ── Module-level DocStore（避免 deepagents worker thread 讀不到 st.session_state）
 class _DS:
-    store = None  # 在 invoke() 前由主執行緒更新
+    store = None  # 每次 invoke 前在主 thread 設定
 
 
-# ── 工具定義 ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTEXT ENGINEERING
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CoworkContext:
+    """型別化 Runtime Context，每次 Agent 執行時傳入，讓 middleware 知道目前環境狀態。"""
+    has_documents: bool = False    # 是否有已建立索引的文件
+    doc_chunk_count: int = 0       # 索引的 chunks 數量
+    has_kb: bool = False           # Supabase 知識庫是否啟用
+
+
+# ── @dynamic_prompt：每次 LLM 呼叫前動態注入環境資訊到 system prompt ──────────
+if _HAS_CE_MW:
+    @_dynamic_prompt_deco
+    def _cowork_dynamic_prompt(request: _ModelRequest) -> str:
+        """注入今日日期、文件狀態、長對話提醒，讓 Agent 不需使用者告知即可掌握環境。"""
+        ctx: CoworkContext | None = getattr(request, "context", None)
+        lines: list[str] = [f"📅 今日日期：{datetime.now().strftime('%Y-%m-%d %H:%M')}"]
+
+        # 文件索引狀態
+        if ctx and ctx.has_documents:
+            lines.append(f"📚 已建立文件索引：{ctx.doc_chunk_count} chunks 可用，請優先使用 docstore_search 搜尋。")
+        else:
+            lines.append("📚 目前無已索引文件，請勿呼叫 docstore_search。")
+
+        # 公司知識庫狀態
+        if ctx and not ctx.has_kb:
+            lines.append("🏢 公司知識庫未啟用，請勿呼叫 company_knowledge_search。")
+
+        # 長對話精簡提醒
+        if len(getattr(request, "messages", [])) > 20:
+            lines.append("⚠️ 對話已很長，請精簡回答，避免重複前面已說過的內容。")
+
+        return "\n".join(lines)
+
+    # ── @wrap_model_call：依據 context 過濾工具，避免 Agent 呼叫無法使用的工具 ──
+    @_wrap_model_call_deco
+    def _filter_tools(request: _ModelRequest, handler: Callable) -> Any:
+        """移除當前狀態下不可用的工具，減少 Agent 的無效呼叫與幻覺。"""
+        ctx: CoworkContext | None = getattr(request, "context", None)
+        tools = list(request.tools)
+
+        if ctx is not None:
+            if not ctx.has_documents:
+                tools = [t for t in tools if getattr(t, "name", "") != "docstore_search"]
+            if not ctx.has_kb:
+                tools = [t for t in tools if getattr(t, "name", "") != "company_knowledge_search"]
+
+        return handler(request.override(tools=tools))
+
+# ── Session State 初始化 ───────────────────────────────────────────────────────
+_SS_DEFAULTS: dict = {
+    "cowork_chat_history": [],   # list of {role, content, todos, tool_calls_log, web_sources, report_content, files}
+    "cowork_file_rows": [],
+    "cowork_file_bytes": {},
+    "cowork_ds_store": None,
+    "cowork_ds_processed_keys": set(),
+}
+for _k, _v in _SS_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# ── URL 解析 regex ─────────────────────────────────────────────────────────────
+_URL_SRC_RE = re.compile(r"- \[(.+?)\]\((https?://[^\)]+)\)")
+
+def _parse_sources(text: str) -> list[dict]:
+    return [{"title": m.group(1), "url": m.group(2)} for m in _URL_SRC_RE.finditer(text)]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOLS
+# ══════════════════════════════════════════════════════════════════════════════
 
 @tool
 def web_search(query: str) -> str:
     """Search the web for current information using OpenAI web search.
-    Use for factual queries, recent events, or topics not in internal knowledge."""
+    Always use think after each search to evaluate: Did I find enough?
+    What's missing? Should I search again with different keywords?"""
     try:
         response = _oai.responses.create(
             model="gpt-4.1",
             tools=[{"type": "web_search_preview"}],
             input=query,
         )
-        return response.output_text or "（搜尋無結果）"
+        text = response.output_text or "（搜尋無結果）"
+
+        # 提取 URL 引用
+        sources: list[dict] = []
+        for item in response.output:
+            for block in getattr(item, "content", None) or []:
+                for ann in getattr(block, "annotations", None) or []:
+                    if getattr(ann, "type", "") == "url_citation":
+                        url = getattr(ann, "url", "")
+                        title = getattr(ann, "title", url)
+                        if url and not any(s["url"] == url for s in sources):
+                            sources.append({"title": title, "url": url})
+
+        if sources:
+            src_md = "\n".join(f"- [{s['title']}]({s['url']})" for s in sources)
+            return f"{text}\n\n**🔗 搜尋來源：**\n{src_md}"
+        return text
     except Exception as e:
         return f"搜尋失敗：{e}"
 
 
 @tool
 def think(thought: str) -> str:
-    """Think through your reasoning step by step.
-    Use after gathering information to reflect: What did I find? What's missing?
-    Do I have enough to write the report, or should I search more?"""
+    """Think through reasoning step by step.
+    Use after web_search to evaluate:
+    - What did I find? Is it relevant and credible?
+    - What gaps remain? Should I search again?
+    Use before writing reports to plan structure and coverage."""
     return thought
 
 
 @tool
 def docstore_search(query: str) -> str:
-    """Search documents uploaded by the user in the Cowork document library (FAISS + BM25 hybrid).
-    Use when the user has uploaded files and wants information from them.
-    IMPORTANT: Call this tool MULTIPLE TIMES with different specific queries to cover different
-    aspects of a document (e.g. summary, key findings, risks, conclusions). Do NOT use '*' or
-    generic queries — use focused topic keywords for best results."""
+    """Search user-uploaded documents (FAISS + BM25 hybrid retrieval).
+    Call MULTIPLE TIMES with different focused queries for comprehensive coverage.
+    Never use '*' or vague terms — use specific topic keywords."""
     ds = _DS.store
     if ds is None or not getattr(ds, "chunks", None):
-        return "目前沒有已建立索引的文件。請先在上方的「📚 上傳文件」區塊上傳並建立索引。"
+        return "目前沒有已建立索引的文件。請先在上方「📚 上傳文件」區塊建立索引。"
     try:
         emb_resp = _oai.embeddings.create(model="text-embedding-3-small", input=[query])
         qvec = np.array(emb_resp.data[0].embedding, dtype="float32")
         qvec /= np.linalg.norm(qvec) + 1e-9
-        qvec = qvec.reshape(1, -1)  # FAISS needs 2D input: (n_queries, dim)
+        qvec = qvec.reshape(1, -1)
         results = ds.search_hybrid(query, qvec, k=10)
         if not results:
             return "在上傳文件中找不到相關內容。"
@@ -136,66 +236,47 @@ def docstore_search(query: str) -> str:
 
 @tool
 def company_knowledge_search(query: str) -> str:
-    """Search the company internal knowledge base (SOPs, regulations, product documents, ESG).
-    Use when the user asks about internal company information."""
+    """Search company internal knowledge base (SOPs, regulations, ESG, product docs)."""
     if not _HAS_KB or _kb_supabase is None or _kb_embeddings is None:
         return "公司知識庫未啟用。請確認 SUPABASE_URL 和 SUPABASE_KEY 已設定。"
     try:
         qvec = _kb_embeddings.embed_query(query)
         result = _kb_supabase.rpc(
             "match_knowledge_chunks",
-            {
-                "query_embedding": qvec,
-                "match_threshold": 0.30,
-                "match_count": 8,
-                "namespace_filter": None,
-            },
+            {"query_embedding": qvec, "match_threshold": 0.30,
+             "match_count": 8, "namespace_filter": None},
         ).execute()
         rows = result.data or []
         if not rows:
             return "公司知識庫中找不到相關內容。"
-        parts = []
-        for row in rows[:6]:
-            fname = row.get("filename", "unknown")
-            content = (row.get("content") or "")[:500]
-            score = row.get("similarity", 0)
-            parts.append(f"[{score:.2f}] {fname}\n{content}")
-        return "\n\n".join(parts)
+        return "\n\n".join(
+            f"[{r.get('similarity', 0):.2f}] {r.get('filename', '')}:\n{(r.get('content') or '')[:500]}"
+            for r in rows[:6]
+        )
     except Exception as e:
         return f"知識庫搜尋失敗：{e}"
 
 
 # ── Research Sub-Agent ────────────────────────────────────────────────────────
-
-RESEARCHER_PROMPT = """You are a research assistant conducting targeted web research.
-
-<Task>
-Use web_search and think tools to gather information on the given topic.
-Call tools in series or parallel to research comprehensively.
-</Task>
+RESEARCHER_PROMPT = """You are a focused research assistant conducting targeted web research.
 
 <Instructions>
 1. Read the research topic carefully
-2. Start with a broad search query
-3. Use think after each search: What did I find? What's missing? Need more searches?
-4. Execute narrower searches to fill gaps
-5. Stop when you can answer confidently
+2. Execute web_search with a well-crafted query
+3. ALWAYS use think after each search:
+   - What did I find? Is it relevant, credible, and sufficient?
+   - What gaps remain?
+   - Should I search again with different or narrower keywords?
+4. Stop when you have 3+ good sources OR after 5 searches maximum
+5. Structure your findings clearly with headings and cite all sources
 </Instructions>
 
-<Hard Limits>
-- Simple queries: 2-3 searches maximum
-- Complex queries: up to 5 searches maximum
-- Always stop after 5 searches
-- Stop immediately when you have 3+ relevant sources
-</Hard Limits>
-
 <Output Format>
-Structure your findings with clear headings.
-Cite sources inline: [1], [2], [3]
+Use clear headings. Cite inline as [1][2][3].
 End with:
 ### Sources
-[1] Title: URL
-[2] Title: URL
+[1] Title — URL
+[2] Title — URL
 </Output Format>"""
 
 _research_llm = _ChatOpenAI(
@@ -208,18 +289,19 @@ _research_llm = _ChatOpenAI(
 research_sub_agent = {
     "name": "research-agent",
     "description": (
-        "Delegate web research to this agent. "
-        "Give ONE focused research topic at a time. "
-        "Returns structured findings with citations."
+        "Delegate COMPREHENSIVE multi-step research to this agent — NOT simple factual lookups. "
+        "Use when you need: multiple searches, critical evaluation, structured findings with citations. "
+        "For quick single-fact queries, use web_search directly instead. "
+        "Give ONE focused research topic per delegation."
     ),
     "system_prompt": RESEARCHER_PROMPT,
     "tools": [web_search, think],
     "model": _research_llm,
 }
 
-# ── Agent 建立（per session）─────────────────────────────────────────────────
 
-def _get_agent_and_workspace():
+# ── Agent 建立（per-session，保留 thread 跨回合對話記憶）────────────────────────
+def _get_agent_and_workspace() -> tuple:
     if "cowork_agent" not in st.session_state:
         workspace = tempfile.mkdtemp(prefix="cowork_")
         st.session_state.cowork_workspace = workspace
@@ -227,15 +309,34 @@ def _get_agent_and_workspace():
 
         from deepagents import create_deep_agent
         from deepagents.backends import FilesystemBackend
+        from deepagents.middleware import SummarizationMiddleware
         from langgraph.checkpoint.memory import InMemorySaver
+
+        # 先建 backend，再與 SummarizationMiddleware 共用同一實例
+        backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+
+        # 自訂摘要 middleware（覆蓋預設的 170K tokens 閾值，改為更積極的 8K）
+        summ_mw = SummarizationMiddleware(
+            model="gpt-4.1-mini",     # 輕量模型做摘要，省成本
+            backend=backend,           # 共用同一 backend，摘要存於 workspace/conversation_history/
+            trigger=("tokens", 8000),  # 超過 8K tokens 觸發摘要
+            keep=("messages", 10),     # 摘要後保留最近 10 則訊息
+        )
+
+        # Context Engineering middleware（若成功 import）
+        ce_middleware: list = [summ_mw]
+        if _HAS_CE_MW:
+            ce_middleware = [_cowork_dynamic_prompt, _filter_tools, summ_mw]
 
         agent = create_deep_agent(
             model=_main_llm,
+            middleware=ce_middleware,
+            context_schema=CoworkContext,  # 型別化 runtime context
             memory=[str(COWORK_DIR / "AGENTS.md")],
             skills=[str(COWORK_DIR / "skills")],
             tools=[web_search, think, docstore_search, company_knowledge_search],
             subagents=[research_sub_agent],
-            backend=FilesystemBackend(root_dir=workspace, virtual_mode=True),
+            backend=backend,           # 共用同一 backend 實例
             checkpointer=InMemorySaver(),
         )
         st.session_state.cowork_agent = agent
@@ -243,67 +344,98 @@ def _get_agent_and_workspace():
     return st.session_state.cowork_agent, st.session_state.cowork_workspace
 
 
-def _reset_task():
-    """清除任務結果，保留已上傳文件。"""
-    for key in ["cowork_agent", "cowork_workspace", "cowork_thread_id",
-                "cowork_result", "cowork_todos", "cowork_files"]:
-        st.session_state.pop(key, None)
+def _reset_conversation():
+    """清除對話記憶，開啟新 thread（保留已上傳文件索引）。"""
+    for k in ["cowork_agent", "cowork_workspace", "cowork_thread_id"]:
+        st.session_state.pop(k, None)
+    st.session_state.cowork_chat_history = []
 
 
-# ── 結果解析 ──────────────────────────────────────────────────────────────────
+# ── UI 短期記憶修剪 ───────────────────────────────────────────────────────────
+TRIM_LAST_N_TURNS = 20  # 保留最近 N 則訊息（user + assistant 合計）
 
-def _extract_todos(messages: list) -> list:
-    todos = []
-    for msg in messages:
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                if tc.get("name") == "write_todos":
-                    todos = tc.get("args", {}).get("todos", [])
-    return todos
+def _trim_chat_history() -> None:
+    """修剪 UI 聊天歷史，防止 session_state 無限成長（類似 Home.py TRIM_LAST_N_USER_TURNS）。"""
+    hist = st.session_state.cowork_chat_history
+    if len(hist) > TRIM_LAST_N_TURNS:
+        st.session_state.cowork_chat_history = hist[-TRIM_LAST_N_TURNS:]
 
 
-def _extract_tool_calls(messages: list) -> list:
-    calls = []
-    for msg in messages:
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                name = tc.get("name", "")
-                args = tc.get("args", {})
-                if name == "write_todos":
-                    continue
-                summary = ""
-                if name == "web_search":
-                    summary = args.get("query", "")[:60]
-                elif name == "think":
-                    summary = args.get("thought", "")[:60]
-                elif name in ("write_file", "read_file", "edit_file"):
-                    summary = args.get("file_path", "")
-                elif name == "task":
-                    summary = args.get("description", "")[:60]
-                elif name in ("docstore_search", "company_knowledge_search"):
-                    summary = args.get("query", "")[:60]
-                calls.append({"name": name, "summary": summary})
-    return calls
-
-
-TOOL_ICONS = {
+# ── UI 常數 ───────────────────────────────────────────────────────────────────
+TOOL_ICONS: dict[str, str] = {
     "web_search": "🔍", "think": "🤔", "write_file": "📝",
     "read_file": "📖", "edit_file": "✏️", "task": "🤖",
     "docstore_search": "📚", "company_knowledge_search": "🏢",
     "glob": "🗂️", "grep": "🔎", "ls": "📂",
+    "research-agent": "🔬", "write_todos": "📋",
 }
+TODO_ICONS: dict[str, str] = {
+    "completed": "✅", "in_progress": "🔄", "pending": "⬜",
+}
+REPORT_NAMES = ["final_report.md", "analysis_report.md", "report.md"]
 
-TODO_ICONS = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
+
+# ── 歷史訊息渲染（collapsed，用 expander）────────────────────────────────────
+def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
+    todos = msg.get("todos", [])
+    tool_calls_log = msg.get("tool_calls_log", [])
+    web_sources = msg.get("web_sources", [])
+    report = msg.get("report_content", "")
+    content = msg.get("content", "")
+    files = msg.get("files", {})
+
+    if todos:
+        with st.expander("📋 任務進度", expanded=False):
+            for t in todos:
+                icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
+                st.markdown(f"{icon} {t.get('content', '')}")
+
+    if tool_calls_log:
+        with st.expander("🔧 工具呼叫紀錄", expanded=False):
+            for tc in tool_calls_log:
+                icon = TOOL_ICONS.get(tc["name"], "🔧")
+                label = f"{icon} **{tc['name']}**"
+                if tc.get("summary"):
+                    label += f"：{tc['summary']}"
+                st.markdown(label)
+
+    if web_sources:
+        with st.expander("🔗 網路來源", expanded=False):
+            for s in web_sources:
+                st.markdown(f"- [{s['title']}]({s['url']})")
+
+    if report:
+        st.markdown(report)
+    if content and not report:
+        st.markdown(content)
+    elif content and report:
+        with st.expander("💬 Agent 最終回應", expanded=False):
+            st.markdown(content)
+
+    if files:
+        with st.expander("📁 工作區檔案", expanded=False):
+            for fpath, file_data in files.items():
+                filename = Path(fpath).name
+                cn, cb = st.columns([4, 1])
+                cn.markdown(f"📄 `{filename}`")
+                raw = (
+                    file_data if isinstance(file_data, bytes)
+                    else file_data.encode() if isinstance(file_data, str)
+                    else str(file_data).encode()
+                )
+                cb.download_button(
+                    "下載", data=raw, file_name=filename,
+                    key=f"dl_h{msg_idx}_{filename}",
+                )
 
 
-# ── 主頁面 ────────────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# 主頁面
+# ══════════════════════════════════════════════════════════════════════════════
 st.title("🥜 Cowork — 任務型 Agent")
-st.caption("輸入複合任務，Agent 將自動規劃、研究、整合並產出報告。")
+st.caption("輸入複合任務，Agent 將自動規劃、研究、整合並產出報告。支援上下文對話。")
 
-st.divider()
-
-# ── 文件上傳區 ────────────────────────────────────────────────────────────────
+# ── 頂部操作列：文件上傳 + 清除對話 ──────────────────────────────────────────
 _ds_store = st.session_state.cowork_ds_store
 _has_index = (
     _ds_store is not None
@@ -312,13 +444,11 @@ _has_index = (
 )
 doc_label = (
     f"📚 上傳文件（已建索引：{len(_ds_store.chunks)} chunks）"
-    if _has_index
-    else "📚 上傳文件"
+    if _has_index else "📚 上傳文件"
 )
 
 with st.expander(doc_label, expanded=not _has_index):
-    st.caption("檔案只存在本次 session。建索引後，Agent 才能搜尋文件內容。")
-    st.caption(":small[:gray[拖曳檔案到這裡，或點一下選取。]]")
+    st.caption("檔案只存在本次 session。建立索引後，Agent 才能搜尋文件內容。")
 
     uploaded = st.file_uploader(
         "上傳文件",
@@ -327,7 +457,6 @@ with st.expander(doc_label, expanded=not _has_index):
         label_visibility="collapsed",
         key="cowork_file_uploader",
     )
-
     if uploaded:
         existing = {(r.name, r.bytes_len) for r in st.session_state.cowork_file_rows}
         for f in uploaded:
@@ -339,34 +468,30 @@ with st.expander(doc_label, expanded=not _has_index):
             st.session_state.cowork_file_bytes[row.file_id] = data
 
     rows = st.session_state.cowork_file_rows
-    store = st.session_state.cowork_ds_store
-
     if rows:
-        payload = doc_list_payload(rows, store)
+        payload = doc_list_payload(rows, st.session_state.cowork_ds_store)
         items = payload.get("items", [])
-
-        # 建 file_id 查找表
-        id_to_row = {r.file_id: r for r in st.session_state.cowork_file_rows}
-        key_to_file_id = {}
-        for r in st.session_state.cowork_file_rows:
-            title = os.path.splitext(r.name)[0]
-            key_to_file_id[(title, r.ext)] = r.file_id
+        id_to_row = {r.file_id: r for r in rows}
+        key_to_file_id = {
+            (os.path.splitext(r.name)[0], r.ext): r.file_id for r in rows
+        }
 
         def _short(name: str, n: int = 48) -> str:
             name = (name or "").strip()
-            return name if len(name) <= n else (name[:n] + "…")
+            return name if len(name) <= n else name[:n] + "…"
 
+        _blank_row = FileRow(
+            file_id="", file_sig="", name="", ext="", bytes_len=0,
+            pages=None, extracted_chars=0, token_est=0,
+            blank_pages=None, blank_ratio=None, text_pages=None,
+            text_pages_ratio=None, likely_scanned=False, use_ocr=False,
+        )
         df = pd.DataFrame([
             {
                 "OCR": bool(
                     id_to_row.get(
                         key_to_file_id.get((it.get("title"), it.get("ext"))),
-                        FileRow(
-                            file_id="", file_sig="", name="", ext="", bytes_len=0,
-                            pages=None, extracted_chars=0, token_est=0,
-                            blank_pages=None, blank_ratio=None, text_pages=None,
-                            text_pages_ratio=None, likely_scanned=False, use_ocr=False,
-                        ),
+                        _blank_row,
                     ).use_ocr
                 ) if it.get("ext") == ".pdf" else False,
                 "檔名": _short(f"{it.get('title')}{it.get('ext')}"),
@@ -377,14 +502,8 @@ with st.expander(doc_label, expanded=not _has_index):
             }
             for it in items
         ])
-
-        st.markdown("### 📄 文件清單")
-        st.caption("OCR 勾選只對 PDF 生效；非 PDF 會自動忽略。")
-
         edited = st.data_editor(
-            df,
-            hide_index=True,
-            width="stretch",
+            df, hide_index=True, width="stretch",
             key="cowork_file_list_editor",
             column_config={
                 "_file_id": st.column_config.TextColumn("_file_id", disabled=True, width="small"),
@@ -393,43 +512,33 @@ with st.expander(doc_label, expanded=not _has_index):
                 "頁數": st.column_config.NumberColumn("頁數", disabled=True, width="small"),
                 "chunks": st.column_config.NumberColumn("chunks", disabled=True, width="small"),
                 "OCR": st.column_config.CheckboxColumn(
-                    "OCR",
-                    help="僅 PDF 可用；用 OCR 抽取掃描 PDF 文字（較慢）",
-                    width="small",
+                    "OCR", help="僅 PDF；掃描 PDF 用視覺 OCR（較慢）", width="small"
                 ),
             },
             disabled=["_file_id", "檔名", "類型", "頁數", "chunks"],
         )
-
-        # 回寫 OCR 設定（只對 PDF 生效）
         try:
             for rec in edited.to_dict(orient="records"):
                 fid = rec.get("_file_id")
-                if not fid or fid not in id_to_row:
-                    continue
-                r = id_to_row[fid]
-                r.use_ocr = bool(rec.get("OCR")) if r.ext == ".pdf" else False
+                if fid and fid in id_to_row:
+                    r = id_to_row[fid]
+                    r.use_ocr = bool(rec.get("OCR")) if r.ext == ".pdf" else False
         except Exception:
             pass
 
-        # 能力摘要
         caps = payload.get("capabilities", {}) or {}
-        st.markdown(
-            ":small[:gray[能力："
+        st.caption(
             f"BM25={'on' if caps.get('bm25') else 'off'} · "
             f"FlashRank={'on' if caps.get('flashrank') else 'off'} · "
             f"Unstructured={'on' if caps.get('unstructured_loaders') else 'off'} · "
             f"PyMuPDF={'on' if caps.get('pymupdf') else 'off'}"
-            "]]"
         )
     else:
-        st.markdown(":small[（尚未上傳任何文件）]")
+        st.caption("（尚未上傳任何文件）")
 
-    cb1, cb2 = st.columns([1, 1])
+    cb1, cb2 = st.columns(2)
     build_btn = cb1.button("🚀 建立/更新索引", type="primary", width="stretch", key="cowork_build_idx")
-    clear_docs_btn = cb2.button("🧹 清空文件庫", width="stretch", key="cowork_clear_docs")
-
-    if clear_docs_btn:
+    if cb2.button("🧹 清空文件庫", width="stretch", key="cowork_clear_docs"):
         st.session_state.cowork_file_rows = []
         st.session_state.cowork_file_bytes = {}
         st.session_state.cowork_ds_store = None
@@ -437,192 +546,264 @@ with st.expander(doc_label, expanded=not _has_index):
         st.rerun()
 
     if build_btn and rows:
-        with st.status("建索引中（抽文/OCR + embeddings）...", expanded=True) as s:
-            store, stats, processed_keys = build_indices_incremental(
+        with st.status("建索引中（文字抽取 + embeddings）...", expanded=True) as s:
+            _store, _stats, _pkeys = build_indices_incremental(
                 _oai,
                 file_rows=st.session_state.cowork_file_rows,
                 file_bytes_map=st.session_state.cowork_file_bytes,
                 store=st.session_state.cowork_ds_store,
                 processed_keys=st.session_state.cowork_ds_processed_keys,
             )
-            st.session_state.cowork_ds_store = store
-            st.session_state.cowork_ds_processed_keys = processed_keys
-            s.write(f"新增文件數：{stats.get('new_reports', 0)}")
-            s.write(f"新增 chunks：{stats.get('new_chunks', 0)}")
-            if stats.get("errors"):
-                s.warning("部分檔案失敗：\n" + "\n".join(f"- {e}" for e in stats["errors"][:5]))
+            st.session_state.cowork_ds_store = _store
+            st.session_state.cowork_ds_processed_keys = _pkeys
+            s.write(f"新增文件：{_stats.get('new_reports', 0)}　新增 chunks：{_stats.get('new_chunks', 0)}")
+            if _stats.get("errors"):
+                s.warning("\n".join(f"- {e}" for e in _stats["errors"][:5]))
             s.update(state="complete")
         st.rerun()
 
     if _has_index:
-        st.success(f"已建立索引：chunks={len(st.session_state.cowork_ds_store.chunks)}")
+        st.success(f"已建立索引：{len(st.session_state.cowork_ds_store.chunks)} chunks")
     elif rows:
-        st.info("尚未建立索引（或索引為空）。")
+        st.info("尚未建立索引（點「建立/更新索引」）")
 
 st.divider()
 
-# ── 任務輸入 ──────────────────────────────────────────────────────────────────
-task_input = st.text_area(
-    "任務描述",
-    placeholder=(
-        "例如：研究 LangGraph 的最新功能，整理成 markdown 報告並存成 final_report.md\n"
-        "例如：比較 Claude、GPT-4、Gemini 在程式碼生成上的差異\n"
-        "例如：分析上傳的 PDF 文件，找出關鍵風險點"
-    ),
-    height=120,
-    key="task_input",
-    label_visibility="collapsed",
-)
-
-col1, col2 = st.columns([1, 6])
-with col1:
-    run_btn = st.button("🚀 開始任務", type="primary", width="stretch")
-with col2:
-    if st.button("🗑 清除任務"):
-        _reset_task()
+# ── 清除對話按鈕 ──────────────────────────────────────────────────────────────
+_ch = st.session_state.cowork_chat_history
+col_info, col_clear = st.columns([5, 1])
+with col_info:
+    if _ch:
+        st.caption(f"對話共 {len(_ch)} 則訊息 · 相同 session 保有短期記憶")
+    else:
+        st.caption("💡 輸入任務或問題，Agent 會自動規劃並執行。支援多輪對話。")
+with col_clear:
+    if st.button("🗑 清除對話", key="cowork_clear_conv"):
+        _reset_conversation()
         st.rerun()
 
-# ── 執行（LangGraph stream → 即時 Todo 更新）─────────────────────────────────
+# ── 顯示歷史對話 ──────────────────────────────────────────────────────────────
+for _i, _msg in enumerate(st.session_state.cowork_chat_history):
+    with st.chat_message(_msg["role"]):
+        if _msg["role"] == "user":
+            st.markdown(_msg["content"])
+        else:
+            _render_history_assistant(_msg, msg_idx=_i)
 
-if run_btn:
-    task = (task_input or "").strip()
-    if not task:
-        st.warning("請輸入任務描述。")
-    else:
-        _reset_task()
-        agent, workspace = _get_agent_and_workspace()
-        _DS.store = st.session_state.cowork_ds_store
+# ══════════════════════════════════════════════════════════════════════════════
+# Chat Input → Agent 執行
+# ══════════════════════════════════════════════════════════════════════════════
+if prompt := st.chat_input(
+    "輸入任務或問題… 例：分析上傳文件找出關鍵風險 / 研究 AI Agent 趨勢並產出報告",
+    key="cowork_chat_input",
+):
+    # ── 1. 顯示使用者訊息 ─────────────────────────────────────────────────────
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    st.session_state.cowork_chat_history.append({"role": "user", "content": prompt})
 
-        # 即時 Todo 區塊（在 spinner 外，讓更新可見）
-        todos_ph = st.empty()
-        current_todos = []
-        all_messages = []
+    # ── 2. 取得 Agent + 建立 CoworkContext ────────────────────────────────────
+    agent, workspace = _get_agent_and_workspace()
+    _DS.store = st.session_state.cowork_ds_store  # 保留 module-level ref（工具 thread 安全用）
 
-        def _render_live_todos(todos: list):
-            with todos_ph.container():
-                st.subheader("📋 任務進度")
-                for t in todos:
+    _ds_ref = st.session_state.cowork_ds_store
+    _has_idx = (
+        _ds_ref is not None
+        and getattr(_ds_ref, "index", None) is not None
+        and _ds_ref.index.ntotal > 0
+    )
+    _runtime_ctx = CoworkContext(
+        has_documents=_has_idx,
+        doc_chunk_count=len(_ds_ref.chunks) if _has_idx else 0,
+        has_kb=_HAS_KB,
+    )
+
+    # ── 3. Assistant 回應區塊 ─────────────────────────────────────────────────
+    with st.chat_message("assistant"):
+        # 狀態指示器（即時更新工具呼叫 + 任務進度）
+        status = st.status("思考中…✨", expanded=True)
+        status_steps_ph = status.empty()   # 工具呼叫列表
+        status_todos_ph  = status.empty()  # 任務進度 TodoList
+
+        # 主要回應佔位（在 status 之下）
+        response_ph = st.empty()
+
+        # ── 狀態追蹤（用可變容器避免 closure 重新賦值問題）
+        step_log: list[str]       = []
+        current_todos: list[dict] = []
+        tool_calls_log: list[dict] = []
+        web_sources: list[dict]   = []
+
+        def _refresh_status() -> None:
+            """更新 status 內的步驟列表與任務進度。"""
+            if step_log:
+                status_steps_ph.markdown(
+                    "**🔧 執行步驟**\n" + "\n".join(f"- {s}" for s in step_log[-10:])
+                )
+            if current_todos:
+                lines = [
+                    f"{TODO_ICONS.get(t.get('status', 'pending'), '⬜')} {t.get('content', '')}"
+                    for t in current_todos
+                ]
+                status_todos_ph.markdown("**📋 任務進度**\n\n" + "\n\n".join(lines))
+
+        # ── 執行 Agent（LangGraph stream_mode="values"）────────────────────────
+        all_messages: list = []
+        try:
+            cfg = {"configurable": {"thread_id": st.session_state.cowork_thread_id}}
+            last_msg_count = 0
+            final_chunk = None
+
+            for chunk in agent.stream(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config=cfg,
+                context=_runtime_ctx,  # CoworkContext：傳遞環境狀態給 middleware 和工具
+                stream_mode="values",  # 完整 state dict；避免 Overwrite 物件問題
+            ):
+                final_chunk = chunk
+                all_msgs = chunk.get("messages", [])
+                new_msgs = all_msgs[last_msg_count:]
+                last_msg_count = len(all_msgs)
+
+                for msg in new_msgs:
+                    # ── AI 訊息：工具呼叫 ─────────────────────────────────
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            name = tc.get("name", "")
+                            args = tc.get("args", {})
+
+                            if name == "write_todos":
+                                # 更新任務進度（原地清空 + 填入，避免 closure 重新賦值）
+                                current_todos.clear()
+                                current_todos.extend(args.get("todos", []))
+                            else:
+                                icon = TOOL_ICONS.get(name, "🔧")
+                                summary_raw = (
+                                    args.get("query")
+                                    or args.get("thought", "")
+                                    or args.get("description", "")
+                                )
+                                summary = str(summary_raw)[:80] if summary_raw else ""
+                                step_str = f"{icon} {name}" + (f"：{summary}" if summary else "")
+                                step_log.append(step_str)
+                                tool_calls_log.append({"name": name, "summary": summary})
+
+                            _refresh_status()
+
+                    # ── Tool 回應訊息：擷取 web_search 來源 URL ────────────
+                    msg_name = getattr(msg, "name", "")
+                    if msg_name == "web_search":
+                        content_text = getattr(msg, "content", "")
+                        if isinstance(content_text, str):
+                            for s in _parse_sources(content_text):
+                                if not any(x["url"] == s["url"] for x in web_sources):
+                                    web_sources.append(s)
+
+            all_messages = final_chunk.get("messages", []) if final_chunk else []
+            status.update(label="完成 ✅", state="complete", expanded=False)
+
+        except Exception as exc:
+            status.update(label="執行失敗 ❌", state="error", expanded=False)
+            st.error(f"Agent 執行失敗：{exc}")
+            st.stop()
+
+        # ── 網路來源（expanded，最優先顯示）──────────────────────────────
+        if web_sources:
+            with st.expander("🔗 網路來源", expanded=True):
+                for s in web_sources:
+                    st.markdown(f"- [{s['title']}]({s['url']})")
+
+        # ── 任務進度（最終狀態）──────────────────────────────────────────
+        if current_todos:
+            with st.expander("📋 任務進度", expanded=True):
+                for t in current_todos:
                     icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
                     st.markdown(f"{icon} {t.get('content', '')}")
 
-        with st.spinner("⏳ Cowork Agent 正在處理任務，請稍候..."):
-            try:
-                cfg = {"configurable": {"thread_id": st.session_state.cowork_thread_id}}
-                last_msg_count = 0
-                final_chunk = None
-                for chunk in agent.stream(
-                    {"messages": [{"role": "user", "content": task}]},
-                    config=cfg,
-                    stream_mode="values",  # 完整 state dict，避免 Overwrite 物件問題
-                ):
-                    final_chunk = chunk
-                    all_msgs = chunk.get("messages", [])
-                    new_msgs = all_msgs[last_msg_count:]
-                    last_msg_count = len(all_msgs)
-                    for msg in new_msgs:
-                        if hasattr(msg, "tool_calls") and msg.tool_calls:
-                            for tc in msg.tool_calls:
-                                if tc.get("name") == "write_todos":
-                                    current_todos = tc.get("args", {}).get("todos", [])
-                                    _render_live_todos(current_todos)
-                all_messages = final_chunk.get("messages", []) if final_chunk else []
+        # ── 工具呼叫紀錄（collapsed）─────────────────────────────────────
+        if tool_calls_log:
+            with st.expander("🔧 工具呼叫紀錄", expanded=False):
+                for tc in tool_calls_log:
+                    icon = TOOL_ICONS.get(tc["name"], "🔧")
+                    label = f"{icon} **{tc['name']}**"
+                    if tc.get("summary"):
+                        label += f"：{tc['summary']}"
+                    st.markdown(label)
 
-                # 收集工作區檔案（直接讀取 workspace 目錄）
-                workspace_path = Path(workspace)
-                files: dict = {}
-                for f in workspace_path.rglob("*"):
-                    if f.is_file():
-                        rel = str(f.relative_to(workspace_path))
-                        files[rel] = f.read_bytes()
+        # ── 收集工作區檔案 ────────────────────────────────────────────────
+        workspace_path = Path(workspace)
+        files: dict = {}
+        for _f in workspace_path.rglob("*"):
+            if _f.is_file():
+                rel = str(_f.relative_to(workspace_path))
+                files[rel] = _f.read_bytes()
 
-                st.session_state.cowork_result = {"messages": all_messages}
-                st.session_state.cowork_todos = current_todos
-                st.session_state.cowork_files = files
+        # ── 研究報告直接展示（優先）──────────────────────────────────────
+        report_content = ""
+        for rname in REPORT_NAMES:
+            rdata = files.get(rname)
+            if rdata:
+                report_content = (
+                    rdata.decode("utf-8", errors="replace")
+                    if isinstance(rdata, bytes) else str(rdata)
+                )
+                st.subheader("📄 研究報告")
+                st.markdown(report_content)
+                break
 
-                todos_ph.empty()  # 清掉即時區塊，下方統一顯示
-
-            except Exception as e:
-                st.error(f"Agent 執行失敗：{e}")
-                st.stop()
-
-# ── 顯示結果 ──────────────────────────────────────────────────────────────────
-
-if "cowork_result" in st.session_state:
-    result = st.session_state.cowork_result
-    todos = st.session_state.get("cowork_todos", [])
-    files = st.session_state.get("cowork_files", {})
-    messages = result.get("messages", [])
-
-    st.divider()
-
-    # Todo 清單（最終狀態）
-    if todos:
-        st.subheader("📋 任務進度")
-        for todo in todos:
-            status = todo.get("status", "pending")
-            icon = TODO_ICONS.get(status, "⬜")
-            st.markdown(f"{icon} {todo.get('content', '')}")
-        st.divider()
-
-    # 工具呼叫紀錄
-    tool_calls = _extract_tool_calls(messages)
-    if tool_calls:
-        with st.expander("🔧 工具呼叫紀錄", expanded=False):
-            for tc in tool_calls:
-                icon = TOOL_ICONS.get(tc["name"], "🔧")
-                label = f"{icon} **{tc['name']}**"
-                if tc["summary"]:
-                    label += f"：{tc['summary']}"
-                st.markdown(label)
-
-    # ── 報告直接展示（final_report.md / analysis_report.md 優先）────────────
-    REPORT_NAMES = ["final_report.md", "analysis_report.md", "report.md"]
-    report_shown = False
-    for rname in REPORT_NAMES:
-        rdata = files.get(rname)
-        if rdata:
-            report_content = (
-                rdata.decode("utf-8", errors="replace")
-                if isinstance(rdata, bytes) else str(rdata)
-            )
-            st.subheader("📄 研究報告")
-            st.markdown(report_content)
-            report_shown = True
-            break
-
-    # 最終 Agent 回應（若無報告檔，或作為補充）
-    final_msg = messages[-1] if messages else None
-    if final_msg and hasattr(final_msg, "content") and final_msg.content:
-        if not report_shown:
-            st.subheader("💬 Agent 回應")
-        content = final_msg.content
-        if isinstance(content, list):
-            content = "\n".join(
-                p.get("text", "") for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        if not report_shown:
-            st.markdown(content)
+        # ── 最終 Agent 文字回應 ───────────────────────────────────────────
+        final_msg = all_messages[-1] if all_messages else None
+        response_text = ""
+        if final_msg and hasattr(final_msg, "content") and final_msg.content:
+            content = final_msg.content
+            if isinstance(content, list):
+                content = "\n".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            response_text = content
+            if not report_content:
+                response_ph.markdown(response_text)
+            else:
+                response_ph.empty()
+                with st.expander("💬 Agent 最終回應", expanded=False):
+                    st.markdown(response_text)
         else:
-            with st.expander("💬 Agent 最終回應", expanded=False):
-                st.markdown(content)
+            response_ph.empty()
 
-    # 工作區檔案下載
-    if files:
-        st.divider()
-        st.subheader("📁 工作區檔案")
-        for fpath, file_data in files.items():
-            filename = Path(fpath).name
-            col_name, col_btn = st.columns([4, 1])
-            col_name.markdown(f"📄 `{filename}`")
-            raw = (
-                file_data if isinstance(file_data, bytes)
-                else file_data.encode("utf-8") if hasattr(file_data, "encode")
-                else str(file_data).encode("utf-8")
-            )
-            col_btn.download_button(
-                "下載",
-                data=raw,
-                file_name=filename,
-                key=f"dl_{filename}",
-            )
+        # ── 工作區檔案下載 ────────────────────────────────────────────────
+        if files:
+            with st.expander("📁 工作區檔案", expanded=False):
+                for fpath, file_data in files.items():
+                    filename = Path(fpath).name
+                    cn, cb = st.columns([4, 1])
+                    cn.markdown(f"📄 `{filename}`")
+                    raw = (
+                        file_data if isinstance(file_data, bytes)
+                        else file_data.encode() if isinstance(file_data, str)
+                        else str(file_data).encode()
+                    )
+                    cb.download_button(
+                        "下載", data=raw, file_name=filename,
+                        key=f"dl_new_{filename}",
+                    )
+
+        # ── 對話記憶摘要（SummarizationMiddleware 生成，存於 workspace）────
+        _thread_id = st.session_state.get("cowork_thread_id", "")
+        _mem_file = Path(workspace) / "conversation_history" / f"{_thread_id}.md"
+        if _mem_file.exists():
+            with st.expander("🧠 對話記憶摘要", expanded=False):
+                st.caption("由 SummarizationMiddleware 自動生成，當對話超過 8K tokens 時觸發。")
+                st.markdown(_mem_file.read_text(encoding="utf-8", errors="replace"))
+
+        # ── 儲存 assistant 訊息到對話歷史，並修剪 UI 歷史長度 ────────────
+        st.session_state.cowork_chat_history.append({
+            "role": "assistant",
+            "content": response_text,
+            "todos": list(current_todos),
+            "tool_calls_log": list(tool_calls_log),
+            "web_sources": list(web_sources),
+            "report_content": report_content,
+            "files": files,
+        })
+        _trim_chat_history()  # 保留最近 TRIM_LAST_N_TURNS 則，防止 session_state 過大
