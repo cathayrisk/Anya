@@ -610,6 +610,24 @@ if prompt := st.chat_input(
         has_kb=_HAS_KB,
     )
 
+    # ── 環境提示前綴（不依賴 CE middleware，直接注入 user message）────────────
+    # 確保 Agent 即使在 middleware 不可用時也知道目前的文件索引狀態
+    _env_lines: list[str] = [f"📅 今日日期：{datetime.now().strftime('%Y-%m-%d')}"]
+    if _has_idx:
+        _chunk_count = len(_ds_ref.chunks)
+        _env_lines.append(
+            f"📚 文件索引狀態：已建立 {_chunk_count} chunks，"
+            "使用者上傳的文件已可搜尋。**請使用 `docstore_search` 工具搜尋文件內容。**"
+        )
+    else:
+        _env_lines.append("📚 文件索引狀態：目前無已索引文件，請勿呼叫 docstore_search。")
+
+    if not _HAS_KB:
+        _env_lines.append("🏢 公司知識庫：未啟用，請勿呼叫 company_knowledge_search。")
+
+    _env_prefix = "<系統環境資訊>\n" + "\n".join(_env_lines) + "\n</系統環境資訊>\n\n"
+    _agent_prompt = _env_prefix + prompt
+
     # ── 3. Assistant 回應區塊 ─────────────────────────────────────────────────
     with st.chat_message("assistant"):
         # 狀態指示器（即時更新工具呼叫 + 任務進度）
@@ -647,7 +665,7 @@ if prompt := st.chat_input(
             final_chunk = None
 
             for chunk in agent.stream(
-                {"messages": [{"role": "user", "content": prompt}]},
+                {"messages": [{"role": "user", "content": _agent_prompt}]},
                 config=cfg,
                 context=_runtime_ctx,  # CoworkContext：傳遞環境狀態給 middleware 和工具
                 stream_mode="values",  # 完整 state dict；避免 Overwrite 物件問題
