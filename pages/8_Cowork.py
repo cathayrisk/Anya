@@ -49,6 +49,15 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 _oai = OpenAI(api_key=OPENAI_API_KEY)
 
+# ── LangChain LLM（gpt-5.2 + Responses API，主 Agent 使用）────────────────────
+from langchain_openai import ChatOpenAI as _ChatOpenAI
+
+_main_llm = _ChatOpenAI(
+    model="gpt-5.2",
+    api_key=OPENAI_API_KEY,
+    use_responses_api=True,
+)
+
 # ── Supabase 知識庫初始化（選用）────────────────────────────────────────────
 _HAS_KB = False
 _kb_supabase = None
@@ -113,6 +122,7 @@ def docstore_search(query: str) -> str:
         emb_resp = _oai.embeddings.create(model="text-embedding-3-small", input=[query])
         qvec = np.array(emb_resp.data[0].embedding, dtype="float32")
         qvec /= np.linalg.norm(qvec) + 1e-9
+        qvec = qvec.reshape(1, -1)  # FAISS needs 2D input: (n_queries, dim)
         results = ds.search_hybrid(query, qvec, k=5)
         if not results:
             return "在上傳文件中找不到相關內容。"
@@ -210,7 +220,7 @@ def _get_agent_and_workspace():
         from langgraph.checkpoint.memory import InMemorySaver
 
         agent = create_deep_agent(
-            model="openai:gpt-5.2",
+            model=_main_llm,
             memory=[str(COWORK_DIR / "AGENTS.md")],
             skills=[str(COWORK_DIR / "skills")],
             tools=[web_search, think, docstore_search, company_knowledge_search],
