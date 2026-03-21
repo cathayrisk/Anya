@@ -85,7 +85,7 @@ def web_search(query: str) -> str:
     Use for factual queries, recent events, or topics not in internal knowledge."""
     try:
         response = _oai.responses.create(
-            model="gpt-4.1-mini",
+            model="gpt-4.1",
             tools=[{"type": "web_search_preview"}],
             input=query,
         )
@@ -194,7 +194,7 @@ research_sub_agent = {
     ),
     "system_prompt": RESEARCHER_PROMPT,
     "tools": [web_search, think],
-    "model": "openai:gpt-4.1-mini",
+    "model": "openai:gpt-5.2",
 }
 
 # ── Agent 建立（per session）─────────────────────────────────────────────────
@@ -210,7 +210,7 @@ def _get_agent_and_workspace():
         from langgraph.checkpoint.memory import InMemorySaver
 
         agent = create_deep_agent(
-            model="openai:gpt-4.1",
+            model="openai:gpt-5.2",
             memory=[str(COWORK_DIR / "AGENTS.md")],
             skills=[str(COWORK_DIR / "skills")],
             tools=[web_search, think, docstore_search, company_knowledge_search],
