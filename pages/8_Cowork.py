@@ -661,7 +661,15 @@ if prompt := st.chat_input(
         all_messages: list = []
         try:
             cfg = {"configurable": {"thread_id": st.session_state.cowork_thread_id}}
-            last_msg_count = 0
+
+            # 取得本次執行前的訊息數量，避免 stream 時重複處理舊輪次的 tool calls
+            # （stream_mode="values" 返回完整累積 state，不是本輪 delta）
+            try:
+                _pre_state = agent.get_state(cfg)
+                last_msg_count = len((_pre_state.values or {}).get("messages", []))
+            except Exception:
+                last_msg_count = 0
+
             final_chunk = None
 
             for chunk in agent.stream(
@@ -730,15 +738,8 @@ if prompt := st.chat_input(
                     icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
                     st.markdown(f"{icon} {t.get('content', '')}")
 
-        # ── 工具呼叫紀錄（collapsed）─────────────────────────────────────
-        if tool_calls_log:
-            with st.expander("🔧 工具呼叫紀錄", expanded=False):
-                for tc in tool_calls_log:
-                    icon = TOOL_ICONS.get(tc["name"], "🔧")
-                    label = f"{icon} **{tc['name']}**"
-                    if tc.get("summary"):
-                        label += f"：{tc['summary']}"
-                    st.markdown(label)
+        # 注意：工具呼叫紀錄（tool_calls_log）仍保留在 session_state，供歷史訊息渲染使用。
+        # 當前回應不另顯示，因 status 展開的「執行步驟」已包含相同資訊。
 
         # ── 收集工作區檔案 ────────────────────────────────────────────────
         workspace_path = Path(workspace)
