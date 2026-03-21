@@ -561,18 +561,12 @@ with st.expander(doc_label, expanded=not _has_index):
 
 st.divider()
 
-# ── 清除對話按鈕 ──────────────────────────────────────────────────────────────
+# ── 對話狀態說明 ───────────────────────────────────────────────────────────────
 _ch = st.session_state.cowork_chat_history
-col_info, col_clear = st.columns([5, 1])
-with col_info:
-    if _ch:
-        st.caption(f"對話共 {len(_ch)} 則訊息 · 相同 session 保有短期記憶")
-    else:
-        st.caption("💡 輸入任務或問題，Agent 會自動規劃並執行。支援多輪對話。")
-with col_clear:
-    if st.button("🗑 清除對話", key="cowork_clear_conv"):
-        _reset_conversation()
-        st.rerun()
+if _ch:
+    st.caption(f"對話共 {len(_ch)} 則訊息 · 相同 session 保有短期記憶")
+else:
+    st.caption("💡 輸入任務或問題，Agent 會自動規劃並執行。支援多輪對話。")
 
 # ── 顯示歷史對話 ──────────────────────────────────────────────────────────────
 for _i, _msg in enumerate(st.session_state.cowork_chat_history):
@@ -599,28 +593,39 @@ if prompt := st.chat_input(
     _DS.store = st.session_state.cowork_ds_store  # 保留 module-level ref（工具 thread 安全用）
 
     _ds_ref = st.session_state.cowork_ds_store
-    _has_idx = (
-        _ds_ref is not None
-        and getattr(_ds_ref, "index", None) is not None
-        and _ds_ref.index.ntotal > 0
-    )
+
+    # 使用 chunks（與 docstore_search 工具內部相同的判斷），比 index.ntotal 更穩定
+    _doc_chunks = list(getattr(_ds_ref, "chunks", None) or []) if _ds_ref else []
+    _has_idx = len(_doc_chunks) > 0
+
+    # fallback：如果 FAISS 狀態異常但使用者曾建立過索引，仍應嘗試搜尋
+    _has_processed = bool(st.session_state.cowork_ds_processed_keys)
+
     _runtime_ctx = CoworkContext(
         has_documents=_has_idx,
-        doc_chunk_count=len(_ds_ref.chunks) if _has_idx else 0,
+        doc_chunk_count=len(_doc_chunks),
         has_kb=_HAS_KB,
     )
 
-    # ── 環境提示前綴（不依賴 CE middleware，直接注入 user message）────────────
-    # 確保 Agent 即使在 middleware 不可用時也知道目前的文件索引狀態
+    # ── 環境提示前綴（直接注入 user message，不依賴 CE middleware）────────────
     _env_lines: list[str] = [f"📅 今日日期：{datetime.now().strftime('%Y-%m-%d')}"]
     if _has_idx:
-        _chunk_count = len(_ds_ref.chunks)
         _env_lines.append(
-            f"📚 文件索引狀態：已建立 {_chunk_count} chunks，"
-            "使用者上傳的文件已可搜尋。**請使用 `docstore_search` 工具搜尋文件內容。**"
+            f"📚 文件索引：已就緒，共 {len(_doc_chunks)} chunks。"
+            "使用者問到文件/附件時，**你必須立即呼叫 `docstore_search` 工具**取得內容，"
+            "不得說找不到文件或要求使用者再次提供。"
+        )
+    elif _has_processed:
+        # 曾建立過索引但目前 store 物件狀態異常 → 仍鼓勵嘗試
+        _env_lines.append(
+            "📚 文件索引：使用者本次 session 曾上傳並建立索引。"
+            "若問到附件內容，請先呼叫 `docstore_search` 確認是否可用。"
         )
     else:
-        _env_lines.append("📚 文件索引狀態：目前無已索引文件，請勿呼叫 docstore_search。")
+        _env_lines.append(
+            "📚 文件索引：目前無已索引文件。"
+            "若使用者提到附件，請提示他先在上方上傳並點「建立/更新索引」。"
+        )
 
     if not _HAS_KB:
         _env_lines.append("🏢 公司知識庫：未啟用，請勿呼叫 company_knowledge_search。")
