@@ -64,3 +64,4 @@ streamlit-extras
 bs4
 lxml
 st-login-form
+supabase
