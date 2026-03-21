@@ -508,20 +508,24 @@ if run_btn:
         with st.spinner("⏳ Cowork Agent 正在處理任務，請稍候..."):
             try:
                 cfg = {"configurable": {"thread_id": st.session_state.cowork_thread_id}}
+                last_msg_count = 0
+                final_chunk = None
                 for chunk in agent.stream(
                     {"messages": [{"role": "user", "content": task}]},
                     config=cfg,
-                    stream_mode="updates",
+                    stream_mode="values",  # 完整 state dict，避免 Overwrite 物件問題
                 ):
-                    for _node, update in chunk.items():
-                        msgs = update.get("messages", [])
-                        all_messages.extend(msgs)
-                        for msg in msgs:
-                            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                                for tc in msg.tool_calls:
-                                    if tc.get("name") == "write_todos":
-                                        current_todos = tc.get("args", {}).get("todos", [])
-                                        _render_live_todos(current_todos)
+                    final_chunk = chunk
+                    all_msgs = chunk.get("messages", [])
+                    new_msgs = all_msgs[last_msg_count:]
+                    last_msg_count = len(all_msgs)
+                    for msg in new_msgs:
+                        if hasattr(msg, "tool_calls") and msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                if tc.get("name") == "write_todos":
+                                    current_todos = tc.get("args", {}).get("todos", [])
+                                    _render_live_todos(current_todos)
+                all_messages = final_chunk.get("messages", []) if final_chunk else []
 
                 # 收集工作區檔案（直接讀取 workspace 目錄）
                 workspace_path = Path(workspace)
