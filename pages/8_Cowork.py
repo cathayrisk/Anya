@@ -117,15 +117,15 @@ if _HAS_CE_MW:
         ctx: CoworkContext | None = getattr(request, "context", None)
         lines: list[str] = [f"📅 今日日期：{datetime.now().strftime('%Y-%m-%d %H:%M')}"]
 
-        # 文件索引狀態
-        if ctx and ctx.has_documents:
-            lines.append(f"📚 已建立文件索引：{ctx.doc_chunk_count} chunks 可用，請優先使用 docstore_search 搜尋。")
-        else:
-            lines.append("📚 目前無已索引文件，請勿呼叫 docstore_search。")
-
-        # 公司知識庫狀態
-        if ctx and not ctx.has_kb:
-            lines.append("🏢 公司知識庫未啟用，請勿呼叫 company_knowledge_search。")
+        # 文件索引 / KB 狀態：只在 ctx 有效時注入
+        # ctx=None 表示 context= 參數未能正確傳遞；此時靜默，由 user message 的 env prefix 負責
+        if ctx is not None:
+            if ctx.has_documents:
+                lines.append(f"📚 已建立文件索引：{ctx.doc_chunk_count} chunks 可用，請優先使用 docstore_search 搜尋。")
+            else:
+                lines.append("📚 目前無已索引文件，請勿呼叫 docstore_search。")
+            if not ctx.has_kb:
+                lines.append("🏢 公司知識庫未啟用，請勿呼叫 company_knowledge_search。")
 
         # 長對話精簡提醒
         if len(getattr(request, "messages", [])) > 20:
