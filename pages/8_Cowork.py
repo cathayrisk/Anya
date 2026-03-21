@@ -309,24 +309,16 @@ def _get_agent_and_workspace() -> tuple:
 
         from deepagents import create_deep_agent
         from deepagents.backends import FilesystemBackend
-        from deepagents.middleware import SummarizationMiddleware
         from langgraph.checkpoint.memory import InMemorySaver
 
-        # 先建 backend，再與 SummarizationMiddleware 共用同一實例
         backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
 
-        # 自訂摘要 middleware（覆蓋預設的 170K tokens 閾值，改為更積極的 8K）
-        summ_mw = SummarizationMiddleware(
-            model="gpt-4.1-mini",     # 輕量模型做摘要，省成本
-            backend=backend,           # 共用同一 backend，摘要存於 workspace/conversation_history/
-            trigger=("tokens", 8000),  # 超過 8K tokens 觸發摘要
-            keep=("messages", 10),     # 摘要後保留最近 10 則訊息
-        )
-
-        # Context Engineering middleware（若成功 import）
-        ce_middleware: list = [summ_mw]
+        # SummarizationMiddleware 已在 create_deep_agent 預設 stack 中，
+        # 不可重複傳入（會觸發 AssertionError: duplicate middleware）。
+        # 只傳入我們自訂的 Context Engineering middleware。
+        ce_middleware: list = []
         if _HAS_CE_MW:
-            ce_middleware = [_cowork_dynamic_prompt, _filter_tools, summ_mw]
+            ce_middleware = [_cowork_dynamic_prompt, _filter_tools]
 
         agent = create_deep_agent(
             model=_main_llm,
@@ -336,7 +328,7 @@ def _get_agent_and_workspace() -> tuple:
             skills=[str(COWORK_DIR / "skills")],
             tools=[web_search, think, docstore_search, company_knowledge_search],
             subagents=[research_sub_agent],
-            backend=backend,           # 共用同一 backend 實例
+            backend=backend,
             checkpointer=InMemorySaver(),
         )
         st.session_state.cowork_agent = agent
