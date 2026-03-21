@@ -202,7 +202,7 @@ _research_llm = _ChatOpenAI(
     model="gpt-5.2",
     api_key=OPENAI_API_KEY,
     use_responses_api=True,
-    model_kwargs={"reasoning": {"effort": "low"}},
+    reasoning_effort="low",
 )
 
 research_sub_agent = {
@@ -235,7 +235,7 @@ def _get_agent_and_workspace():
             skills=[str(COWORK_DIR / "skills")],
             tools=[web_search, think, docstore_search, company_knowledge_search],
             subagents=[research_sub_agent],
-            backend=FilesystemBackend(root_dir=workspace),
+            backend=FilesystemBackend(root_dir=workspace, virtual_mode=True),
             checkpointer=InMemorySaver(),
         )
         st.session_state.cowork_agent = agent
@@ -384,7 +384,7 @@ with st.expander(doc_label, expanded=not _has_index):
         edited = st.data_editor(
             df,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             key="cowork_file_list_editor",
             column_config={
                 "_file_id": st.column_config.TextColumn("_file_id", disabled=True, width="small"),
@@ -426,8 +426,8 @@ with st.expander(doc_label, expanded=not _has_index):
         st.markdown(":small[（尚未上傳任何文件）]")
 
     cb1, cb2 = st.columns([1, 1])
-    build_btn = cb1.button("🚀 建立/更新索引", type="primary", use_container_width=True, key="cowork_build_idx")
-    clear_docs_btn = cb2.button("🧹 清空文件庫", use_container_width=True, key="cowork_clear_docs")
+    build_btn = cb1.button("🚀 建立/更新索引", type="primary", width="stretch", key="cowork_build_idx")
+    clear_docs_btn = cb2.button("🧹 清空文件庫", width="stretch", key="cowork_clear_docs")
 
     if clear_docs_btn:
         st.session_state.cowork_file_rows = []
@@ -476,13 +476,13 @@ task_input = st.text_area(
 
 col1, col2 = st.columns([1, 6])
 with col1:
-    run_btn = st.button("🚀 開始任務", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 開始任務", type="primary", width="stretch")
 with col2:
-    if st.button("🗑 清除任務", use_container_width=False):
+    if st.button("🗑 清除任務"):
         _reset_task()
         st.rerun()
 
-# ── 執行 ──────────────────────────────────────────────────────────────────────
+# ── 執行（LangGraph stream → 即時 Todo 更新）─────────────────────────────────
 
 if run_btn:
     task = (task_input or "").strip()
@@ -491,21 +491,55 @@ if run_btn:
     else:
         _reset_task()
         agent, workspace = _get_agent_and_workspace()
-
-        # ★ 在 invoke 前把 DocStore 傳給 module-level 參考，確保子執行緒可讀到
         _DS.store = st.session_state.cowork_ds_store
+
+        # 即時 Todo 區塊（在 spinner 外，讓更新可見）
+        todos_ph = st.empty()
+        current_todos = []
+        all_messages = []
+
+        def _render_live_todos(todos: list):
+            with todos_ph.container():
+                st.subheader("📋 任務進度")
+                for t in todos:
+                    icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
+                    st.markdown(f"{icon} {t.get('content', '')}")
 
         with st.spinner("⏳ Cowork Agent 正在處理任務，請稍候..."):
             try:
-                result = agent.invoke(
+                cfg = {"configurable": {"thread_id": st.session_state.cowork_thread_id}}
+                for chunk in agent.stream(
                     {"messages": [{"role": "user", "content": task}]},
-                    config={"configurable": {"thread_id": st.session_state.cowork_thread_id}},
-                )
-                st.session_state.cowork_result = result
-                st.session_state.cowork_todos = _extract_todos(result.get("messages", []))
-                st.session_state.cowork_files = result.get("files", {})
+                    config=cfg,
+                    stream_mode="updates",
+                ):
+                    for _node, update in chunk.items():
+                        msgs = update.get("messages", [])
+                        all_messages.extend(msgs)
+                        for msg in msgs:
+                            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                                for tc in msg.tool_calls:
+                                    if tc.get("name") == "write_todos":
+                                        current_todos = tc.get("args", {}).get("todos", [])
+                                        _render_live_todos(current_todos)
+
+                # 收集工作區檔案（直接讀取 workspace 目錄）
+                workspace_path = Path(workspace)
+                files: dict = {}
+                for f in workspace_path.rglob("*"):
+                    if f.is_file():
+                        rel = str(f.relative_to(workspace_path))
+                        files[rel] = f.read_bytes()
+
+                st.session_state.cowork_result = {"messages": all_messages}
+                st.session_state.cowork_todos = current_todos
+                st.session_state.cowork_files = files
+
+                todos_ph.empty()  # 清掉即時區塊，下方統一顯示
+
             except Exception as e:
                 st.error(f"Agent 執行失敗：{e}")
+                st.stop()
 
 # ── 顯示結果 ──────────────────────────────────────────────────────────────────
 
@@ -517,7 +551,7 @@ if "cowork_result" in st.session_state:
 
     st.divider()
 
-    # Todo 清單
+    # Todo 清單（最終狀態）
     if todos:
         st.subheader("📋 任務進度")
         for todo in todos:
@@ -537,36 +571,51 @@ if "cowork_result" in st.session_state:
                     label += f"：{tc['summary']}"
                 st.markdown(label)
 
-    # 最終回應
+    # ── 報告直接展示（final_report.md / analysis_report.md 優先）────────────
+    REPORT_NAMES = ["final_report.md", "analysis_report.md", "report.md"]
+    report_shown = False
+    for rname in REPORT_NAMES:
+        rdata = files.get(rname)
+        if rdata:
+            report_content = (
+                rdata.decode("utf-8", errors="replace")
+                if isinstance(rdata, bytes) else str(rdata)
+            )
+            st.subheader("📄 研究報告")
+            st.markdown(report_content)
+            report_shown = True
+            break
+
+    # 最終 Agent 回應（若無報告檔，或作為補充）
     final_msg = messages[-1] if messages else None
     if final_msg and hasattr(final_msg, "content") and final_msg.content:
-        st.subheader("💬 Agent 回應")
+        if not report_shown:
+            st.subheader("💬 Agent 回應")
         content = final_msg.content
         if isinstance(content, list):
             content = "\n".join(
                 p.get("text", "") for p in content
                 if isinstance(p, dict) and p.get("type") == "text"
             )
-        st.markdown(content)
+        if not report_shown:
+            st.markdown(content)
+        else:
+            with st.expander("💬 Agent 最終回應", expanded=False):
+                st.markdown(content)
 
     # 工作區檔案下載
     if files:
         st.divider()
         st.subheader("📁 工作區檔案")
-        for path, file_data in files.items():
-            filename = Path(path).name
+        for fpath, file_data in files.items():
+            filename = Path(fpath).name
             col_name, col_btn = st.columns([4, 1])
             col_name.markdown(f"📄 `{filename}`")
-            if isinstance(file_data, bytes):
-                raw = file_data
-            elif hasattr(file_data, "encode"):
-                raw = file_data.encode("utf-8")
-            else:
-                try:
-                    from deepagents.backends.utils import file_data_to_string
-                    raw = file_data_to_string(file_data).encode("utf-8")
-                except Exception:
-                    raw = str(file_data).encode("utf-8")
+            raw = (
+                file_data if isinstance(file_data, bytes)
+                else file_data.encode("utf-8") if hasattr(file_data, "encode")
+                else str(file_data).encode("utf-8")
+            )
             col_btn.download_button(
                 "下載",
                 data=raw,
