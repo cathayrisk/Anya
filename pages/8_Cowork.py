@@ -114,7 +114,10 @@ def think(thought: str) -> str:
 @tool
 def docstore_search(query: str) -> str:
     """Search documents uploaded by the user in the Cowork document library (FAISS + BM25 hybrid).
-    Use when the user has uploaded files and wants information from them."""
+    Use when the user has uploaded files and wants information from them.
+    IMPORTANT: Call this tool MULTIPLE TIMES with different specific queries to cover different
+    aspects of a document (e.g. summary, key findings, risks, conclusions). Do NOT use '*' or
+    generic queries — use focused topic keywords for best results."""
     ds = _DS.store
     if ds is None or not getattr(ds, "chunks", None):
         return "目前沒有已建立索引的文件。請先在上方的「📚 上傳文件」區塊上傳並建立索引。"
@@ -123,7 +126,7 @@ def docstore_search(query: str) -> str:
         qvec = np.array(emb_resp.data[0].embedding, dtype="float32")
         qvec /= np.linalg.norm(qvec) + 1e-9
         qvec = qvec.reshape(1, -1)  # FAISS needs 2D input: (n_queries, dim)
-        results = ds.search_hybrid(query, qvec, k=5)
+        results = ds.search_hybrid(query, qvec, k=10)
         if not results:
             return "在上傳文件中找不到相關內容。"
         return "\n\n".join(f"[相似度 {score:.2f}] {chunk.text}" for score, chunk in results)
@@ -195,6 +198,13 @@ End with:
 [2] Title: URL
 </Output Format>"""
 
+_research_llm = _ChatOpenAI(
+    model="gpt-5.2",
+    api_key=OPENAI_API_KEY,
+    use_responses_api=True,
+    model_kwargs={"reasoning": {"effort": "low"}},
+)
+
 research_sub_agent = {
     "name": "research-agent",
     "description": (
@@ -204,7 +214,7 @@ research_sub_agent = {
     ),
     "system_prompt": RESEARCHER_PROMPT,
     "tools": [web_search, think],
-    "model": "openai:gpt-5.2",
+    "model": _research_llm,
 }
 
 # ── Agent 建立（per session）─────────────────────────────────────────────────
