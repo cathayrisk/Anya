@@ -101,7 +101,7 @@ if _KB_DEPS_OK and st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_K
         HAS_KB = False
 
 # === 1. Streamlit 頁面 ===
-st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
+st.set_page_config(page_title="Anya Forger", page_icon="🥜", layout="wide")
 inject_rich_styles()  # 注入富文本 CSS（品牌紅色標題、blockquote、表格斑馬紋）
 
 # =========================
@@ -2142,7 +2142,7 @@ search_INSTRUCTIONS = with_handoff_prefix(
 
 search_agent = Agent(
     name="SearchAgent",
-    model="gpt-5.4",
+    model="gpt-5.2",
     instructions=search_INSTRUCTIONS,
     tools=[WebSearchTool()],
     #model_settings=ModelSettings(tool_choice="required"),
