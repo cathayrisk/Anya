@@ -633,19 +633,20 @@ def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
     todo_step_map = {int(k): v for k, v in todo_step_map.items()}
 
     if todos:
-        # 有 Todo：巢狀顯示（每個 todo 下方列出其工具呼叫）
-        def _nested_md(t_list, t_map):
-            lines = []
-            for i, t in enumerate(t_list):
-                icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
-                lines.append(f"{icon} {t.get('content', '')}")
-                for s in t_map.get(i, []):
-                    lines.append(f"  - {s}")
-            return "\n".join(lines)
-        with st.expander("📋 任務進度", expanded=False):
-            st.markdown(_nested_md(todos, todo_step_map))
+        # 有 Todo：每個 todo 一個 expander（有子步驟才展開，無則純文字）
+        st.markdown("**📋 任務進度**")
+        for _hi, _ht in enumerate(todos):
+            _hicon = TODO_ICONS.get(_ht.get("status", "pending"), "⬜")
+            _hlabel = f"{_hicon} {_ht.get('content', '')}"
+            _hsteps = todo_step_map.get(_hi, [])
+            if _hsteps:
+                with st.expander(_hlabel, expanded=False):
+                    for _hs in _hsteps:
+                        st.markdown(f"- {_hs}")
+            else:
+                st.markdown(_hlabel)
     elif tool_calls_log:
-        # 無 Todo：退回顯示工具呼叫清單
+        # 無 Todo：退回顯示執行步驟
         with st.expander("🔧 執行步驟", expanded=False):
             for tc in tool_calls_log:
                 icon = TOOL_ICONS.get(tc["name"], "🔧")
@@ -922,24 +923,30 @@ if prompt := st.chat_input(
         _active_todo_idx: list[int]        = [-1]   # 目前 in_progress 的 todo 索引
         _todo_step_map: dict[int, list[str]] = {}   # todo_idx → step 字串清單
 
-        def _build_nested_todos_md() -> str:
-            """產生巢狀 Todo markdown：每個 todo 下方縮排列出其工具呼叫。"""
+        def _build_status_todos_md() -> str:
+            """執行中用的簡化 markdown（純文字，無縮排，避免格式跑版）。
+            active todo 顯示已執行步驟數；完成/待辦僅顯示圖示與標題。"""
             lines: list[str] = []
             for i, t in enumerate(current_todos):
-                icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
-                lines.append(f"{icon} {t.get('content', '')}")
-                for s in _todo_step_map.get(i, []):
-                    lines.append(f"  - {s}")
-            return "\n".join(lines)
+                status_val = t.get("status", "pending")
+                icon = TODO_ICONS.get(status_val, "⬜")
+                content = t.get("content", "")
+                steps = _todo_step_map.get(i, [])
+                if status_val == "in_progress":
+                    step_note = f"（{len(steps)} 步）" if steps else ""
+                    lines.append(f"**{icon} {content}{step_note}**")
+                else:
+                    lines.append(f"{icon} {content}")
+            return "\n\n".join(lines)
 
         def _refresh_status() -> None:
             """更新 status 內的顯示：
-            - 有 Todo → 巢狀任務進度（含子步驟），隱藏獨立執行步驟
-            - 無 Todo → 顯示執行步驟
+            - 有 Todo → 簡化任務進度清單（active todo 顯示步驟數）
+            - 無 Todo → 執行步驟清單
             """
             if current_todos:
-                status_steps_ph.empty()  # 有 Todo 時不另外顯示執行步驟
-                status_todos_ph.markdown("**📋 任務進度**\n\n" + _build_nested_todos_md())
+                status_steps_ph.empty()
+                status_todos_ph.markdown("**📋 任務進度**\n\n" + _build_status_todos_md())
             elif step_log:
                 status_todos_ph.empty()
                 status_steps_ph.markdown(
@@ -1035,9 +1042,18 @@ if prompt := st.chat_input(
 
         # ── 任務進度 / 執行步驟（最終狀態，擇一顯示）────────────────────
         if current_todos:
-            # 有 Todo：巢狀顯示（每個 todo 下方列出其工具呼叫）
-            with st.expander("📋 任務進度", expanded=True):
-                st.markdown(_build_nested_todos_md())
+            # 有 Todo：每個 todo 一個 expander（有子步驟才展開，無則純文字）
+            st.markdown("**📋 任務進度**")
+            for _i, _t in enumerate(current_todos):
+                _icon = TODO_ICONS.get(_t.get("status", "pending"), "⬜")
+                _label = f"{_icon} {_t.get('content', '')}"
+                _steps = _todo_step_map.get(_i, [])
+                if _steps:
+                    with st.expander(_label, expanded=False):
+                        for _s in _steps:
+                            st.markdown(f"- {_s}")
+                else:
+                    st.markdown(_label)
         elif tool_calls_log:
             # 無 Todo：退回顯示執行步驟
             with st.expander("🔧 執行步驟", expanded=True):
