@@ -127,6 +127,14 @@ if _HAS_CE_MW:
             if not ctx.has_kb:
                 lines.append("🏢 公司知識庫未啟用，請勿呼叫 company_knowledge_search。")
 
+        # 強制 write_todos 規則（每次 LLM 呼叫都注入，確保執行）
+        lines.append(
+            "📋 【強制規則】若任務包含 2 個以上子步驟（例如：搜尋＋分析＋報告、"
+            "整理時間軸＋分析風險、比較多個主題），你的**第一個工具呼叫必須是 `write_todos`**，"
+            "列出所有子任務（status=pending）。每完成一個子任務立即更新其狀態。"
+            "單一問答不需要 Todo。"
+        )
+
         # 長對話精簡提醒
         if len(getattr(request, "messages", [])) > 20:
             lines.append("⚠️ 對話已很長，請精簡回答，避免重複前面已說過的內容。")
@@ -873,6 +881,13 @@ if prompt := st.chat_input(
 
     if not _HAS_KB:
         _env_lines.append("🏢 公司知識庫：未啟用，請勿呼叫 company_knowledge_search。")
+
+    _env_lines.append(
+        "📋 【強制規則】若此任務包含 2 個以上子步驟（例如：搜尋＋分析＋報告、"
+        "整理時間軸＋分析風險、比較多個主題），**第一個工具呼叫必須是 `write_todos`**，"
+        "列出所有子任務（status=pending），並在執行過程中持續更新各步驟狀態。"
+        "單一問答不需要 Todo。"
+    )
 
     _env_prefix = "<系統環境資訊>\n" + "\n".join(_env_lines) + "\n</系統環境資訊>\n\n"
     _agent_prompt = _env_prefix + prompt
