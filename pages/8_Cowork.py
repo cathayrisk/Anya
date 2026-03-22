@@ -383,7 +383,10 @@ def _evaluate_turn_background(
         from supabase import create_client as _sb_create
         import json as _json
         _sb_url = st.secrets.get("SUPABASE_URL", "")
-        _sb_key = st.secrets.get("SUPABASE_KEY", "")
+        # 寫入操作使用 Service Role Key（繞過 RLS INSERT policy，消除安全警告）
+        # 若未設定 SUPABASE_SERVICE_KEY，退回使用 SUPABASE_KEY
+        _sb_key = (st.secrets.get("SUPABASE_SERVICE_KEY")
+                   or st.secrets.get("SUPABASE_KEY", ""))
         if not _sb_url or not _sb_key:
             return
         _sb = _sb_create(_sb_url, _sb_key)
