@@ -59,6 +59,9 @@ from docstore import (
 )
 import uuid as _uuid
 
+# === Rich Styles（輸出美化）===
+from utils.rich_styles import inject_rich_styles, render_report_header, render_source_chips, copy_html_button
+
 # === 知識庫 imports（Supabase + embedding，選用） ===
 try:
     from supabase import create_client as _sb_create_client
@@ -99,6 +102,7 @@ if _KB_DEPS_OK and st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_K
 
 # === 1. Streamlit 頁面 ===
 st.set_page_config(page_title="Anya Multimodal Agent", page_icon="🥜", layout="wide")
+inject_rich_styles()  # 注入富文本 CSS（品牌紅色標題、blockquote、表格斑馬紋）
 
 # =========================
 # 1) ✅ 在主程式 imports 附近（有 os / streamlit 後）新增：DEV_MODE
@@ -1756,7 +1760,7 @@ def run_general_with_webpage_tool(
     meta = {"doc_calls": 0, "web_calls": 0, "db_used": False, "web_used": False, "tool_step": 0}
 
     _MAX_ROUNDS    = 12
-    _MAX_WEB_CALLS = 25   # 防止 web search 爆量（無上限時曾出現 72 次 / 643s）
+    _MAX_WEB_CALLS = 15   # 防止 web search 爆量（無上限時曾出現 72 次 / 643s）
     _round = 0
 
     while True:
@@ -2372,7 +2376,7 @@ FastAgent 的簡潔度與長度規則
 
 fast_agent = Agent(
     name="FastAgent",
-    model="gpt-5.2",
+    model="gpt-5.4",
     instructions=FAST_AGENT_PROMPT,
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
@@ -3241,7 +3245,7 @@ for msg in st.session_state.get("chat_history", []):
 
 # === 8. 使用者輸入（支援圖片 + 檔案） ===
 prompt = st.chat_input(
-    "wakuwaku！安妮亞有時候會說錯話!要再次確認喔～",
+    "wakuwaku！上傳圖片或PDF，輸入你的問題吧～",
     accept_file="multiple",
     file_type=["jpg","jpeg","png","webp","gif"],
 )
@@ -3474,7 +3478,7 @@ if prompt is not None:
                     # ✅ if kind == "general":（整段替換）
                     # =========================
                     if kind == "general":
-                        status.update(label="↗️ 切換到深思模式（gpt‑5.4）", state="running", expanded=False)
+                        status.update(label="↗️ 切換到深思模式（gpt‑5.2）", state="running", expanded=False)
                         try:
                             st.toast("**深思模式**", icon=":material/psychology:", duration="long")
                         except TypeError:
@@ -3720,9 +3724,9 @@ if prompt is not None:
                     if kind == "research":
                         status.update(label="↗️ 切換到研究流程（規劃→搜尋→寫作）", state="running", expanded=True)
                         try:
-                            st.toast("研究模式", icon=":material/science:", duration="short")
+                            st.toast("🔬 研究模式", icon=":material/science:", duration="short")
                         except TypeError:
-                            st.toast("研究模式", icon=":material/science:")
+                            st.toast("🔬 研究模式", icon=":material/science:")
 
                         # ✅ badges 最上面：research 一定會做 web（search_plan 有幾條就算幾次嘗試）
                         badges_ph = st.empty()
