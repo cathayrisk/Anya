@@ -628,17 +628,28 @@ def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
     content = msg.get("content", "")
     files = msg.get("files", {})
 
-    if todos:
-        with st.expander("📋 任務進度", expanded=False):
-            for t in todos:
-                icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
-                st.markdown(f"{icon} {t.get('content', '')}")
+    todo_step_map = msg.get("todo_step_map", {})
+    # 將 key 轉回 int（JSON 序列化後 key 會變 str）
+    todo_step_map = {int(k): v for k, v in todo_step_map.items()}
 
-    if tool_calls_log:
-        with st.expander("🔧 工具呼叫紀錄", expanded=False):
+    if todos:
+        # 有 Todo：巢狀顯示（每個 todo 下方列出其工具呼叫）
+        def _nested_md(t_list, t_map):
+            lines = []
+            for i, t in enumerate(t_list):
+                icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
+                lines.append(f"{icon} {t.get('content', '')}")
+                for s in t_map.get(i, []):
+                    lines.append(f"  - {s}")
+            return "\n".join(lines)
+        with st.expander("📋 任務進度", expanded=False):
+            st.markdown(_nested_md(todos, todo_step_map))
+    elif tool_calls_log:
+        # 無 Todo：退回顯示工具呼叫清單
+        with st.expander("🔧 執行步驟", expanded=False):
             for tc in tool_calls_log:
                 icon = TOOL_ICONS.get(tc["name"], "🔧")
-                label = f"{icon} **{tc['name']}**"
+                label = f"- {icon} {tc['name']}"
                 if tc.get("summary"):
                     label += f"：{tc['summary']}"
                 st.markdown(label)
@@ -903,23 +914,37 @@ if prompt := st.chat_input(
         response_ph = st.empty()
 
         # ── 狀態追蹤（用可變容器避免 closure 重新賦值問題）
-        step_log: list[str]       = []
-        current_todos: list[dict] = []
+        step_log: list[str]        = []
+        current_todos: list[dict]  = []
         tool_calls_log: list[dict] = []
-        web_sources: list[dict]   = []
+        web_sources: list[dict]    = []
+        # 巢狀追蹤：哪些工具呼叫屬於哪個 Todo（用 list 包裹 int 以避免 closure 重新賦值）
+        _active_todo_idx: list[int]        = [-1]   # 目前 in_progress 的 todo 索引
+        _todo_step_map: dict[int, list[str]] = {}   # todo_idx → step 字串清單
+
+        def _build_nested_todos_md() -> str:
+            """產生巢狀 Todo markdown：每個 todo 下方縮排列出其工具呼叫。"""
+            lines: list[str] = []
+            for i, t in enumerate(current_todos):
+                icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
+                lines.append(f"{icon} {t.get('content', '')}")
+                for s in _todo_step_map.get(i, []):
+                    lines.append(f"  - {s}")
+            return "\n".join(lines)
 
         def _refresh_status() -> None:
-            """更新 status 內的步驟列表與任務進度。"""
-            if step_log:
+            """更新 status 內的顯示：
+            - 有 Todo → 巢狀任務進度（含子步驟），隱藏獨立執行步驟
+            - 無 Todo → 顯示執行步驟
+            """
+            if current_todos:
+                status_steps_ph.empty()  # 有 Todo 時不另外顯示執行步驟
+                status_todos_ph.markdown("**📋 任務進度**\n\n" + _build_nested_todos_md())
+            elif step_log:
+                status_todos_ph.empty()
                 status_steps_ph.markdown(
                     "**🔧 執行步驟**\n" + "\n".join(f"- {s}" for s in step_log[-10:])
                 )
-            if current_todos:
-                lines = [
-                    f"{TODO_ICONS.get(t.get('status', 'pending'), '⬜')} {t.get('content', '')}"
-                    for t in current_todos
-                ]
-                status_todos_ph.markdown("**📋 任務進度**\n\n" + "\n\n".join(lines))
 
         # ── 執行 Agent（LangGraph stream_mode="values"）────────────────────────
         all_messages: list = []
@@ -958,6 +983,12 @@ if prompt := st.chat_input(
                                 # 更新任務進度（原地清空 + 填入，避免 closure 重新賦值）
                                 current_todos.clear()
                                 current_todos.extend(args.get("todos", []))
+                                # 偵測哪個 todo 變成 in_progress，更新 active 索引
+                                for _i, _t in enumerate(current_todos):
+                                    if _t.get("status") == "in_progress":
+                                        _active_todo_idx[0] = _i
+                                        _todo_step_map.setdefault(_i, [])
+                                        break
                             else:
                                 icon = TOOL_ICONS.get(name, "🔧")
                                 summary_raw = (
@@ -969,6 +1000,9 @@ if prompt := st.chat_input(
                                 step_str = f"{icon} {name}" + (f"：{summary}" if summary else "")
                                 step_log.append(step_str)
                                 tool_calls_log.append({"name": name, "summary": summary})
+                                # 若有 active todo，將此步驟歸入該 todo 的子步驟
+                                if _active_todo_idx[0] >= 0:
+                                    _todo_step_map.setdefault(_active_todo_idx[0], []).append(step_str)
 
                             _refresh_status()
 
@@ -999,15 +1033,20 @@ if prompt := st.chat_input(
                 for s in web_sources:
                     st.markdown(f"- [{s['title']}]({s['url']})")
 
-        # ── 任務進度（最終狀態）──────────────────────────────────────────
+        # ── 任務進度 / 執行步驟（最終狀態，擇一顯示）────────────────────
         if current_todos:
+            # 有 Todo：巢狀顯示（每個 todo 下方列出其工具呼叫）
             with st.expander("📋 任務進度", expanded=True):
-                for t in current_todos:
-                    icon = TODO_ICONS.get(t.get("status", "pending"), "⬜")
-                    st.markdown(f"{icon} {t.get('content', '')}")
-
-        # 注意：工具呼叫紀錄（tool_calls_log）仍保留在 session_state，供歷史訊息渲染使用。
-        # 當前回應不另顯示，因 status 展開的「執行步驟」已包含相同資訊。
+                st.markdown(_build_nested_todos_md())
+        elif tool_calls_log:
+            # 無 Todo：退回顯示執行步驟
+            with st.expander("🔧 執行步驟", expanded=True):
+                for tc in tool_calls_log:
+                    _icon = TOOL_ICONS.get(tc["name"], "🔧")
+                    _label = f"{_icon} {tc['name']}"
+                    if tc.get("summary"):
+                        _label += f"：{tc['summary']}"
+                    st.markdown(f"- {_label}")
 
         # ── 收集工作區檔案 ────────────────────────────────────────────────
         workspace_path = Path(workspace)
@@ -1096,6 +1135,7 @@ if prompt := st.chat_input(
             "role": "assistant",
             "content": response_text,
             "todos": list(current_todos),
+            "todo_step_map": {k: list(v) for k, v in _todo_step_map.items()},
             "tool_calls_log": list(tool_calls_log),
             "web_sources": list(web_sources),
             "report_content": report_content,
