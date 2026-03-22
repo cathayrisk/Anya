@@ -4,12 +4,15 @@ Cowork — 任務型 Agent（對話式介面）
 """
 from __future__ import annotations
 
+import base64
 import os
 import re
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
@@ -63,6 +66,55 @@ if not OPENAI_API_KEY:
 
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 _oai = OpenAI(api_key=OPENAI_API_KEY)
+
+# ── PIL（選用，圖片縮圖用）────────────────────────────────────────────────────
+try:
+    from PIL import Image as _PILImage
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+# ── 圖片工具 ──────────────────────────────────────────────────────────────────
+def _make_thumb(imgbytes: bytes, max_w: int = 220) -> bytes:
+    """生成縮圖（JPEG，max_w px），用於 chat bubble 顯示。"""
+    if not _HAS_PIL:
+        return imgbytes
+    try:
+        im = _PILImage.open(BytesIO(imgbytes))
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        im.thumbnail((max_w, max_w))
+        out = BytesIO()
+        im.save(out, format="JPEG", quality=80, optimize=True)
+        return out.getvalue()
+    except Exception:
+        return imgbytes
+
+def _img_to_data_url(imgbytes: bytes) -> str:
+    """將圖片 bytes 轉為 base64 data URL（自動偵測格式）。"""
+    mime = "image/jpeg"
+    try:
+        if _HAS_PIL:
+            im = _PILImage.open(BytesIO(imgbytes))
+            fmt = (im.format or "JPEG").upper()
+            mime = {"PNG": "image/png", "JPEG": "image/jpeg",
+                    "WEBP": "image/webp", "GIF": "image/gif"}.get(fmt, "image/jpeg")
+    except Exception:
+        pass
+    return f"data:{mime};base64,{base64.b64encode(imgbytes).decode()}"
+
+# ── 打字機效果 ────────────────────────────────────────────────────────────────
+def _fake_stream(text: str, placeholder, step_chars: int = 8, delay: float = 0.015) -> str:
+    """逐字呈現 markdown（打字機效果），完成後覆蓋為完整文字。"""
+    if not text:
+        return text
+    buf = ""
+    for i in range(0, len(text), step_chars):
+        buf = text[: i + step_chars]
+        placeholder.markdown(buf)
+        time.sleep(delay)
+    placeholder.markdown(text)   # 確保最終完整顯示
+    return text
 
 from langchain_openai import ChatOpenAI as _ChatOpenAI
 
@@ -633,18 +685,17 @@ def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
     todo_step_map = {int(k): v for k, v in todo_step_map.items()}
 
     if todos:
-        # 有 Todo：每個 todo 一個 expander（有子步驟才展開，無則純文字）
-        st.markdown("**📋 任務進度**")
+        # 有 Todo：每個 todo 一個 expander（一致顯示，有無子步驟皆用 expander）
         for _hi, _ht in enumerate(todos):
             _hicon = TODO_ICONS.get(_ht.get("status", "pending"), "⬜")
             _hlabel = f"{_hicon} {_ht.get('content', '')}"
             _hsteps = todo_step_map.get(_hi, [])
-            if _hsteps:
-                with st.expander(_hlabel, expanded=False):
+            with st.expander(_hlabel, expanded=False):
+                if _hsteps:
                     for _hs in _hsteps:
                         st.markdown(f"- {_hs}")
-            else:
-                st.markdown(_hlabel)
+                else:
+                    st.caption("（無細部執行步驟）")
     elif tool_calls_log:
         # 無 Todo：退回顯示執行步驟
         with st.expander("🔧 執行步驟", expanded=False):
@@ -836,21 +887,53 @@ else:
 for _i, _msg in enumerate(st.session_state.cowork_chat_history):
     with st.chat_message(_msg["role"]):
         if _msg["role"] == "user":
-            st.markdown(_msg["content"])
+            if _msg.get("content"):
+                st.markdown(_msg["content"])
+            for _fn, _th in _msg.get("images", []):
+                st.image(_th, caption=_fn, width=220)
         else:
             _render_history_assistant(_msg, msg_idx=_i)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Chat Input → Agent 執行
 # ══════════════════════════════════════════════════════════════════════════════
-if prompt := st.chat_input(
+if _inp := st.chat_input(
     "輸入任務或問題… 例：分析上傳文件找出關鍵風險 / 研究 AI Agent 趨勢並產出報告",
     key="cowork_chat_input",
+    accept_file="multiple",
+    file_type=["jpg", "jpeg", "png", "webp", "gif"],
 ):
+    prompt = (_inp.text or "").strip()
+
+    # ── 處理上傳圖片 ──────────────────────────────────────────────────────────
+    _uploaded_files = getattr(_inp, "files", []) or []
+    _img_blocks: list[dict] = []      # 傳給 API 的 image content blocks
+    _img_history: list[tuple] = []    # (name, thumb_bytes) 存入歷史
+
+    for _uf in _uploaded_files:
+        _raw = _uf.getvalue()
+        if len(_raw) > 48 * 1024 * 1024:
+            st.warning(f"圖片過大（{_uf.name}），略過。")
+            continue
+        _thumb = _make_thumb(_raw)
+        _img_history.append((_uf.name, _thumb))
+        _img_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": _img_to_data_url(_raw), "detail": "high"},
+        })
+
     # ── 1. 顯示使用者訊息 ─────────────────────────────────────────────────────
     with st.chat_message("user"):
-        st.markdown(prompt)
-    st.session_state.cowork_chat_history.append({"role": "user", "content": prompt})
+        if prompt:
+            st.markdown(prompt)
+        for _fn, _th in _img_history:
+            st.image(_th, caption=_fn, width=220)
+
+    st.session_state.cowork_chat_history.append({
+        "role": "user",
+        "content": prompt,
+        "images": _img_history,
+    })
 
     # ── 2. 取得 Agent + 建立 CoworkContext ────────────────────────────────────
     agent, workspace = _get_agent_and_workspace()
@@ -902,7 +985,12 @@ if prompt := st.chat_input(
     )
 
     _env_prefix = "<系統環境資訊>\n" + "\n".join(_env_lines) + "\n</系統環境資訊>\n\n"
-    _agent_prompt = _env_prefix + prompt
+
+    # 組裝訊息 content（有圖片 → multimodal list；無圖片 → 純文字）
+    if _img_blocks:
+        _agent_prompt = [{"type": "text", "text": _env_prefix + prompt}] + _img_blocks
+    else:
+        _agent_prompt = _env_prefix + prompt
 
     # ── 3. Assistant 回應區塊 ─────────────────────────────────────────────────
     with st.chat_message("assistant"):
@@ -1043,12 +1131,12 @@ if prompt := st.chat_input(
                     _ficon = TODO_ICONS.get(_ft.get("status", "pending"), "⬜")
                     _flabel = f"{_ficon} {_ft.get('content', '')}"
                     _fsteps = _todo_step_map.get(_fi, [])
-                    if _fsteps:
-                        with st.expander(_flabel, expanded=False):
+                    with st.expander(_flabel, expanded=False):
+                        if _fsteps:
                             for _fs in _fsteps:
                                 st.markdown(f"- {_fs}")
-                    else:
-                        st.markdown(_flabel)
+                        else:
+                            st.caption("（無細部執行步驟）")
             elif tool_calls_log:
                 with st.expander("🔧 執行步驟", expanded=False):
                     for _ftc in tool_calls_log:
@@ -1098,7 +1186,7 @@ if prompt := st.chat_input(
                 )
             response_text = content
             if not report_content:
-                response_ph.markdown(response_text)
+                _fake_stream(response_text, response_ph)   # 打字機效果
             else:
                 response_ph.empty()
                 with st.expander("💬 Agent 最終回應", expanded=False):
