@@ -149,6 +149,10 @@ COWORK_DIR = Path(__file__).parent.parent / "cowork"
 class _DS:
     store = None  # 每次 invoke 前在主 thread 設定
 
+# ── Module-level Workspace 路徑（run_python 工具跨 thread 存取）
+class _WS:
+    path: str = ""  # 每次 invoke 前在主 thread 設定
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONTEXT ENGINEERING
@@ -351,6 +355,52 @@ def company_knowledge_search(query: str) -> str:
         )
     except Exception as e:
         return f"知識庫搜尋失敗：{e}"
+
+
+@tool
+def run_python(code: str) -> str:
+    """在工作區執行 Python 程式碼，回傳 stdout/stderr。
+    matplotlib 圖表自動儲存為 PNG 至工作區（不彈出視窗）。
+    timeout 30 秒。適合資料分析、統計計算、圖表生成、字串處理、自動化腳本。
+    pandas/numpy/matplotlib 等標準套件可直接 import，無需安裝。"""
+    import subprocess as _sp
+    import sys as _sys
+    import uuid as _uuid2
+    ws = Path(_WS.path)
+    if not ws.exists():
+        return "[錯誤：工作區尚未初始化，請先傳送一則訊息]"
+
+    # matplotlib patch：改用 Agg backend，plt.show() 自動存 PNG
+    _patch = (
+        "import matplotlib\nmatplotlib.use('Agg')\n"
+        "import matplotlib.pyplot as _plt\n"
+        "def _patched_show(*a, **k):\n"
+        "    import uuid as _u\n"
+        "    fn = f'chart_{_u.uuid4().hex[:8]}.png'\n"
+        "    _plt.gcf().savefig(fn, bbox_inches='tight', dpi=150)\n"
+        "    print(f'[圖表已儲存：{fn}]')\n"
+        "    _plt.close()\n"
+        "_plt.show = _patched_show\n\n"
+    )
+    script = ws / f"_run_{_uuid2.uuid4().hex[:8]}.py"
+    script.write_text(_patch + code, encoding="utf-8")
+    try:
+        r = _sp.run(
+            [_sys.executable, str(script)],
+            cwd=str(ws), capture_output=True, text=True, timeout=30,
+        )
+        out = r.stdout or ""
+        if r.stderr:
+            out += f"\n[stderr]\n{r.stderr}"
+        if r.returncode != 0:
+            out = f"[exit {r.returncode}]\n" + out
+        return out.strip() or "(無輸出)"
+    except _sp.TimeoutExpired:
+        return "[逾時：程式執行超過 30 秒]"
+    except Exception as e:
+        return f"[執行錯誤：{e}]"
+    finally:
+        script.unlink(missing_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -567,6 +617,38 @@ research_sub_agent = {
     "model": _research_llm,
 }
 
+_CODE_AGENT_PROMPT = """\
+你是 code-agent，專門負責撰寫、執行、除錯 Python 程式碼。
+
+## 工作流程
+1. 用 think 規劃解題思路（套件選擇、資料結構、執行步驟）
+2. 用 run_python 執行第一版程式碼
+3. 讀取輸出，若有錯誤 → 分析原因 → 修正 → 再次 run_python
+4. 最多迭代 4 次；仍失敗則說明根本原因並提供人工建議
+5. 成功後整理：說明程式做了什麼、輸出結果摘要、產生哪些檔案
+
+## 規則
+- pandas / numpy / matplotlib / scipy / sklearn 等標準套件直接使用，無需安裝
+- 工作區檔案（CSV/Excel/JSON）用相對路徑讀取（例：pd.read_csv('data.csv')）
+- 圖表一律用 plt.show()，系統已自動 patch 為儲存 PNG 至工作區
+- 不輸出超過 50 行的 raw 資料，用 .head(10) / .describe() 摘要
+- 需要查 API 文件或解決方案時，用 web_search（不要憑記憶猜 API）
+- 程式碼要加繁體中文註解說明每個關鍵步驟
+"""
+
+code_sub_agent = {
+    "name": "code-agent",
+    "description": (
+        "委派**需要撰寫或執行 Python 程式碼**的任務。"
+        "適用：資料分析（CSV/Excel）、統計計算、圖表生成、字串處理、自動化腳本、除錯。"
+        "不適用：純文字研究、趨勢報告（用 research-agent）、單一快速查詢（直接用 web_search）。"
+        "委派時告知任務目標 + 相關檔案名稱（若有）。"
+    ),
+    "system_prompt": _CODE_AGENT_PROMPT,
+    "tools": [run_python, web_search, think],
+    "model": _research_llm,   # gpt-5.4, reasoning=medium
+}
+
 
 # ── Agent 建立（per-session，保留 thread 跨回合對話記憶）────────────────────────
 def _get_agent_and_workspace() -> tuple:
@@ -631,8 +713,9 @@ def _get_agent_and_workspace() -> tuple:
             context_schema=CoworkContext,  # 型別化 runtime context
             memory=memory_files,
             skills=[str(COWORK_DIR / "skills")],
-            tools=[web_search, think, docstore_search, company_knowledge_search, record_lesson],
-            subagents=[research_sub_agent],
+            tools=[web_search, think, docstore_search, company_knowledge_search,
+                   record_lesson, run_python],
+            subagents=[research_sub_agent, code_sub_agent],
             backend=backend,
             checkpointer=InMemorySaver(),
         )
@@ -939,6 +1022,7 @@ if _inp := st.chat_input(
     # ── 2. 取得 Agent + 建立 CoworkContext ────────────────────────────────────
     agent, workspace = _get_agent_and_workspace()
     _DS.store = st.session_state.cowork_ds_store  # 保留 module-level ref（工具 thread 安全用）
+    _WS.path = workspace                           # run_python 工具跨 thread 存取工作區
 
     _ds_ref = st.session_state.cowork_ds_store
 
