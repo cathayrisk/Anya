@@ -52,7 +52,7 @@ from docstore import (
 )
 
 # ── 頁面設定 ───────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Cowork", page_icon="🥜", layout="wide")
+st.set_page_config(page_title="Anya_Cowork", page_icon="🥜", layout="wide")
 
 # ── API Key ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = (
@@ -104,7 +104,7 @@ def _img_to_data_url(imgbytes: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(imgbytes).decode()}"
 
 # ── 打字機效果 ────────────────────────────────────────────────────────────────
-def _fake_stream(text: str, placeholder, step_chars: int = 8, delay: float = 0.015) -> str:
+def _fake_stream(text: str, placeholder, step_chars: int = 3, delay: float = 0.015) -> str:
     """逐字呈現 markdown（打字機效果），完成後覆蓋為完整文字。"""
     if not text:
         return text
@@ -829,9 +829,6 @@ def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # 主頁面
 # ══════════════════════════════════════════════════════════════════════════════
-st.title("🥜 Cowork — 任務型 Agent")
-st.caption("輸入複合任務，Agent 將自動規劃、研究、整合並產出報告。支援上下文對話。")
-
 # ── 頂部操作列：文件上傳 + 清除對話 ──────────────────────────────────────────
 _ds_store = st.session_state.cowork_ds_store
 _has_index = (
@@ -963,8 +960,6 @@ with st.expander(doc_label, expanded=not _has_index):
         st.success(f"已建立索引：{len(st.session_state.cowork_ds_store.chunks)} chunks")
     elif rows:
         st.info("尚未建立索引（點「建立/更新索引」）")
-
-st.divider()
 
 # ── 對話狀態說明 ───────────────────────────────────────────────────────────────
 _ch = st.session_state.cowork_chat_history
