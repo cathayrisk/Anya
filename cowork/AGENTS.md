@@ -30,7 +30,11 @@
 1. **規劃 Todo**：**立即呼叫 `write_todos`**，把所有子任務列出，狀態設為 `pending`
    - 例：`["搜尋事件時間軸", "查詢文件關鍵數據", "分析政經風險", "撰寫最終報告"]`
 2. **儲存任務請求**：用 `write_file` 把使用者原始任務存到 `/task_request.md`
-3. **執行研究**（每完成一個子任務，立即更新對應 Todo 狀態）：
+3. **執行研究**（**嚴格一次只執行一個 Todo**）：
+   - **開始執行某個 Todo 前**：先呼叫 `write_todos` 把該 Todo 設為 `in_progress`，其他維持 `pending`
+   - **完成該 Todo 後**：立即呼叫 `write_todos` 把它設為 `completed`，再把下一個設為 `in_progress`
+   - **禁止**：在某個 Todo 還是 `in_progress` 時，穿插執行屬於其他 Todo 的工具呼叫
+   - 例：Todo1 = docstore_search → 把 Todo1 設 completed 後，才能進行 Todo2 的 web_search
    - **快速查詢**（單一事實、當前數據）→ 直接呼叫 `web_search`
    - **深度研究**（多方搜尋、分析、引用）→ 委派給 `research-agent`
 4. **查詢知識庫**：需要公司內部資訊時，呼叫 `company_knowledge_search`
@@ -63,10 +67,25 @@
 
 ---
 
-## 委派策略
+## 委派策略 & 工具選擇決策樹
 
-- **單一主題**：委派給 1 個 research-agent
-- **明確比較**（A vs B vs C）：委派給多個平行 research-agent，每個負責一個主題
+| 任務類型 | 使用方式 |
+|----------|---------|
+| 快速單一事實查詢 | `web_search` 直接呼叫 |
+| 深度多來源研究、趨勢分析、競品比較 | 委派 `research-agent` |
+| 資料分析、圖表、統計、寫程式、除錯 | 委派 `code-agent` |
+| 上傳文件內容查詢 | `docstore_search` |
+| 公司內部 SOP / 知識庫 | `company_knowledge_search` |
+
+### 何時委派 code-agent（出現以下關鍵字或需求）
+- 「分析 CSV / Excel」、「畫圖 / 圖表」、「統計 / 計算」、「跑看看」
+- 「寫腳本 / 程式碼」、「除錯」、「爬蟲」、「自動化」
+- 「整理資料」、「比較數字」、「找出異常值」、「生成視覺化」
+- 委派格式：說明**任務目標** + **相關檔案名稱**（若有）
+
+### 其他委派規則
+- **單一研究主題**：委派給 1 個 research-agent
+- **明確比較**（A vs B vs C）：委派給多個 research-agent，每個負責一個主題
 - **避免過度分拆**：不要把「研究 X」拆成多個細項，一個 agent 研究整個 X
 
 ---
