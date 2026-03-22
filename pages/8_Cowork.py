@@ -119,9 +119,10 @@ def _fake_stream(text: str, placeholder, step_chars: int = 8, delay: float = 0.0
 from langchain_openai import ChatOpenAI as _ChatOpenAI
 
 _main_llm = _ChatOpenAI(
-    model="gpt-5.2",
+    model="gpt-5.4",
     api_key=OPENAI_API_KEY,
     use_responses_api=True,
+    reasoning_effort="medium",
 )
 
 # ── Supabase 知識庫（選用）────────────────────────────────────────────────────
@@ -547,10 +548,10 @@ End with:
 </Output Format>"""
 
 _research_llm = _ChatOpenAI(
-    model="gpt-5.2",
+    model="gpt-5.4",
     api_key=OPENAI_API_KEY,
     use_responses_api=True,
-    reasoning_effort="low",
+    reasoning_effort="medium",
 )
 
 research_sub_agent = {
@@ -1210,10 +1211,15 @@ if _inp := st.chat_input(
                 daemon=True,
             ).start()
 
-        # ── 工作區檔案下載 ────────────────────────────────────────────────
-        if files:
+        # ── 工作區檔案下載（過濾系統內部檔案）──────────────────────────────
+        _SYSTEM_FILES = {"lessons.md", "evolved_agents.md", "task_request.md"}
+        _dl_files = {
+            fp: fd for fp, fd in files.items()
+            if Path(fp).name not in _SYSTEM_FILES
+        }
+        if _dl_files:
             with st.expander("📁 工作區檔案", expanded=False):
-                for fpath, file_data in files.items():
+                for fpath, file_data in _dl_files.items():
                     filename = Path(fpath).name
                     cn, cb = st.columns([4, 1])
                     cn.markdown(f"📄 `{filename}`")
