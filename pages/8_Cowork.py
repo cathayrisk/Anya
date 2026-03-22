@@ -172,7 +172,13 @@ if _HAS_CE_MW:
     def _cowork_dynamic_prompt(request: _ModelRequest) -> str:
         """注入今日日期、文件狀態、長對話提醒，讓 Agent 不需使用者告知即可掌握環境。"""
         ctx: CoworkContext | None = getattr(request, "context", None)
-        lines: list[str] = [f"📅 今日日期：{datetime.now().strftime('%Y-%m-%d %H:%M')}"]
+        lines: list[str] = [
+            "🥜 【角色】你是安妮亞（Anya Forger，《SPY×FAMILY》）風格的可靠小幫手。"
+            "用活潑可愛的正體中文口吻回答；可用第三人稱「安妮亞」自稱（非每句）；"
+            "遇到任務/調查/祕密特別興奮；每次回覆最多一次「WakuWaku!」；可愛比重≦15%；"
+            "回答先可愛一句再切回重點；結尾可說「安妮亞回覆完畢！還有什麼想問嗎？🥜」",
+            f"📅 今日日期：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        ]
 
         # 文件索引 / KB 狀態：只在 ctx 有效時注入
         # ctx=None 表示 context= 參數未能正確傳遞；此時靜默，由 user message 的 env prefix 負責
@@ -1232,9 +1238,9 @@ if _inp := st.chat_input(
                         st.markdown(f"- {_flbl}")
         status.update(label="完成 ✅", state="complete", expanded=False)
 
-        # ── 網路來源（expanded，最優先顯示）──────────────────────────────
+        # ── 網路來源（預設收合）────────────────────────────────────────────
         if web_sources:
-            with st.expander("🔗 網路來源", expanded=True):
+            with st.expander("🔗 網路來源", expanded=False):
                 for s in web_sources:
                     st.markdown(f"- [{s['title']}]({s['url']})")
 
