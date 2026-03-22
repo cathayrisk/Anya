@@ -446,16 +446,13 @@ def _evaluate_turn_background(
                 }).execute()
                 _lesson_rec = True
 
-        # 記錄評估結果
+        # 記錄評估結果（只存元數據，不存對話內容，避免機密外洩）
         _sb.table("cowork_evaluations").insert({
             "session_id":         session_id,
-            "user_message":       user_msg[:500],
-            "agent_response":     agent_resp[:500],
             "tool_calls":         ", ".join(tool_calls_made),
             "overall_score":      _score,
             "tool_usage_score":   float(_result.get("tool_usage_score", 1.0)),
             "completeness_score": float(_result.get("completeness_score", 1.0)),
-            "feedback":           _result.get("feedback", ""),
             "lesson_recorded":    _lesson_rec,
         }).execute()
 
