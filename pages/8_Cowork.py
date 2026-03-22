@@ -235,6 +235,41 @@ def docstore_search(query: str) -> str:
 
 
 @tool
+def record_lesson(category: str, problem: str, rule: str, tags: list | None = None) -> str:
+    """Record a lesson learned after making a mistake or being corrected by the user.
+    Call this AUTOMATICALLY and IMMEDIATELY whenever the user corrects you — no need to be asked.
+
+    Trigger conditions:
+    - User says something is wrong / incorrect / should be different
+    - User provides a better approach or points out a logic error
+    - Any form of correction or feedback about your behavior
+
+    Args:
+        category: 2-4 char label, e.g. 'CE middleware', 'Streamlit state', 'deepagents', '工具使用'
+        problem:  What went wrong (1-2 sentences, describe YOUR mistake)
+        rule:     The rule to follow to prevent this mistake next time (1-2 sentences)
+        tags:     Optional list of searchable keywords
+    """
+    try:
+        import requests as _requests
+        _sb_url = (st.secrets.get("SUPABASE_URL") or "").rstrip("/")
+        _sb_key = st.secrets.get("SUPABASE_KEY") or ""
+        if not _sb_url or not _sb_key:
+            return "Supabase 未啟用，無法記錄 lesson。請確認 SUPABASE_URL 和 SUPABASE_KEY 已設定。"
+        _edge_url = f"{_sb_url}/functions/v1/record-lesson"
+        _resp = _requests.post(
+            _edge_url,
+            json={"category": category, "problem": problem, "rule": rule, "tags": tags or []},
+            headers={"Authorization": f"Bearer {_sb_key}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        _resp.raise_for_status()
+        return f"✅ Lesson 已記錄：[{category}] {rule}"
+    except Exception as e:
+        return f"記錄 lesson 失敗：{e}"
+
+
+@tool
 def company_knowledge_search(query: str) -> str:
     """Search company internal knowledge base (SOPs, regulations, ESG, product docs)."""
     if not _HAS_KB or _kb_supabase is None or _kb_embeddings is None:
@@ -255,6 +290,178 @@ def company_knowledge_search(query: str) -> str:
         )
     except Exception as e:
         return f"知識庫搜尋失敗：{e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SELF-EVOLVING AGENT（OpenAI VersionedPrompt 概念）
+# 每輪對話結束後，背景 Thread 自動評估品質：
+#   低分 → auto-lesson → 累積 10 個 → Metaprompt Agent 生成改善版 prompt
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _smart_truncate(text: str, head: int = 1000, tail: int = 500) -> str:
+    """取前 head + 後 tail 字，確保評審同時看到問題描述（開頭）和結論（結尾）。"""
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n…(略去中間 {len(text) - head - tail} 字)…\n{text[-tail:]}"
+
+
+def _run_metaprompt_evolution(sb_client, new_lessons: list[dict]) -> None:
+    """Metaprompt Agent：讀取失敗案例，生成改善後的完整 AGENTS 補充文件並版本化儲存。"""
+    try:
+        _base_agents = (COWORK_DIR / "AGENTS.md").read_text(encoding="utf-8")
+        _failures = "\n".join(
+            f"- [{r.get('category', '?')}] 問題：{r.get('problem', '')} → 規則：{r.get('rule', '')}"
+            for r in new_lessons
+        )
+        _metaprompt = (
+            "你是 AI Agent 系統設計師。\n"
+            "以下是 Cowork Agent 的當前行為準則（AGENTS.md）：\n\n"
+            f"{_base_agents}\n\n"
+            f"以下是近期 {len(new_lessons)} 個自動偵測到的失敗模式：\n\n"
+            f"{_failures}\n\n"
+            "請根據這些失敗模式，撰寫一份**補充行為準則**（supplement），用繁體中文，markdown 格式：\n"
+            "- 使用 ## 標題分類\n"
+            "- 每條規則要具體、可執行、有明確觸發條件\n"
+            "- 不要重複 AGENTS.md 已有的規則，只寫新增補充\n"
+            "- 目標：讓 Agent 下次遇到相同情況時能正確行動\n"
+            "- 長度控制在 300-500 字"
+        )
+        _oai_local = OpenAI(api_key=OPENAI_API_KEY)
+        _resp = _oai_local.chat.completions.create(
+            model="gpt-4.1",
+            messages=[{"role": "user", "content": _metaprompt}],
+            timeout=45,
+        )
+        _evolved = _resp.choices[0].message.content
+
+        _last = (sb_client.table("cowork_prompt_versions")
+                 .select("version").order("version", desc=True)
+                 .limit(1).execute().data or [])
+        _next_ver = (_last[0]["version"] + 1) if _last else 1
+
+        sb_client.table("cowork_prompt_versions").insert({
+            "version":        _next_ver,
+            "prompt_content": _evolved,
+            "source_lessons": len(new_lessons),
+        }).execute()
+    except Exception:
+        pass  # evolution 失敗不影響主流程
+
+
+def _auto_evolve_if_needed(sb_client) -> None:
+    """若自上次 evolution 後累積 ≥10 個 auto-lessons，自動觸發 metaprompt evolution。"""
+    try:
+        _last_ver = (sb_client.table("cowork_prompt_versions")
+                     .select("created_at").order("created_at", desc=True)
+                     .limit(1).execute().data or [])
+        _since = _last_ver[0]["created_at"] if _last_ver else "1970-01-01"
+
+        _new = (sb_client.table("claude_lessons")
+                .select("category,problem,rule")
+                .eq("source", "auto")
+                .gt("created_at", _since)
+                .execute().data or [])
+
+        if len(_new) >= 10:
+            _run_metaprompt_evolution(sb_client, _new)
+    except Exception:
+        pass
+
+
+def _evaluate_turn_background(
+    session_id: str,
+    user_msg: str,
+    agent_resp: str,
+    tool_calls_made: list[str],
+    has_docs: bool,
+    has_kb: bool,
+) -> None:
+    """背景 Thread（daemon，不阻塞 UI）：
+    LLM-as-judge 評估本輪品質 → 低分自動記 lesson → 累積後觸發 metaprompt evolution。
+    """
+    try:
+        from supabase import create_client as _sb_create
+        import json as _json
+        _sb_url = st.secrets.get("SUPABASE_URL", "")
+        _sb_key = st.secrets.get("SUPABASE_KEY", "")
+        if not _sb_url or not _sb_key:
+            return
+        _sb = _sb_create(_sb_url, _sb_key)
+        _eval_oai = OpenAI(api_key=OPENAI_API_KEY)
+
+        _user_text = _smart_truncate(user_msg, head=1000, tail=0)
+        _resp_text = _smart_truncate(agent_resp, head=1000, tail=500)
+
+        _judge_prompt = (
+            "你是 AI Agent 品質評審，請評估以下對話輪次的品質。\n\n"
+            f"使用者問題：{_user_text}\n\n"
+            f"Agent 回應：{_resp_text}\n\n"
+            f"實際呼叫工具：{', '.join(tool_calls_made) if tool_calls_made else '（無）'}\n"
+            f"環境：有文件索引={'是' if has_docs else '否'}，有知識庫={'是' if has_kb else '否'}\n\n"
+            "tool_usage_score 標準（最重要的指標）：\n"
+            "- 有文件但完全沒呼叫 docstore_search → 0.1\n"
+            "- 明確需要網路資訊但沒用 web_search → 0.3\n"
+            "- 工具選擇恰當 → 0.9-1.0\n\n"
+            "completeness_score 標準：\n"
+            "- 完整回答問題 → 0.9+；部分回答 → 0.5-0.8；推託或要求重新提供 → 0.2\n\n"
+            "overall_score = tool_usage × 0.4 + completeness × 0.6\n\n"
+            "以 JSON 格式回覆，不加其他文字：\n"
+            '{\n'
+            '  "tool_usage_score": 0.0,\n'
+            '  "completeness_score": 0.0,\n'
+            '  "overall_score": 0.0,\n'
+            '  "feedback": "主要問題一句話",\n'
+            '  "auto_lesson": {\n'
+            '    "category": "2-4字錯誤類別",\n'
+            '    "problem": "我做錯了什麼（1句，主詞是我）",\n'
+            '    "rule": "下次應遵守的規則（1句，具體可執行）"\n'
+            '  }\n'
+            '}\n'
+            "注意：overall_score >= 0.75 時，auto_lesson 所有欄位填空字串。"
+        )
+
+        _res = _eval_oai.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": _judge_prompt}],
+            response_format={"type": "json_object"},
+            timeout=25,
+        )
+        _result = _json.loads(_res.choices[0].message.content)
+        _score = float(_result.get("overall_score", 1.0))
+
+        # 低分 → 自動記 lesson
+        _lesson_rec = False
+        if _score < 0.75:
+            _al = _result.get("auto_lesson", {})
+            if _al.get("problem") and _al.get("rule"):
+                _sb.table("claude_lessons").insert({
+                    "category": _al.get("category", "自動偵測"),
+                    "problem":  _al["problem"],
+                    "rule":     _al["rule"],
+                    "source":   "auto",
+                    "tags":     ["auto-detected"],
+                }).execute()
+                _lesson_rec = True
+
+        # 記錄評估結果
+        _sb.table("cowork_evaluations").insert({
+            "session_id":         session_id,
+            "user_message":       user_msg[:500],
+            "agent_response":     agent_resp[:500],
+            "tool_calls":         ", ".join(tool_calls_made),
+            "overall_score":      _score,
+            "tool_usage_score":   float(_result.get("tool_usage_score", 1.0)),
+            "completeness_score": float(_result.get("completeness_score", 1.0)),
+            "feedback":           _result.get("feedback", ""),
+            "lesson_recorded":    _lesson_rec,
+        }).execute()
+
+        # 若新增了 lesson，檢查是否達到 evolution 門檻
+        if _lesson_rec:
+            _auto_evolve_if_needed(_sb)
+
+    except Exception:
+        pass  # 評估失敗不影響主流程
 
 
 # ── Research Sub-Agent ────────────────────────────────────────────────────────
@@ -313,6 +520,43 @@ def _get_agent_and_workspace() -> tuple:
 
         backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
 
+        # ── 從 Supabase 載入 lessons，注入 Agent 記憶 ─────────────────────────
+        memory_files = [str(COWORK_DIR / "AGENTS.md")]
+        if _kb_supabase is not None:
+            try:
+                _rows = (_kb_supabase.table("claude_lessons")
+                         .select("date,category,problem,rule,tags")
+                         .order("created_at").execute().data or [])
+                if _rows:
+                    _md = "# Claude Lessons Learned\n\n每次被糾正後記錄的錯誤模式，自動載入以避免重蹈覆轍。\n\n"
+                    for r in _rows:
+                        _cat = r.get("category", "未分類")
+                        _date = r.get("date", "")
+                        _md += f"## [{_cat}]  {_date}\n"
+                        _md += f"**問題**：{r.get('problem', '')}\n\n"
+                        _md += f"**規則**：{r.get('rule', '')}\n\n"
+                        _tags = r.get("tags") or []
+                        if _tags:
+                            _md += f"*Tags: {', '.join(_tags)}*\n\n"
+                        _md += "---\n\n"
+                    # 載入最新 prompt evolution 版本（OpenAI VersionedPrompt 概念）
+                    _latest_ver = (_kb_supabase.table("cowork_prompt_versions")
+                                   .select("prompt_content,version")
+                                   .order("version", desc=True).limit(1).execute().data or [])
+                    if _latest_ver:
+                        _md += (
+                            f"\n\n---\n\n"
+                            f"# 演化補充準則（v{_latest_ver[0]['version']}）\n\n"
+                            + _latest_ver[0]["prompt_content"]
+                        )
+
+                    _lessons_path = os.path.join(workspace, "lessons.md")
+                    with open(_lessons_path, "w", encoding="utf-8") as _f:
+                        _f.write(_md)
+                    memory_files.append(_lessons_path)
+            except Exception:
+                pass  # lessons / evolved prompt 載入失敗不影響主流程
+
         # SummarizationMiddleware 已在 create_deep_agent 預設 stack 中，
         # 不可重複傳入（會觸發 AssertionError: duplicate middleware）。
         # 只傳入我們自訂的 Context Engineering middleware。
@@ -324,9 +568,9 @@ def _get_agent_and_workspace() -> tuple:
             model=_main_llm,
             middleware=ce_middleware,
             context_schema=CoworkContext,  # 型別化 runtime context
-            memory=[str(COWORK_DIR / "AGENTS.md")],
+            memory=memory_files,
             skills=[str(COWORK_DIR / "skills")],
-            tools=[web_search, think, docstore_search, company_knowledge_search],
+            tools=[web_search, think, docstore_search, company_knowledge_search, record_lesson],
             subagents=[research_sub_agent],
             backend=backend,
             checkpointer=InMemorySaver(),
@@ -725,6 +969,10 @@ if prompt := st.chat_input(
             all_messages = final_chunk.get("messages", []) if final_chunk else []
             status.update(label="完成 ✅", state="complete", expanded=False)
 
+            # ── Self-evolution：非阻塞背景評估（使用者感受不到）─────────────
+            # 在 response_text 取得前先記下 tool_calls，後面再觸發 thread
+            _eval_tool_calls = list(tool_calls_log)
+
         except Exception as exc:
             status.update(label="執行失敗 ❌", state="error", expanded=False)
             st.error(f"Agent 執行失敗：{exc}")
@@ -786,6 +1034,22 @@ if prompt := st.chat_input(
                     st.markdown(response_text)
         else:
             response_ph.empty()
+
+        # ── Self-evolution 背景 Thread（response_text 已確定後觸發）────────
+        if _kb_supabase is not None and response_text:
+            import threading as _threading
+            _threading.Thread(
+                target=_evaluate_turn_background,
+                args=(
+                    st.session_state.cowork_thread_id,
+                    prompt,
+                    response_text,
+                    [tc["name"] for tc in _eval_tool_calls],
+                    _has_idx,
+                    _HAS_KB,
+                ),
+                daemon=True,
+            ).start()
 
         # ── 工作區檔案下載 ────────────────────────────────────────────────
         if files:
