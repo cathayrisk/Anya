@@ -906,10 +906,9 @@ if prompt := st.chat_input(
 
     # ── 3. Assistant 回應區塊 ─────────────────────────────────────────────────
     with st.chat_message("assistant"):
-        # 狀態指示器（即時更新工具呼叫 + 任務進度）
+        # 狀態指示器（執行中即時更新標題+清單；完成後收合，可點開看 todo expanders）
         status = st.status("思考中…✨", expanded=True)
-        status_steps_ph = status.empty()   # 工具呼叫列表
-        status_todos_ph  = status.empty()  # 任務進度 TodoList
+        live_ph = status.empty()   # 執行中簡化進度清單；完成後清除改用 expanders
 
         # 主要回應佔位（在 status 之下）
         response_ph = st.empty()
@@ -940,16 +939,20 @@ if prompt := st.chat_input(
             return "\n\n".join(lines)
 
         def _refresh_status() -> None:
-            """更新 status 內的顯示：
-            - 有 Todo → 簡化任務進度清單（active todo 顯示步驟數）
-            - 無 Todo → 執行步驟清單
+            """更新 status 標題（active todo）+ live_ph 簡化清單。
+            - 有 Todo → status label = active todo 標題，live_ph = 全部進度
+            - 無 Todo → live_ph = 執行步驟
             """
             if current_todos:
-                status_steps_ph.empty()
-                status_todos_ph.markdown("**📋 任務進度**\n\n" + _build_status_todos_md())
+                _active = next(
+                    (t for t in current_todos if t.get("status") == "in_progress"), None
+                )
+                if _active:
+                    _short = _active.get("content", "執行中")[:40]
+                    status.update(label=f"🔄 {_short}…")
+                live_ph.markdown(_build_status_todos_md())
             elif step_log:
-                status_todos_ph.empty()
-                status_steps_ph.markdown(
+                live_ph.markdown(
                     "**🔧 執行步驟**\n" + "\n".join(f"- {s}" for s in step_log[-10:])
                 )
 
@@ -1023,46 +1026,44 @@ if prompt := st.chat_input(
                                     web_sources.append(s)
 
             all_messages = final_chunk.get("messages", []) if final_chunk else []
-            status.update(label="完成 ✅", state="complete", expanded=False)
-
-            # ── Self-evolution：非阻塞背景評估（使用者感受不到）─────────────
             # 在 response_text 取得前先記下 tool_calls，後面再觸發 thread
             _eval_tool_calls = list(tool_calls_log)
 
         except Exception as exc:
+            live_ph.empty()
             status.update(label="執行失敗 ❌", state="error", expanded=False)
             st.error(f"Agent 執行失敗：{exc}")
             st.stop()
+
+        # ── 清除 live_ph，在 status 內渲染最終任務進度（expander per todo）────
+        live_ph.empty()
+        with status:
+            if current_todos:
+                for _fi, _ft in enumerate(current_todos):
+                    _ficon = TODO_ICONS.get(_ft.get("status", "pending"), "⬜")
+                    _flabel = f"{_ficon} {_ft.get('content', '')}"
+                    _fsteps = _todo_step_map.get(_fi, [])
+                    if _fsteps:
+                        with st.expander(_flabel, expanded=False):
+                            for _fs in _fsteps:
+                                st.markdown(f"- {_fs}")
+                    else:
+                        st.markdown(_flabel)
+            elif tool_calls_log:
+                with st.expander("🔧 執行步驟", expanded=False):
+                    for _ftc in tool_calls_log:
+                        _ficon = TOOL_ICONS.get(_ftc["name"], "🔧")
+                        _flbl = f"{_ficon} {_ftc['name']}"
+                        if _ftc.get("summary"):
+                            _flbl += f"：{_ftc['summary']}"
+                        st.markdown(f"- {_flbl}")
+        status.update(label="完成 ✅", state="complete", expanded=False)
 
         # ── 網路來源（expanded，最優先顯示）──────────────────────────────
         if web_sources:
             with st.expander("🔗 網路來源", expanded=True):
                 for s in web_sources:
                     st.markdown(f"- [{s['title']}]({s['url']})")
-
-        # ── 任務進度 / 執行步驟（最終狀態，擇一顯示）────────────────────
-        if current_todos:
-            # 有 Todo：每個 todo 一個 expander（有子步驟才展開，無則純文字）
-            st.markdown("**📋 任務進度**")
-            for _i, _t in enumerate(current_todos):
-                _icon = TODO_ICONS.get(_t.get("status", "pending"), "⬜")
-                _label = f"{_icon} {_t.get('content', '')}"
-                _steps = _todo_step_map.get(_i, [])
-                if _steps:
-                    with st.expander(_label, expanded=False):
-                        for _s in _steps:
-                            st.markdown(f"- {_s}")
-                else:
-                    st.markdown(_label)
-        elif tool_calls_log:
-            # 無 Todo：退回顯示執行步驟
-            with st.expander("🔧 執行步驟", expanded=True):
-                for tc in tool_calls_log:
-                    _icon = TOOL_ICONS.get(tc["name"], "🔧")
-                    _label = f"{_icon} {tc['name']}"
-                    if tc.get("summary"):
-                        _label += f"：{tc['summary']}"
-                    st.markdown(f"- {_label}")
 
         # ── 收集工作區檔案 ────────────────────────────────────────────────
         workspace_path = Path(workspace)
