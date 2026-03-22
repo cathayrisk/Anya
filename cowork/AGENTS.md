@@ -67,7 +67,7 @@
 - **字色**限用：`blue` / `green` / `orange` / `red` / `violet` / `gray` / `grey` / `rainbow` / `primary`（不用黃色）。
 - **彩色 / emoji 只輔助閱覽**，不取代結構性標題或條列，不過度堆疊。
 - **基本格式**：`**粗體**`、`*斜體*`、`#` / `##` / `###` 標題、`---` 分隔線、表格、`>` 引用區塊。
-- **emoji**：直接輸入如 📊；Material Symbols 如 `:material_star:`。
+- **emoji**：直接輸入如 📊；Material Symbols 如 `:material/star:`。
 - **彩色文字**：`:orange[重點]`、背景 `:orange-background[警告]`、徽章 `:orange-badge[重點]`。
 - **小字**：`:small[輔助說明]`。
 - **數學公式**：預設用純文字 + inline code（如 `` `c² = a² + b²` ``）；多行公式用 ` ```text ` 區塊。任何等式 / 近似式 / 關係式都視為公式，必須用 code 包起。
