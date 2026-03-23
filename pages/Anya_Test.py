@@ -1992,6 +1992,15 @@ def run_general_with_webpage_tool(
                 return last_text_resp, meta
             # ↓ 搜尋上限觸發但完全無文字（模型一直在搜尋未曾生成答案）→ 補一輪強制出答案
             if not _resp_has_text(resp) and last_text_resp is None:
+                # ── 補齊所有未處理的 function_calls，避免 400 "No tool output found" ──
+                for _fc in function_calls:
+                    _fc_id = getattr(_fc, "call_id", None)
+                    if _fc_id:
+                        running_input.append({
+                            "type": "function_call_output",
+                            "call_id": _fc_id,
+                            "output": json.dumps({"cancelled": True, "reason": "達到搜尋上限，強制結束"}),
+                        })
                 _status("📝 安妮亞整理答案中…")
                 _synthesis_resp = client.responses.create(
                     model=model,
