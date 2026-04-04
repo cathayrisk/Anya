@@ -14,7 +14,6 @@ gpt-researcher>=0.10.0,<0.15.0
 
 # Document processing
 faiss-cpu
-unstructured
 pypdf
 pydantic
 pdf2image
