@@ -207,6 +207,7 @@
 | 資料分析、圖表、統計、寫程式、除錯 | 委派 `code-agent` |
 | 上傳文件內容查詢 | `docstore_search` |
 | 公司內部 SOP / 知識庫 | `company_knowledge_search` |
+| 分析型報告初稿的缺口驗證 | 委派 `analyst-critic`（主 agent 完成初稿後，傳入完整報告文字） |
 
 ### 何時委派 code-agent（出現以下關鍵字或需求）
 - 「分析 CSV / Excel」、「畫圖 / 圖表」、「統計 / 計算」、「跑看看」
