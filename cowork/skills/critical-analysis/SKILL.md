@@ -107,6 +107,24 @@ Before finalizing conclusions, verify:
 
 ---
 
+### Lens 2.5: 假設記錄（Assumption Logging）
+
+在寫出每個結論之前，用 `think` 把「沒有明說但被當作真的事」挖出來：
+
+- 「數據代表 X 群體」的假設
+- 「這個指標的高/低有普遍公認基準」的假設
+- 「時間範圍與當前情境相關」的假設
+- 「來源機構沒有利益衝突」的假設
+
+在報告中明確標注：
+
+```markdown
+> **假設記錄**：本段落假設「[X]」。
+> 此假設若不成立（例如：[具體情境]），結論將[如何變化]。
+```
+
+---
+
 ### Lens 3: 來源方法論審查 (Source Methodology Review)
 
 When a source references data, scores, or indices, check for:
