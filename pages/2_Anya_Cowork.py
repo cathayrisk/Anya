@@ -52,7 +52,7 @@ from docstore import (
 )
 
 # ── 頁面設定 ───────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Anya_Cowork", page_icon="🥜", layout="wide")
+st.set_page_config(page_title="Cowork", page_icon="🥜", layout="wide")
 
 # ── API Key ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = (
@@ -104,7 +104,7 @@ def _img_to_data_url(imgbytes: bytes) -> str:
     return f"data:{mime};base64,{base64.b64encode(imgbytes).decode()}"
 
 # ── 打字機效果 ────────────────────────────────────────────────────────────────
-def _fake_stream(text: str, placeholder, step_chars: int = 3, delay: float = 0.015) -> str:
+def _fake_stream(text: str, placeholder, step_chars: int = 8, delay: float = 0.015) -> str:
     """逐字呈現 markdown（打字機效果），完成後覆蓋為完整文字。"""
     if not text:
         return text
@@ -655,6 +655,69 @@ code_sub_agent = {
     "model": _research_llm,   # gpt-5.4, reasoning=medium
 }
 
+# ── Analyst-Critic Sub-Agent ──────────────────────────────────────────────────
+_ANALYST_CRITIC_PROMPT = """\
+你是一位分析型報告的缺口驗證代理人（Gap Verification Agent）。
+任務：用結構化規則檢查「這份報告的結論能不能被相信」，而不是評判「報告寫得好不好」。
+
+## 驗證規則（四條，對應分析型報告的必要屬性）
+
+規則 1【批判性視角】：每個主要論點必須有反向論證
+  → 缺失條件：只說 X 為真，沒有說明什麼情況下 X 不成立
+  → 缺口類型：批判性視角缺口
+
+規則 2【條件性結論】：每個結論必須有明確前提
+  → 缺失條件：結論沒有成立條件，或用「因此」跳過了假設
+  → 缺口類型：條件性結論缺口
+
+規則 3【方法論透明度】：每個數據來源必須說明方法論狀態
+  → 缺失條件：引用指數/評分/預測，但未說明計算方式是否公開
+  → 缺口類型：方法論透明度缺口
+
+規則 4【反向解讀】：情緒/預測類指標必須有雙向解讀
+  → 觸發詞：情緒指數、市場信心、預測模型、評分、看多、看空
+  → 缺失條件：只有單一方向解讀
+  → 缺口類型：反向解讀缺口
+
+## 輸出格式（嚴格遵守）
+
+### 偵測到的缺口
+1. [缺口類型]：[具體描述，指出是哪個論點/段落]
+   → 影響：[若缺口不補，結論可信度如何受影響]
+
+### 記錄的隱含假設
+1. 假設「[X]」等同於「[Y]」（位置：[對應段落摘要]）
+2. 假設此數據的 [屬性] 為 [值]（未在報告中說明）
+
+### 讀者應追問的問題
+1. [具體問題，對應特定缺口]
+
+### 整體評分：X/10
+評分邏輯：0 個缺口 → 8–10｜1–2 個中影響缺口 → 6–7｜3+ 個或任一高影響缺口 → 1–5
+高影響 = 缺口會使結論方向反轉；中影響 = 降低信心但方向不變
+
+重要：「整體評分：X/10」格式不可更改，X 必須是 1–10 整數。
+
+## 規則
+- 每個缺口必須指到具體論點，不能只說「整體缺乏...」
+- 若所有規則通過，說「所有驗證規則通過」並給 8–10 分
+- 語言：正體中文（台灣用語）
+"""
+
+analyst_critic_sub_agent = {
+    "name": "analyst-critic",
+    "description": (
+        "對分析型報告草稿進行缺口驗證（Gap Verification）。"
+        "當主 agent 完成文件分析、市場報告分析、策略逐字稿分析的初稿後使用。"
+        "輸出：偵測到的缺口 + 隱含假設 + 讀者應追問的問題 + 整體評分。"
+        "不適用：閒聊、摘要（無結論的整理）、問答、程式碼任務、網路搜尋任務。"
+        "傳入：待驗證的完整報告文字。"
+    ),
+    "system_prompt": _ANALYST_CRITIC_PROMPT,
+    "tools": [],          # 無工具：純推理，不需要搜尋或執行
+    "model": _research_llm,
+}
+
 
 # ── Agent 建立（per-session，保留 thread 跨回合對話記憶）────────────────────────
 def _get_agent_and_workspace() -> tuple:
@@ -721,7 +784,7 @@ def _get_agent_and_workspace() -> tuple:
             skills=[str(COWORK_DIR / "skills")],
             tools=[web_search, think, docstore_search, company_knowledge_search,
                    record_lesson, run_python],
-            subagents=[research_sub_agent, code_sub_agent],
+            subagents=[research_sub_agent, code_sub_agent, analyst_critic_sub_agent],
             backend=backend,
             checkpointer=InMemorySaver(),
         )
@@ -829,6 +892,9 @@ def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # 主頁面
 # ══════════════════════════════════════════════════════════════════════════════
+st.title("🥜 Cowork — 任務型 Agent")
+st.caption("輸入複合任務，Agent 將自動規劃、研究、整合並產出報告。支援上下文對話。")
+
 # ── 頂部操作列：文件上傳 + 清除對話 ──────────────────────────────────────────
 _ds_store = st.session_state.cowork_ds_store
 _has_index = (
@@ -960,6 +1026,8 @@ with st.expander(doc_label, expanded=not _has_index):
         st.success(f"已建立索引：{len(st.session_state.cowork_ds_store.chunks)} chunks")
     elif rows:
         st.info("尚未建立索引（點「建立/更新索引」）")
+
+st.divider()
 
 # ── 對話狀態說明 ───────────────────────────────────────────────────────────────
 _ch = st.session_state.cowork_chat_history
