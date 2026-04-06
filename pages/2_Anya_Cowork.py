@@ -5,6 +5,7 @@ Cowork — 任務型 Agent（對話式介面）
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import tempfile
@@ -67,6 +68,19 @@ if not OPENAI_API_KEY:
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 _oai = OpenAI(api_key=OPENAI_API_KEY)
 
+# ── LangSmith Tracing（選用）────────────────────────────────────────────────
+_LANGCHAIN_API_KEY = (
+    st.secrets.get("LANGCHAIN_API_KEY")
+    or os.getenv("LANGCHAIN_API_KEY")
+)
+if _LANGCHAIN_API_KEY:
+    os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+    os.environ["LANGCHAIN_API_KEY"] = _LANGCHAIN_API_KEY
+    os.environ.setdefault(
+        "LANGCHAIN_PROJECT",
+        st.secrets.get("LANGCHAIN_PROJECT", "anya-cowork"),
+    )
+
 # ── PIL（選用，圖片縮圖用）────────────────────────────────────────────────────
 try:
     from PIL import Image as _PILImage
@@ -118,12 +132,31 @@ def _fake_stream(text: str, placeholder, step_chars: int = 8, delay: float = 0.0
 
 from langchain_openai import ChatOpenAI as _ChatOpenAI
 
-_main_llm = _ChatOpenAI(
-    model="gpt-5.4",
-    api_key=OPENAI_API_KEY,
-    use_responses_api=True,
-    reasoning_effort="medium",
-)
+
+def _make_llm_with_fallback(
+    primary: str = "gpt-5.4",
+    fallback: str = "gpt-4.1",
+    reasoning_effort: str = "medium",
+) -> "_ChatOpenAI":
+    """建立 LLM 實例；primary 不可用時自動降級至 fallback。"""
+    try:
+        llm = _ChatOpenAI(
+            model=primary,
+            api_key=OPENAI_API_KEY,
+            use_responses_api=True,
+            reasoning_effort=reasoning_effort,
+        )
+        return llm
+    except Exception:
+        st.warning(f"⚠️ 主要模型 {primary} 無法初始化，已自動切換為 {fallback}。")
+        return _ChatOpenAI(
+            model=fallback,
+            api_key=OPENAI_API_KEY,
+            use_responses_api=True,
+        )
+
+
+_main_llm = _make_llm_with_fallback("gpt-5.4", "gpt-4.1")
 
 # ── Supabase 知識庫（選用）────────────────────────────────────────────────────
 _HAS_KB = False
@@ -198,6 +231,13 @@ if _HAS_CE_MW:
             "單一問答不需要 Todo。"
         )
 
+        # 分析任務批判性檢查（LLM 自主判斷是否呼叫）
+        lines.append(
+            "📊 【分析任務自我檢查】若本次回覆包含「結論 / 預測 / 評分解讀 / 策略建議」，"
+            "輸出前請用 think 確認是否需要呼叫 critique_analysis 進行四維度缺口驗證；"
+            "若來源中有「內部模型 / 第三方指數 / 專有框架」，可呼叫 check_source_framework 審查方法論。"
+        )
+
         # 長對話精簡提醒
         if len(getattr(request, "messages", [])) > 20:
             lines.append("⚠️ 對話已很長，請精簡回答，避免重複前面已說過的內容。")
@@ -226,6 +266,12 @@ _SS_DEFAULTS: dict = {
     "cowork_file_bytes": {},
     "cowork_ds_store": None,
     "cowork_ds_processed_keys": set(),
+    # HumanInTheLoop state
+    "cowork_hitl_pending": False,      # True = waiting for user direction selection
+    "cowork_hitl_question": "",        # question shown to user
+    "cowork_hitl_options": [],         # direction options (list[str])
+    "cowork_hitl_original_prompt": "", # original user prompt to resume with
+    "cowork_hitl_original_imgs": [],   # original image blocks
 }
 for _k, _v in _SS_DEFAULTS.items():
     if _k not in st.session_state:
@@ -238,9 +284,79 @@ def _parse_sources(text: str) -> list[dict]:
     return [{"title": m.group(1), "url": m.group(2)} for m in _URL_SRC_RE.finditer(text)]
 
 
+# ── HumanInTheLoop：方向探測 ───────────────────────────────────────────────────
+_HITL_PROBE_SYSTEM = """\
+你是 Anya 的分析方向顧問。判斷使用者的問題是否屬於「需要方向確認的分析任務」。
+
+輸出純 JSON（不加 markdown 代碼塊）。
+
+如果是分析類、研究類、複雜問題（例如：分析報告、研究趨勢、評估策略、解讀數據、解釋文件）：
+{"needed": true, "question": "（8-20字的具體問題，例如：您希望從哪個維度分析這份報告？）", "options": ["選項A（8-15字）", "選項B", "選項C"]}
+
+如果是以下情況則不需要確認：
+- 簡短問答（15字以內）
+- 日常對話或閒聊
+- 明確指定任務（已說清楚做什麼）
+- 單純摘要或翻譯
+輸出：{"needed": false}
+
+規則：
+- options 限 3-4 個，每項 8-15 字，要具體且互相有差異
+- question 要針對使用者的具體提問，不是泛泛的「分析方向」
+- 語言：正體中文
+"""
+
+def _probe_hitl_options(prompt: str) -> dict | None:
+    """Quick LLM probe: decide if HITL direction selection is needed.
+    Returns {question: str, options: list[str]} or None (no HITL needed)."""
+    if len(prompt.strip()) < 15:
+        return None
+    try:
+        resp = _oai.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": _HITL_PROBE_SYSTEM},
+                {"role": "user", "content": prompt[:800]},  # cap length
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=250,
+            timeout=8,
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        if data.get("needed") and data.get("options"):
+            return {
+                "question": data.get("question", "您希望從哪個方向進行分析？"),
+                "options": [str(o) for o in data["options"][:4] if o],
+            }
+    except Exception:
+        pass  # Probe failure is non-fatal; proceed without HITL
+    return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TOOLS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _retry_web_search(query: str, max_attempts: int = 3):
+    """OpenAI web search with exponential backoff retry（處理暫時性 API 逾時）。"""
+    import time as _time
+    import openai as _openai_mod
+    last_exc: Exception = RuntimeError("未知錯誤")
+    for attempt in range(max_attempts):
+        try:
+            return _oai.responses.create(
+                model="gpt-4.1",
+                tools=[{"type": "web_search_preview"}],
+                input=query,
+            )
+        except _openai_mod.RateLimitError:
+            raise   # 速率限制：立即失敗，不重試
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                _time.sleep(2 ** attempt)  # 1s → 2s
+    raise last_exc
+
 
 @tool
 def web_search(query: str) -> str:
@@ -248,11 +364,7 @@ def web_search(query: str) -> str:
     Always use think after each search to evaluate: Did I find enough?
     What's missing? Should I search again with different keywords?"""
     try:
-        response = _oai.responses.create(
-            model="gpt-4.1",
-            tools=[{"type": "web_search_preview"}],
-            input=query,
-        )
+        response = _retry_web_search(query)
         text = response.output_text or "（搜尋無結果）"
 
         # 提取 URL 引用
@@ -280,7 +392,10 @@ def think(thought: str) -> str:
     Use after web_search to evaluate:
     - What did I find? Is it relevant and credible?
     - What gaps remain? Should I search again?
-    Use before writing reports to plan structure and coverage."""
+    Use before writing reports to plan structure and coverage.
+    Use before finalizing analysis responses: ask yourself —
+    "Does my draft contain conclusions, predictions, or metric interpretations?
+    If yes, call critique_analysis before replying." """
     return thought
 
 
@@ -407,6 +522,90 @@ def run_python(code: str) -> str:
         return f"[執行錯誤：{e}]"
     finally:
         script.unlink(missing_ok=True)
+
+
+@tool
+def critique_analysis(report_draft: str) -> str:
+    """對分析型報告草稿執行四維度缺口驗證（批判性視角 / 條件性結論 / 方法論透明度 / 反向解讀）。
+    金融類報告（含估值、財報、賣方研究）自動追加三條金融領域補充規則。
+
+    呼叫時機（自行判斷）：
+    - 當你的回覆包含結論、預測、評分解讀、策略建議時
+    - 當你使用過 docstore_search 或 web_search 且要輸出分析結果時
+    - 在輸出最終答案前，主動評估是否需要呼叫此工具
+
+    不適用：閒聊、單純問答、純摘要（無論點或結論的整理）、程式碼任務。
+
+    傳入：待驗證的完整報告草稿文字。
+    回傳：若評分 ≥ 8 直接通過；否則回傳缺口說明，並自動進行最多 2 輪修訂。"""
+    from cowork.critic_pipeline import (
+        run_critic_pipeline,
+        run_finance_critic_pipeline,
+        is_finance_context,
+        format_critic_output,
+    )
+
+    # 依內容自動選擇批判管道
+    pipeline_fn = run_finance_critic_pipeline if is_finance_context(report_draft) else run_critic_pipeline
+    result = pipeline_fn(report_draft)
+
+    # ── Evaluator-Optimizer 迴圈（最多 2 輪修訂）──────────────────────────────
+    MAX_REVISIONS = 2
+    revision_count = 0
+    current_draft = report_draft
+
+    while not result.passed and revision_count < MAX_REVISIONS:
+        revision_prompt = (
+            "以下是一份分析報告草稿，以及批判性驗證找到的缺口。\n\n"
+            "## 原始報告草稿\n\n" + current_draft + "\n\n"
+            "## 偵測到的缺口\n\n" + result.raw_output + "\n\n"
+            "請根據以上缺口修訂報告，補足每個缺口。\n"
+            "重要：完整保留原報告所有資訊，只在不足之處補充說明，不可刪除原有內容。\n"
+            "輸出修訂後的完整報告（不需要前言或說明）。"
+        )
+        try:
+            rev_resp = _oai.chat.completions.create(
+                model="gpt-4.1",
+                messages=[{"role": "user", "content": revision_prompt}],
+            )
+            current_draft = rev_resp.choices[0].message.content or current_draft
+        except Exception:
+            break  # 修訂失敗，回傳原始批判結果
+
+        result = pipeline_fn(current_draft)
+        revision_count += 1
+
+    # ── 組裝回傳訊息 ──────────────────────────────────────────────────────────
+    critic_feedback = format_critic_output(result)
+
+    if revision_count > 0 and result.passed:
+        return (
+            f"✅ 報告經 {revision_count} 輪修訂後通過驗證（整體評分：{result.score}/10）\n\n"
+            f"## 修訂後報告\n\n{current_draft}"
+        )
+    elif revision_count > 0:
+        return (
+            f"⚠️ 修訂 {revision_count} 輪後整體評分：{result.score}/10（未達 8 分）\n\n"
+            f"## 修訂後報告\n\n{current_draft}\n\n"
+            f"## 剩餘缺口\n\n{critic_feedback}"
+        )
+    elif critic_feedback:
+        return critic_feedback
+    else:
+        return f"✅ 四維度驗證通過（整體評分：{result.score}/10）"
+
+
+@tool
+def check_source_framework(source_description: str) -> str:
+    """檢查引用的資料來源是否使用專有或未公開驗證的框架/模型。
+
+    呼叫時機：報告中引用「內部評分模型」「第三方情緒指數」「預測模型」
+              「某機構指數」等來源，且報告未說明其計算方式時。
+
+    傳入：來源描述（例如：「某機構情緒指數顯示 75 分看多」）。
+    回傳：框架性質評估 + 可驗證性 + 應追問的問題 + 引用建議。"""
+    from cowork.critic_pipeline import check_source_framework as _check
+    return _check(source_description)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -671,7 +870,9 @@ _ANALYST_CRITIC_PROMPT = """\
   → 缺口類型：條件性結論缺口
 
 規則 3【方法論透明度】：每個數據來源必須說明方法論狀態
-  → 缺失條件：引用指數/評分/預測，但未說明計算方式是否公開
+  → 缺失條件 A：引用指數/評分/預測，但未說明計算方式是否公開
+  → 缺失條件 B：來源為「內部模型」「專有框架」「第三方評估」但未說明其驗證依據
+  → 追問方向：此框架是否公開可驗證？是否有獨立第三方審計？
   → 缺口類型：方法論透明度缺口
 
 規則 4【反向解讀】：情緒/預測類指標必須有雙向解讀
@@ -707,11 +908,12 @@ _ANALYST_CRITIC_PROMPT = """\
 analyst_critic_sub_agent = {
     "name": "analyst-critic",
     "description": (
-        "對分析型報告草稿進行缺口驗證（Gap Verification）。"
-        "當主 agent 完成文件分析、市場報告分析、策略逐字稿分析的初稿後使用。"
-        "輸出：偵測到的缺口 + 隱含假設 + 讀者應追問的問題 + 整體評分。"
-        "不適用：閒聊、摘要（無結論的整理）、問答、程式碼任務、網路搜尋任務。"
+        "對分析型報告草稿進行四維度缺口驗證（Gap Verification）。"
+        "觸發條件（出現任一即委派）：回覆包含「結論」「預測」「評分」「情緒指數」「策略建議」「看多/看空」「分析結果」「市場報告」。"
+        "委派時機：主 agent 完成初稿且草稿有明確論點或結論時。"
+        "不委派：閒聊、純摘要（無論點的整理）、問答、程式碼任務、搜尋任務。"
         "傳入：待驗證的完整報告文字。"
+        "輸出：偵測到的缺口 + 隱含假設 + 讀者應追問的問題 + 整體評分。"
     ),
     "system_prompt": _ANALYST_CRITIC_PROMPT,
     "tools": [],          # 無工具：純推理，不需要搜尋或執行
@@ -783,7 +985,7 @@ def _get_agent_and_workspace() -> tuple:
             memory=memory_files,
             skills=[str(COWORK_DIR / "skills")],
             tools=[web_search, think, docstore_search, company_knowledge_search,
-                   record_lesson, run_python],
+                   record_lesson, run_python, critique_analysis, check_source_framework],
             subagents=[research_sub_agent, code_sub_agent, analyst_critic_sub_agent],
             backend=backend,
             checkpointer=InMemorySaver(),
@@ -824,271 +1026,13 @@ TODO_ICONS: dict[str, str] = {
 REPORT_NAMES = ["final_report.md", "analysis_report.md", "report.md"]
 
 
-# ── 歷史訊息渲染（collapsed，用 expander）────────────────────────────────────
-def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
-    todos = msg.get("todos", [])
-    tool_calls_log = msg.get("tool_calls_log", [])
-    web_sources = msg.get("web_sources", [])
-    report = msg.get("report_content", "")
-    content = msg.get("content", "")
-    files = msg.get("files", {})
-
-    todo_step_map = msg.get("todo_step_map", {})
-    # 將 key 轉回 int（JSON 序列化後 key 會變 str）
-    todo_step_map = {int(k): v for k, v in todo_step_map.items()}
-
-    if todos:
-        # 有 Todo：每個 todo 一個 expander（一致顯示，有無子步驟皆用 expander）
-        for _hi, _ht in enumerate(todos):
-            _hicon = TODO_ICONS.get(_ht.get("status", "pending"), "⬜")
-            _hlabel = f"{_hicon} {_ht.get('content', '')}"
-            _hsteps = todo_step_map.get(_hi, [])
-            with st.expander(_hlabel, expanded=False):
-                if _hsteps:
-                    for _hs in _hsteps:
-                        st.markdown(f"- {_hs}")
-                else:
-                    st.caption("（無細部執行步驟）")
-    elif tool_calls_log:
-        # 無 Todo：退回顯示執行步驟
-        with st.expander("🔧 執行步驟", expanded=False):
-            for tc in tool_calls_log:
-                icon = TOOL_ICONS.get(tc["name"], "🔧")
-                label = f"- {icon} {tc['name']}"
-                if tc.get("summary"):
-                    label += f"：{tc['summary']}"
-                st.markdown(label)
-
-    if web_sources:
-        with st.expander("🔗 網路來源", expanded=False):
-            for s in web_sources:
-                st.markdown(f"- [{s['title']}]({s['url']})")
-
-    if report:
-        st.markdown(report)
-    if content and not report:
-        st.markdown(content)
-    elif content and report:
-        with st.expander("💬 Agent 最終回應", expanded=False):
-            st.markdown(content)
-
-    if files:
-        with st.expander("📁 工作區檔案", expanded=False):
-            for fpath, file_data in files.items():
-                filename = Path(fpath).name
-                cn, cb = st.columns([4, 1])
-                cn.markdown(f"📄 `{filename}`")
-                raw = (
-                    file_data if isinstance(file_data, bytes)
-                    else file_data.encode() if isinstance(file_data, str)
-                    else str(file_data).encode()
-                )
-                cb.download_button(
-                    "下載", data=raw, file_name=filename,
-                    key=f"dl_h{msg_idx}_{filename}",
-                )
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# 主頁面
+# Agent 執行主體（供正常流程與 HumanInTheLoop 恢復流程共同呼叫）
 # ══════════════════════════════════════════════════════════════════════════════
-st.title("🥜 Cowork — 任務型 Agent")
-st.caption("輸入複合任務，Agent 將自動規劃、研究、整合並產出報告。支援上下文對話。")
-
-# ── 頂部操作列：文件上傳 + 清除對話 ──────────────────────────────────────────
-_ds_store = st.session_state.cowork_ds_store
-_has_index = (
-    _ds_store is not None
-    and getattr(_ds_store, "index", None) is not None
-    and _ds_store.index.ntotal > 0
-)
-doc_label = (
-    f"📚 上傳文件（已建索引：{len(_ds_store.chunks)} chunks）"
-    if _has_index else "📚 上傳文件"
-)
-
-with st.expander(doc_label, expanded=not _has_index):
-    st.caption("檔案只存在本次 session。建立索引後，Agent 才能搜尋文件內容。")
-
-    uploaded = st.file_uploader(
-        "上傳文件",
-        type=["pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt", "png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-        key="cowork_file_uploader",
-    )
-    if uploaded:
-        existing = {(r.name, r.bytes_len) for r in st.session_state.cowork_file_rows}
-        for f in uploaded:
-            data = f.read()
-            if (f.name, len(data)) in existing:
-                continue
-            row = build_file_row_from_bytes(filename=f.name, data=data)
-            st.session_state.cowork_file_rows.append(row)
-            st.session_state.cowork_file_bytes[row.file_id] = data
-
-    rows = st.session_state.cowork_file_rows
-    if rows:
-        payload = doc_list_payload(rows, st.session_state.cowork_ds_store)
-        items = payload.get("items", [])
-        id_to_row = {r.file_id: r for r in rows}
-        key_to_file_id = {
-            (os.path.splitext(r.name)[0], r.ext): r.file_id for r in rows
-        }
-
-        def _short(name: str, n: int = 48) -> str:
-            name = (name or "").strip()
-            return name if len(name) <= n else name[:n] + "…"
-
-        _blank_row = FileRow(
-            file_id="", file_sig="", name="", ext="", bytes_len=0,
-            pages=None, extracted_chars=0, token_est=0,
-            blank_pages=None, blank_ratio=None, text_pages=None,
-            text_pages_ratio=None, likely_scanned=False, use_ocr=False,
-        )
-        df = pd.DataFrame([
-            {
-                "OCR": bool(
-                    id_to_row.get(
-                        key_to_file_id.get((it.get("title"), it.get("ext"))),
-                        _blank_row,
-                    ).use_ocr
-                ) if it.get("ext") == ".pdf" else False,
-                "檔名": _short(f"{it.get('title')}{it.get('ext')}"),
-                "類型": (it.get("ext") or "").lstrip(".").upper(),
-                "頁數": it.get("pages"),
-                "chunks": int(it.get("chunks") or 0),
-                "_file_id": key_to_file_id.get((it.get("title"), it.get("ext"))),
-            }
-            for it in items
-        ])
-        edited = st.data_editor(
-            df, hide_index=True, width="stretch",
-            key="cowork_file_list_editor",
-            column_config={
-                "_file_id": st.column_config.TextColumn("_file_id", disabled=True, width="small"),
-                "檔名": st.column_config.TextColumn("檔名", disabled=True, width="large"),
-                "類型": st.column_config.TextColumn("類型", disabled=True, width="small"),
-                "頁數": st.column_config.NumberColumn("頁數", disabled=True, width="small"),
-                "chunks": st.column_config.NumberColumn("chunks", disabled=True, width="small"),
-                "OCR": st.column_config.CheckboxColumn(
-                    "OCR", help="僅 PDF；掃描 PDF 用視覺 OCR（較慢）", width="small"
-                ),
-            },
-            disabled=["_file_id", "檔名", "類型", "頁數", "chunks"],
-        )
-        try:
-            for rec in edited.to_dict(orient="records"):
-                fid = rec.get("_file_id")
-                if fid and fid in id_to_row:
-                    r = id_to_row[fid]
-                    r.use_ocr = bool(rec.get("OCR")) if r.ext == ".pdf" else False
-        except Exception:
-            pass
-
-        caps = payload.get("capabilities", {}) or {}
-        st.caption(
-            f"BM25={'on' if caps.get('bm25') else 'off'} · "
-            f"FlashRank={'on' if caps.get('flashrank') else 'off'} · "
-            f"Unstructured={'on' if caps.get('unstructured_loaders') else 'off'} · "
-            f"PyMuPDF={'on' if caps.get('pymupdf') else 'off'}"
-        )
-    else:
-        st.caption("（尚未上傳任何文件）")
-
-    cb1, cb2 = st.columns(2)
-    build_btn = cb1.button("🚀 建立/更新索引", type="primary", width="stretch", key="cowork_build_idx")
-    if cb2.button("🧹 清空文件庫", width="stretch", key="cowork_clear_docs"):
-        st.session_state.cowork_file_rows = []
-        st.session_state.cowork_file_bytes = {}
-        st.session_state.cowork_ds_store = None
-        st.session_state.cowork_ds_processed_keys = set()
-        st.rerun()
-
-    if build_btn and rows:
-        with st.status("建索引中（文字抽取 + embeddings）...", expanded=True) as s:
-            _store, _stats, _pkeys = build_indices_incremental(
-                _oai,
-                file_rows=st.session_state.cowork_file_rows,
-                file_bytes_map=st.session_state.cowork_file_bytes,
-                store=st.session_state.cowork_ds_store,
-                processed_keys=st.session_state.cowork_ds_processed_keys,
-            )
-            st.session_state.cowork_ds_store = _store
-            st.session_state.cowork_ds_processed_keys = _pkeys
-            s.write(f"新增文件：{_stats.get('new_reports', 0)}　新增 chunks：{_stats.get('new_chunks', 0)}")
-            if _stats.get("errors"):
-                s.warning("\n".join(f"- {e}" for e in _stats["errors"][:5]))
-            s.update(state="complete")
-        st.rerun()
-
-    if _has_index:
-        st.success(f"已建立索引：{len(st.session_state.cowork_ds_store.chunks)} chunks")
-    elif rows:
-        st.info("尚未建立索引（點「建立/更新索引」）")
-
-st.divider()
-
-# ── 對話狀態說明 ───────────────────────────────────────────────────────────────
-_ch = st.session_state.cowork_chat_history
-if _ch:
-    st.caption(f"對話共 {len(_ch)} 則訊息 · 相同 session 保有短期記憶")
-else:
-    st.caption("💡 輸入任務或問題，Agent 會自動規劃並執行。支援多輪對話。")
-
-# ── 顯示歷史對話 ──────────────────────────────────────────────────────────────
-for _i, _msg in enumerate(st.session_state.cowork_chat_history):
-    with st.chat_message(_msg["role"]):
-        if _msg["role"] == "user":
-            if _msg.get("content"):
-                st.markdown(_msg["content"])
-            for _fn, _th in _msg.get("images", []):
-                st.image(_th, caption=_fn, width=220)
-        else:
-            _render_history_assistant(_msg, msg_idx=_i)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Chat Input → Agent 執行
-# ══════════════════════════════════════════════════════════════════════════════
-if _inp := st.chat_input(
-    "輸入任務或問題… 例：分析上傳文件找出關鍵風險 / 研究 AI Agent 趨勢並產出報告",
-    key="cowork_chat_input",
-    accept_file="multiple",
-    file_type=["jpg", "jpeg", "png", "webp", "gif"],
-):
-    prompt = (_inp.text or "").strip()
-
-    # ── 處理上傳圖片 ──────────────────────────────────────────────────────────
-    _uploaded_files = getattr(_inp, "files", []) or []
-    _img_blocks: list[dict] = []      # 傳給 API 的 image content blocks
-    _img_history: list[tuple] = []    # (name, thumb_bytes) 存入歷史
-
-    for _uf in _uploaded_files:
-        _raw = _uf.getvalue()
-        if len(_raw) > 48 * 1024 * 1024:
-            st.warning(f"圖片過大（{_uf.name}），略過。")
-            continue
-        _thumb = _make_thumb(_raw)
-        _img_history.append((_uf.name, _thumb))
-        _img_blocks.append({
-            "type": "image_url",
-            "image_url": {"url": _img_to_data_url(_raw), "detail": "high"},
-        })
-
-    # ── 1. 顯示使用者訊息 ─────────────────────────────────────────────────────
-    with st.chat_message("user"):
-        if prompt:
-            st.markdown(prompt)
-        for _fn, _th in _img_history:
-            st.image(_th, caption=_fn, width=220)
-
-    st.session_state.cowork_chat_history.append({
-        "role": "user",
-        "content": prompt,
-        "images": _img_history,
-    })
-
-    # ── 2. 取得 Agent + 建立 CoworkContext ────────────────────────────────────
+def _run_agent_for_prompt(prompt: str, img_blocks: list) -> None:
+    """執行一輪 Agent：接受 prompt + img_blocks，渲染回應，存入對話歷史。
+    由正常輸入流程與 HumanInTheLoop 恢復流程共同呼叫。"""
+    # ── 取得 Agent + 建立 CoworkContext ────────────────────────────────────────
     agent, workspace = _get_agent_and_workspace()
     _DS.store = st.session_state.cowork_ds_store  # 保留 module-level ref（工具 thread 安全用）
     _WS.path = workspace                           # run_python 工具跨 thread 存取工作區
@@ -1117,7 +1061,6 @@ if _inp := st.chat_input(
             "不得說找不到文件或要求使用者再次提供。"
         )
     elif _has_processed:
-        # 曾建立過索引但目前 store 物件狀態異常 → 仍鼓勵嘗試
         _env_lines.append(
             "📚 文件索引：使用者本次 session 曾上傳並建立索引。"
             "若問到附件內容，請先呼叫 `docstore_search` 確認是否可用。"
@@ -1141,12 +1084,12 @@ if _inp := st.chat_input(
     _env_prefix = "<系統環境資訊>\n" + "\n".join(_env_lines) + "\n</系統環境資訊>\n\n"
 
     # 組裝訊息 content（有圖片 → multimodal list；無圖片 → 純文字）
-    if _img_blocks:
-        _agent_prompt = [{"type": "text", "text": _env_prefix + prompt}] + _img_blocks
+    if img_blocks:
+        _agent_prompt = [{"type": "text", "text": _env_prefix + prompt}] + img_blocks
     else:
         _agent_prompt = _env_prefix + prompt
 
-    # ── 3. Assistant 回應區塊 ─────────────────────────────────────────────────
+    # ── Assistant 回應區塊 ─────────────────────────────────────────────────────
     with st.chat_message("assistant"):
         # 狀態指示器（執行中即時更新標題+清單；完成後收合，可點開看 todo expanders）
         status = st.status("思考中…✨", expanded=True)
@@ -1406,3 +1349,337 @@ if _inp := st.chat_input(
             "files": files,
         })
         _trim_chat_history()  # 保留最近 TRIM_LAST_N_TURNS 則，防止 session_state 過大
+
+
+# ── 歷史訊息渲染（collapsed，用 expander）────────────────────────────────────
+def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
+    todos = msg.get("todos", [])
+    tool_calls_log = msg.get("tool_calls_log", [])
+    web_sources = msg.get("web_sources", [])
+    report = msg.get("report_content", "")
+    content = msg.get("content", "")
+    files = msg.get("files", {})
+
+    todo_step_map = msg.get("todo_step_map", {})
+    # 將 key 轉回 int（JSON 序列化後 key 會變 str）
+    todo_step_map = {int(k): v for k, v in todo_step_map.items()}
+
+    if todos:
+        # 有 Todo：每個 todo 一個 expander（一致顯示，有無子步驟皆用 expander）
+        for _hi, _ht in enumerate(todos):
+            _hicon = TODO_ICONS.get(_ht.get("status", "pending"), "⬜")
+            _hlabel = f"{_hicon} {_ht.get('content', '')}"
+            _hsteps = todo_step_map.get(_hi, [])
+            with st.expander(_hlabel, expanded=False):
+                if _hsteps:
+                    for _hs in _hsteps:
+                        st.markdown(f"- {_hs}")
+                else:
+                    st.caption("（無細部執行步驟）")
+    elif tool_calls_log:
+        # 無 Todo：退回顯示執行步驟
+        with st.expander("🔧 執行步驟", expanded=False):
+            for tc in tool_calls_log:
+                icon = TOOL_ICONS.get(tc["name"], "🔧")
+                label = f"- {icon} {tc['name']}"
+                if tc.get("summary"):
+                    label += f"：{tc['summary']}"
+                st.markdown(label)
+
+    if web_sources:
+        with st.expander("🔗 網路來源", expanded=False):
+            for s in web_sources:
+                st.markdown(f"- [{s['title']}]({s['url']})")
+
+    if report:
+        st.markdown(report)
+    if content and not report:
+        st.markdown(content)
+    elif content and report:
+        with st.expander("💬 Agent 最終回應", expanded=False):
+            st.markdown(content)
+
+    if files:
+        with st.expander("📁 工作區檔案", expanded=False):
+            for fpath, file_data in files.items():
+                filename = Path(fpath).name
+                cn, cb = st.columns([4, 1])
+                cn.markdown(f"📄 `{filename}`")
+                raw = (
+                    file_data if isinstance(file_data, bytes)
+                    else file_data.encode() if isinstance(file_data, str)
+                    else str(file_data).encode()
+                )
+                cb.download_button(
+                    "下載", data=raw, file_name=filename,
+                    key=f"dl_h{msg_idx}_{filename}",
+                )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 主頁面
+# ══════════════════════════════════════════════════════════════════════════════
+st.title("🥜 Cowork — 任務型 Agent")
+st.caption("輸入複合任務，Agent 將自動規劃、研究、整合並產出報告。支援上下文對話。")
+
+# ── 頂部操作列：文件上傳 + 清除對話 ──────────────────────────────────────────
+_ds_store = st.session_state.cowork_ds_store
+_has_index = (
+    _ds_store is not None
+    and getattr(_ds_store, "index", None) is not None
+    and _ds_store.index.ntotal > 0
+)
+doc_label = (
+    f"📚 上傳文件（已建索引：{len(_ds_store.chunks)} chunks）"
+    if _has_index else "📚 上傳文件"
+)
+
+with st.expander(doc_label, expanded=not _has_index):
+    st.caption("檔案只存在本次 session。建立索引後，Agent 才能搜尋文件內容。")
+
+    uploaded = st.file_uploader(
+        "上傳文件",
+        type=["pdf", "docx", "doc", "pptx", "xlsx", "xls", "txt", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key="cowork_file_uploader",
+    )
+    if uploaded:
+        existing = {(r.name, r.bytes_len) for r in st.session_state.cowork_file_rows}
+        for f in uploaded:
+            data = f.read()
+            if (f.name, len(data)) in existing:
+                continue
+            row = build_file_row_from_bytes(filename=f.name, data=data)
+            st.session_state.cowork_file_rows.append(row)
+            st.session_state.cowork_file_bytes[row.file_id] = data
+
+    rows = st.session_state.cowork_file_rows
+    if rows:
+        payload = doc_list_payload(rows, st.session_state.cowork_ds_store)
+        items = payload.get("items", [])
+        id_to_row = {r.file_id: r for r in rows}
+        key_to_file_id = {
+            (os.path.splitext(r.name)[0], r.ext): r.file_id for r in rows
+        }
+
+        def _short(name: str, n: int = 48) -> str:
+            name = (name or "").strip()
+            return name if len(name) <= n else name[:n] + "…"
+
+        _blank_row = FileRow(
+            file_id="", file_sig="", name="", ext="", bytes_len=0,
+            pages=None, extracted_chars=0, token_est=0,
+            blank_pages=None, blank_ratio=None, text_pages=None,
+            text_pages_ratio=None, likely_scanned=False, use_ocr=False,
+        )
+        df = pd.DataFrame([
+            {
+                "OCR": bool(
+                    id_to_row.get(
+                        key_to_file_id.get((it.get("title"), it.get("ext"))),
+                        _blank_row,
+                    ).use_ocr
+                ) if it.get("ext") == ".pdf" else False,
+                "檔名": _short(f"{it.get('title')}{it.get('ext')}"),
+                "類型": (it.get("ext") or "").lstrip(".").upper(),
+                "頁數": it.get("pages"),
+                "chunks": int(it.get("chunks") or 0),
+                "_file_id": key_to_file_id.get((it.get("title"), it.get("ext"))),
+            }
+            for it in items
+        ])
+        edited = st.data_editor(
+            df, hide_index=True, width="stretch",
+            key="cowork_file_list_editor",
+            column_config={
+                "_file_id": st.column_config.TextColumn("_file_id", disabled=True, width="small"),
+                "檔名": st.column_config.TextColumn("檔名", disabled=True, width="large"),
+                "類型": st.column_config.TextColumn("類型", disabled=True, width="small"),
+                "頁數": st.column_config.NumberColumn("頁數", disabled=True, width="small"),
+                "chunks": st.column_config.NumberColumn("chunks", disabled=True, width="small"),
+                "OCR": st.column_config.CheckboxColumn(
+                    "OCR", help="僅 PDF；掃描 PDF 用視覺 OCR（較慢）", width="small"
+                ),
+            },
+            disabled=["_file_id", "檔名", "類型", "頁數", "chunks"],
+        )
+        try:
+            for rec in edited.to_dict(orient="records"):
+                fid = rec.get("_file_id")
+                if fid and fid in id_to_row:
+                    r = id_to_row[fid]
+                    r.use_ocr = bool(rec.get("OCR")) if r.ext == ".pdf" else False
+        except Exception:
+            pass
+
+        caps = payload.get("capabilities", {}) or {}
+        st.caption(
+            f"BM25={'on' if caps.get('bm25') else 'off'} · "
+            f"FlashRank={'on' if caps.get('flashrank') else 'off'} · "
+            f"Unstructured={'on' if caps.get('unstructured_loaders') else 'off'} · "
+            f"PyMuPDF={'on' if caps.get('pymupdf') else 'off'}"
+        )
+    else:
+        st.caption("（尚未上傳任何文件）")
+
+    cb1, cb2 = st.columns(2)
+    build_btn = cb1.button("🚀 建立/更新索引", type="primary", width="stretch", key="cowork_build_idx")
+    if cb2.button("🧹 清空文件庫", width="stretch", key="cowork_clear_docs"):
+        st.session_state.cowork_file_rows = []
+        st.session_state.cowork_file_bytes = {}
+        st.session_state.cowork_ds_store = None
+        st.session_state.cowork_ds_processed_keys = set()
+        st.rerun()
+
+    if build_btn and rows:
+        with st.status("建索引中（文字抽取 + embeddings）...", expanded=True) as s:
+            _store, _stats, _pkeys = build_indices_incremental(
+                _oai,
+                file_rows=st.session_state.cowork_file_rows,
+                file_bytes_map=st.session_state.cowork_file_bytes,
+                store=st.session_state.cowork_ds_store,
+                processed_keys=st.session_state.cowork_ds_processed_keys,
+            )
+            st.session_state.cowork_ds_store = _store
+            st.session_state.cowork_ds_processed_keys = _pkeys
+            s.write(f"新增文件：{_stats.get('new_reports', 0)}　新增 chunks：{_stats.get('new_chunks', 0)}")
+            if _stats.get("errors"):
+                s.warning("\n".join(f"- {e}" for e in _stats["errors"][:5]))
+            s.update(state="complete")
+        st.rerun()
+
+    if _has_index:
+        st.success(f"已建立索引：{len(st.session_state.cowork_ds_store.chunks)} chunks")
+    elif rows:
+        st.info("尚未建立索引（點「建立/更新索引」）")
+
+st.divider()
+
+# ── 對話狀態說明 ───────────────────────────────────────────────────────────────
+_ch = st.session_state.cowork_chat_history
+if _ch:
+    st.caption(f"對話共 {len(_ch)} 則訊息 · 相同 session 保有短期記憶")
+else:
+    st.caption("💡 輸入任務或問題，Agent 會自動規劃並執行。支援多輪對話。")
+
+# ── 顯示歷史對話 ──────────────────────────────────────────────────────────────
+for _i, _msg in enumerate(st.session_state.cowork_chat_history):
+    with st.chat_message(_msg["role"]):
+        if _msg["role"] == "user":
+            if _msg.get("content"):
+                st.markdown(_msg["content"])
+            for _fn, _th in _msg.get("images", []):
+                st.image(_th, caption=_fn, width=220)
+        else:
+            _render_history_assistant(_msg, msg_idx=_i)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HumanInTheLoop 選擇 UI（在 chat input 之前渲染；pending 時顯示方向選擇卡片）
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.get("cowork_hitl_pending"):
+    with st.chat_message("assistant"):
+        st.markdown(f"🤔 **{st.session_state.cowork_hitl_question}**")
+        st.caption("請選擇安妮亞要聚焦的分析方向，選定後點「確認」繼續：")
+        with st.container(border=True):
+            _hitl_sel = st.pills(
+                "分析方向",
+                st.session_state.cowork_hitl_options,
+                selection_mode="single",
+                default=None,
+                key="cowork_hitl_pills_widget",
+            )
+            _hcol1, _hcol2, _ = st.columns([1, 1, 5])
+            with _hcol1:
+                if st.button(
+                    "確認",
+                    type="primary",
+                    disabled=(_hitl_sel is None),
+                    key="cowork_hitl_confirm_btn",
+                ):
+                    _modified_prompt = (
+                        f"{st.session_state.cowork_hitl_original_prompt}"
+                        f"\n\n[分析方向已確認：{_hitl_sel}]"
+                    )
+                    st.session_state["cowork_hitl_resume"] = {
+                        "prompt": _modified_prompt,
+                        "imgs": st.session_state.cowork_hitl_original_imgs,
+                    }
+                    st.session_state["cowork_hitl_pending"] = False
+                    st.rerun()
+            with _hcol2:
+                if st.button("略過", key="cowork_hitl_skip_btn"):
+                    st.session_state["cowork_hitl_resume"] = {
+                        "prompt": st.session_state.cowork_hitl_original_prompt,
+                        "imgs": st.session_state.cowork_hitl_original_imgs,
+                    }
+                    st.session_state["cowork_hitl_pending"] = False
+                    st.rerun()
+
+# ── HumanInTheLoop 恢復執行（使用者確認/略過後觸發）─────────────────────────────
+elif "cowork_hitl_resume" in st.session_state:
+    _hitl_resume = st.session_state.pop("cowork_hitl_resume")
+    _run_agent_for_prompt(
+        _hitl_resume["prompt"],
+        _hitl_resume.get("imgs", []),
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Chat Input → Agent 執行
+# ══════════════════════════════════════════════════════════════════════════════
+if not st.session_state.get("cowork_hitl_pending"):
+    if _inp := st.chat_input(
+        "輸入任務或問題… 例：分析上傳文件找出關鍵風險 / 研究 AI Agent 趨勢並產出報告",
+        key="cowork_chat_input",
+        accept_file="multiple",
+        file_type=["jpg", "jpeg", "png", "webp", "gif"],
+    ):
+        prompt = (_inp.text or "").strip()
+
+        # ── 處理上傳圖片 ──────────────────────────────────────────────────────
+        _uploaded_files = getattr(_inp, "files", []) or []
+        _img_blocks: list[dict] = []      # 傳給 API 的 image content blocks
+        _img_history: list[tuple] = []    # (name, thumb_bytes) 存入歷史
+
+        for _uf in _uploaded_files:
+            _raw = _uf.getvalue()
+            if len(_raw) > 48 * 1024 * 1024:
+                st.warning(f"圖片過大（{_uf.name}），略過。")
+                continue
+            _thumb = _make_thumb(_raw)
+            _img_history.append((_uf.name, _thumb))
+            _img_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": _img_to_data_url(_raw), "detail": "high"},
+            })
+
+        # ── 1. 顯示使用者訊息 ─────────────────────────────────────────────────
+        with st.chat_message("user"):
+            if prompt:
+                st.markdown(prompt)
+            for _fn, _th in _img_history:
+                st.image(_th, caption=_fn, width=220)
+
+        st.session_state.cowork_chat_history.append({
+            "role": "user",
+            "content": prompt,
+            "images": _img_history,
+        })
+
+        # ── 2. HumanInTheLoop 探測（純文字分析型任務才詢問方向）──────────────
+        # 有圖片時略過：視覺任務通常方向明確，不需選擇
+        # 已有 HITL pending 時略過：避免重複觸發
+        if prompt and not _img_blocks and not st.session_state.get("cowork_hitl_pending"):
+            _hitl_data = _probe_hitl_options(prompt)
+            if _hitl_data:
+                st.session_state.update({
+                    "cowork_hitl_pending": True,
+                    "cowork_hitl_question": _hitl_data["question"],
+                    "cowork_hitl_options": _hitl_data["options"],
+                    "cowork_hitl_original_prompt": prompt,
+                    "cowork_hitl_original_imgs": _img_blocks,
+                })
+                st.rerun()
+
+        # ── 3. 執行 Agent ──────────────────────────────────────────────────────
+        _run_agent_for_prompt(prompt, _img_blocks)
