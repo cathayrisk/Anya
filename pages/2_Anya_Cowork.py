@@ -51,9 +51,11 @@ from docstore import (
     build_indices_incremental,
     doc_list_payload,
 )
+from utils.rich_styles import inject_rich_styles, render_source_chips, copy_html_button
 
 # ── 頁面設定 ───────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Cowork", page_icon="🥜", layout="wide")
+inject_rich_styles()   # Anya Forger 主題 CSS（珊瑚粉標題、金邊 blockquote、斑馬紋表格）
 
 # ── API Key ────────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = (
@@ -236,6 +238,19 @@ if _HAS_CE_MW:
             "📊 【分析任務自我檢查】若本次回覆包含「結論 / 預測 / 評分解讀 / 策略建議」，"
             "輸出前請用 think 確認是否需要呼叫 critique_analysis 進行四維度缺口驗證；"
             "若來源中有「內部模型 / 第三方指數 / 專有框架」，可呼叫 check_source_framework 審查方法論。"
+        )
+
+        # 分析回覆格式（敘事流暢性）
+        lines.append(
+            "📝 【分析回覆格式】輸出分析型報告時，請遵守以下格式："
+            "① 第一段先用 1 句話給出核心結論（10–30 字，直接說判斷是什麼）；"
+            "② 論點以流暢的敘事段落展開，用「因為」「這代表」「換句話說」「值得注意的是」"
+            "等連接詞串接論點，避免整份報告全是條列；"
+            "③ 若 critique_analysis 回傳缺口，將反向論證與條件說明自然融入敘事段落，"
+            "不需逐條標注「補充」；"
+            "④ 條列（bullet / numbered list）只用於「最值得觀察的指標」或「行動建議」清單，"
+            "每份報告條列不超過 6 項；"
+            "⑤ 結尾提供 1–2 個具體後續選項（例如：是否需要壓縮成 200 字快訊 / 製作鷹鴿評分表）。"
         )
 
         # 長對話精簡提醒
@@ -562,62 +577,28 @@ def critique_analysis(report_draft: str) -> str:
     不適用：閒聊、單純問答、純摘要（無論點或結論的整理）、程式碼任務。
 
     傳入：待驗證的完整報告草稿文字。
-    回傳：若評分 ≥ 8 直接通過；否則回傳缺口說明，並自動進行最多 2 輪修訂。"""
+    回傳：評分 ≥ 8 時回傳 ✅ 訊息；否則回傳缺口說明，你需在最終回覆中以流暢敘事自然補足。"""
     from cowork.critic_pipeline import (
         run_critic_pipeline,
         run_finance_critic_pipeline,
         is_finance_context,
-        format_critic_output,
     )
 
     # 依內容自動選擇批判管道
     pipeline_fn = run_finance_critic_pipeline if is_finance_context(report_draft) else run_critic_pipeline
     result = pipeline_fn(report_draft)
 
-    # ── Evaluator-Optimizer 迴圈（最多 2 輪修訂）──────────────────────────────
-    MAX_REVISIONS = 2
-    revision_count = 0
-    current_draft = report_draft
-
-    while not result.passed and revision_count < MAX_REVISIONS:
-        revision_prompt = (
-            "以下是一份分析報告草稿，以及批判性驗證找到的缺口。\n\n"
-            "## 原始報告草稿\n\n" + current_draft + "\n\n"
-            "## 偵測到的缺口\n\n" + result.raw_output + "\n\n"
-            "請根據以上缺口修訂報告，補足每個缺口。\n"
-            "重要：完整保留原報告所有資訊，只在不足之處補充說明，不可刪除原有內容。\n"
-            "輸出修訂後的完整報告（不需要前言或說明）。"
-        )
-        try:
-            rev_resp = _oai.chat.completions.create(
-                model="gpt-4.1",
-                messages=[{"role": "user", "content": revision_prompt}],
-            )
-            current_draft = rev_resp.choices[0].message.content or current_draft
-        except Exception:
-            break  # 修訂失敗，回傳原始批判結果
-
-        result = pipeline_fn(current_draft)
-        revision_count += 1
-
-    # ── 組裝回傳訊息 ──────────────────────────────────────────────────────────
-    critic_feedback = format_critic_output(result)
-
-    if revision_count > 0 and result.passed:
-        return (
-            f"✅ 報告經 {revision_count} 輪修訂後通過驗證（整體評分：{result.score}/10）\n\n"
-            f"## 修訂後報告\n\n{current_draft}"
-        )
-    elif revision_count > 0:
-        return (
-            f"⚠️ 修訂 {revision_count} 輪後整體評分：{result.score}/10（未達 8 分）\n\n"
-            f"## 修訂後報告\n\n{current_draft}\n\n"
-            f"## 剩餘缺口\n\n{critic_feedback}"
-        )
-    elif critic_feedback:
-        return critic_feedback
-    else:
+    # ── 回傳結果：只傳遞缺口說明，由 Agent 自行在最終回覆中整合補足 ───────────
+    if result.passed:
         return f"✅ 四維度驗證通過（整體評分：{result.score}/10）"
+
+    return (
+        f"⚠️ 整體評分：{result.score}/10（未達 8 分）\n\n"
+        f"{result.raw_output}\n\n"
+        "請根據以上缺口，在最終回覆中以流暢的敘事段落自然補足：條件性說明、"
+        "反向論證、方法論透明度（如適用）。無需逐條標注「補充」字樣，"
+        "融入敘事即可。"
+    )
 
 
 @tool
@@ -1269,11 +1250,9 @@ def _run_agent_for_prompt(prompt: str, img_blocks: list) -> None:
                         st.markdown(f"- {_flbl}")
         status.update(label="完成 ✅", state="complete", expanded=False)
 
-        # ── 網路來源（預設收合）────────────────────────────────────────────
+        # ── 網路來源 chip 列（render_source_chips）────────────────────────
         if web_sources:
-            with st.expander("🔗 網路來源", expanded=False):
-                for s in web_sources:
-                    st.markdown(f"- [{s['title']}]({s['url']})")
+            render_source_chips([s["url"] for s in web_sources])
 
         # ── 收集工作區檔案 ────────────────────────────────────────────────
         workspace_path = Path(workspace)
@@ -1294,6 +1273,8 @@ def _run_agent_for_prompt(prompt: str, img_blocks: list) -> None:
                 )
                 st.subheader("📄 研究報告")
                 st.markdown(report_content)
+                if len(report_content) > 300:
+                    copy_html_button(report_content, key=f"copy_rpt_live_{uuid.uuid4().hex[:8]}")
                 break
 
         # ── 最終 Agent 文字回應 ───────────────────────────────────────────
@@ -1309,6 +1290,8 @@ def _run_agent_for_prompt(prompt: str, img_blocks: list) -> None:
             response_text = content
             if not report_content:
                 _fake_stream(response_text, response_ph)   # 打字機效果
+                if len(response_text) > 300:
+                    copy_html_button(response_text, key=f"copy_resp_live_{uuid.uuid4().hex[:8]}")
             else:
                 response_ph.empty()
                 with st.expander("💬 Agent 最終回應", expanded=False):
@@ -1412,14 +1395,16 @@ def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
                 st.markdown(label)
 
     if web_sources:
-        with st.expander("🔗 網路來源", expanded=False):
-            for s in web_sources:
-                st.markdown(f"- [{s['title']}]({s['url']})")
+        render_source_chips([s["url"] for s in web_sources])
 
     if report:
         st.markdown(report)
+        if len(report) > 300:
+            copy_html_button(report, key=f"copy_rpt_h{msg_idx}")
     if content and not report:
         st.markdown(content)
+        if len(content) > 300:
+            copy_html_button(content, key=f"copy_cnt_h{msg_idx}")
     elif content and report:
         with st.expander("💬 Agent 最終回應", expanded=False):
             st.markdown(content)
@@ -1601,29 +1586,41 @@ for _i, _msg in enumerate(st.session_state.cowork_chat_history):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HumanInTheLoop 選擇 UI（在 chat input 之前渲染；pending 時顯示方向選擇卡片）
+# ── 封裝為 @st.fragment：radio 互動只觸發 fragment rerun，不滾回頂部 ──────────
 # ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.get("cowork_hitl_pending"):
-    _hitl_opts = st.session_state.cowork_hitl_options  # list[{label, description}]
+@st.fragment
+def _hitl_card() -> None:
+    """HumanInTheLoop 方向選擇卡片。
+    fragment 內的 radio / text_input 互動僅重繪此區塊，不捲動整頁。
+    確認/略過後呼叫 st.rerun() 觸發完整 rerun 以執行 Agent。"""
+    _opts: list[dict] = st.session_state.get("cowork_hitl_options", [])
     _CUSTOM_LABEL = "✏️ 自訂分析方向…"
 
     with st.chat_message("assistant"):
         # ── 文件摘要（若有）──────────────────────────────────────────────────
-        _hitl_summary = st.session_state.get("cowork_hitl_summary", "")
-        if _hitl_summary:
-            st.info(f"📄 **安妮亞讀到的內容**：{_hitl_summary}", icon=None)
+        _summary = st.session_state.get("cowork_hitl_summary", "")
+        if _summary:
+            st.info(_summary, icon=":material/article:")
 
-        st.markdown(f"### 🤔 {st.session_state.cowork_hitl_question}")
-        st.caption("選擇一個分析方向，或在最後一欄輸入自訂內容，再點「開始分析」。")
+        # ── 問題標題 ─────────────────────────────────────────────────────────
+        st.markdown(
+            f":material/psychology: &nbsp;**{st.session_state.cowork_hitl_question}**"
+        )
+        st.caption(
+            f"共 {len(_opts)} 個建議方向　·　選擇後點「開始分析」，或自訂方向"
+        )
 
         with st.container(border=True):
             # ── 垂直 radio + captions ────────────────────────────────────────
-            _radio_labels = [o["label"] for o in _hitl_opts] + [_CUSTOM_LABEL]
-            _radio_captions = [o.get("description", "") for o in _hitl_opts] + ["請在下方欄位輸入您的分析方向"]
+            _labels  = [o["label"] for o in _opts] + [_CUSTOM_LABEL]
+            _captions = [o.get("description", "") for o in _opts] + [
+                "請在下方欄位輸入您的分析方向"
+            ]
 
-            _hitl_radio = st.radio(
+            _choice = st.radio(
                 "分析方向",
-                options=_radio_labels,
-                captions=_radio_captions,
+                options=_labels,
+                captions=_captions,
                 index=None,
                 key="cowork_hitl_radio_widget",
                 label_visibility="collapsed",
@@ -1631,7 +1628,7 @@ if st.session_state.get("cowork_hitl_pending"):
 
             # ── 自訂輸入（僅當選到最後一項時顯示）──────────────────────────
             _custom_text = ""
-            if _hitl_radio == _CUSTOM_LABEL:
+            if _choice == _CUSTOM_LABEL:
                 _custom_text = st.text_input(
                     "自訂方向",
                     placeholder="例如：分析演說對台灣金融市場的潛在影響",
@@ -1639,35 +1636,29 @@ if st.session_state.get("cowork_hitl_pending"):
                     label_visibility="collapsed",
                 )
 
-            st.divider()
-
             # ── 按鈕區 ───────────────────────────────────────────────────────
             _btn_col1, _btn_col2, _ = st.columns([2, 1, 5])
-
-            # 確認按鈕：選了選項才啟用（自訂模式下需有文字）
             _confirm_disabled = (
-                _hitl_radio is None
-                or (_hitl_radio == _CUSTOM_LABEL and not _custom_text.strip())
+                _choice is None
+                or (_choice == _CUSTOM_LABEL and not _custom_text.strip())
             )
             with _btn_col1:
                 if st.button(
-                    "🚀 開始分析",
+                    "開始分析",
                     type="primary",
+                    icon=":material/rocket_launch:",
                     disabled=_confirm_disabled,
                     use_container_width=True,
                     key="cowork_hitl_confirm_btn",
                 ):
                     _chosen = (
-                        _custom_text.strip()
-                        if _hitl_radio == _CUSTOM_LABEL
-                        else _hitl_radio
-                    )
-                    _modified_prompt = (
-                        f"{st.session_state.cowork_hitl_original_prompt}"
-                        f"\n\n[分析方向已確認：{_chosen}]"
+                        _custom_text.strip() if _choice == _CUSTOM_LABEL else _choice
                     )
                     st.session_state["cowork_hitl_resume"] = {
-                        "prompt": _modified_prompt,
+                        "prompt": (
+                            f"{st.session_state.cowork_hitl_original_prompt}"
+                            f"\n\n[分析方向已確認：{_chosen}]"
+                        ),
                         "imgs": st.session_state.cowork_hitl_original_imgs,
                     }
                     st.session_state["cowork_hitl_pending"] = False
@@ -1676,6 +1667,7 @@ if st.session_state.get("cowork_hitl_pending"):
             with _btn_col2:
                 if st.button(
                     "略過",
+                    icon=":material/skip_next:",
                     use_container_width=True,
                     key="cowork_hitl_skip_btn",
                 ):
@@ -1685,6 +1677,10 @@ if st.session_state.get("cowork_hitl_pending"):
                     }
                     st.session_state["cowork_hitl_pending"] = False
                     st.rerun()
+
+
+if st.session_state.get("cowork_hitl_pending"):
+    _hitl_card()
 
 # ── HumanInTheLoop 恢復執行（使用者確認/略過後觸發）─────────────────────────────
 elif "cowork_hitl_resume" in st.session_state:
