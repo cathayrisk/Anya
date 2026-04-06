@@ -268,8 +268,9 @@ _SS_DEFAULTS: dict = {
     "cowork_ds_processed_keys": set(),
     # HumanInTheLoop state
     "cowork_hitl_pending": False,      # True = waiting for user direction selection
+    "cowork_hitl_summary": "",         # brief article/task summary shown to user
     "cowork_hitl_question": "",        # question shown to user
-    "cowork_hitl_options": [],         # direction options (list[str])
+    "cowork_hitl_options": [],         # direction options (list[{label, description}])
     "cowork_hitl_original_prompt": "", # original user prompt to resume with
     "cowork_hitl_original_imgs": [],   # original image blocks
 }
@@ -291,7 +292,17 @@ _HITL_PROBE_SYSTEM = """\
 輸出純 JSON（不加 markdown 代碼塊）。
 
 如果是分析類、研究類、複雜問題（例如：分析報告、研究趨勢、評估策略、解讀數據、解釋文件）：
-{"needed": true, "question": "（8-20字的具體問題，例如：您希望從哪個維度分析這份報告？）", "options": ["選項A（8-15字）", "選項B", "選項C"]}
+{
+  "needed": true,
+  "summary": "（1-2句，簡述這份文件/問題的核心內容，讓使用者確認讀到的是同一份東西）",
+  "question": "（8-20字的具體問題，例如：您希望從哪個維度分析這份演說？）",
+  "options": [
+    {"label": "選項A標題（8-15字）", "description": "選此方向將聚焦於...（15-30字說明分析重點）"},
+    {"label": "選項B標題", "description": "說明B"},
+    {"label": "選項C標題", "description": "說明C"},
+    {"label": "選項D標題", "description": "說明D"}
+  ]
+}
 
 如果是以下情況則不需要確認：
 - 簡短問答（15字以內）
@@ -301,14 +312,15 @@ _HITL_PROBE_SYSTEM = """\
 輸出：{"needed": false}
 
 規則：
-- options 限 3-4 個，每項 8-15 字，要具體且互相有差異
+- options 限 3-4 個，label 8-15 字，description 15-30 字，選項間要有實質差異
+- summary 不超過 40 字，重點是讓使用者快速確認文件內容
 - question 要針對使用者的具體提問，不是泛泛的「分析方向」
 - 語言：正體中文
 """
 
 def _probe_hitl_options(prompt: str) -> dict | None:
     """Quick LLM probe: decide if HITL direction selection is needed.
-    Returns {question: str, options: list[str]} or None (no HITL needed)."""
+    Returns {summary, question, options: list[{label, description}]} or None."""
     if len(prompt.strip()) < 15:
         return None
     try:
@@ -316,18 +328,31 @@ def _probe_hitl_options(prompt: str) -> dict | None:
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": _HITL_PROBE_SYSTEM},
-                {"role": "user", "content": prompt[:800]},  # cap length
+                {"role": "user", "content": prompt[:1200]},  # slightly more context for summary
             ],
             response_format={"type": "json_object"},
-            max_tokens=250,
-            timeout=8,
+            max_tokens=450,
+            timeout=10,
         )
         data = json.loads(resp.choices[0].message.content or "{}")
         if data.get("needed") and data.get("options"):
-            return {
-                "question": data.get("question", "您希望從哪個方向進行分析？"),
-                "options": [str(o) for o in data["options"][:4] if o],
-            }
+            raw_opts = data["options"][:4]
+            # Normalize: accept both string format (legacy) and {label, description} dicts
+            options = []
+            for o in raw_opts:
+                if isinstance(o, dict) and o.get("label"):
+                    options.append({
+                        "label": str(o["label"]),
+                        "description": str(o.get("description", "")),
+                    })
+                elif isinstance(o, str) and o:
+                    options.append({"label": o, "description": ""})
+            if options:
+                return {
+                    "summary": data.get("summary", ""),
+                    "question": data.get("question", "您希望從哪個方向進行分析？"),
+                    "options": options,
+                }
     except Exception:
         pass  # Probe failure is non-fatal; proceed without HITL
     return None
@@ -1578,28 +1603,68 @@ for _i, _msg in enumerate(st.session_state.cowork_chat_history):
 # HumanInTheLoop 選擇 UI（在 chat input 之前渲染；pending 時顯示方向選擇卡片）
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.get("cowork_hitl_pending"):
+    _hitl_opts = st.session_state.cowork_hitl_options  # list[{label, description}]
+    _CUSTOM_LABEL = "✏️ 自訂分析方向…"
+
     with st.chat_message("assistant"):
-        st.markdown(f"🤔 **{st.session_state.cowork_hitl_question}**")
-        st.caption("請選擇安妮亞要聚焦的分析方向，選定後點「確認」繼續：")
+        # ── 文件摘要（若有）──────────────────────────────────────────────────
+        _hitl_summary = st.session_state.get("cowork_hitl_summary", "")
+        if _hitl_summary:
+            st.info(f"📄 **安妮亞讀到的內容**：{_hitl_summary}", icon=None)
+
+        st.markdown(f"### 🤔 {st.session_state.cowork_hitl_question}")
+        st.caption("選擇一個分析方向，或在最後一欄輸入自訂內容，再點「開始分析」。")
+
         with st.container(border=True):
-            _hitl_sel = st.pills(
+            # ── 垂直 radio + captions ────────────────────────────────────────
+            _radio_labels = [o["label"] for o in _hitl_opts] + [_CUSTOM_LABEL]
+            _radio_captions = [o.get("description", "") for o in _hitl_opts] + ["請在下方欄位輸入您的分析方向"]
+
+            _hitl_radio = st.radio(
                 "分析方向",
-                st.session_state.cowork_hitl_options,
-                selection_mode="single",
-                default=None,
-                key="cowork_hitl_pills_widget",
+                options=_radio_labels,
+                captions=_radio_captions,
+                index=None,
+                key="cowork_hitl_radio_widget",
+                label_visibility="collapsed",
             )
-            _hcol1, _hcol2, _ = st.columns([1, 1, 5])
-            with _hcol1:
+
+            # ── 自訂輸入（僅當選到最後一項時顯示）──────────────────────────
+            _custom_text = ""
+            if _hitl_radio == _CUSTOM_LABEL:
+                _custom_text = st.text_input(
+                    "自訂方向",
+                    placeholder="例如：分析演說對台灣金融市場的潛在影響",
+                    key="cowork_hitl_custom_input",
+                    label_visibility="collapsed",
+                )
+
+            st.divider()
+
+            # ── 按鈕區 ───────────────────────────────────────────────────────
+            _btn_col1, _btn_col2, _ = st.columns([2, 1, 5])
+
+            # 確認按鈕：選了選項才啟用（自訂模式下需有文字）
+            _confirm_disabled = (
+                _hitl_radio is None
+                or (_hitl_radio == _CUSTOM_LABEL and not _custom_text.strip())
+            )
+            with _btn_col1:
                 if st.button(
-                    "確認",
+                    "🚀 開始分析",
                     type="primary",
-                    disabled=(_hitl_sel is None),
+                    disabled=_confirm_disabled,
+                    use_container_width=True,
                     key="cowork_hitl_confirm_btn",
                 ):
+                    _chosen = (
+                        _custom_text.strip()
+                        if _hitl_radio == _CUSTOM_LABEL
+                        else _hitl_radio
+                    )
                     _modified_prompt = (
                         f"{st.session_state.cowork_hitl_original_prompt}"
-                        f"\n\n[分析方向已確認：{_hitl_sel}]"
+                        f"\n\n[分析方向已確認：{_chosen}]"
                     )
                     st.session_state["cowork_hitl_resume"] = {
                         "prompt": _modified_prompt,
@@ -1607,8 +1672,13 @@ if st.session_state.get("cowork_hitl_pending"):
                     }
                     st.session_state["cowork_hitl_pending"] = False
                     st.rerun()
-            with _hcol2:
-                if st.button("略過", key="cowork_hitl_skip_btn"):
+
+            with _btn_col2:
+                if st.button(
+                    "略過",
+                    use_container_width=True,
+                    key="cowork_hitl_skip_btn",
+                ):
                     st.session_state["cowork_hitl_resume"] = {
                         "prompt": st.session_state.cowork_hitl_original_prompt,
                         "imgs": st.session_state.cowork_hitl_original_imgs,
@@ -1674,6 +1744,7 @@ if not st.session_state.get("cowork_hitl_pending"):
             if _hitl_data:
                 st.session_state.update({
                     "cowork_hitl_pending": True,
+                    "cowork_hitl_summary": _hitl_data.get("summary", ""),
                     "cowork_hitl_question": _hitl_data["question"],
                     "cowork_hitl_options": _hitl_data["options"],
                     "cowork_hitl_original_prompt": prompt,
