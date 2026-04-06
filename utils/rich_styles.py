@@ -116,13 +116,30 @@ _RICH_CSS = f"""
     background: {_STRIPE};
 }}
 
-/* ── 行內程式碼 — 淡金底色 ── */
+/* ── 行內程式碼 — 淡暖灰底色 ── */
 .stMarkdown code:not(pre > code) {{
     background: {_CODE_BG};
     padding: 2px 6px;
     border-radius: 4px;
     font-size: .88em;
     color: {_BROWN};
+}}
+
+/* ── 程式碼區塊（triple-backtick）— 覆蓋 Streamlit 預設黃底 ── */
+.stMarkdown pre {{
+    background: #F5F1EE !important;   /* 暖灰白，取代 Streamlit 預設黃底 */
+    border: 1px solid {_BORDER} !important;
+    border-radius: 8px;
+    padding: 1em 1.4em;
+    line-height: 1.65;
+    overflow-x: auto;
+}}
+.stMarkdown pre > code {{
+    background: transparent !important;
+    font-size: 0.93em;                /* 比預設略小但清晰可讀 */
+    color: #2E1F18;                   /* 深褐近黑，最高對比 */
+    padding: 0;
+    border-radius: 0;
 }}
 
 /* ── 清單項目符號 — 珊瑚粉 ── */
