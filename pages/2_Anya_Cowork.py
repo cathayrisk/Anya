@@ -51,7 +51,7 @@ from docstore import (
     build_indices_incremental,
     doc_list_payload,
 )
-from utils.rich_styles import inject_rich_styles, render_source_chips, copy_html_button
+from utils.rich_styles import inject_rich_styles, render_source_chips
 
 # ── 頁面設定 ───────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Cowork", page_icon="🥜", layout="wide")
@@ -1275,8 +1275,6 @@ def _run_agent_for_prompt(prompt: str, img_blocks: list) -> None:
                 )
                 st.subheader("📄 研究報告")
                 st.markdown(report_content)
-                if len(report_content) > 300:
-                    copy_html_button(report_content, key=f"copy_rpt_live_{uuid.uuid4().hex[:8]}")
                 break
 
         # ── 最終 Agent 文字回應 ───────────────────────────────────────────
@@ -1292,8 +1290,6 @@ def _run_agent_for_prompt(prompt: str, img_blocks: list) -> None:
             response_text = content
             if not report_content:
                 _fake_stream(response_text, response_ph)   # 打字機效果
-                if len(response_text) > 300:
-                    copy_html_button(response_text, key=f"copy_resp_live_{uuid.uuid4().hex[:8]}")
             else:
                 response_ph.empty()
                 with st.expander("💬 Agent 最終回應", expanded=False):
@@ -1401,12 +1397,8 @@ def _render_history_assistant(msg: dict, msg_idx: int = 0) -> None:
 
     if report:
         st.markdown(report)
-        if len(report) > 300:
-            copy_html_button(report, key=f"copy_rpt_h{msg_idx}")
     if content and not report:
         st.markdown(content)
-        if len(content) > 300:
-            copy_html_button(content, key=f"copy_cnt_h{msg_idx}")
     elif content and report:
         with st.expander("💬 Agent 最終回應", expanded=False):
             st.markdown(content)
