@@ -643,6 +643,23 @@ def strip_doc_citation_tokens(text: str) -> str:
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
 
+# Responses API web_search 內嵌引用標記（inline citation markers）
+# 格式：®cite@turn14view0® 或 【turn14view0】
+_INLINE_WEB_CITATION_RE = re.compile(
+    r"®cite@[^®]*®"           # ®cite@turn14view0®
+    r"|【turn\d+(?:view\d+)?】"  # 【turn14view0】
+    r"|\[turn\d+(?:view\d+)?\]"  # [turn14view0]
+)
+
+def strip_inline_web_citations(text: str) -> str:
+    """移除 Responses API web_search 在正文裡嵌入的 inline citation 標記。"""
+    if not text:
+        return text
+    t = _INLINE_WEB_CITATION_RE.sub("", text)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
 def aggregate_doc_evidence_from_log(*, run_id: str) -> dict[str, Any]:
     """
     從 st.session_state.ds_doc_search_log 聚合：
@@ -1886,6 +1903,15 @@ def run_general_with_webpage_tool(
                 return last_text_resp, meta
             # ↓ 搜尋上限觸發但完全無文字（模型一直在搜尋未曾生成答案）→ 補一輪強制出答案
             if not _resp_has_text(resp) and last_text_resp is None:
+                # ── 補齊所有未處理的 function_calls，避免 400 "No tool output found" ──
+                for _fc in function_calls:
+                    _fc_id = getattr(_fc, "call_id", None)
+                    if _fc_id:
+                        running_input.append({
+                            "type": "function_call_output",
+                            "call_id": _fc_id,
+                            "output": json.dumps({"cancelled": True, "reason": "達到搜尋上限，強制結束"}),
+                        })
                 _status("📝 安妮亞整理答案中…")
                 _synthesis_resp = client.responses.create(
                     model=model,
@@ -3502,7 +3528,10 @@ async def fast_agent_stream(query: str, placeholder):
         except Exception:
             pass
 
-    return (buf or "安妮亞找不到答案～（抱歉啦！）"), meta
+    clean_buf = strip_inline_web_citations(buf)
+    if clean_buf != buf:
+        placeholder.markdown(clean_buf)   # 更新一次，把標記從畫面上移除
+    return (clean_buf or "安妮亞找不到答案～（抱歉啦！）"), meta
 
 # === 9. 主流程：前置 Router → Fast / General / Research ===
 
@@ -3803,6 +3832,8 @@ if prompt is not None:
                         
                         # ✅ 移除每句後面的 [Title pN] token（閱讀變乾淨）
                         ai_text = strip_doc_citation_tokens(ai_text)
+                        # ✅ 移除 Responses API web_search 內嵌引用標記（®cite@turn14view0® 等）
+                        ai_text = strip_inline_web_citations(ai_text)
                         # ✅ 1) 把模型吐的「來源：」空行清掉（避免你截圖那種 來源：、）
                         ai_text = cleanup_report_markdown(ai_text)
                         
@@ -4047,8 +4078,8 @@ if prompt is not None:
 
                         # ✅ U3：優化輸出佈局 — Summary 用 expander，完整報告直接串流，最後列建議問題
                         with output_area:
-                            _short_summary = (writer_data.get("short_summary") or "").strip()
-                            _full_report   = (writer_data.get("markdown_report") or "").strip()
+                            _short_summary = strip_inline_web_citations((writer_data.get("short_summary") or "").strip())
+                            _full_report   = strip_inline_web_citations((writer_data.get("markdown_report") or "").strip())
                             _follow_ups    = writer_data.get("follow_up_questions") or []
 
                             # ① Executive Summary — 可展開/收起，預設展開
