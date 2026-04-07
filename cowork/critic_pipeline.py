@@ -2,12 +2,13 @@
 critic_pipeline.py — 四維度批判分析管道
 
 純 Python 模組，不依賴 Streamlit。
-由 2_Anya_Cowork.py 的 critique_analysis / check_source_framework 工具呼叫。
+由 Home.py 的 critique_analysis / check_source_framework 工具呼叫。
+使用 Responses API（支援 gpt-5.2）。
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # 金融領域補充規則（安全 import，缺少時靜默降級）
 try:
@@ -100,57 +101,51 @@ class CriticResult:
 
 
 # ── 核心函式 ──────────────────────────────────────────────────────────────────
-def run_critic_pipeline(report_text: str, model: str = "gpt-4.1-mini") -> CriticResult:
-    """四維度批判分析，回傳結構化結果。使用輕量模型降低成本。"""
+def run_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> CriticResult:
+    """四維度批判分析，回傳結構化結果。使用 Responses API。"""
     from openai import OpenAI
     client = OpenAI()  # key 由 os.environ["OPENAI_API_KEY"] 提供
 
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
-        messages=[
-            {"role": "system", "content": _CRITIC_PROMPT},
-            {"role": "user", "content": report_text},
-        ],
+        instructions=_CRITIC_PROMPT,
+        input=report_text,
     )
-    raw = response.choices[0].message.content or ""
+    raw = response.output_text or ""
     score = _parse_score(raw)
     passed = score >= 8 or bool(re.search(r"所有驗證規則通過\s*$", raw, re.MULTILINE))
     return CriticResult(score=score, raw_output=raw, passed=passed)
 
 
-def run_finance_critic_pipeline(report_text: str, model: str = "gpt-4.1-mini") -> CriticResult:
+def run_finance_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> CriticResult:
     """四維度批判分析 + 金融領域三條補充規則（規則 5/6/7）。
     適用於涉及估值、財務報表、賣方研究、總經指標的報告。"""
     from openai import OpenAI
     client = OpenAI()
 
-    combined_prompt = _CRITIC_PROMPT + FINANCE_CRITIC_ADDENDUM
-    response = client.chat.completions.create(
+    combined_instructions = _CRITIC_PROMPT + FINANCE_CRITIC_ADDENDUM
+    response = client.responses.create(
         model=model,
-        messages=[
-            {"role": "system", "content": combined_prompt},
-            {"role": "user", "content": report_text},
-        ],
+        instructions=combined_instructions,
+        input=report_text,
     )
-    raw = response.choices[0].message.content or ""
+    raw = response.output_text or ""
     score = _parse_score(raw)
     passed = score >= 8 or bool(re.search(r"所有驗證規則通過\s*$", raw, re.MULTILINE))
     return CriticResult(score=score, raw_output=raw, passed=passed)
 
 
-def check_source_framework(source_description: str, model: str = "gpt-4.1-mini") -> str:
+def check_source_framework(source_description: str, model: str = "gpt-5.2") -> str:
     """針對單一來源或框架的方法論透明度審查，回傳評估文字。"""
     from openai import OpenAI
     client = OpenAI()
 
-    response = client.chat.completions.create(
+    response = client.responses.create(
         model=model,
-        messages=[
-            {"role": "system", "content": _SOURCE_FRAMEWORK_PROMPT},
-            {"role": "user", "content": source_description},
-        ],
+        instructions=_SOURCE_FRAMEWORK_PROMPT,
+        input=source_description,
     )
-    return response.choices[0].message.content or ""
+    return response.output_text or ""
 
 
 def format_critic_output(result: CriticResult) -> str:
