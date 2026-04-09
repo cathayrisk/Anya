@@ -79,6 +79,33 @@ _RICH_CSS = f"""
     padding-left: 1.4em;
 }}
 
+/* ── 無序清單 — 與 ol 統一縮排與間距 ── */
+.stMarkdown ul {{
+    padding-left: 1.6em;
+    line-height: 1.7;
+}}
+.stMarkdown ul li {{
+    margin-bottom: 0.35em;
+}}
+.stMarkdown ul li ul,
+.stMarkdown ul li ol {{
+    margin-top: 0.25em;
+    padding-left: 1.4em;
+}}
+
+/* ── li 內部 p 標籤（Markdown parser 有時自動包 p）不加額外間距 ── */
+.stMarkdown li > p {{
+    margin: 0;
+    padding: 0;
+}}
+
+/* ── 段落間距 ── */
+.stMarkdown p {{
+    margin-top: 0.3em;
+    margin-bottom: 0.5em;
+    line-height: 1.7;
+}}
+
 /* ── Blockquote — 金邊框 + 淡珊瑚背景 ── */
 /* 靈感自 Compose Richtext BlockQuote 元件 */
 .stMarkdown blockquote {{
