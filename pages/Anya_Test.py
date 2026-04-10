@@ -278,7 +278,12 @@ def _strip_unbalanced_code_fences(text: str) -> str:
         out.append(ln)
     return "\n".join(out)
 
+_LIST_INDENT_RE = re.compile(r"^[ \t]+[-*+] |^[ \t]+\d+\. ")
+
 def _maybe_unindent_indented_block(text: str) -> str:
+    """整段被 4-space 縮排導致 Streamlit 誤判為 code block 時，移除縮排。
+    但若縮排行本身是巢狀清單語法（  - item / 1. item），則不拆，避免破壞層級。
+    """
     if not text:
         return text
 
@@ -289,6 +294,10 @@ def _maybe_unindent_indented_block(text: str) -> str:
 
     indented = sum(1 for ln in non_empty if ln.startswith("    ") or ln.startswith("\t"))
     if (indented / len(non_empty)) < 0.7:
+        return text
+
+    # 縮排行中若含 markdown 清單語法，代表是巢狀清單，不得拆縮排
+    if any(_LIST_INDENT_RE.match(ln) for ln in non_empty):
         return text
 
     new_lines = []
