@@ -39,139 +39,365 @@ _CODE_BG = "#EDE8E6"   # 行內程式碼底色（淡暖灰，不搶眼）
 # ── CSS（只套用在 .stMarkdown 範圍，不影響 widget）
 _RICH_CSS = f"""
 <style>
-/* ── 標題 — Anya 珊瑚粉 ── */
+/* ════════════════════════════════════════════════════════
+   Anya Forger Markdown Theme — 完整元素定義
+   參考：GitHub Markdown CSS (sindresorhus.com/github-markdown-css)
+   色調：珊瑚粉 / 金邊黃 / 深褐色（Spy x Family Anya 配色）
+   ════════════════════════════════════════════════════════ */
+
+/* ── 全域：字型 + 文字換行 ── */
+.stMarkdown {{
+    word-break: break-word;
+    overflow-wrap: break-word;
+}}
+.stMarkdown, .stMarkdown *:not(code):not(pre):not(kbd) {{
+    font-family:
+        'SF Pro Rounded',        /* 本地靜態字型（config.toml fontFaces 載入）*/
+        'PingFang TC',           /* macOS/iOS 繁中系統字型（SF Pro 無 CJK，此為 fallback）*/
+        'Microsoft JhengHei',    /* Windows 繁中 */
+        'Noto Sans CJK TC',      /* Linux 繁中 */
+        'WenQuanYi Micro Hei',   /* Linux 中文備用 */
+        sans-serif;
+}}
+/* 程式碼專用等寬字型（系統 monospace，與 config.toml codeFont = "monospace" 一致）*/
+.stMarkdown code,
+.stMarkdown pre,
+.stMarkdown kbd {{
+    font-family:
+        'Cascadia Code', 'Consolas', 'Monaco', 'Menlo',
+        'DejaVu Sans Mono', monospace;
+}}
+
+/* ════════════════════
+   標題 h1–h6
+   ════════════════════ */
 .stMarkdown h1 {{
+    font-size: 1.9em;
+    font-weight: 700;
     color: {_CORAL};
-    border-bottom: 1px solid {_BORDER};   /* 改細：1px 比 2px 輕盈 */
+    border-bottom: 2px solid {_BORDER};
     padding-bottom: .25em;
-    margin-top: 0.9em;
-    margin-bottom: 0.2em;
+    margin-top: 1em;
+    margin-bottom: 0.4em;
 }}
 .stMarkdown h2 {{
+    font-size: 1.5em;
+    font-weight: 700;
     color: {_CORAL};
-    margin-top: 0.8em;
+    border-bottom: 1px solid {_BORDER};
+    padding-bottom: .2em;
+    margin-top: 0.9em;
+    margin-bottom: 0.3em;
+}}
+.stMarkdown h3 {{
+    font-size: 1.22em;
+    font-weight: 600;
+    color: #7A4030;
+    margin-top: .8em;
     margin-bottom: 0.2em;
 }}
-.stMarkdown h3,
 .stMarkdown h4 {{
-    color: #7A4030;   /* 暖褐色：比 h1/h2 深但比正文有層次感 */
+    font-size: 1.05em;
+    font-weight: 600;
+    color: #7A4030;
     margin-top: .7em;
+    margin-bottom: 0.15em;
+}}
+.stMarkdown h5 {{
+    font-size: 0.93em;
+    font-weight: 600;
+    color: #9A5040;
+    margin-top: .6em;
     margin-bottom: 0.1em;
 }}
-/* Tab / container 內第一個標題不需要上方空白 */
+.stMarkdown h6 {{
+    font-size: 0.85em;
+    font-weight: 600;
+    color: #B07060;   /* 最淺色，表層級最低 */
+    margin-top: .5em;
+    margin-bottom: 0.1em;
+}}
+/* 容器內第一個標題不加上方空白 */
 .stMarkdown h1:first-child,
 .stMarkdown h2:first-child,
-.stMarkdown h3:first-child {{
+.stMarkdown h3:first-child,
+.stMarkdown h4:first-child,
+.stMarkdown h5:first-child,
+.stMarkdown h6:first-child {{
     margin-top: 0.2em;
 }}
 
-/* ── 有序清單 — 層級縮排加強 ── */
-.stMarkdown ol {{
-    padding-left: 1.6em;
-    line-height: 1.7;
-}}
-.stMarkdown ol li {{
-    margin-bottom: 0.35em;
-}}
-.stMarkdown ol li ul,
-.stMarkdown ol li ol {{
-    margin-top: 0.25em;
-    padding-left: 1.4em;
+/* ════════════════════
+   段落 / 換行
+   ════════════════════ */
+.stMarkdown p {{
+    margin-top: 0.3em;
+    margin-bottom: 0.6em;
+    line-height: 1.75;
 }}
 
-/* ── 無序清單 — 與 ol 統一縮排與間距 ── */
+/* ════════════════════
+   文字強調
+   ════════════════════ */
+.stMarkdown strong {{ font-weight: 700; }}
+.stMarkdown em     {{ font-style: italic; }}
+.stMarkdown strong em,
+.stMarkdown em strong {{ font-weight: 700; font-style: italic; }}
+
+/* 刪除線 — 灰色，暗示「已廢棄」 */
+.stMarkdown del {{
+    color: #999;
+    text-decoration: line-through;
+}}
+
+/* ════════════════════
+   連結
+   ════════════════════ */
+.stMarkdown a {{
+    color: {_CORAL};
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.15s;
+}}
+.stMarkdown a:hover {{
+    border-bottom-color: {_CORAL};
+}}
+
+/* ════════════════════
+   水平分隔線
+   ════════════════════ */
+.stMarkdown hr {{
+    border: none;
+    border-top: 2px solid {_BORDER};
+    margin: 1.6em 0;
+    opacity: 0.8;
+}}
+
+/* ════════════════════
+   圖片
+   ════════════════════ */
+.stMarkdown img {{
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+    display: block;
+    margin: 0.6em auto;
+}}
+
+/* ════════════════════
+   有序 / 無序清單
+   ════════════════════ */
+.stMarkdown ol,
 .stMarkdown ul {{
     padding-left: 1.6em;
-    line-height: 1.7;
+    line-height: 1.75;
+    margin-top: 0.2em;
+    margin-bottom: 0.6em;
 }}
+.stMarkdown ol li,
 .stMarkdown ul li {{
     margin-bottom: 0.35em;
 }}
-.stMarkdown ul li ul,
-.stMarkdown ul li ol {{
+/* 巢狀清單 */
+.stMarkdown ol li ol, .stMarkdown ol li ul,
+.stMarkdown ul li ul, .stMarkdown ul li ol {{
     margin-top: 0.25em;
+    margin-bottom: 0;
     padding-left: 1.4em;
 }}
-
-/* ── li 內部 p 標籤（Markdown parser 有時自動包 p）不加額外間距 ── */
+/* li 內部 p 不加額外間距 */
 .stMarkdown li > p {{
     margin: 0;
     padding: 0;
 }}
+/* 清單符號顏色 */
+.stMarkdown ul li::marker {{ color: {_CORAL}; }}
+.stMarkdown ol li::marker {{ color: {_CORAL}; font-weight: 700; }}
 
-/* ── 段落間距 ── */
-.stMarkdown p {{
-    margin-top: 0.3em;
-    margin-bottom: 0.5em;
-    line-height: 1.7;
+/* Task list（GFM checkbox）*/
+.stMarkdown .task-list-item {{
+    list-style: none;
+    padding-left: 0;
+}}
+.stMarkdown .task-list-item input[type="checkbox"] {{
+    margin-right: 0.5em;
+    margin-left: -1.6em;
+    accent-color: {_CORAL};
+    vertical-align: middle;
 }}
 
-/* ── Blockquote — 金邊框 + 淡珊瑚背景 ── */
-/* 靈感自 Compose Richtext BlockQuote 元件 */
+/* ════════════════════
+   Blockquote
+   ════════════════════ */
 .stMarkdown blockquote {{
     border-left: 4px solid {_GOLD};
     background: {_LIGHT};
     padding: .6em 1.2em;
     border-radius: 0 8px 8px 0;
-    margin-top: .6em;
-    margin-bottom: .3em;   /* 縮小下方間距，避免與後續段落缺口過大 */
+    margin: .6em 0 .3em 0;
     color: {_BROWN};
 }}
-/* blockquote 內的 p 標籤不加額外間距 */
 .stMarkdown blockquote p {{
     margin: 0;
     padding: 0;
+    line-height: 1.7;
+}}
+/* 巢狀 blockquote — 金色變淡，區分層級 */
+.stMarkdown blockquote blockquote {{
+    border-left-color: #E0C87A;
+    background: #FFFBF0;
+    margin: .4em 0;
 }}
 
-/* ── 表格 — 深褐色標頭 + 斑馬紋 ── */
+/* ════════════════════
+   表格
+   ════════════════════ */
+/* 外層可橫向捲動（防止窄螢幕溢出）*/
 .stMarkdown table {{
+    display: block;
+    overflow-x: auto;
     border-collapse: collapse;
-    width: 100%;
+    width: max-content;
+    max-width: 100%;
+    border: 1px solid {_BORDER};
+    border-radius: 8px;
+    margin-bottom: 0.8em;
+}}
+.stMarkdown thead tr {{
+    background: {_BROWN};
 }}
 .stMarkdown th {{
-    background: {_BROWN};
-    color: {_GOLD};          /* 金色文字搭深褐底，如制服金邊 */
-    padding: 8px 12px;
+    color: {_GOLD};
+    padding: 8px 14px;
     text-align: left;
+    font-weight: 600;
     letter-spacing: .03em;
+    white-space: nowrap;
 }}
 .stMarkdown td {{
-    padding: 8px 12px;
-    border-bottom: 1px solid {_BORDER};
+    padding: 8px 14px;
+    border-top: 1px solid {_BORDER};
+    vertical-align: top;
 }}
 .stMarkdown tr:nth-child(even) td {{
     background: {_STRIPE};
 }}
+.stMarkdown tr:hover td {{
+    background: #FAEAE7;   /* hover 淡珊瑚 */
+}}
 
-/* ── 行內程式碼 — 淡暖灰底色 ── */
+/* ════════════════════
+   行內程式碼
+   ════════════════════ */
 .stMarkdown code:not(pre > code) {{
     background: {_CODE_BG};
     padding: 2px 6px;
     border-radius: 4px;
-    font-size: .88em;
+    font-size: .87em;
     color: {_BROWN};
+    border: 1px solid {_BORDER};
 }}
 
-/* ── 程式碼區塊（triple-backtick）— 覆蓋 Streamlit 預設黃底 ── */
+/* ════════════════════
+   程式碼區塊
+   ════════════════════ */
 .stMarkdown pre {{
-    background: #F5F1EE !important;   /* 暖灰白，取代 Streamlit 預設黃底 */
+    background: #F5F1EE !important;
     border: 1px solid {_BORDER} !important;
     border-radius: 8px;
     padding: 1em 1.4em;
     line-height: 1.65;
     overflow-x: auto;
+    margin: 0.6em 0;
 }}
 .stMarkdown pre > code {{
     background: transparent !important;
-    font-size: 0.93em;                /* 比預設略小但清晰可讀 */
-    color: #2E1F18;                   /* 深褐近黑，最高對比 */
+    font-size: 0.92em;
+    color: #2E1F18;
     padding: 0;
+    border: none;
     border-radius: 0;
 }}
 
-/* ── 清單項目符號 — 珊瑚粉 ── */
-.stMarkdown ul li::marker {{ color: {_CORAL}; }}
-.stMarkdown ol li::marker {{ color: {_CORAL}; font-weight: bold; }}
+/* ════════════════════
+   鍵盤按鍵 <kbd>
+   ════════════════════ */
+.stMarkdown kbd {{
+    background: #F0EBE8;
+    border: 1px solid {_BORDER};
+    border-bottom-width: 3px;       /* 立體感 */
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-size: 0.83em;
+    color: {_BROWN};
+    white-space: nowrap;
+}}
+
+/* ════════════════════
+   <details> / <summary>（摺疊區塊）
+   ════════════════════ */
+.stMarkdown details {{
+    background: {_LIGHT};
+    border: 1px solid {_BORDER};
+    border-radius: 8px;
+    padding: 0.5em 1em;
+    margin: 0.7em 0;
+}}
+.stMarkdown summary {{
+    cursor: pointer;
+    font-weight: 600;
+    color: {_CORAL};
+    user-select: none;
+    outline: none;
+    list-style: none;
+}}
+.stMarkdown summary::before {{
+    content: '▶ ';
+    font-size: 0.75em;
+    transition: transform 0.2s;
+}}
+.stMarkdown details[open] summary::before {{
+    content: '▼ ';
+}}
+.stMarkdown details[open] summary {{
+    margin-bottom: 0.5em;
+    border-bottom: 1px solid {_BORDER};
+    padding-bottom: 0.3em;
+}}
+
+/* ════════════════════
+   定義清單 <dl>
+   ════════════════════ */
+.stMarkdown dl {{
+    margin: 0.6em 0;
+}}
+.stMarkdown dt {{
+    font-weight: 700;
+    color: {_CORAL};
+    margin-top: 0.6em;
+}}
+.stMarkdown dd {{
+    margin-left: 1.6em;
+    color: {_BROWN};
+    margin-bottom: 0.3em;
+}}
+
+/* ════════════════════
+   腳注 footnote
+   ════════════════════ */
+.stMarkdown .footnotes {{
+    border-top: 1px solid {_BORDER};
+    margin-top: 1.5em;
+    padding-top: 0.8em;
+    font-size: 0.88em;
+    color: #666;
+}}
+.stMarkdown .footnote-ref a,
+.stMarkdown .footnotes a {{
+    color: {_CORAL};
+    font-size: 0.85em;
+    vertical-align: super;
+}}
 </style>
 """
 
@@ -181,13 +407,13 @@ def inject_rich_styles() -> None:
     在每個頁面的 set_page_config() 之後呼叫即可。
     Streamlit 每次 rerun 都會重建 DOM，所以 CSS 每次都需要重新注入。
 
-    效果（Anya Forger 主題）：
-      - h1/h2 顯示珊瑚粉 #D97B72
-      - h3/h4 顯示深褐色 #4A2F1A
-      - blockquote 顯示金色左邊框 + 淡珊瑚背景
-      - table 標頭為深褐底金色字（制服配色）+ 斑馬紋
-      - 行內 `code` 顯示淡金底圓角
-      - 清單項目符號為珊瑚粉
+    覆蓋元素（Anya Forger 主題，參考 GitHub Markdown CSS）：
+      - h1–h6：珊瑚粉漸層，h1/h2 有底線
+      - p / strong / em / del / a / hr / img
+      - ul / ol（含巢狀）/ task list / dl / 腳注
+      - blockquote（含巢狀） / details+summary
+      - table（橫向捲動 + hover）/ th / td / 斑馬紋
+      - inline code / pre code block / kbd
     """
     st.markdown(_RICH_CSS, unsafe_allow_html=True)
 
@@ -270,14 +496,19 @@ def copy_html_button(text: str, key: str = "copy") -> None:
     # 2. 補 inline style — Word 只讀 inline style，不讀 CSS class
     html = (
         html
-        .replace("<h1>", '<h1 style="color:#C05A50;font-size:20pt;font-weight:bold;margin-top:1em;">')
-        .replace("<h2>", '<h2 style="color:#C05A50;font-size:16pt;font-weight:bold;margin-top:.8em;">')
+        .replace("<h1>", '<h1 style="color:#C05A50;font-size:20pt;font-weight:bold;margin-top:1em;border-bottom:2px solid #F2D5CF;padding-bottom:.2em;">')
+        .replace("<h2>", '<h2 style="color:#C05A50;font-size:16pt;font-weight:bold;margin-top:.8em;border-bottom:1px solid #F2D5CF;padding-bottom:.15em;">')
         .replace("<h3>", '<h3 style="color:#7A4030;font-size:13pt;font-weight:bold;margin-top:.6em;">')
         .replace("<h4>", '<h4 style="color:#7A4030;font-size:12pt;font-weight:bold;">')
-        .replace("<th>", '<th style="background:#4A2F1A;color:#C8A43A;padding:6px 10px;text-align:left;">')
-        .replace("<td>", '<td style="padding:6px 10px;border-bottom:1px solid #F2D5CF;">')
-        .replace("<table>", '<table style="border-collapse:collapse;width:100%;">')
-        .replace("<blockquote>", '<blockquote style="border-left:4px solid #C8A43A;padding:.5em 1em;background:#FFF5F2;color:#4A2F1A;margin:.5em 0;">')
+        .replace("<h5>", '<h5 style="color:#9A5040;font-size:11pt;font-weight:bold;">')
+        .replace("<h6>", '<h6 style="color:#B07060;font-size:10pt;font-weight:bold;">')
+        .replace("<th>", '<th style="background:#4A2F1A;color:#C8A43A;padding:6px 10px;text-align:left;font-weight:600;">')
+        .replace("<td>", '<td style="padding:6px 10px;border-top:1px solid #F2D5CF;vertical-align:top;">')
+        .replace("<table>", '<table style="border-collapse:collapse;width:100%;border:1px solid #F2D5CF;border-radius:8px;">')
+        .replace("<blockquote>", '<blockquote style="border-left:4px solid #C8A43A;padding:.5em 1em;background:#FFF5F2;color:#4A2F1A;margin:.5em 0;border-radius:0 6px 6px 0;">')
+        .replace("<hr>", '<hr style="border:none;border-top:2px solid #F2D5CF;margin:1.2em 0;">')
+        .replace("<del>", '<del style="color:#999;">')
+        .replace("<kbd>", '<kbd style="background:#F0EBE8;border:1px solid #F2D5CF;border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.85em;">')
     )
 
     # 3. 用 st.html() 注入 JS 按鈕（在主 DOM，無 same-origin iframe 限制）
