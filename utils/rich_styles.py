@@ -90,32 +90,34 @@ _RICH_CSS = f"""
     margin-bottom: 0.3em;
 }}
 .stMarkdown h3 {{
-    font-size: 1.22em;
-    font-weight: 600;
+    font-size: 1.28em;
+    font-weight: 700;
     color: #7A4030;
-    margin-top: .8em;
-    margin-bottom: 0.2em;
+    border-left: 3px solid {_CORAL};
+    padding-left: 0.6em;
+    margin-top: 1.1em;
+    margin-bottom: 0.45em;
 }}
 .stMarkdown h4 {{
-    font-size: 1.05em;
-    font-weight: 600;
+    font-size: 1.08em;
+    font-weight: 700;
     color: #7A4030;
-    margin-top: .7em;
-    margin-bottom: 0.15em;
+    margin-top: 0.9em;
+    margin-bottom: 0.35em;
 }}
 .stMarkdown h5 {{
-    font-size: 0.93em;
+    font-size: 0.95em;
     font-weight: 600;
     color: #9A5040;
-    margin-top: .6em;
-    margin-bottom: 0.1em;
+    margin-top: .7em;
+    margin-bottom: 0.2em;
 }}
 .stMarkdown h6 {{
-    font-size: 0.85em;
+    font-size: 0.87em;
     font-weight: 600;
-    color: #B07060;   /* 最淺色，表層級最低 */
+    color: #B07060;
     margin-top: .5em;
-    margin-bottom: 0.1em;
+    margin-bottom: 0.15em;
 }}
 /* 容器內第一個標題不加上方空白 */
 .stMarkdown h1:first-child,
@@ -189,21 +191,21 @@ _RICH_CSS = f"""
    ════════════════════ */
 .stMarkdown ol,
 .stMarkdown ul {{
-    padding-left: 1.6em;
+    padding-left: 2.2em;
     line-height: 1.75;
-    margin-top: 0.2em;
-    margin-bottom: 0.6em;
+    margin-top: 0.3em;
+    margin-bottom: 0.8em;
 }}
 .stMarkdown ol li,
 .stMarkdown ul li {{
-    margin-bottom: 0.35em;
+    margin-bottom: 0.45em;
 }}
 /* 巢狀清單 */
 .stMarkdown ol li ol, .stMarkdown ol li ul,
 .stMarkdown ul li ul, .stMarkdown ul li ol {{
-    margin-top: 0.25em;
+    margin-top: 0.3em;
     margin-bottom: 0;
-    padding-left: 1.4em;
+    padding-left: 1.6em;
 }}
 /* li 內部 p 不加額外間距 */
 .stMarkdown li > p {{
