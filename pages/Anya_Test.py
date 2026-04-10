@@ -660,23 +660,6 @@ def strip_inline_web_citations(text: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
-# ── 異文字清理：移除 LLM 偶爾混入的韓文／俄文／其他非預期字符 ──
-# 繁中+英文的正常回覆不應出現 Hangul 或 Cyrillic；過濾後若有空白殘留一併清理
-_HANGUL_RE   = re.compile(r"[\uAC00-\uD7FF\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uD7B0-\uD7FF]+")
-_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF\u0500-\u052F]+")
-
-def strip_foreign_script_intrusions(text: str) -> str:
-    """移除繁中/英文回覆中不應出現的韓文（Hangul）與俄文（Cyrillic）字符。
-    不影響 CJK 漢字、日文假名（可能合法出現於引文）、英文或標點。
-    """
-    if not text:
-        return text
-    t = _HANGUL_RE.sub("", text)
-    t = _CYRILLIC_RE.sub("", t)
-    # 清掉因移除字符產生的多餘空白
-    t = re.sub(r"[ \t]{2,}", " ", t)
-    t = re.sub(r" ([，。！？；：、」』）])", r"\1", t)  # 標點前不留空格
-    return t
 
 def aggregate_doc_evidence_from_log(*, run_id: str) -> dict[str, Any]:
     """
@@ -3570,7 +3553,6 @@ async def fast_agent_stream(query: str, placeholder):
             pass
 
     clean_buf = strip_inline_web_citations(buf)
-    clean_buf = strip_foreign_script_intrusions(clean_buf)
     if clean_buf != buf:
         placeholder.markdown(clean_buf)   # 更新一次，把標記從畫面上移除
     return (clean_buf or "安妮亞找不到答案～（抱歉啦！）"), meta
@@ -3876,8 +3858,6 @@ if prompt is not None:
                         ai_text = strip_doc_citation_tokens(ai_text)
                         # ✅ 移除 Responses API web_search 內嵌引用標記（®cite@turn14view0® 等）
                         ai_text = strip_inline_web_citations(ai_text)
-                        # ✅ 移除 LLM 偶爾混入的韓文／俄文字符
-                        ai_text = strip_foreign_script_intrusions(ai_text)
                         # ✅ 1) 把模型吐的「來源：」空行清掉（避免你截圖那種 來源：、）
                         ai_text = cleanup_report_markdown(ai_text)
                         
@@ -4125,8 +4105,8 @@ if prompt is not None:
 
                         # ✅ U3：優化輸出佈局 — Summary 用 expander，完整報告直接串流，最後列建議問題
                         with output_area:
-                            _short_summary = strip_foreign_script_intrusions(strip_inline_web_citations((writer_data.get("short_summary") or "").strip()))
-                            _full_report   = strip_foreign_script_intrusions(strip_inline_web_citations((writer_data.get("markdown_report") or "").strip()))
+                            _short_summary = strip_inline_web_citations((writer_data.get("short_summary") or "").strip())
+                            _full_report   = strip_inline_web_citations((writer_data.get("markdown_report") or "").strip())
                             _follow_ups    = writer_data.get("follow_up_questions") or []
 
                             # ① Executive Summary — 可展開/收起，預設展開
