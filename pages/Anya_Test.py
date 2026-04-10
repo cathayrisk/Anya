@@ -641,7 +641,8 @@ def strip_doc_citation_tokens(text: str) -> str:
     # 清掉多餘空白（避免 "句子  :small[]" 之類）
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
-    t = re.sub(r"[ \t]{2,}", " ", t)
+    # ⚠️ 只壓縮非行首的多餘空格，避免破壞巢狀清單縮排
+    t = re.sub(r"(?m)(?<=\S)[ \t]{2,}", " ", t)
     return t.strip()
 
 # Responses API web_search 內嵌引用標記（inline citation markers）
