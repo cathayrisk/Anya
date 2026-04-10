@@ -278,12 +278,8 @@ def _strip_unbalanced_code_fences(text: str) -> str:
         out.append(ln)
     return "\n".join(out)
 
-_LIST_INDENT_RE = re.compile(r"^[ \t]+[-*+] |^[ \t]+\d+\. ")
-
 def _maybe_unindent_indented_block(text: str) -> str:
-    """整段被 4-space 縮排導致 Streamlit 誤判為 code block 時，移除縮排。
-    但若縮排行本身是巢狀清單語法（  - item / 1. item），則不拆，避免破壞層級。
-    """
+    """整段被 4-space 縮排導致 Streamlit 誤判為 code block 時，移除縮排。"""
     if not text:
         return text
 
@@ -294,10 +290,6 @@ def _maybe_unindent_indented_block(text: str) -> str:
 
     indented = sum(1 for ln in non_empty if ln.startswith("    ") or ln.startswith("\t"))
     if (indented / len(non_empty)) < 0.7:
-        return text
-
-    # 縮排行中若含 markdown 清單語法，代表是巢狀清單，不得拆縮排
-    if any(_LIST_INDENT_RE.match(ln) for ln in non_empty):
         return text
 
     new_lines = []
@@ -665,7 +657,9 @@ def strip_inline_web_citations(text: str) -> str:
     if not text:
         return text
     t = _INLINE_WEB_CITATION_RE.sub("", text)
-    t = re.sub(r"[ \t]{2,}", " ", t)
+    # ⚠️ 只壓縮「非行首」的多餘空格（避免破壞巢狀清單的縮排）
+    # (?m)^([ \t]+) 保留每行開頭的縮排，只對內容部分做 2+ 空格 → 1 空格
+    t = re.sub(r"(?m)(?<=\S)[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
