@@ -241,25 +241,23 @@ _RICH_CSS = f"""
    Blockquote
    ════════════════════ */
 .stMarkdown blockquote {{
-    border-left: 4px solid {_GOLD};
-    background: #FDF6E3;
+    border-left: 4px solid {_CORAL};
+    background: #FDECEA;
     padding: .65em 1.2em;
     border-radius: 0 8px 8px 0;
     margin: .7em 0 .4em 0;
     color: {_BROWN};
-    box-shadow: inset 0 0 0 1px rgba(200,164,58,0.18);
 }}
 .stMarkdown blockquote p {{
     margin: 0;
     padding: 0;
     line-height: 1.75;
 }}
-/* 巢狀 blockquote — 珊瑚色左邊框，略深底色，區分層級 */
+/* 巢狀 blockquote — 金色邊框，略深底色，區分層級 */
 .stMarkdown blockquote blockquote {{
-    border-left: 3px solid {_CORAL};
-    background: #FAF0E6;
+    border-left: 3px solid {_GOLD};
+    background: #FAE4E1;
     margin: .45em 0;
-    box-shadow: inset 0 0 0 1px rgba(192,90,80,0.12);
 }}
 
 /* ════════════════════
