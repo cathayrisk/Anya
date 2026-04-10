@@ -201,7 +201,7 @@ _RICH_CSS = f"""
 .stMarkdown ul li {{
     margin-bottom: 0.45em;
 }}
-/* 巢狀清單 */
+/* 巢狀清單縮排 */
 .stMarkdown ol li ol, .stMarkdown ol li ul,
 .stMarkdown ul li ul, .stMarkdown ul li ol {{
     margin-top: 0.3em;
@@ -213,6 +213,14 @@ _RICH_CSS = f"""
     margin: 0;
     padding: 0;
 }}
+/* 無序清單三層符號：● ○ ▪ */
+.stMarkdown ul                   {{ list-style-type: disc; }}
+.stMarkdown ul ul                {{ list-style-type: circle; }}
+.stMarkdown ul ul ul             {{ list-style-type: square; }}
+/* 有序清單三層符號：1. a. i. */
+.stMarkdown ol                   {{ list-style-type: decimal; }}
+.stMarkdown ol ol                {{ list-style-type: lower-alpha; }}
+.stMarkdown ol ol ol             {{ list-style-type: lower-roman; }}
 /* 清單符號顏色 */
 .stMarkdown ul li::marker {{ color: {_CORAL}; }}
 .stMarkdown ol li::marker {{ color: {_CORAL}; font-weight: 700; }}
