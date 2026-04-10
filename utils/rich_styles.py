@@ -94,7 +94,8 @@ _RICH_CSS = f"""
     font-weight: 700;
     color: #7A4030;
     border-left: 3px solid {_CORAL};
-    padding-left: 0.6em;
+    padding: 0.1em 0 0.1em 0.6em;
+    line-height: 1.3;
     margin-top: 1.1em;
     margin-bottom: 0.45em;
 }}
