@@ -398,6 +398,18 @@ _RICH_CSS = f"""
     font-size: 0.85em;
     vertical-align: super;
 }}
+
+/* ════════════════════
+   st.code 元件（非 markdown 內的程式碼區塊）
+   ════════════════════ */
+div[data-testid="stCode"] pre {{
+    font-size: 0.97em !important;
+    line-height: 1.65 !important;
+}}
+div[data-testid="stCode"] code {{
+    font-size: 0.97em !important;
+    font-family: 'Cascadia Code', 'Consolas', 'Monaco', 'Menlo', 'DejaVu Sans Mono', monospace !important;
+}}
 </style>
 """
 
