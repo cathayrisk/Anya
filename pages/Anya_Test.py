@@ -652,6 +652,7 @@ _INLINE_WEB_CITATION_RE = re.compile(
     r"®cite@[^®]*®"           # ®cite@turn14view0®
     r"|【turn\d+(?:view\d+)?】"  # 【turn14view0】
     r"|\[turn\d+(?:view\d+)?\]"  # [turn14view0]
+    r"|\s*\[\d+\](?!\()"         # [1] [2] 數字引用（不吃 [1](url) 連結）
 )
 
 def strip_inline_web_citations(text: str) -> str:
