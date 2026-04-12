@@ -3850,7 +3850,7 @@ if prompt is not None:
                         if effective_need_web:
                             gif_in_status_ph.image("lord-anya.gif")
                         else:
-                            gif_in_status_ph.image("anime/anya-excited-sparkling-eyes.gif")
+                            gif_in_status_ph.image("anime/anya-jumping-rope.gif")
 
                         # ✅ 使用 tool-calling 迴圈（含 fetch_webpage + doc tools）
                         resp, meta = run_general_with_webpage_tool(
