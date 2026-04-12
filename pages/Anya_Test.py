@@ -168,7 +168,6 @@ st.session_state.setdefault("ds_last_index_stats", None) # dict | None
 st.session_state.setdefault("ds_doc_search_log", [])     # list[dict]
 st.session_state.setdefault("ds_web_search_log", [])     # list[dict] — web_search_call log
 st.session_state.setdefault("ds_think_log", [])          # list[dict] — think_tool log
-st.session_state.setdefault("ds_sequential_thinking_log", [])  # list[dict] — sequential_thinking log
 st.session_state.setdefault("ds_active_run_id", None)    # str | None
 
 
@@ -861,7 +860,7 @@ def render_evidence_panel_expander_in(
 
     with container:
         with st.expander("📚 證據 / 檢索 / 來源", expanded=expanded):
-            tab_sources, tab_evidence, tab_search, tab_think, tab_seq_think = st.tabs(["Sources", "Evidence", "Search", "Think", "Thoughts"])
+            tab_sources, tab_evidence, tab_search, tab_think = st.tabs(["Sources", "Evidence", "Search", "Think"])
 
             # -------------------------
             # Sources（維持你原本風格）
@@ -1050,38 +1049,6 @@ def render_evidence_panel_expander_in(
                             if hint:
                                 st.markdown("---")
                                 st.warning(hint, icon="⚠️")
-
-            # -------------------------
-            # Thoughts（sequential_thinking log）
-            # -------------------------
-            with tab_seq_think:
-                seq_log = st.session_state.get("ds_sequential_thinking_log") or []
-                run_seq = [x for x in seq_log if x.get("run_id") == run_id]
-                if not run_seq:
-                    st.markdown(":small[:gray[（本回合 sequential_thinking 未被呼叫）]]")
-                else:
-                    total_steps = max((x.get("totalThoughts", 0) for x in run_seq), default=0)
-                    st.markdown(f"**逐步推理 {len(run_seq)} 步**（預估總步數：{total_steps}）")
-                    for rec in run_seq:
-                        n           = rec.get("thoughtNumber", "?")
-                        total       = rec.get("totalThoughts", "?")
-                        thought_txt = (rec.get("thought") or "").strip()
-                        is_rev      = rec.get("isRevision", False)
-                        revises     = rec.get("revisesThought")
-                        branch_from = rec.get("branchFromThought")
-                        branch_id   = (rec.get("branchId") or "").strip()
-                        next_needed = rec.get("nextThoughtNeeded", True)
-
-                        label = f"第 {n}/{total} 步"
-                        if is_rev and revises:
-                            label += f" ↩ 修正第 {revises} 步"
-                        elif branch_from and branch_id:
-                            label += f" 🌿 {branch_id}"
-                        if not next_needed:
-                            label += " 🏁"
-
-                        with st.expander(label, expanded=False):
-                            st.markdown(thought_txt or ":small[:gray[（空）]]")
 
 
 # 用於剝除 chat_history 裡 <!-- tools:... --> 標記（只影響顯示，儲存內容不變）
@@ -1723,69 +1690,6 @@ CHECK_SOURCE_FRAMEWORK_TOOL = {
     },
 }
 
-SEQUENTIAL_THINKING_TOOL = {
-    "type": "function",
-    "name": "sequential_thinking",
-    "description": (
-        "【必須最先呼叫】回答任何問題的第一步：規劃如何回答。\n"
-        "在呼叫任何其他工具（搜尋、文件、網頁）之前，必須先用此工具思考清楚：\n"
-        "- 這個問題在問什麼？核心需求是什麼？\n"
-        "- 需要哪些資訊才能回答？哪些我已知，哪些需要查？\n"
-        "- 應該用哪些工具？順序為何？\n"
-        "- 回答的結構與深度應該是什麼樣子？\n"
-        "\n"
-        "規劃完成後（nextThoughtNeeded=false），才開始呼叫其他工具或直接作答。\n"
-        "\n"
-        "【進階功能】\n"
-        "- 可用 isRevision=true + revisesThought 修正先前某步驟的推理\n"
-        "- 可用 branchFromThought + branchId 開啟不同解法的平行探索\n"
-        "- totalThoughts 是預估，可隨推理進展調整\n"
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "thought": {
-                "type": "string",
-                "description": "此步驟的完整推理內容",
-            },
-            "thoughtNumber": {
-                "type": "integer",
-                "description": "目前是第幾步（從 1 開始）",
-            },
-            "totalThoughts": {
-                "type": "integer",
-                "description": "預估總步驟數（可在推理過程中調整）",
-            },
-            "nextThoughtNeeded": {
-                "type": "boolean",
-                "description": "是否還需要繼續推理步驟（false 表示推理完成，準備作答）",
-            },
-            "isRevision": {
-                "type": "boolean",
-                "description": "此步驟是否在修正先前某步驟的推理",
-            },
-            "revisesThought": {
-                "type": "integer",
-                "description": "若 isRevision=true，指出正在修正第幾步",
-            },
-            "branchFromThought": {
-                "type": "integer",
-                "description": "若要開啟新探索分支，指出分叉自第幾步",
-            },
-            "branchId": {
-                "type": "string",
-                "description": "分支識別碼（例如 'option-A'、'path-2'）",
-            },
-            "needsMoreThoughts": {
-                "type": "boolean",
-                "description": "若推理中發現問題比預期複雜，設為 true 以提示自己增加 totalThoughts",
-            },
-        },
-        "required": ["thought", "thoughtNumber", "totalThoughts", "nextThoughtNeeded"],
-        "additionalProperties": False,
-    },
-}
-
 FETCH_WEBPAGE_TOOL = {
     "type": "function",
     "name": "fetch_webpage",
@@ -1879,6 +1783,7 @@ def run_general_with_webpage_tool(
     doc_fulltext_token_budget_hint: int = 20000,
     status=None,  # Streamlit st.status 物件，None 時靜默（向後相容）
     use_kb: bool = True,  # False 時完全移除 knowledge_search（使用者明確限制只看上傳文件）
+    gif_ph=None,  # Streamlit empty placeholder，用於工具動作點切換 GIF；None 時靜默
 ):
     """
     General 分支 runner：
@@ -1900,8 +1805,16 @@ def run_general_with_webpage_tool(
         if status is not None:
             status.write(summary)
 
+    def _gif(path: str):
+        """切換 GIF 動畫（General mode 工具動作點）；gif_ph=None 時靜默。"""
+        if gif_ph is not None:
+            try:
+                gif_ph.image(path)
+            except Exception:
+                pass
+
     tools = [DOC_LIST_TOOL, DOC_SEARCH_TOOL, DOC_GET_FULLTEXT_TOOL, FETCH_WEBPAGE_TOOL, THINK_TOOL,
-             CRITIQUE_ANALYSIS_TOOL, CHECK_SOURCE_FRAMEWORK_TOOL, SEQUENTIAL_THINKING_TOOL]
+             CRITIQUE_ANALYSIS_TOOL, CHECK_SOURCE_FRAMEWORK_TOOL]
     if use_kb and HAS_KB and KNOWLEDGE_SEARCH_TOOL:
         tools.append(KNOWLEDGE_SEARCH_TOOL)
     if need_web:
@@ -2046,6 +1959,7 @@ def run_general_with_webpage_tool(
 
                 if name == "fetch_webpage":
                     meta["tool_step"] += 1
+                    _gif("anime/anya-starstruck-in-awe.gif")
                     url = forced_url or args.get("url")
                     _status(
                         f"[{meta['tool_step']}] 🌐 安妮亞去把那個網頁讀過來！→ {(url or '')[:60]}{'...' if len(url or '') > 60 else ''}",
@@ -2077,6 +1991,7 @@ def run_general_with_webpage_tool(
                     meta["doc_calls"] += 1
                     meta["db_used"] = True
                     q = (args.get("query") or "").strip()
+                    _gif("anime/anya-peeking-over-car-window.gif")
                     _status(f"[{meta['tool_step']}] 🔎 安妮亞去找找你上傳的文件！（{q}）", write=f"🔎 安妮亞找文件：{q}")
                     k = int(args.get("k", 8))
                     diff = str(args.get("difficulty", "medium") or "medium")
@@ -2110,6 +2025,7 @@ def run_general_with_webpage_tool(
                     meta["db_used"] = True
 
                     title = (args.get("title") or "").strip()
+                    _gif("anime/anya-cheerfully-writing.gif")
                     _status(f"[{meta['tool_step']}] 📄 安妮亞把整份文件都讀一遍！（{title}）", write=f"📄 安妮亞讀全文：{title}")
                     asked_budget = int(args.get("token_budget", 20000))
 
@@ -2135,6 +2051,7 @@ def run_general_with_webpage_tool(
                     meta["doc_calls"] += 1
                     meta["db_used"] = True
                     q = (args.get("query") or "").strip()
+                    _gif("anime/anya-peeking-over-car-window.gif")
                     _status(f"[{meta['tool_step']}] 📚 安妮亞去知識庫找找看！（{q}）", write=f"📚 安妮亞查知識庫：{q}")
                     k = int(args.get("top_k", 8))
                     t0 = time.time()
@@ -2156,6 +2073,7 @@ def run_general_with_webpage_tool(
                         pass
 
                 elif name == "think":
+                    _gif("anime/anya-smug-scheming.gif")
                     thought      = args.get("reflection", "")
                     key_finding  = (args.get("key_finding") or "").strip()
                     next_action  = (args.get("next_action") or "繼續搜尋").strip()
@@ -2243,6 +2161,7 @@ def run_general_with_webpage_tool(
 
                 elif name == "critique_analysis":
                     meta["tool_step"] += 1
+                    _gif("anime/anya-judging.gif")
                     report_draft = args.get("report_draft", "")
                     _status(
                         f"[{meta['tool_step']}] 🔍 安妮亞在做批判性分析…",
@@ -2294,6 +2213,7 @@ def run_general_with_webpage_tool(
 
                 elif name == "check_source_framework":
                     meta["tool_step"] += 1
+                    _gif("anime/anya-judging.gif")
                     source_desc = (args.get("source_description") or "").strip()
                     _status(
                         f"[{meta['tool_step']}] 🔬 安妮亞審查方法論透明度…",
@@ -2314,55 +2234,6 @@ def run_general_with_webpage_tool(
                         output = f"方法論審查失敗：{_se}"
                         _step_done(f"❌ 方法論審查失敗：{_se}")
 
-                elif name == "sequential_thinking":
-                    thought_num = int(args.get("thoughtNumber", 1))
-                    total       = int(args.get("totalThoughts", 1))
-                    thought_txt = args.get("thought", "")
-                    next_needed = bool(args.get("nextThoughtNeeded", True))
-                    is_rev      = bool(args.get("isRevision", False))
-                    revises     = args.get("revisesThought")
-                    branch_from = args.get("branchFromThought")
-                    branch_id   = (args.get("branchId") or "").strip()
-
-                    step_tag = f"第 {thought_num}/{total} 步"
-                    if is_rev and revises:
-                        step_tag += f" ↩ 修正第 {revises} 步"
-                    elif branch_from and branch_id:
-                        step_tag += f" 🌿 {branch_id}"
-
-                    # 取思考內容的第一個非空行作為即時預覽
-                    _first_line = next(
-                        (ln.strip() for ln in thought_txt.splitlines() if ln.strip()),
-                        ""
-                    )
-                    _preview = (_first_line[:120] + "…") if len(_first_line) > 120 else _first_line
-
-                    _status(
-                        f"🧠 安妮亞在推理… {step_tag}",
-                        write=f"🧠 **{step_tag}**" + ("　🏁 規劃完成" if not next_needed else ""),
-                    )
-                    if _preview:
-                        _step_done(f"　　{_preview}")
-
-                    run_id_now = st.session_state.get("ds_active_run_id")
-                    st.session_state.ds_sequential_thinking_log.append({
-                        "run_id":           run_id_now,
-                        "thoughtNumber":    thought_num,
-                        "totalThoughts":    total,
-                        "thought":          thought_txt,
-                        "nextThoughtNeeded": next_needed,
-                        "isRevision":       is_rev,
-                        "revisesThought":   revises,
-                        "branchFromThought": branch_from,
-                        "branchId":         branch_id,
-                    })
-                    output = {
-                        "thoughtNumber":    thought_num,
-                        "totalThoughts":    total,
-                        "nextThoughtNeeded": next_needed,
-                        "status":           "思考中，請繼續" if next_needed else "推理完成，請作答",
-                    }
-
                 else:
                     output = {"error": f"Unknown function: {name}"}
 
@@ -2370,6 +2241,7 @@ def run_general_with_webpage_tool(
                 # ── 工具執行過程中的非預期例外：記錄到 output，讓 loop 繼續 ──
                 _tool_err_msg = f"工具 {name!r} 執行失敗：{_tool_exc}"
                 output = {"error": _tool_err_msg}
+                _gif("anime/anya-face-down-defeated.gif")
                 _step_done(f"⚠️ {_tool_err_msg}")
 
             # ── 安全 append：json.dumps 失敗也不會中斷 loop ──
@@ -3531,7 +3403,6 @@ with st.popover("📚 引用資料夾"):
         st.session_state.ds_doc_search_log = []
         st.session_state.ds_web_search_log = []
         st.session_state.ds_think_log = []
-        st.session_state.ds_sequential_thinking_log = []
         st.session_state.ds_active_run_id = None
         st.rerun()
 
@@ -3622,21 +3493,6 @@ def _build_general_instructions() -> str:
         "- web_search 已使用 ≥ 10 次 → 停止搜尋，以現有資料作答\n"
         "- 連續兩次搜尋結果高度重疊\n"
     )
-    SEQUENTIAL_THINKING_RULES = (
-        "\n\n"
-        "【sequential_thinking 工具使用規則（強制）】\n"
-        "收到任何問題後，第一個工具呼叫永遠是 sequential_thinking，無例外。\n"
-        "用途：規劃如何回答這個問題，而不是直接開始搜尋或回答。\n"
-        "規劃內容至少涵蓋：\n"
-        "1. 問題核心：使用者真正想知道的是什麼？\n"
-        "2. 資訊盤點：哪些我已知可以直接回答？哪些需要查（文件/網路/知識庫）？\n"
-        "3. 工具規劃：依序要呼叫哪些工具？每個工具的查詢目的是什麼？\n"
-        "4. 回答架構：最終回答的結構與深度應該是什麼樣子？\n"
-        "\n"
-        "規劃步驟可以是多步（nextThoughtNeeded=true 時繼續規劃），"
-        "確認規劃完整後才設 nextThoughtNeeded=false，然後開始執行。\n"
-        "唯一例外：若問題是純粹的簡單確認（是/否、單一數字查詢），可省略。\n"
-    )
     CRITIQUE_RULES = (
         "\n\n"
         "【批判分析工具使用規則（自主判斷）】\n"
@@ -3651,7 +3507,7 @@ def _build_general_instructions() -> str:
         "呼叫 check_source_framework 審查方法論透明度。\n"
         "不適用：閒聊、純問答、純摘要（整理重點但無論點結論）、翻譯、程式碼任務。\n"
     )
-    return ANYA_SYSTEM_PROMPT + SEQUENTIAL_THINKING_RULES + DOCSTORE_RULES + THINK_TOOL_RULES + CRITIQUE_RULES
+    return ANYA_SYSTEM_PROMPT + DOCSTORE_RULES + THINK_TOOL_RULES + CRITIQUE_RULES
 
 
 # === 7. 顯示歷史 ===
@@ -3945,7 +3801,6 @@ if prompt is not None:
                         st.session_state.ds_doc_search_log = []
                         st.session_state.ds_web_search_log = []
                         st.session_state.ds_think_log = []
-                        st.session_state.ds_sequential_thinking_log = []
 
                         # ✅ 改成：用 status_area（或直接 st.container）建立 placeholders
                         evidence_panel_ph = status_area.empty()
@@ -3994,7 +3849,9 @@ if prompt is not None:
                         gif_in_status_ph = status.empty()
                         if effective_need_web:
                             gif_in_status_ph.image("lord-anya.gif")
-                            
+                        else:
+                            gif_in_status_ph.image("anime/anya-excited-sparkling-eyes.gif")
+
                         # ✅ 使用 tool-calling 迴圈（含 fetch_webpage + doc tools）
                         resp, meta = run_general_with_webpage_tool(
                             client=client,
@@ -4007,9 +3864,10 @@ if prompt is not None:
                             doc_fulltext_token_budget_hint=doc_fulltext_budget_hint,
                             status=status,
                             use_kb=use_kb,
+                            gif_ph=gif_in_status_ph,
                         )
 
-                        gif_in_status_ph.empty()   # ✅ 搜尋完成，移除 gif
+                        gif_in_status_ph.empty()   # ✅ 完成，移除 gif
                         
                         # ✅ 更新 badges（放最上面）
                         badges_ph.markdown(
