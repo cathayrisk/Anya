@@ -20,6 +20,9 @@ from urllib.parse import urlparse
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+# Home.py 頂部加入
+import nest_asyncio
+nest_asyncio.apply()
 
 # ====== Agents SDK（Router / Planner / Search / Fast）======
 from agents import (
