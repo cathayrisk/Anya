@@ -44,5 +44,5 @@ weight = 700
 [server]
 maxUploadSize = 300
 enableStaticServing = true
-enableXsrfProtection = false
+enableXsrfProtection = true
 #enableCORS = false
