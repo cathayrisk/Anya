@@ -1864,7 +1864,7 @@ def run_general_with_webpage_tool(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=False,
-            text={"verbosity": "medium"},
+            text={"verbosity": "high"},
             include=["web_search_call.action.sources"] if need_web else [],
             timeout=180,   # 防止 Streamlit Cloud 靜默斷線
         )
@@ -1909,6 +1909,9 @@ def run_general_with_webpage_tool(
         except Exception:
             pass
 
+        # ── Phase 保護：將 SDK 原始 output items 直接 append 回 input，
+        #    確保 reasoning / preamble / final_answer 的 `phase` 欄位被保留。
+        #    GPT-5.5+ 要求 manual replay 時 phase 不能丟失；不要在這裡攤平 / 篩欄位。
         if getattr(resp, "output", None):
             running_input += resp.output
 
@@ -2173,7 +2176,7 @@ def run_general_with_webpage_tool(
                     report_draft = args.get("report_draft", "")
                     _status(
                         f"[{meta['tool_step']}] 🔍 安妮亞在做批判性分析…",
-                        write="🔍 四維度缺口驗證中…",
+                        write="🔍 五維度缺口驗證中…",
                     )
                     try:
                         from cowork.critic_pipeline import (
@@ -2190,7 +2193,7 @@ def run_general_with_webpage_tool(
                         critic_result = pipeline_fn(report_draft)
                         _elapsed = time.time() - t0
                         if critic_result.passed:
-                            output = f"✅ 四維度驗證通過（整體評分：{critic_result.score}/10）"
+                            output = f"✅ 五維度驗證通過（整體評分：{critic_result.score}/10）"
                             _step_done(
                                 f"✅ 批判分析通過 — 整體評分：{critic_result.score}/10 ⏱ {_elapsed:.1f}s"
                             )
@@ -3511,8 +3514,11 @@ def _build_general_instructions() -> str:
         "- 投資建議或策略分析（「超配」「低配」「目標價」「投資委員會」「買入/賣出評級」）\n"
         "critique_analysis 評分 ≥ 8 → 直接輸出；"
         "< 8 → 將缺口以流暢敘事自然補入最終回覆（不需逐條標注「補充」）。\n"
+        "【停止條件】critique_analysis 每回合最多呼叫 1 次。"
+        "即使首次評分 < 8，補完缺口後直接輸出最終答案，"
+        "不要為了拉高分數再次呼叫驗證；反覆驗證會降低回應效率且不會改善品質。\n"
         "若來源中有「內部模型」「第三方指數」「專有框架」且未說明計算方式，"
-        "呼叫 check_source_framework 審查方法論透明度。\n"
+        "呼叫 check_source_framework 審查方法論透明度（同樣每回合最多 1 次）。\n"
         "不適用：閒聊、純問答、純摘要（整理重點但無論點結論）、翻譯、程式碼任務。\n"
     )
     return ANYA_SYSTEM_PROMPT + DOCSTORE_RULES + THINK_TOOL_RULES + CRITIQUE_RULES
