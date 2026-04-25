@@ -1864,7 +1864,7 @@ def run_general_with_webpage_tool(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=False,
-            text={"verbosity": "high"},
+            text={"verbosity": "medium"},
             include=["web_search_call.action.sources"] if need_web else [],
             timeout=180,   # 防止 Streamlit Cloud 靜默斷線
         )
@@ -1951,7 +1951,7 @@ def run_general_with_webpage_tool(
                     ),
                     tools=[],
                     parallel_tool_calls=False,
-                    text={"verbosity": "high"},
+                    text={"verbosity": "medium"},
                     timeout=120,
                 )
                 return _synthesis_resp, meta
