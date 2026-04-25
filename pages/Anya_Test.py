@@ -20,6 +20,9 @@ from urllib.parse import urlparse
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+# Home.py 頂部加入
+import nest_asyncio
+nest_asyncio.apply()
 
 # ====== Agents SDK（Router / Planner / Search / Fast）======
 from agents import (
@@ -133,7 +136,12 @@ def get_today_str() -> str:
     return f"{now.strftime('%a %b')} {day}, {now.strftime('%Y')}"
 
 def build_today_line() -> str:
-    return f"Today's date is {get_today_str()}."
+    return (
+        f"User is in Taiwan (timezone: UTC+8, Asia/Taipei). "
+        f"Today is {get_today_str()} in Taipei local time. "
+        f"When the user mentions time without timezone, assume Taipei local time; "
+        f"convert UTC values to UTC+8 when reporting time-sensitive information."
+    )
 
 def build_today_system_message():
     """
@@ -1856,7 +1864,7 @@ def run_general_with_webpage_tool(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=False,
-            text={"verbosity": "high"},
+            text={"verbosity": "medium"},
             include=["web_search_call.action.sources"] if need_web else [],
             timeout=180,   # 防止 Streamlit Cloud 靜默斷線
         )
@@ -2570,7 +2578,7 @@ FastAgent 的簡潔度與長度規則
 
 fast_agent = Agent(
     name="FastAgent",
-    model="gpt-5.4",
+    model="gpt-5.2",
     instructions=FAST_AGENT_PROMPT,
     tools=[WebSearchTool()],
     model_settings=ModelSettings(
@@ -3825,7 +3833,7 @@ if prompt is not None:
                             with status_area:
                                 st.info("💡 本回合沒有文件庫，安妮亞會透過網路搜尋來回答。", icon="🌐")
                     
-                        # ✅ Full-doc 動態 token budget（gpt-5.4 支援 1M，保守設 256K 避免超量計費）
+                        # ✅ Full-doc 動態 token budget（gpt-5.5 支援 1M，保守設 256K 避免超量計費）
                         MAX_CONTEXT_TOKENS = 256_000
                         OUTPUT_BUDGET = 3_000
                         SAFETY_MARGIN = 4_000
@@ -3837,7 +3845,7 @@ if prompt is not None:
                         doc_fulltext_budget = MAX_CONTEXT_TOKENS - OUTPUT_BUDGET - SAFETY_MARGIN - base_tokens
                         doc_fulltext_budget = max(0, int(doc_fulltext_budget))
                     
-                        # ✅ 額外硬 cap（gpt-5.4 放寬至 120K，避免過大導致延遲）
+                        # ✅ 額外硬 cap（gpt-5.5 放寬至 120K，避免過大導致延遲）
                         doc_fulltext_budget_hint = max(0, min(doc_fulltext_budget, 120_000))
                     
                         # ✅ 在 instructions 補規則（由模組層輔助函式產生，避免重複）
@@ -3857,7 +3865,7 @@ if prompt is not None:
                             client=client,
                             trimmed_messages=trimmed_messages_with_today,
                             instructions=effective_instructions,
-                            model="gpt-5.4",
+                            model="gpt-5.5",
                             reasoning_effort=reasoning_effort,
                             need_web=effective_need_web,
                             forced_url=url_in_text,
@@ -4234,7 +4242,7 @@ if prompt is not None:
                                 client=client,
                                 trimmed_messages=trimmed_messages,
                                 instructions=ANYA_SYSTEM_PROMPT,
-                                model="gpt-5.4",
+                                model="gpt-5.5",
                                 reasoning_effort="medium",
                                 need_web=effective_need_web,
                                 forced_url=url_in_text,
@@ -4289,4 +4297,3 @@ if prompt is not None:
             # 頁面頂層寫出 traceback，確保使用者看得到
             st.error(_err_msg)
             st.code(_err_trace)
-
