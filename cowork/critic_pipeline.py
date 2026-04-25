@@ -1,9 +1,9 @@
 """
-critic_pipeline.py — 四維度批判分析管道
+critic_pipeline.py — 五維度批判分析管道
 
 純 Python 模組，不依賴 Streamlit。
 由 Home.py 的 critique_analysis / check_source_framework 工具呼叫。
-使用 Responses API（支援 gpt-5.2）。
+使用 Responses API（gpt-5.5）。
 """
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ except ImportError:
     def is_finance_context(text: str) -> bool:  # noqa: E302
         return False
 
-# ── 四維度批判 Prompt ──────────────────────────────────────────────────────────
+# ── 五維度批判 Prompt ──────────────────────────────────────────────────────────
 _CRITIC_PROMPT = """\
 你是一位分析型報告的缺口驗證代理人（Gap Verification Agent）。
 任務：用結構化規則檢查「這份報告的結論能不能被相信」，而不是評判「報告寫得好不好」。
 
-## 驗證規則（四條）
+## 驗證規則（五條）
 
 規則 1【批判性視角】：每個主要論點必須有反向論證
   → 缺失條件：只說 X 為真，沒有說明什麼情況下 X 不成立
@@ -45,6 +45,14 @@ _CRITIC_PROMPT = """\
   → 觸發詞：情緒指數、市場信心、預測模型、評分、看多、看空
   → 缺失條件：只有單一方向解讀
   → 缺口類型：反向解讀缺口
+
+規則 5【論證邏輯有效性】：每個結論的推理鏈必須能從前提合法推導
+  → 缺失條件 A：前提到結論存在邏輯跳躍（中間步驟省略，例如 A→C 但沒說明 B）
+  → 缺失條件 B：使用無效推理形式（肯定後件、否定前件、循環論證、虛假兩難、滑坡謬誤、訴諸權威/人身、以偏概全、相關當因果）
+  → 缺失條件 C：報告內部自相矛盾（前段陳述 X、後段陳述非 X；或同一指標前後給出不一致的數字、方向、結論）
+  → 追問方向：這個推理是否經得起反例？前後段的主張是否互相支援還是互相打架？
+  → 缺口類型：論證邏輯缺口
+  → 影響等級提示：規則 5 的缺口通常為**高影響**（邏輯不成立 → 結論方向可能反轉）
 
 ## 輸出格式（嚴格遵守）
 
@@ -101,8 +109,8 @@ class CriticResult:
 
 
 # ── 核心函式 ──────────────────────────────────────────────────────────────────
-def run_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> CriticResult:
-    """四維度批判分析，回傳結構化結果。使用 Responses API。"""
+def run_critic_pipeline(report_text: str, model: str = "gpt-5.5") -> CriticResult:
+    """五維度批判分析，回傳結構化結果。使用 Responses API。"""
     from openai import OpenAI
     client = OpenAI()  # key 由 os.environ["OPENAI_API_KEY"] 提供
 
@@ -110,6 +118,8 @@ def run_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> CriticResul
         model=model,
         instructions=_CRITIC_PROMPT,
         input=report_text,
+        reasoning={"effort": "medium"},
+        text={"verbosity": "low"},
     )
     raw = response.output_text or ""
     score = _parse_score(raw)
@@ -117,8 +127,8 @@ def run_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> CriticResul
     return CriticResult(score=score, raw_output=raw, passed=passed)
 
 
-def run_finance_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> CriticResult:
-    """四維度批判分析 + 金融領域三條補充規則（規則 5/6/7）。
+def run_finance_critic_pipeline(report_text: str, model: str = "gpt-5.5") -> CriticResult:
+    """五維度批判分析 + 金融領域三條補充規則（規則 6/7/8）。
     適用於涉及估值、財務報表、賣方研究、總經指標的報告。"""
     from openai import OpenAI
     client = OpenAI()
@@ -128,6 +138,8 @@ def run_finance_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> Cri
         model=model,
         instructions=combined_instructions,
         input=report_text,
+        reasoning={"effort": "medium"},
+        text={"verbosity": "low"},
     )
     raw = response.output_text or ""
     score = _parse_score(raw)
@@ -135,7 +147,7 @@ def run_finance_critic_pipeline(report_text: str, model: str = "gpt-5.2") -> Cri
     return CriticResult(score=score, raw_output=raw, passed=passed)
 
 
-def check_source_framework(source_description: str, model: str = "gpt-5.2") -> str:
+def check_source_framework(source_description: str, model: str = "gpt-5.5") -> str:
     """針對單一來源或框架的方法論透明度審查，回傳評估文字。"""
     from openai import OpenAI
     client = OpenAI()
@@ -144,6 +156,8 @@ def check_source_framework(source_description: str, model: str = "gpt-5.2") -> s
         model=model,
         instructions=_SOURCE_FRAMEWORK_PROMPT,
         input=source_description,
+        reasoning={"effort": "low"},
+        text={"verbosity": "low"},
     )
     return response.output_text or ""
 
