@@ -2396,11 +2396,6 @@ Developer: # Agentic Reminders
 - 不提供可能造成傷害或違法的具體操作步驟。
 - 關鍵資訊不足時：只問 1–3 題最必要問題；或用【假設】條件式回答（避免亂猜）。
 
-✅ **長輸入處理（FastAgent）**
-若輸入很長（如 >1500 字或多段文章/逐字稿/長對話）：
-- 先問一句「要全做還是先做前 N 段/重點？」
-- 或先交付最小可用版本：TL;DR + 3–7 點重點（再依回覆繼續）。
-
 ✅ **跨輪一致性自檢（每次輸出前必做、無需工具）**
 輸出最終回答前，先對照 chat_history 與本輪需求，做三件事檢查：
 1. **延伸推薦類檢查**：若使用者用「備選／再挑／其他選項／換一個／再推一個」延伸上一輪推薦，
@@ -2418,6 +2413,11 @@ Developer: # Agentic Reminders
    推薦項目與其分類標籤對齊（標「酸款」就要真的偏酸；標「茶香型」就不能是純果汁感）。
 任一條不通過 → 重寫該段才能輸出，不要把已知有問題的回答原樣交出去。
 若你發現自己即將違反 1、2、3 任一條，必須在輸出前自行修正。
+
+✅ **長輸入處理（FastAgent）**
+若輸入很長（如 >1500 字或多段文章/逐字稿/長對話）：
+- 先問一句「要全做還是先做前 N 段/重點？」
+- 或先交付最小可用版本：TL;DR + 3–7 點重點（再依回覆繼續）。
 
 ✅ **翻譯任務的 TL;DR**
 只要本次任務屬於「翻譯」或「把一段外語內容翻成中文」（含新聞、公告、貼文、訪談），你必須在回覆最前面先輸出 1 行 TL;DR（先不要逐句翻譯）。
@@ -3579,17 +3579,20 @@ def call_fast_agent_once(query: str) -> str:
 async def fast_agent_stream(query: str, placeholder):
     """
     ✅ 真串流：一邊收到 token，一邊更新 Streamlit placeholder
-    ✅ best-effort：統計 WebSearchTool 是否有被呼叫（用於 badges）
+    ✅ 穩健計數：透過多策略 + call_id 去重，正確統計 WebSearchTool 呼叫次數
+    ✅ DEV_MODE 診斷：?dev=1 時，把 SDK emit 的 event 結構寫進 session_state
     回傳：(final_text, meta)
       meta = {"web_calls": int, "web_used": bool}
     """
     buf = ""
     meta = {"web_calls": 0, "web_used": False}
+    seen_call_ids: set = set()   # 用 call_id 去重，避免同一次呼叫的多個生命週期事件重複計數
+    debug_log = [] if DEV_MODE else None
 
     result = Runner.run_streamed(fast_agent, input=query)
 
     async for event in result.stream_events():
-        # 1) token delta
+        # 1) token delta（既有，不變）
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             delta = event.data.delta or ""
             if not delta:
@@ -3598,24 +3601,72 @@ async def fast_agent_stream(query: str, placeholder):
             placeholder.markdown(buf)
             continue
 
-        # 2) best-effort tool call counting（Agents SDK 不同版本事件名稱可能不同）
-        try:
-            et = str(getattr(event, "type", "") or "")
-            if "tool" in et.lower() or "web" in et.lower():
-                meta["web_calls"] += 1
-                meta["web_used"] = True
-        except Exception:
-            pass
+        # 2) Web search 偵測（多策略，先識別後去重再計數）
+        web_call_id = None
 
-        # 3) 再保守一點：看 event.data 裡是否有 tool_name / name
-        try:
+        # 策略 A：raw_response_event 內的 output_item 帶 web_search_call
+        # 這是 Responses API 串流時新增 hosted tool call 的標準路徑
+        if event.type == "raw_response_event":
+            data = event.data
+            item = getattr(data, "item", None)
+            if item is not None and getattr(item, "type", "") == "web_search_call":
+                web_call_id = getattr(item, "id", None) or f"item_{id(item)}"
+
+        # 策略 B：Agents SDK 高階 tool 事件（精確比對，避免亂抓）
+        if web_call_id is None:
+            et = str(getattr(event, "type", "") or "")
+            if et in {"tool_called", "tool_call_started", "tool_call", "agent_tool_call"}:
+                data = getattr(event, "data", None)
+                tool_name = (
+                    getattr(event, "name", None)
+                    or getattr(data, "name", None)
+                    or getattr(data, "tool_name", None)
+                )
+                if isinstance(tool_name, str) and (
+                    "web_search" in tool_name.lower() or "websearch" in tool_name.lower()
+                ):
+                    web_call_id = (
+                        getattr(event, "call_id", None)
+                        or getattr(data, "call_id", None)
+                        or f"event_{id(event)}"
+                    )
+
+        # 策略 C：data 直接帶 name=web_search（保險網）
+        if web_call_id is None:
             data = getattr(event, "data", None)
             tool_name = getattr(data, "name", None) or getattr(data, "tool_name", None)
-            if isinstance(tool_name, str) and tool_name:
-                meta["web_calls"] += 1
-                meta["web_used"] = True
-        except Exception:
-            pass
+            if isinstance(tool_name, str) and (
+                "web_search" in tool_name.lower() or "websearch" in tool_name.lower()
+            ):
+                web_call_id = (
+                    getattr(data, "call_id", None) or getattr(data, "id", None) or f"data_{id(data)}"
+                )
+
+        # 去重後計數
+        if web_call_id is not None and web_call_id not in seen_call_ids:
+            seen_call_ids.add(web_call_id)
+            meta["web_calls"] += 1
+            meta["web_used"] = True
+
+        # 3) DEV_MODE 診斷收集（不影響正式行為）
+        if debug_log is not None:
+            try:
+                data = getattr(event, "data", None)
+                item = getattr(data, "item", None) if data is not None else None
+                debug_log.append({
+                    "event_type": str(getattr(event, "type", None)),
+                    "data_class": type(data).__name__ if data is not None else None,
+                    "item_type": str(getattr(item, "type", None)) if item is not None else None,
+                    "data_name": str(
+                        getattr(data, "name", None) or getattr(data, "tool_name", None) or ""
+                    ) or None,
+                    "matched_web": web_call_id is not None,
+                })
+            except Exception:
+                pass
+
+    if debug_log is not None:
+        st.session_state["_fast_agent_debug_events"] = debug_log
 
     clean_buf = strip_inline_web_citations(buf)
     if clean_buf != buf:
@@ -3780,7 +3831,28 @@ if prompt is not None:
                                 web_calls=int(fast_meta.get("web_calls") or 0),
                             )
                         )
-                    
+
+                        # DEV_MODE 診斷：顯示 SDK emit 的 event 結構，協助校正計數策略
+                        if DEV_MODE:
+                            _dbg_events = st.session_state.get("_fast_agent_debug_events") or []
+                            with st.expander(
+                                f"🔧 [dev] FastAgent stream events（{len(_dbg_events)} 筆，web_calls={fast_meta.get('web_calls', 0)}）",
+                                expanded=False,
+                            ):
+                                # 只列出非 token-delta 的 event（token delta 量太大）
+                                _interesting = [
+                                    e for e in _dbg_events
+                                    if e.get("data_class") != "ResponseTextDeltaEvent"
+                                ]
+                                st.caption(
+                                    f"全部 {len(_dbg_events)} 筆事件，過濾掉 token delta 後剩 {len(_interesting)} 筆。"
+                                    " 觀察重點：item_type='web_search_call' 或 data_name 含 web_search 即代表搜尋呼叫。"
+                                )
+                                if _interesting:
+                                    st.json(_interesting)
+                                else:
+                                    st.caption("（沒有非 token-delta 事件，代表本輪未呼叫任何工具）")
+
                         with sources_container:
                             if docs_for_history:
                                 st.markdown("**本回合上傳檔案**")
