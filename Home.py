@@ -136,7 +136,12 @@ def get_today_str() -> str:
     return f"{now.strftime('%a %b')} {day}, {now.strftime('%Y')}"
 
 def build_today_line() -> str:
-    return f"Today's date is {get_today_str()}."
+    return (
+        f"User is in Taiwan (timezone: UTC+8, Asia/Taipei). "
+        f"Today is {get_today_str()} in Taipei local time. "
+        f"When the user mentions time without timezone, assume Taipei local time; "
+        f"convert UTC values to UTC+8 when reporting time-sensitive information."
+    )
 
 def build_today_system_message():
     """
@@ -1859,7 +1864,7 @@ def run_general_with_webpage_tool(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=False,
-            text={"verbosity": "high"},
+            text={"verbosity": "medium"},
             include=["web_search_call.action.sources"] if need_web else [],
             timeout=180,   # 防止 Streamlit Cloud 靜默斷線
         )
@@ -1904,6 +1909,9 @@ def run_general_with_webpage_tool(
         except Exception:
             pass
 
+        # ── Phase 保護：將 SDK 原始 output items 直接 append 回 input，
+        #    確保 reasoning / preamble / final_answer 的 `phase` 欄位被保留。
+        #    GPT-5.5+ 要求 manual replay 時 phase 不能丟失；不要在這裡攤平 / 篩欄位。
         if getattr(resp, "output", None):
             running_input += resp.output
 
@@ -1943,7 +1951,7 @@ def run_general_with_webpage_tool(
                     ),
                     tools=[],
                     parallel_tool_calls=False,
-                    text={"verbosity": "high"},
+                    text={"verbosity": "medium"},
                     timeout=120,
                 )
                 return _synthesis_resp, meta
@@ -2168,7 +2176,7 @@ def run_general_with_webpage_tool(
                     report_draft = args.get("report_draft", "")
                     _status(
                         f"[{meta['tool_step']}] 🔍 安妮亞在做批判性分析…",
-                        write="🔍 四維度缺口驗證中…",
+                        write="🔍 五維度缺口驗證中…",
                     )
                     try:
                         from cowork.critic_pipeline import (
@@ -2185,7 +2193,7 @@ def run_general_with_webpage_tool(
                         critic_result = pipeline_fn(report_draft)
                         _elapsed = time.time() - t0
                         if critic_result.passed:
-                            output = f"✅ 四維度驗證通過（整體評分：{critic_result.score}/10）"
+                            output = f"✅ 五維度驗證通過（整體評分：{critic_result.score}/10）"
                             _step_done(
                                 f"✅ 批判分析通過 — 整體評分：{critic_result.score}/10 ⏱ {_elapsed:.1f}s"
                             )
@@ -2388,6 +2396,24 @@ Developer: # Agentic Reminders
 - 不提供可能造成傷害或違法的具體操作步驟。
 - 關鍵資訊不足時：只問 1–3 題最必要問題；或用【假設】條件式回答（避免亂猜）。
 
+✅ **跨輪一致性自檢（每次輸出前必做、無需工具）**
+輸出最終回答前，先對照 chat_history 與本輪需求，做三件事檢查：
+1. **延伸推薦類檢查**：若使用者用「備選／再挑／其他選項／換一個／再推一個」延伸上一輪推薦，
+   上一輪的主推**不能**再次出現在本輪清單；數量也要對齊（承諾「一杯」就一杯，不要自行擴展為兩杯）。
+2. **具體事物強制查證檢查**：若回覆要列出**具體商品名／菜單品項／品牌品項／店家／人名／
+   機構名／法條編號／統計數字／日期**，且本輪你**沒有實際呼叫 web_search**，
+   必須**二擇一（沒有第三選項，不可省略）**：
+   - 選項 A：立即呼叫 web_search 查證後再列。
+   - 選項 B：在清單前加明確聲明「⚠️ 以下基於我的既有印象，未即時查證，可能與實際不符，請以官方為準」，
+     且每個品項後加「（未查證）」標記。
+   ⚠️ 絕對禁止「聽起來合理就直接列」——模型對特定品牌的具體品項（尤其台灣本地品牌、店家菜單）
+   記憶不可靠、幻覺率極高；錯一個品項比答錯主推更傷信任，使用者會花時間去店裡找不存在的東西。
+   即使你「覺得自己知道」也不算數，必須走二擇一流程。
+3. **內部邏輯檢查**：數字計算正確（如降幅、增幅、比率）、前後立場一致、
+   推薦項目與其分類標籤對齊（標「酸款」就要真的偏酸；標「茶香型」就不能是純果汁感）。
+任一條不通過 → 重寫該段才能輸出，不要把已知有問題的回答原樣交出去。
+若你發現自己即將違反 1、2、3 任一條，必須在輸出前自行修正。
+
 ✅ **長輸入處理（FastAgent）**
 若輸入很長（如 >1500 字或多段文章/逐字稿/長對話）：
 - 先問一句「要全做還是先做前 N 段/重點？」
@@ -2565,6 +2591,9 @@ FastAgent 的簡潔度與長度規則
 - 優先序：
   - 先利用你現有的知識與推理能力回答。
   - 只有在你懷疑資訊可能過時，或需要確認簡單事實時，才考慮呼叫 web_search。
+- 【強制查證例外】當問題涉及【具體商品名／菜單／店家／品牌品項／人名／機構名／法條／統計數字】
+  這類「特定事實」時，上面的「先靠自己知識」原則**不適用**，必須走「跨輪一致性自檢」規則 2 的二擇一流程
+  （A：呼叫 web_search 查證；B：明確聲明未查證）。
 - 若未呼叫 web_search：不得輸出任何外部來源段落，也不得假裝已查證。
 </tool_usage_rules>
 
@@ -3506,8 +3535,11 @@ def _build_general_instructions() -> str:
         "- 投資建議或策略分析（「超配」「低配」「目標價」「投資委員會」「買入/賣出評級」）\n"
         "critique_analysis 評分 ≥ 8 → 直接輸出；"
         "< 8 → 將缺口以流暢敘事自然補入最終回覆（不需逐條標注「補充」）。\n"
+        "【停止條件】critique_analysis 每回合最多呼叫 1 次。"
+        "即使首次評分 < 8，補完缺口後直接輸出最終答案，"
+        "不要為了拉高分數再次呼叫驗證；反覆驗證會降低回應效率且不會改善品質。\n"
         "若來源中有「內部模型」「第三方指數」「專有框架」且未說明計算方式，"
-        "呼叫 check_source_framework 審查方法論透明度。\n"
+        "呼叫 check_source_framework 審查方法論透明度（同樣每回合最多 1 次）。\n"
         "不適用：閒聊、純問答、純摘要（整理重點但無論點結論）、翻譯、程式碼任務。\n"
     )
     return ANYA_SYSTEM_PROMPT + DOCSTORE_RULES + THINK_TOOL_RULES + CRITIQUE_RULES
@@ -3547,17 +3579,20 @@ def call_fast_agent_once(query: str) -> str:
 async def fast_agent_stream(query: str, placeholder):
     """
     ✅ 真串流：一邊收到 token，一邊更新 Streamlit placeholder
-    ✅ best-effort：統計 WebSearchTool 是否有被呼叫（用於 badges）
+    ✅ 穩健計數：透過多策略 + call_id 去重，正確統計 WebSearchTool 呼叫次數
+    ✅ DEV_MODE 診斷：?dev=1 時，把 SDK emit 的 event 結構寫進 session_state
     回傳：(final_text, meta)
       meta = {"web_calls": int, "web_used": bool}
     """
     buf = ""
     meta = {"web_calls": 0, "web_used": False}
+    seen_call_ids: set = set()   # 用 call_id 去重，避免同一次呼叫的多個生命週期事件重複計數
+    debug_log = [] if DEV_MODE else None
 
     result = Runner.run_streamed(fast_agent, input=query)
 
     async for event in result.stream_events():
-        # 1) token delta
+        # 1) token delta（既有，不變）
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             delta = event.data.delta or ""
             if not delta:
@@ -3566,24 +3601,72 @@ async def fast_agent_stream(query: str, placeholder):
             placeholder.markdown(buf)
             continue
 
-        # 2) best-effort tool call counting（Agents SDK 不同版本事件名稱可能不同）
-        try:
-            et = str(getattr(event, "type", "") or "")
-            if "tool" in et.lower() or "web" in et.lower():
-                meta["web_calls"] += 1
-                meta["web_used"] = True
-        except Exception:
-            pass
+        # 2) Web search 偵測（多策略，先識別後去重再計數）
+        web_call_id = None
 
-        # 3) 再保守一點：看 event.data 裡是否有 tool_name / name
-        try:
+        # 策略 A：raw_response_event 內的 output_item 帶 web_search_call
+        # 這是 Responses API 串流時新增 hosted tool call 的標準路徑
+        if event.type == "raw_response_event":
+            data = event.data
+            item = getattr(data, "item", None)
+            if item is not None and getattr(item, "type", "") == "web_search_call":
+                web_call_id = getattr(item, "id", None) or f"item_{id(item)}"
+
+        # 策略 B：Agents SDK 高階 tool 事件（精確比對，避免亂抓）
+        if web_call_id is None:
+            et = str(getattr(event, "type", "") or "")
+            if et in {"tool_called", "tool_call_started", "tool_call", "agent_tool_call"}:
+                data = getattr(event, "data", None)
+                tool_name = (
+                    getattr(event, "name", None)
+                    or getattr(data, "name", None)
+                    or getattr(data, "tool_name", None)
+                )
+                if isinstance(tool_name, str) and (
+                    "web_search" in tool_name.lower() or "websearch" in tool_name.lower()
+                ):
+                    web_call_id = (
+                        getattr(event, "call_id", None)
+                        or getattr(data, "call_id", None)
+                        or f"event_{id(event)}"
+                    )
+
+        # 策略 C：data 直接帶 name=web_search（保險網）
+        if web_call_id is None:
             data = getattr(event, "data", None)
             tool_name = getattr(data, "name", None) or getattr(data, "tool_name", None)
-            if isinstance(tool_name, str) and tool_name:
-                meta["web_calls"] += 1
-                meta["web_used"] = True
-        except Exception:
-            pass
+            if isinstance(tool_name, str) and (
+                "web_search" in tool_name.lower() or "websearch" in tool_name.lower()
+            ):
+                web_call_id = (
+                    getattr(data, "call_id", None) or getattr(data, "id", None) or f"data_{id(data)}"
+                )
+
+        # 去重後計數
+        if web_call_id is not None and web_call_id not in seen_call_ids:
+            seen_call_ids.add(web_call_id)
+            meta["web_calls"] += 1
+            meta["web_used"] = True
+
+        # 3) DEV_MODE 診斷收集（不影響正式行為）
+        if debug_log is not None:
+            try:
+                data = getattr(event, "data", None)
+                item = getattr(data, "item", None) if data is not None else None
+                debug_log.append({
+                    "event_type": str(getattr(event, "type", None)),
+                    "data_class": type(data).__name__ if data is not None else None,
+                    "item_type": str(getattr(item, "type", None)) if item is not None else None,
+                    "data_name": str(
+                        getattr(data, "name", None) or getattr(data, "tool_name", None) or ""
+                    ) or None,
+                    "matched_web": web_call_id is not None,
+                })
+            except Exception:
+                pass
+
+    if debug_log is not None:
+        st.session_state["_fast_agent_debug_events"] = debug_log
 
     clean_buf = strip_inline_web_citations(buf)
     if clean_buf != buf:
@@ -3748,7 +3831,28 @@ if prompt is not None:
                                 web_calls=int(fast_meta.get("web_calls") or 0),
                             )
                         )
-                    
+
+                        # DEV_MODE 診斷：顯示 SDK emit 的 event 結構，協助校正計數策略
+                        if DEV_MODE:
+                            _dbg_events = st.session_state.get("_fast_agent_debug_events") or []
+                            with st.expander(
+                                f"🔧 [dev] FastAgent stream events（{len(_dbg_events)} 筆，web_calls={fast_meta.get('web_calls', 0)}）",
+                                expanded=False,
+                            ):
+                                # 只列出非 token-delta 的 event（token delta 量太大）
+                                _interesting = [
+                                    e for e in _dbg_events
+                                    if e.get("data_class") != "ResponseTextDeltaEvent"
+                                ]
+                                st.caption(
+                                    f"全部 {len(_dbg_events)} 筆事件，過濾掉 token delta 後剩 {len(_interesting)} 筆。"
+                                    " 觀察重點：item_type='web_search_call' 或 data_name 含 web_search 即代表搜尋呼叫。"
+                                )
+                                if _interesting:
+                                    st.json(_interesting)
+                                else:
+                                    st.caption("（沒有非 token-delta 事件，代表本輪未呼叫任何工具）")
+
                         with sources_container:
                             if docs_for_history:
                                 st.markdown("**本回合上傳檔案**")
@@ -3828,7 +3932,7 @@ if prompt is not None:
                             with status_area:
                                 st.info("💡 本回合沒有文件庫，安妮亞會透過網路搜尋來回答。", icon="🌐")
                     
-                        # ✅ Full-doc 動態 token budget（gpt-5.4 支援 1M，保守設 256K 避免超量計費）
+                        # ✅ Full-doc 動態 token budget（gpt-5.5 支援 1M，保守設 256K 避免超量計費）
                         MAX_CONTEXT_TOKENS = 256_000
                         OUTPUT_BUDGET = 3_000
                         SAFETY_MARGIN = 4_000
@@ -3840,7 +3944,7 @@ if prompt is not None:
                         doc_fulltext_budget = MAX_CONTEXT_TOKENS - OUTPUT_BUDGET - SAFETY_MARGIN - base_tokens
                         doc_fulltext_budget = max(0, int(doc_fulltext_budget))
                     
-                        # ✅ 額外硬 cap（gpt-5.4 放寬至 120K，避免過大導致延遲）
+                        # ✅ 額外硬 cap（gpt-5.5 放寬至 120K，避免過大導致延遲）
                         doc_fulltext_budget_hint = max(0, min(doc_fulltext_budget, 120_000))
                     
                         # ✅ 在 instructions 補規則（由模組層輔助函式產生，避免重複）
@@ -3860,7 +3964,7 @@ if prompt is not None:
                             client=client,
                             trimmed_messages=trimmed_messages_with_today,
                             instructions=effective_instructions,
-                            model="gpt-5.4",
+                            model="gpt-5.5",
                             reasoning_effort=reasoning_effort,
                             need_web=effective_need_web,
                             forced_url=url_in_text,
@@ -4237,7 +4341,7 @@ if prompt is not None:
                                 client=client,
                                 trimmed_messages=trimmed_messages,
                                 instructions=ANYA_SYSTEM_PROMPT,
-                                model="gpt-5.4",
+                                model="gpt-5.5",
                                 reasoning_effort="medium",
                                 need_web=effective_need_web,
                                 forced_url=url_in_text,
