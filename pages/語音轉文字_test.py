@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import math
 import time
 import difflib
 import hashlib
@@ -56,7 +57,8 @@ MODEL_DIARIZE = "gpt-4o-transcribe-diarize"  # 說話人辨識轉錄
 MODEL_MAP    = "gpt-5-mini"               # 分段摘要
 MODEL_REDUCE = "gpt-4.1"                 # 總整/潤飾
 
-MAX_WORKERS = 4  # 平行轉錄最大執行緒數
+MAX_WORKERS = 4      # 平行轉錄最大執行緒數
+DIARIZE_MAX_SEC = 1400  # gpt-4o-transcribe-diarize API 上限（秒）
 
 # 說話者顏色對應（最多支援 8 位說話者）
 SPEAKER_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
@@ -384,16 +386,29 @@ def transcribe_all(
     if use_prompting:
         all_text = ""
         rolling_context = ""
+        failed_indices: List[int] = []
         for i, chunk in enumerate(chunks):
             prompt_parts = [BASE_PROMPT]
             extra = build_prompt(rolling_context, glossary, style_seed, max_chars=800)
             if extra:
                 prompt_parts.append(extra)
             text = _transcribe_chunk(chunk, "\n".join(prompt_parts), use_cache=False)
+            # 首次失敗：等 2 秒後重試一次
+            if not text.strip():
+                time.sleep(2)
+                text = _transcribe_chunk(chunk, "\n".join(prompt_parts), use_cache=False)
+            if not text.strip():
+                failed_indices.append(i + 1)
             all_text += text + "\n"
             rolling_context = (rolling_context + " " + text).strip()[-5000:]
             progress_bar.progress((i + 1) / total)
             container.markdown(f"*{i+1}/{total} 段完成...*\n\n" + all_text)
+        if failed_indices:
+            container.error(
+                f"⛔ 第 {', '.join(map(str, failed_indices))} 段轉錄失敗（重試後仍無法取得內容），"
+                "無法保證逐字稿完整性，已終止後續摘要生成。請重試或縮短音檔。"
+            )
+            st.stop()
         return all_text.strip()
 
     # ── 無 prompt 引導：平行執行，速度提升 3-5x ──
@@ -425,13 +440,14 @@ def transcribe_all(
             except Exception:
                 pass
 
-    # 統計重試後仍失敗的段
+    # 統計重試後仍失敗的段，失敗時終止流程（避免以不完整內容生成摘要）
     still_failed = [i + 1 for i in range(total) if not results.get(i, "").strip()]
     if still_failed:
-        container.warning(
-            f"⚠️ 以下第 {', '.join(map(str, still_failed))} 段轉錄失敗（共 {len(still_failed)}/{total} 段），"
-            "內容可能不完整。摘要將依現有內容生成。"
+        container.error(
+            f"⛔ 以下第 {', '.join(map(str, still_failed))} 段轉錄失敗（共 {len(still_failed)}/{total} 段），"
+            "無法保證逐字稿完整性，已終止後續摘要生成。請重試或縮短音檔。"
         )
+        st.stop()
 
     all_text = "\n".join(results.get(i, "") for i in range(total))
     container.markdown(all_text)
@@ -447,43 +463,18 @@ def _format_speaker_label(raw: str, speaker_map: Dict[str, str]) -> str:
     return speaker_map[raw]
 
 
-def transcribe_diarize(wav_path: str, container, progress_bar) -> Tuple[str, str]:
-    """
-    使用 gpt-4o-transcribe-diarize 進行說話人辨識轉錄。
-    回傳 (diarized_md, plain_text)：
-      - diarized_md：含說話者標籤的 Markdown（供顯示）
-      - plain_text ：純文字（供摘要 pipeline 使用）
-    """
-    container.markdown("*正在送出整段音檔進行說話人辨識，請稍候...*")
-    progress_bar.progress(0.3)
-
-    try:
-        with open(wav_path, "rb") as audio_file:
-            resp = client.audio.transcriptions.create(
-                model=MODEL_DIARIZE,
-                file=audio_file,
-                response_format="diarized_json",
-                chunking_strategy="auto",
-            )
-        progress_bar.progress(1.0)
-    except Exception as e:
-        container.error(f"說話人辨識失敗：{e}")
-        return "", ""
-
-    # 解析回應：嘗試 .utterances，再嘗試 dict 形式
+def _parse_diarize_resp(resp) -> Tuple[str, str]:
+    """回應物件 → (diarized_md, plain_text)，與 speaker_map 無關（每次獨立）。"""
     utterances = getattr(resp, "utterances", None)
     if utterances is None and hasattr(resp, "model_dump"):
         utterances = resp.model_dump().get("utterances") or resp.model_dump().get("segments")
     if utterances is None:
-        # 最後 fallback：整段 text
         plain = getattr(resp, "text", "") or ""
-        container.markdown(plain)
         return plain, plain
 
     speaker_map: Dict[str, str] = {}
     md_lines: List[str] = []
     plain_lines: List[str] = []
-
     for utt in utterances:
         if isinstance(utt, dict):
             raw_speaker = utt.get("speaker", "SPEAKER_00")
@@ -491,16 +482,113 @@ def transcribe_diarize(wav_path: str, container, progress_bar) -> Tuple[str, str
         else:
             raw_speaker = getattr(utt, "speaker", "SPEAKER_00")
             text = getattr(utt, "text", "").strip()
-
         if not text:
             continue
         label = _format_speaker_label(raw_speaker, speaker_map)
         md_lines.append(f"{label}　{text}")
         plain_lines.append(text)
+    return "\n\n".join(md_lines), "\n".join(plain_lines)
 
-    diarized_md = "\n\n".join(md_lines)
-    plain_text = "\n".join(plain_lines)
+
+def _call_diarize_api(tmp_wav_path: str) -> Tuple[str, str]:
+    """對單一 WAV 檔呼叫 diarize API，回傳 (diarized_md, plain_text)。"""
+    with open(tmp_wav_path, "rb") as audio_file:
+        resp = client.audio.transcriptions.create(
+            model=MODEL_DIARIZE,
+            file=audio_file,
+            response_format="diarized_json",
+            chunking_strategy="auto",
+        )
+    return _parse_diarize_resp(resp)
+
+
+def transcribe_diarize(wav_path: str, audio: AudioSegment, container, progress_bar) -> Tuple[str, str]:
+    """
+    說話人辨識轉錄。
+    - 音檔 ≤ DIARIZE_MAX_SEC：單次 API 呼叫。
+    - 音檔 > DIARIZE_MAX_SEC：自動切成 ≤1400 秒的段落分批辨識；
+      各段說話者標籤獨立，不跨段比對，輸出附分段標題。
+    """
+    duration_sec = len(audio) / 1000
+
+    # ── 短音檔：從已前處理的 audio 匯出後送出（確保與長音檔路徑行為一致）──
+    if duration_sec <= DIARIZE_MAX_SEC:
+        container.markdown("*正在送出整段音檔進行說話人辨識，請稍候...*")
+        progress_bar.progress(0.3)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp_path = tmp.name
+                audio.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+            diarized_md, plain_text = _call_diarize_api(tmp_path)
+            progress_bar.progress(1.0)
+        except Exception as e:
+            container.error(f"說話人辨識失敗：{e}")
+            return "", ""
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        container.markdown(diarized_md)
+        return diarized_md, plain_text
+
+    # ── 長音檔：自動分段 ──
+    n_segs = math.ceil(duration_sec / DIARIZE_MAX_SEC)
+    container.info(
+        f"音檔長度 {int(duration_sec // 60)} 分 {int(duration_sec % 60)} 秒，"
+        f"超過模型上限（{DIARIZE_MAX_SEC // 60} 分鐘），"
+        f"自動分成 {n_segs} 段分別辨識。各段說話者標籤獨立，不跨段比對。"
+    )
+
+    all_diarized: List[str] = []
+    all_plain: List[str] = []
+    failed_segs: List[int] = []
+
+    for seg_idx in range(n_segs):
+        start_ms = seg_idx * DIARIZE_MAX_SEC * 1000
+        end_ms = min((seg_idx + 1) * DIARIZE_MAX_SEC * 1000, len(audio))
+        seg = audio[start_ms:end_ms]
+
+        start_min, end_min = int(start_ms / 60000), int(end_ms / 60000)
+        container.markdown(f"*處理第 {seg_idx + 1}/{n_segs} 段（{start_min}–{end_min} 分鐘）...*")
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp_path = tmp.name
+                seg.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+            seg_md, seg_plain = _call_diarize_api(tmp_path)
+            all_diarized.append(
+                f"### 第 {seg_idx + 1} 段（{start_min}–{end_min} 分鐘）\n\n{seg_md}"
+            )
+            all_plain.append(seg_plain)
+        except Exception as e:
+            failed_segs.append(seg_idx + 1)
+            all_diarized.append(f"### 第 {seg_idx + 1} 段（{start_min}–{end_min} 分鐘）\n\n*轉錄失敗：{e}*")
+            all_plain.append("")
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        progress_bar.progress((seg_idx + 1) / n_segs)
+
+    diarized_md = "\n\n---\n\n".join(all_diarized)
+    plain_text = "\n".join(all_plain)
     container.markdown(diarized_md)
+
+    # 任一段失敗時回傳空 plain_text，觸發呼叫端的 st.stop()
+    if failed_segs:
+        container.error(
+            f"⛔ 第 {', '.join(map(str, failed_segs))} 段說話人辨識失敗，"
+            "無法保證逐字稿完整性，已終止後續摘要生成。請重試或縮短音檔。"
+        )
+        return diarized_md, ""
+
     return diarized_md, plain_text
 
 
@@ -732,9 +820,9 @@ with tab1:
         # ── 說話人辨識模式 ──
         if use_diarize:
             status.update(label="說話人辨識轉錄中（整段音檔送出）...")
-            diarized_md, plain_text = transcribe_diarize(wav_path, transcript_container, progress_bar)
+            diarized_md, plain_text = transcribe_diarize(wav_path, audio, transcript_container, progress_bar)
             if not plain_text.strip():
-                st.error("說話人辨識未回傳任何內容，請確認音檔是否有效或稍後重試。")
+                # transcribe_diarize 已顯示具體錯誤訊息，這裡直接終止
                 st.stop()
             raw_output = plain_text
             # 辨識模式跳過切段去重，直接用 plain_text 做摘要
