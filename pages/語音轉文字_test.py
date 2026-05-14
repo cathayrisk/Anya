@@ -1,11 +1,12 @@
 import os
 import re
 import json
+import time
 import difflib
 import hashlib
 import tempfile
-import multiprocessing
-from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 from openai import OpenAI
@@ -50,9 +51,16 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 # ========== 參數 ==========
-MODEL_STT = "gpt-4o-mini-transcribe"  # STT 忠實轉錄原語言
-MODEL_MAP = "gpt-5-mini"              # 分段摘要
-MODEL_REDUCE = "gpt-4.1"             # 總整/潤飾
+MODEL_STT    = "gpt-4o-mini-transcribe"   # 一般轉錄
+MODEL_DIARIZE = "gpt-4o-transcribe-diarize"  # 說話人辨識轉錄
+MODEL_MAP    = "gpt-5-mini"               # 分段摘要
+MODEL_REDUCE = "gpt-4.1"                 # 總整/潤飾
+
+MAX_WORKERS = 4  # 平行轉錄最大執行緒數
+
+# 說話者顏色對應（最多支援 8 位說話者）
+SPEAKER_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
+SPEAKER_EMOJIS = ["🔵", "🟢", "🟠", "🟣", "🔴", "🟡", "⚪", "🟤"]
 
 BASE_PROMPT = (
     "This audio contains a discussion or presentation. "
@@ -76,10 +84,21 @@ MIN_CHUNK_MS = 2_000    # 單段最短 2 秒
 FALLBACK_WINDOW_MS = 20_000  # 找不到靜音時，固定切 20 秒
 
 DEFAULT_MAP_CHUNK_SIZE = 40
-MAX_STREAM_WORKERS = min(4, multiprocessing.cpu_count())
 
-CACHE_DIR = ".stt_cache"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stt_cache")
+CACHE_MAX_FILES = 200   # 超過時刪除最舊的檔案
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+def cache_cleanup():
+    try:
+        files = sorted(
+            [os.path.join(CACHE_DIR, fn) for fn in os.listdir(CACHE_DIR) if fn.endswith(".txt")],
+            key=os.path.getmtime
+        )
+        for old in files[:-CACHE_MAX_FILES]:
+            os.remove(old)
+    except Exception:
+        pass
 
 # ========== 工具函式 ==========
 def _hash_bytes(b: bytes) -> str:
@@ -104,6 +123,8 @@ def convert_to_wav(input_path: str, output_path: str, target_sr=16000):
     return output_path
 
 def normalize_loudness(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
+    if audio.dBFS == float("-inf"):  # 全靜音，跳過正規化避免 apply_gain(inf) 崩潰
+        return audio
     gain = target_dbfs - audio.dBFS
     return audio.apply_gain(gain)
 
@@ -281,9 +302,9 @@ def refine_zh_tw_via_prompt(lines: List[str]) -> List[str]:
     return refined_all if refined_all else lines
 
 # Prompt（若端點支援就用、不支援自動回退）
-def build_prompt(prev_text: str, glossary: str, style_seed: str, max_tokens: int = 220) -> str:
-    parts = []
-    parts.append("請全程使用正體中文（繁體，台灣用語）。")
+def build_prompt(prev_text: str, glossary: str, style_seed: str, max_chars: int = 800) -> str:
+    # max_chars=800 約等於 220 tokens（中英混合估算），改用字元數截斷以正確處理 CJK
+    parts = ["請全程使用正體中文（繁體，台灣用語）。"]
     if style_seed and style_seed.strip():
         parts.append(style_seed.strip())
     if glossary and glossary.strip():
@@ -297,10 +318,57 @@ def build_prompt(prev_text: str, glossary: str, style_seed: str, max_tokens: int
         parts.append(tail)
 
     prompt = "\n".join(parts).strip()
-    toks = prompt.split()
-    if len(toks) > max_tokens:
-        prompt = " ".join(toks[-max_tokens:])
+    if len(prompt) > max_chars:
+        prompt = prompt[-max_chars:]
     return prompt
+
+def _transcribe_chunk(chunk: AudioSegment, prompt: str, use_cache: bool = True) -> str:
+    """單段音訊轉錄，供循序與平行模式共用。
+    use_cache=False 時略過讀寫 cache（prompt 引導模式，每次 prompt 不同）。
+    """
+    cache_key = f"stt_{MODEL_STT}_{_hash_bytes(chunk.raw_data)}"
+    if use_cache:
+        cached = cache_get_text(cache_key)
+        if cached:
+            return cached
+
+    full_text = ""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp_path = tmp.name
+            chunk.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+        with open(tmp_path, "rb") as audio_file:
+            try:
+                resp = client.audio.transcriptions.create(
+                    model=MODEL_STT,
+                    file=audio_file,
+                    response_format="text",
+                    prompt=prompt,
+                )
+                full_text = resp if isinstance(resp, str) else (getattr(resp, "text", None) or "")
+            except Exception:
+                try:
+                    resp = client.audio.transcriptions.create(
+                        model=MODEL_STT,
+                        file=audio_file,
+                        response_format="text",
+                        prompt=BASE_PROMPT,
+                    )
+                    full_text = resp if isinstance(resp, str) else (getattr(resp, "text", None) or "")
+                except Exception:
+                    full_text = ""
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    if use_cache:  # 只有無 prompt 引導的結果才寫入 cache
+        cache_set_text(cache_key, full_text.strip())
+    return full_text
+
 
 def transcribe_all(
     chunks: List[AudioSegment],
@@ -309,80 +377,132 @@ def transcribe_all(
     use_prompting: bool = False,
     glossary: str = "",
     style_seed: str = ""
-):
-    all_text = ""
-    rolling_context = ""
+) -> str:
+    total = len(chunks)
 
-    for i, chunk in enumerate(chunks):
-        chunk_hash = _hash_bytes(chunk.raw_data)
-        cache_key = f"stt_{MODEL_STT}_{chunk_hash}"
-        cached = cache_get_text(cache_key)
-        if cached:
-            all_text += cached + "\n"
-            rolling_context = (rolling_context + " " + cached).strip()
-            if len(rolling_context) > 5000:
-                rolling_context = rolling_context[-5000:]
-            progress_bar.progress((i + 1) / len(chunks))
-            container.markdown(all_text)
-            continue
+    # ── 有 prompt 引導：循序執行以維持 rolling context ──
+    if use_prompting:
+        all_text = ""
+        rolling_context = ""
+        for i, chunk in enumerate(chunks):
+            prompt_parts = [BASE_PROMPT]
+            extra = build_prompt(rolling_context, glossary, style_seed, max_chars=800)
+            if extra:
+                prompt_parts.append(extra)
+            text = _transcribe_chunk(chunk, "\n".join(prompt_parts), use_cache=False)
+            all_text += text + "\n"
+            rolling_context = (rolling_context + " " + text).strip()[-5000:]
+            progress_bar.progress((i + 1) / total)
+            container.markdown(f"*{i+1}/{total} 段完成...*\n\n" + all_text)
+        return all_text.strip()
 
-        full_text = ""
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp_path = tmp.name
-                chunk.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
-            with open(tmp_path, "rb") as audio_file:
-                # 組合最終 prompt：BASE_PROMPT 打底，use_prompting 時附加 glossary/style/context
-                prompt_parts = [BASE_PROMPT]
-                if use_prompting:
-                    extra = build_prompt(rolling_context, glossary, style_seed, max_tokens=220)
-                    if extra:
-                        prompt_parts.append(extra)
-                final_prompt = "\n".join(prompt_parts)
+    # ── 無 prompt 引導：平行執行，速度提升 3-5x ──
+    results: Dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_transcribe_chunk, chunk, BASE_PROMPT, True): i
+            for i, chunk in enumerate(chunks)
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                results[i] = future.result() or ""
+            except Exception:
+                results[i] = ""
+            done = len(results)
+            progress_bar.progress(done / total)
+            container.markdown(f"*{done}/{total} 段完成...*")
 
-                try:
-                    resp = client.audio.transcriptions.create(
-                        model=MODEL_STT,
-                        file=audio_file,
-                        response_format="text",
-                        prompt=final_prompt,
-                    )
-                    full_text = resp if isinstance(resp, str) else (getattr(resp, "text", None) or "")
-                    container.markdown(all_text + full_text)
-                except Exception:
-                    # fallback：只用 BASE_PROMPT，捨棄 use_prompting 附加內容
-                    try:
-                        resp = client.audio.transcriptions.create(
-                            model=MODEL_STT,
-                            file=audio_file,
-                            response_format="text",
-                            prompt=BASE_PROMPT,
-                        )
-                        full_text = resp if isinstance(resp, str) else (getattr(resp, "text", None) or "")
-                        container.warning("此轉錄端點不支援進階 prompt，引導已自動降回基礎模式（本次）。")
-                        container.markdown(all_text + full_text)
-                    except Exception as e2:
-                        container.error(f"API 轉錄失敗：{e2}")
-                        full_text = ""
-        finally:
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+    # 重試空結果的段（一次，間隔 2 秒 backoff）
+    empty_indices = [i for i in range(total) if not results.get(i, "").strip()]
+    if empty_indices:
+        time.sleep(2)
+        for i in empty_indices:
+            try:
+                text = _transcribe_chunk(chunks[i], BASE_PROMPT, use_cache=False)
+                if text.strip():
+                    results[i] = text
+            except Exception:
+                pass
 
-        cache_set_text(cache_key, full_text.strip())
-        all_text += full_text + "\n"
+    # 統計重試後仍失敗的段
+    still_failed = [i + 1 for i in range(total) if not results.get(i, "").strip()]
+    if still_failed:
+        container.warning(
+            f"⚠️ 以下第 {', '.join(map(str, still_failed))} 段轉錄失敗（共 {len(still_failed)}/{total} 段），"
+            "內容可能不完整。摘要將依現有內容生成。"
+        )
 
-        rolling_context = (rolling_context + " " + full_text).strip()
-        if len(rolling_context) > 5000:
-            rolling_context = rolling_context[-5000:]
-
-        progress_bar.progress((i + 1) / len(chunks))
-        container.markdown(all_text)
-
+    all_text = "\n".join(results.get(i, "") for i in range(total))
+    container.markdown(all_text)
     return all_text.strip()
+
+def _format_speaker_label(raw: str, speaker_map: Dict[str, str]) -> str:
+    """將 SPEAKER_00 等原始標籤對應到 說話者 A/B/C...，首次出現時建立對應。"""
+    if raw not in speaker_map:
+        idx = len(speaker_map)
+        label = SPEAKER_LABELS[idx] if idx < len(SPEAKER_LABELS) else str(idx)
+        emoji = SPEAKER_EMOJIS[idx] if idx < len(SPEAKER_EMOJIS) else "🎙"
+        speaker_map[raw] = f"{emoji} **[說話者 {label}]**"
+    return speaker_map[raw]
+
+
+def transcribe_diarize(wav_path: str, container, progress_bar) -> Tuple[str, str]:
+    """
+    使用 gpt-4o-transcribe-diarize 進行說話人辨識轉錄。
+    回傳 (diarized_md, plain_text)：
+      - diarized_md：含說話者標籤的 Markdown（供顯示）
+      - plain_text ：純文字（供摘要 pipeline 使用）
+    """
+    container.markdown("*正在送出整段音檔進行說話人辨識，請稍候...*")
+    progress_bar.progress(0.3)
+
+    try:
+        with open(wav_path, "rb") as audio_file:
+            resp = client.audio.transcriptions.create(
+                model=MODEL_DIARIZE,
+                file=audio_file,
+                response_format="diarized_json",
+                chunking_strategy="auto",
+            )
+        progress_bar.progress(1.0)
+    except Exception as e:
+        container.error(f"說話人辨識失敗：{e}")
+        return "", ""
+
+    # 解析回應：嘗試 .utterances，再嘗試 dict 形式
+    utterances = getattr(resp, "utterances", None)
+    if utterances is None and hasattr(resp, "model_dump"):
+        utterances = resp.model_dump().get("utterances") or resp.model_dump().get("segments")
+    if utterances is None:
+        # 最後 fallback：整段 text
+        plain = getattr(resp, "text", "") or ""
+        container.markdown(plain)
+        return plain, plain
+
+    speaker_map: Dict[str, str] = {}
+    md_lines: List[str] = []
+    plain_lines: List[str] = []
+
+    for utt in utterances:
+        if isinstance(utt, dict):
+            raw_speaker = utt.get("speaker", "SPEAKER_00")
+            text = utt.get("text", "").strip()
+        else:
+            raw_speaker = getattr(utt, "speaker", "SPEAKER_00")
+            text = getattr(utt, "text", "").strip()
+
+        if not text:
+            continue
+        label = _format_speaker_label(raw_speaker, speaker_map)
+        md_lines.append(f"{label}　{text}")
+        plain_lines.append(text)
+
+    diarized_md = "\n\n".join(md_lines)
+    plain_text = "\n".join(plain_lines)
+    container.markdown(diarized_md)
+    return diarized_md, plain_text
+
 
 # ========== Map-Reduce（GPT‑5 + Responses API）==========
 def map_summarize_blocks(flat_sentences: List[str], chunk_size=DEFAULT_MAP_CHUNK_SIZE) -> List[str]:
@@ -505,11 +625,34 @@ def render_topics_only(md: Dict[str, Any], st):
 # ========== 上傳區 ==========
 with st.expander("上傳會議錄音檔案", expanded=True):
     f = st.file_uploader("請上傳音檔（.wav, .mp3, .m4a, .mp4, .webm）", type=["wav", "mp3", "m4a", "mp4", "webm"])
-    start_btn = st.button("開始 Streaming 轉錄與摘要")
+    start_btn = st.button("開始轉錄與摘要")
 
-# ========== 單一整體收合的進階調整 ==========
+# ========== 會議資訊（選填）==========
+with st.expander("會議資訊（選填，加入摘要）", expanded=False):
+    meta_cols = st.columns(2)
+    with meta_cols[0]:
+        meta_date = st.date_input("會議日期", value=None)
+        meta_location = st.text_input("地點", placeholder="例：台北辦公室 / Google Meet")
+    with meta_cols[1]:
+        meta_participants = st.text_area(
+            "參與者（每行一人）",
+            height=100,
+            placeholder="例：\n張三（主持）\n李四\nAimee"
+        )
+        meta_title = st.text_input("會議主題", placeholder="例：Q2 產品規劃會議")
+
+# ========== 進階調整 ==========
 with st.expander("進階調整（全部設定，可選）", expanded=False):
     st.caption("平常維持預設即可；只有音檔特性特殊時再開啟。")
+
+    st.markdown("###### 轉錄模式")
+    use_diarize = st.checkbox(
+        "啟用說話人辨識（gpt-4o-transcribe-diarize）",
+        value=False,
+        help="辨識不同說話者並標記 [說話者 A / B / C...]。注意：此模式不支援 Prompt 引導，且費用較高。"
+    )
+    if use_diarize:
+        st.info("說話人辨識模式：整段音檔一次送出，模型自動切段並標記說話者。")
 
     st.markdown("###### 音訊前處理")
     cols = st.columns(2)
@@ -522,26 +665,36 @@ with st.expander("進階調整（全部設定，可選）", expanded=False):
         use_low_pass = st.checkbox("低通濾波（降高頻噪）", value=False)
         lp_hz = st.slider("低通截止頻率 (Hz)", 4000, 12000, 9500, 100, disabled=not use_low_pass)
 
-    st.markdown("###### Prompt 引導（若端點不支援會自動回退）")
-    use_prompting = st.checkbox("啟用 Prompt 引導（改善專有名詞拼寫與風格一致）", value=False)
+    st.markdown("###### Prompt 引導（說話人辨識模式下無效）")
+    use_prompting = st.checkbox(
+        "啟用 Prompt 引導（改善專有名詞拼寫與風格一致）",
+        value=False,
+        disabled=use_diarize
+    )
     glossary_input = st.text_area(
         "專有名詞拼寫清單（每行一個）",
         height=120,
         placeholder="例：\nAimee\nShawn\nBBQ\nZyntriQix",
-        disabled=not use_prompting
+        disabled=not use_prompting or use_diarize
     )
     style_seed = st.text_area(
         "風格示例（1～3 句示例文本，不是指令）",
         height=80,
         placeholder="例：\n保持簡潔、標點一致。例句：we discuss quarterly outlook and risks.",
-        disabled=not use_prompting
+        disabled=not use_prompting or use_diarize
     )
 
 if not (f and start_btn):
     st.stop()
 
 # ========== 主流程 ==========
+cache_cleanup()
 raw_bytes = f.read()
+
+file_mb = len(raw_bytes) / (1024 * 1024)
+if file_mb > 100:
+    st.warning(f"檔案較大（{file_mb:.0f} MB），轉錄可能需要數分鐘，請耐心等候。")
+
 st.audio(raw_bytes)
 
 # Tabs
@@ -568,47 +721,72 @@ with tab1:
         if use_high_pass or use_low_pass:
             audio = apply_filters(audio, use_high_pass=use_high_pass, hp_hz=hp_hz, use_low_pass=use_low_pass, lp_hz=lp_hz)
 
-        status.update(label="靜音切段（附最長/最短保護；找不到靜音會回退固定切）...")
-        chunks = split_audio_on_silence_safe(audio)
-        if not chunks:
-            st.error("無法切出有效音訊段，請檢查音檔或調整參數。")
-            st.stop()
+        duration_sec = len(audio) / 1000
+        duration_str = f"{int(duration_sec // 60)} 分 {int(duration_sec % 60)} 秒"
+        st.caption(f"音檔時長：{duration_str}　大小：{file_mb:.1f} MB")
 
         st.markdown("#### 轉錄結果")
-        stream_container = st.empty()
+        transcript_container = st.empty()
         progress_bar = st.progress(0.0)
 
-        status.update(label="逐段轉錄中...")
-        all_text = transcribe_all(
-            chunks,
-            stream_container,
-            progress_bar,
-            use_prompting=use_prompting,
-            glossary=glossary_input if use_prompting else "",
-            style_seed=style_seed if use_prompting else ""
+        # ── 說話人辨識模式 ──
+        if use_diarize:
+            status.update(label="說話人辨識轉錄中（整段音檔送出）...")
+            diarized_md, plain_text = transcribe_diarize(wav_path, transcript_container, progress_bar)
+            if not plain_text.strip():
+                st.error("說話人辨識未回傳任何內容，請確認音檔是否有效或稍後重試。")
+                st.stop()
+            raw_output = plain_text
+            # 辨識模式跳過切段去重，直接用 plain_text 做摘要
+            flat_sentences = [s for s in split_sentences(plain_text) if s]
+            final_md = diarized_md  # 顯示含說話者標籤的版本
+
+        # ── 一般轉錄模式（平行 / 循序）──
+        else:
+            status.update(label="靜音切段（附最長/最短保護；找不到靜音會回退固定切）...")
+            chunks = split_audio_on_silence_safe(audio)
+            if not chunks:
+                st.error("無法切出有效音訊段，請檢查音檔或調整參數。")
+                st.stop()
+
+            mode_label = "循序轉錄中（Prompt 引導）..." if use_prompting else f"平行轉錄中（{MAX_WORKERS} 執行緒）..."
+            status.update(label=mode_label)
+            all_text = transcribe_all(
+                chunks,
+                transcript_container,
+                progress_bar,
+                use_prompting=use_prompting,
+                glossary=glossary_input if use_prompting else "",
+                style_seed=style_seed if use_prompting else ""
+            )
+            raw_output = all_text.strip()
+
+            status.update(label="分句與跨段去重...")
+            grouped_sentences = []
+            for i, txt in enumerate(all_text.split("\n")):
+                sents = split_sentences(txt)
+                if i == 0:
+                    grouped_sentences.append(sents)
+                else:
+                    unique = dedupe_against_prev(sents, grouped_sentences[-1], threshold=0.80)
+                    grouped_sentences.append(unique)
+            flat_sentences = [s for group in grouped_sentences for s in group]
+
+            pretty_lines = pretty_format_sentences(flat_sentences)
+            refined_lines = refine_zh_tw_via_prompt(pretty_lines)
+            paras = group_into_paragraphs(refined_lines, max_chars=280, max_sents=4)
+            final_md = "\n\n".join(paras)
+            transcript_container.markdown(final_md)
+            if refined_lines == pretty_lines:
+                st.caption("提示：可讀版潤飾/翻譯可能未生效（已回退原文顯示）。")
+
+        st.success("轉錄完成！")
+        st.download_button(
+            "下載逐字稿（.txt）",
+            data=final_md.encode("utf-8"),
+            file_name=f"{os.path.splitext(f.name)[0]}_transcript.txt",
+            mime="text/plain",
         )
-        raw_stream_text = all_text.strip()
-
-        status.update(label="分句與跨段去重...")
-        grouped_sentences = []
-        for i, txt in enumerate(all_text.split("\n")):
-            sents = split_sentences(txt)
-            if i == 0:
-                grouped_sentences.append(sents)
-            else:
-                unique = dedupe_against_prev(sents, grouped_sentences[-1], threshold=0.80)
-                grouped_sentences.append(unique)
-        flat_sentences = [s for group in grouped_sentences for s in group]
-
-        # 可讀版：輕量整理 → 潤飾/翻譯為正體 → 段落化 → Markdown 呈現（直接覆蓋直播容器，避免空窗）
-        pretty_lines = pretty_format_sentences(flat_sentences)
-        refined_lines = refine_zh_tw_via_prompt(pretty_lines)
-        paras = group_into_paragraphs(refined_lines, max_chars=280, max_sents=4)
-        final_md = "\n\n".join(paras)
-        stream_container.markdown(final_md)
-        if refined_lines == pretty_lines:
-            st.caption("提示：可讀版潤飾/翻譯可能未生效（模型回覆格式不符或服務暫時失敗，已回退原文顯示）。")
-        st.success("Transcription complete!")
 
         status.update(label="整併重點（內部計算）...")
         map_blocks_text = map_summarize_blocks(flat_sentences)
@@ -616,6 +794,20 @@ with tab1:
         status.update(label="生成最終會議摘要與內容解析...")
         final_minutes = reduce_finalize_json(map_blocks_text)
         final_md_summary = reduce_finalize_markdown(map_blocks_text)
+
+        # 將使用者填寫的 metadata 合併進 JSON
+        user_meta = final_minutes.get("metadata", {})
+        if meta_title:
+            user_meta["title"] = meta_title
+        if meta_date:
+            user_meta["date"] = str(meta_date)
+        if meta_location:
+            user_meta["location"] = meta_location
+        if meta_participants.strip():
+            user_meta["participants"] = [p.strip() for p in meta_participants.splitlines() if p.strip()]
+        if use_diarize:
+            user_meta["transcription_mode"] = "speaker_diarization"
+        final_minutes["metadata"] = user_meta
 
         with tab2:
             st.markdown(final_md_summary)
@@ -630,8 +822,8 @@ with tab1:
             render_topics_only(final_minutes, st)
 
         with tab4:
-            st.markdown("#### 原始內容（最原始串流輸出，未分句／未去重）")
-            st.code(raw_stream_text, language="text")
+            st.markdown("#### 原始內容（轉錄原始輸出，未分句／未去重）")
+            st.code(raw_output, language="text")
 
         status.update(label="全部完成！", state="complete", expanded=True)
 
