@@ -1127,7 +1127,7 @@ with st.expander("上傳會議錄音檔案", expanded=True):
     f = st.file_uploader("請上傳音檔（.wav, .mp3, .m4a, .mp4, .webm）", type=["wav", "mp3", "m4a", "mp4", "webm"])
 
     # 按鈕與「啟用說話人辨識」toggle 同一行
-    btn_col, toggle_col = st.columns([1, 2], vertical_alignment="left")
+    btn_col, toggle_col = st.columns([1, 2], vertical_alignment="Top")
     with btn_col:
         start_btn = st.button("開始轉錄與摘要", type="primary")
     with toggle_col:
