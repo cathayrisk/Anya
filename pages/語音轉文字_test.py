@@ -55,8 +55,8 @@ client = OpenAI(api_key=OPENAI_KEY)
 # ========== 參數 ==========
 MODEL_STT    = "gpt-4o-mini-transcribe"   # 一般轉錄
 MODEL_DIARIZE = "gpt-4o-transcribe-diarize"  # 說話人辨識轉錄
-MODEL_MAP    = "gpt-5-mini"               # 分段摘要
-MODEL_REDUCE = "gpt-4.1"                 # 總整/潤飾
+MODEL_MAP    = "gpt-5.4-mini"               # 分段摘要
+MODEL_REDUCE = "gpt-5.4-mini"                 # 總整/潤飾
 
 MAX_WORKERS = 4      # 平行轉錄最大執行緒數
 
