@@ -101,15 +101,44 @@ FALLBACK_WINDOW_MS = 20_000  # 找不到靜音時，固定切 20 秒
 
 DEFAULT_MAP_CHUNK_SIZE = 40
 
-# Cache 目錄：放在系統 temp 目錄（避免唯讀部署環境下 import 失敗）；
+# Cache 目錄：優先放在 user-private 家目錄（避免敏感逐字稿洩漏給同主機其他使用者）。
+# 順序：~/.cache/anya_stt（Linux/Mac 慣例）→ %LOCALAPPDATA%/anya_stt（Windows）→ tempdir（fallback）。
 # 建立失敗時 _CACHE_ENABLED=False，所有讀寫都會優雅降級為 no-op。
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "anya_stt_cache")
+def _pick_cache_dir() -> Tuple[str, bool]:
+    """選擇 cache 目錄，回傳 (path, is_private)。私有目錄會設 0o700 權限。"""
+    candidates: List[str] = []
+    # 1. Linux/Mac：~/.cache/anya_stt（XDG_CACHE_HOME 慣例）
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        candidates.append(os.path.join(xdg_cache, "anya_stt"))
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        # Windows：優先用 LOCALAPPDATA（user-scoped）
+        local_app = os.environ.get("LOCALAPPDATA")
+        if local_app:
+            candidates.append(os.path.join(local_app, "anya_stt", "cache"))
+        # Linux/Mac fallback
+        candidates.append(os.path.join(home, ".cache", "anya_stt"))
+    # 最後 fallback：系統 temp（多 user 主機上會被 Codex 點名，但維持頁面可用）
+    candidates.append(os.path.join(tempfile.gettempdir(), "anya_stt_cache"))
+
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            # POSIX 系統設 0o700（owner only），Windows 上 chmod 是 no-op
+            try:
+                os.chmod(path, 0o700)
+            except Exception:
+                pass
+            is_private = path != candidates[-1]  # 最後一個是 tempdir，非 private
+            return path, is_private
+        except Exception:
+            continue
+    return "", False  # 全部失敗
+
+CACHE_DIR, _CACHE_IS_PRIVATE = _pick_cache_dir()
 CACHE_MAX_FILES = 200   # 超過時刪除最舊的檔案
-_CACHE_ENABLED = True
-try:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-except Exception:
-    _CACHE_ENABLED = False  # 唯讀環境：停用 cache 但不中斷頁面載入
+_CACHE_ENABLED = bool(CACHE_DIR)
 
 def cache_cleanup():
     if not _CACHE_ENABLED:
@@ -157,19 +186,43 @@ def convert_to_wav(input_path: str, output_path: str, target_sr=16000):
     return output_path
 
 
+# MP3 encoder 可用性：第一次匯出失敗後 fallback WAV，並記住結果避免每次重試
+_MP3_ENCODER_AVAILABLE: Optional[bool] = None  # None=未探測, True=可用, False=不可用
+
+
 def export_for_upload(segment: AudioSegment) -> str:
-    """將音訊段匯出為可上傳給 OpenAI Transcription API 的 MP3 暫存檔。
-    使用 MP3（64kbps mono 16kHz）符合官方「use a compressed audio format」建議；
-    流量比 PCM WAV 降約 75%，更不易撞 25MB 上限與 rate limit。
+    """將音訊段匯出為可上傳給 OpenAI Transcription API 的暫存檔。
+    優先使用 MP3（64kbps mono 16kHz）—— 符合官方「use a compressed audio format」建議；
+    若環境缺 libmp3lame（少見的精簡 ffmpeg build），自動 fallback 到 WAV。
     回傳：暫存檔路徑（呼叫端負責 os.remove）。
     """
-    fd, tmp_path = tempfile.mkstemp(suffix=f".{UPLOAD_FORMAT}")
-    os.close(fd)
+    global _MP3_ENCODER_AVAILABLE
     seg = segment.set_frame_rate(UPLOAD_SAMPLE_RATE).set_channels(1)
+
+    # MP3 路徑：先嘗試一次；失敗後鎖定為不可用，後續直接走 WAV
+    if _MP3_ENCODER_AVAILABLE is not False:
+        fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        try:
+            seg.export(
+                tmp_path,
+                format="mp3",
+                bitrate=UPLOAD_MP3_BITRATE,
+                parameters=["-ac", "1", "-ar", str(UPLOAD_SAMPLE_RATE)],
+            )
+            _MP3_ENCODER_AVAILABLE = True
+            return tmp_path
+        except Exception:
+            _MP3_ENCODER_AVAILABLE = False
+            _safe_remove(tmp_path)
+            # 落到 WAV fallback
+
+    # WAV fallback：未壓縮，需注意 25MB 上限（呼叫端的 preflight size check 會擋）
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
     seg.export(
         tmp_path,
-        format=UPLOAD_FORMAT,
-        bitrate=UPLOAD_MP3_BITRATE,
+        format="wav",
         parameters=["-ac", "1", "-ar", str(UPLOAD_SAMPLE_RATE)],
     )
     return tmp_path
@@ -786,18 +839,22 @@ def _max_bytes_per_upload() -> int:
     return API_MAX_UPLOAD_BYTES - SAFETY_MARGIN_BYTES
 
 
-def _estimate_mp3_bytes(duration_sec: float) -> int:
-    """估算 MP3 64kbps 的位元組大小。64 kbps = 8000 bytes/sec。"""
-    return int(duration_sec * 8000)
+def _estimated_bytes_per_sec() -> int:
+    """估算每秒上傳位元組數。MP3 64kbps = 8000 B/s；WAV 16kHz mono 16-bit = 32000 B/s。"""
+    if _MP3_ENCODER_AVAILABLE is False:
+        return 32000  # WAV fallback
+    return 8000  # MP3（預設或已確認可用）
 
 
 def _plan_diarize_segments(duration_sec: float) -> List[Tuple[int, int]]:
     """計算 diarize 的分段（毫秒區間清單），以 byte size 為主、duration 為輔。
-    保證每段：MP3 估計大小 < 24MB 且 時長 ≤ DIARIZE_MAX_SEC。
+    保證每段：上傳大小 < 24MB 且 時長 ≤ DIARIZE_MAX_SEC。
+    依目前 encoder（MP3 或 WAV fallback）自動調整段長。
     """
     max_bytes = _max_bytes_per_upload()
-    # 反推時長上限：byte 上限 / 8000 bytes/sec
-    max_sec_by_bytes = max_bytes / 8000
+    bytes_per_sec = _estimated_bytes_per_sec()
+    # 反推時長上限：byte 上限 / 每秒位元組數
+    max_sec_by_bytes = max_bytes / bytes_per_sec
     # 取「byte 上限」「duration 上限」較小者，再打 0.85 折給編碼變動餘量
     seg_sec = min(max_sec_by_bytes, DIARIZE_MAX_SEC) * 0.85
     seg_sec = max(60, min(seg_sec, DIARIZE_TARGET_SEGMENT_SEC))  # 最少 60 秒、最多 1200 秒
@@ -1068,7 +1125,28 @@ def render_topics_only(md: Dict[str, Any], st):
 # ========== 上傳區 ==========
 with st.expander("上傳會議錄音檔案", expanded=True):
     f = st.file_uploader("請上傳音檔（.wav, .mp3, .m4a, .mp4, .webm）", type=["wav", "mp3", "m4a", "mp4", "webm"])
-    start_btn = st.button("開始轉錄與摘要")
+
+    # 按鈕與「啟用說話人辨識」toggle 同一行
+    btn_col, toggle_col = st.columns([1, 2], vertical_alignment="center")
+    with btn_col:
+        start_btn = st.button("開始轉錄與摘要", type="primary")
+    with toggle_col:
+        use_diarize = st.toggle(
+            "啟用說話人辨識",
+            value=False,
+            help=(
+                "辨識不同說話者並標記 [說話者 A / B / C...]。"
+                "使用 gpt-4o-transcribe-diarize 模型。"
+            ),
+        )
+
+    if use_diarize:
+        st.warning(
+            "⚠️ **Diarize 模式適合多人會議**。對單人簡報、訪談、純講者錄音，"
+            "轉錄品質會比一般模式差很多（diarize 模型不支援 prompt 引導，"
+            "也無法用詞彙表修正專有名詞）。\n\n"
+            "**建議：** 確認音檔是多人對話再啟用；若只有一位主要說話者，請保持關閉以獲得最佳品質。"
+        )
 
 # ========== 會議資訊（選填）==========
 with st.expander("會議資訊（選填，加入摘要）", expanded=False):
@@ -1087,15 +1165,6 @@ with st.expander("會議資訊（選填，加入摘要）", expanded=False):
 # ========== 進階調整 ==========
 with st.expander("進階調整（全部設定，可選）", expanded=False):
     st.caption("平常維持預設即可；只有音檔特性特殊時再開啟。")
-
-    st.markdown("###### 轉錄模式")
-    use_diarize = st.checkbox(
-        "啟用說話人辨識（gpt-4o-transcribe-diarize）",
-        value=False,
-        help="辨識不同說話者並標記 [說話者 A / B / C...]。注意：此模式不支援 Prompt 引導，且費用較高。"
-    )
-    if use_diarize:
-        st.info("說話人辨識模式：整段音檔一次送出，模型自動切段並標記說話者。")
 
     st.markdown("###### 音訊前處理")
     cols = st.columns(2)
