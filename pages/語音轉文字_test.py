@@ -3,6 +3,7 @@ import re
 import json
 import math
 import time
+import random
 import difflib
 import hashlib
 import tempfile
@@ -58,7 +59,20 @@ MODEL_MAP    = "gpt-5-mini"               # 分段摘要
 MODEL_REDUCE = "gpt-4.1"                 # 總整/潤飾
 
 MAX_WORKERS = 4      # 平行轉錄最大執行緒數
-DIARIZE_MAX_SEC = 1400  # gpt-4o-transcribe-diarize API 上限（秒）
+
+# 上傳格式：MP3 mono 64kbps（符合 OpenAI 官方建議「use a compressed audio format」）
+# 對比 16kHz mono WAV（32 KB/s），MP3 64kbps（8 KB/s）流量降 75%，更不易撞 25MB 上限與 rate limit。
+UPLOAD_FORMAT = "mp3"
+UPLOAD_MP3_BITRATE = "64k"
+UPLOAD_SAMPLE_RATE = 16000
+
+# OpenAI Transcription API 硬上限
+API_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
+SAFETY_MARGIN_BYTES = 1 * 1024 * 1024    # 留 1 MB 給 multipart overhead
+
+# Diarize 分段策略：以 byte size 為主、duration 為輔（兩者取較嚴格者）
+DIARIZE_MAX_SEC = 1400         # API 經驗值上限（秒）
+DIARIZE_TARGET_SEGMENT_SEC = 1200  # 預設切點，留安全餘量
 
 # 說話者顏色對應（最多支援 8 位說話者）
 SPEAKER_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H"]
@@ -87,11 +101,19 @@ FALLBACK_WINDOW_MS = 20_000  # 找不到靜音時，固定切 20 秒
 
 DEFAULT_MAP_CHUNK_SIZE = 40
 
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stt_cache")
+# Cache 目錄：放在系統 temp 目錄（避免唯讀部署環境下 import 失敗）；
+# 建立失敗時 _CACHE_ENABLED=False，所有讀寫都會優雅降級為 no-op。
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "anya_stt_cache")
 CACHE_MAX_FILES = 200   # 超過時刪除最舊的檔案
-os.makedirs(CACHE_DIR, exist_ok=True)
+_CACHE_ENABLED = True
+try:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+except Exception:
+    _CACHE_ENABLED = False  # 唯讀環境：停用 cache 但不中斷頁面載入
 
 def cache_cleanup():
+    if not _CACHE_ENABLED:
+        return
     try:
         files = sorted(
             [os.path.join(CACHE_DIR, fn) for fn in os.listdir(CACHE_DIR) if fn.endswith(".txt")],
@@ -107,22 +129,59 @@ def _hash_bytes(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 def cache_get_text(key: str) -> str | None:
+    if not _CACHE_ENABLED:
+        return None
     path = os.path.join(CACHE_DIR, key + ".txt")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+    except Exception:
+        return None
     return None
 
 def cache_set_text(key: str, value: str):
+    if not _CACHE_ENABLED:
+        return
     path = os.path.join(CACHE_DIR, key + ".txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(value)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(value)
+    except Exception:
+        pass
 
 def convert_to_wav(input_path: str, output_path: str, target_sr=16000):
     audio = AudioSegment.from_file(input_path)
     audio = audio.set_frame_rate(target_sr).set_channels(1)
     audio.export(output_path, format="wav")
     return output_path
+
+
+def export_for_upload(segment: AudioSegment) -> str:
+    """將音訊段匯出為可上傳給 OpenAI Transcription API 的 MP3 暫存檔。
+    使用 MP3（64kbps mono 16kHz）符合官方「use a compressed audio format」建議；
+    流量比 PCM WAV 降約 75%，更不易撞 25MB 上限與 rate limit。
+    回傳：暫存檔路徑（呼叫端負責 os.remove）。
+    """
+    fd, tmp_path = tempfile.mkstemp(suffix=f".{UPLOAD_FORMAT}")
+    os.close(fd)
+    seg = segment.set_frame_rate(UPLOAD_SAMPLE_RATE).set_channels(1)
+    seg.export(
+        tmp_path,
+        format=UPLOAD_FORMAT,
+        bitrate=UPLOAD_MP3_BITRATE,
+        parameters=["-ac", "1", "-ar", str(UPLOAD_SAMPLE_RATE)],
+    )
+    return tmp_path
+
+
+def _safe_remove(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except Exception:
+        pass
 
 def normalize_loudness(audio: AudioSegment, target_dbfs: float = -20.0) -> AudioSegment:
     if audio.dBFS == float("-inf"):  # 全靜音，跳過正規化避免 apply_gain(inf) 崩潰
@@ -324,22 +383,23 @@ def build_prompt(prev_text: str, glossary: str, style_seed: str, max_chars: int 
         prompt = prompt[-max_chars:]
     return prompt
 
-def _transcribe_chunk(chunk: AudioSegment, prompt: str, use_cache: bool = True) -> str:
+def _transcribe_chunk(chunk: AudioSegment, prompt: str, use_cache: bool = True) -> Tuple[str, Optional[str]]:
     """單段音訊轉錄，供循序與平行模式共用。
     use_cache=False 時略過讀寫 cache（prompt 引導模式，每次 prompt 不同）。
+    回傳：(transcript_text, last_error_message or None)
     """
     cache_key = f"stt_{MODEL_STT}_{_hash_bytes(chunk.raw_data)}"
     if use_cache:
         cached = cache_get_text(cache_key)
         if cached:
-            return cached
+            return cached, None
 
     full_text = ""
+    last_error: Optional[str] = None
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp_path = tmp.name
-            chunk.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+        tmp_path = export_for_upload(chunk)
+        # 30 秒 chunk 用 MP3 64kbps 約 240KB，遠低於 25MB；不額外檢查 size。
         with open(tmp_path, "rb") as audio_file:
             try:
                 resp = client.audio.transcriptions.create(
@@ -349,7 +409,10 @@ def _transcribe_chunk(chunk: AudioSegment, prompt: str, use_cache: bool = True) 
                     prompt=prompt,
                 )
                 full_text = resp if isinstance(resp, str) else (getattr(resp, "text", None) or "")
-            except Exception:
+            except Exception as e1:
+                last_error = f"{type(e1).__name__}: {e1}"
+                # 回退：去掉 prompt 再試一次（兼容部分舊端點）
+                audio_file.seek(0)
                 try:
                     resp = client.audio.transcriptions.create(
                         model=MODEL_STT,
@@ -358,18 +421,103 @@ def _transcribe_chunk(chunk: AudioSegment, prompt: str, use_cache: bool = True) 
                         prompt=BASE_PROMPT,
                     )
                     full_text = resp if isinstance(resp, str) else (getattr(resp, "text", None) or "")
-                except Exception:
+                    last_error = None  # 回退成功
+                except Exception as e2:
+                    last_error = f"{type(e2).__name__}: {e2}"
                     full_text = ""
+    except Exception as e_outer:
+        last_error = f"{type(e_outer).__name__}: {e_outer}"
     finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        _safe_remove(tmp_path)
 
-    if use_cache:  # 只有無 prompt 引導的結果才寫入 cache
+    if use_cache and full_text.strip():  # 只快取成功的結果
         cache_set_text(cache_key, full_text.strip())
-    return full_text
+    return full_text, last_error
+
+
+def _is_rate_limit_error(err_msg: Optional[str]) -> bool:
+    """判斷錯誤是否為 rate limit / 429 / quota。"""
+    if not err_msg:
+        return False
+    low = err_msg.lower()
+    return ("ratelimit" in low or "rate_limit" in low or "rate limit" in low
+            or "429" in low or "quota" in low or "too many requests" in low)
+
+
+def _parse_retry_after_seconds(err_msg: Optional[str]) -> Optional[float]:
+    """從錯誤訊息中嘗試解析 Retry-After / x-ratelimit-reset-* 提示秒數。
+    OpenAI 的 RateLimitError 字串通常含 'Please try again in 6.123s' 或 'in 1m12s'。
+    """
+    if not err_msg:
+        return None
+    # 'try again in 6.123s' / 'in 6s'
+    m = re.search(r"(?:try again in|in)\s+([0-9]+(?:\.[0-9]+)?)\s*s\b", err_msg, re.I)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    # 'in 1m12s' / 'in 1m 12s'
+    m = re.search(r"in\s+(?:([0-9]+)\s*m)?\s*([0-9]+(?:\.[0-9]+)?)\s*s\b", err_msg, re.I)
+    if m and (m.group(1) or m.group(2)):
+        try:
+            mins = float(m.group(1) or 0)
+            secs = float(m.group(2) or 0)
+            return mins * 60 + secs
+        except ValueError:
+            pass
+    return None
+
+
+def _backoff_with_jitter(base: float, attempt: int, cap: float = 60.0) -> float:
+    """指數退避 + 等量隨機 jitter（Full Jitter 演算法，符合 OpenAI 官方建議）。
+    base * 2^(attempt-1)，封頂後再隨機介於 [0, value]。
+    """
+    raw = min(cap, base * (2 ** (attempt - 1)))
+    return random.uniform(0, raw)
+
+
+def _retry_chunk_sequential(
+    chunks: List[AudioSegment],
+    indices: List[int],
+    prompt: str,
+    use_cache: bool,
+    container,
+    label: str = "重試",
+    max_attempts: int = 3,
+) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """循序重試指定 chunk index 清單，含指數退避 + jitter；rate limit 時優先讀取 Retry-After。
+    回傳：(成功結果 dict, 失敗錯誤訊息 dict)
+    """
+    successes: Dict[int, str] = {}
+    errors: Dict[int, str] = {}
+    for idx in indices:
+        last_err: Optional[str] = None
+        for attempt in range(1, max_attempts + 1):
+            # 等待策略：rate limit 優先讀 API 給的 Retry-After，否則用 jitter backoff
+            wait_sec: float
+            if _is_rate_limit_error(last_err):
+                hinted = _parse_retry_after_seconds(last_err)
+                if hinted is not None:
+                    wait_sec = hinted + random.uniform(0.5, 2.0)  # 略大於官方提示
+                else:
+                    wait_sec = _backoff_with_jitter(base=8.0, attempt=attempt, cap=90.0)
+            else:
+                wait_sec = _backoff_with_jitter(base=3.0, attempt=attempt, cap=30.0)
+
+            container.markdown(
+                f"*{label}第 {idx+1} 段（第 {attempt}/{max_attempts} 次，等待 {wait_sec:.1f}s）...*"
+            )
+            time.sleep(wait_sec)
+            text, err = _transcribe_chunk(chunks[idx], prompt, use_cache=use_cache)
+            if text.strip():
+                successes[idx] = text
+                last_err = None
+                break
+            last_err = err
+        if idx not in successes and last_err:
+            errors[idx] = last_err
+    return successes, errors
 
 
 def transcribe_all(
@@ -383,36 +531,51 @@ def transcribe_all(
     total = len(chunks)
 
     # ── 有 prompt 引導：循序執行以維持 rolling context ──
+    # 關鍵設計：失敗段必須「就地重試」，否則 rolling_context 會用空字串前進，
+    # 污染下游所有 chunk 的 prompt，違背 prompt 模式存在的目的（術語/風格一致性）。
+    # 官方建議：「prompt the model with the transcript of the preceding segment」
     if use_prompting:
         all_text = ""
         rolling_context = ""
-        failed_indices: List[int] = []
+        results: Dict[int, str] = {}
         for i, chunk in enumerate(chunks):
             prompt_parts = [BASE_PROMPT]
             extra = build_prompt(rolling_context, glossary, style_seed, max_chars=800)
             if extra:
                 prompt_parts.append(extra)
-            text = _transcribe_chunk(chunk, "\n".join(prompt_parts), use_cache=False)
-            # 首次失敗：等 2 秒後重試一次
+            this_prompt = "\n".join(prompt_parts)
+
+            text, err = _transcribe_chunk(chunk, this_prompt, use_cache=False)
+
+            # 就地重試：失敗時立刻嘗試（含指數退避 + jitter），避免污染下游 rolling_context
             if not text.strip():
-                time.sleep(2)
-                text = _transcribe_chunk(chunk, "\n".join(prompt_parts), use_cache=False)
-            if not text.strip():
-                failed_indices.append(i + 1)
+                container.info(f"第 {i+1} 段轉錄失敗，立即重試（避免污染下游 context）...")
+                succ, errs = _retry_chunk_sequential(
+                    chunks, [i], this_prompt, use_cache=False,
+                    container=container, label="就地重試"
+                )
+                text = succ.get(i, "")
+                if not text.strip():
+                    err_msg = errs.get(i, err or "未知錯誤")
+                    container.error(
+                        f"⛔ 第 {i+1} 段重試後仍失敗，已終止流程"
+                        f"（避免下游 chunk 在錯誤 context 下繼續）。\n\n"
+                        f"**錯誤訊息：** `{err_msg}`\n\n"
+                        "可能原因：API rate limit、網路逾時、音訊內容問題。"
+                    )
+                    st.stop()
+
+            results[i] = text
             all_text += text + "\n"
             rolling_context = (rolling_context + " " + text).strip()[-5000:]
             progress_bar.progress((i + 1) / total)
             container.markdown(f"*{i+1}/{total} 段完成...*\n\n" + all_text)
-        if failed_indices:
-            container.error(
-                f"⛔ 第 {', '.join(map(str, failed_indices))} 段轉錄失敗（重試後仍無法取得內容），"
-                "無法保證逐字稿完整性，已終止後續摘要生成。請重試或縮短音檔。"
-            )
-            st.stop()
-        return all_text.strip()
 
-    # ── 無 prompt 引導：平行執行，速度提升 3-5x ──
+        return "\n".join(results.get(i, "") for i in range(total)).strip()
+
+    # ── 無 prompt 引導：平行執行 ──
     results: Dict[int, str] = {}
+    errors: Dict[int, str] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(_transcribe_chunk, chunk, BASE_PROMPT, True): i
@@ -421,31 +584,63 @@ def transcribe_all(
         for future in as_completed(futures):
             i = futures[future]
             try:
-                results[i] = future.result() or ""
-            except Exception:
+                text, err = future.result()
+                results[i] = text or ""
+                if not (text or "").strip() and err:
+                    errors[i] = err
+            except Exception as e:
                 results[i] = ""
+                errors[i] = f"{type(e).__name__}: {e}"
             done = len(results)
             progress_bar.progress(done / total)
             container.markdown(f"*{done}/{total} 段完成...*")
 
-    # 重試空結果的段（一次，間隔 2 秒 backoff）
+    # 重試空段：改為循序、指數退避 + jitter；針對 rate limit 優先讀 Retry-After
     empty_indices = [i for i in range(total) if not results.get(i, "").strip()]
     if empty_indices:
-        time.sleep(2)
-        for i in empty_indices:
-            try:
-                text = _transcribe_chunk(chunks[i], BASE_PROMPT, use_cache=False)
-                if text.strip():
-                    results[i] = text
-            except Exception:
-                pass
+        # 偵測是否多為 rate limit；若是，先等一個較長視窗讓 quota 回復
+        rl_count = sum(1 for i in empty_indices if _is_rate_limit_error(errors.get(i)))
+        if rl_count >= max(2, len(empty_indices) // 2):
+            # 嘗試從錯誤訊息中找最大的 Retry-After 提示
+            hinted_waits = [
+                _parse_retry_after_seconds(errors.get(i))
+                for i in empty_indices if _is_rate_limit_error(errors.get(i))
+            ]
+            valid_hints = [w for w in hinted_waits if w is not None]
+            cool_down = max(valid_hints) + random.uniform(1, 3) if valid_hints else 30.0
+            container.warning(
+                f"⏳ 偵測到 {rl_count} 段疑似 API rate limit，"
+                f"等待 {cool_down:.1f} 秒讓配額回復"
+                f"{'（依 API Retry-After 提示）' if valid_hints else ''}..."
+            )
+            time.sleep(cool_down)
 
-    # 統計重試後仍失敗的段，失敗時終止流程（避免以不完整內容生成摘要）
-    still_failed = [i + 1 for i in range(total) if not results.get(i, "").strip()]
+        container.info(f"開始循序重試失敗段（共 {len(empty_indices)} 段，含指數退避）...")
+        succ, errs = _retry_chunk_sequential(
+            chunks, empty_indices, BASE_PROMPT, use_cache=True, container=container
+        )
+        for i, t in succ.items():
+            results[i] = t
+            errors.pop(i, None)
+        for i, e in errs.items():
+            errors[i] = e
+
+    # 統計重試後仍失敗的段
+    still_failed = [i for i in range(total) if not results.get(i, "").strip()]
     if still_failed:
+        sample_err = errors.get(still_failed[0], "未知錯誤")
+        is_rate = sum(1 for i in still_failed if _is_rate_limit_error(errors.get(i)))
+        hint = ""
+        if is_rate:
+            hint = (
+                "\n\n**建議：** 偵測到 rate limit，請：\n"
+                "1) 等幾分鐘後重試；2) 將 `MAX_WORKERS` 從 4 調降為 2 或 1；"
+                "3) 檢查 OpenAI 用量是否達上限。"
+            )
         container.error(
-            f"⛔ 以下第 {', '.join(map(str, still_failed))} 段轉錄失敗（共 {len(still_failed)}/{total} 段），"
-            "無法保證逐字稿完整性，已終止後續摘要生成。請重試或縮短音檔。"
+            f"⛔ 第 {', '.join(str(i+1) for i in still_failed)} 段轉錄失敗"
+            f"（共 {len(still_failed)}/{total} 段）。\n\n"
+            f"**首段錯誤訊息：** `{sample_err}`{hint}"
         )
         st.stop()
 
@@ -490,9 +685,11 @@ def _parse_diarize_resp(resp) -> Tuple[str, str]:
     return "\n\n".join(md_lines), "\n".join(plain_lines)
 
 
-def _call_diarize_api(tmp_wav_path: str) -> Tuple[str, str]:
-    """對單一 WAV 檔呼叫 diarize API，回傳 (diarized_md, plain_text)。"""
-    with open(tmp_wav_path, "rb") as audio_file:
+def _call_diarize_api(tmp_path: str) -> Tuple[str, str]:
+    """對單一音訊檔（MP3 / WAV）呼叫 diarize API，回傳 (diarized_md, plain_text)。
+    呼叫前應由呼叫端保證檔案大小 < 25MB（API 上限）。
+    """
+    with open(tmp_path, "rb") as audio_file:
         resp = client.audio.transcriptions.create(
             model=MODEL_DIARIZE,
             file=audio_file,
@@ -502,90 +699,234 @@ def _call_diarize_api(tmp_wav_path: str) -> Tuple[str, str]:
     return _parse_diarize_resp(resp)
 
 
-def transcribe_diarize(wav_path: str, audio: AudioSegment, container, progress_bar) -> Tuple[str, str]:
+def _call_diarize_api_with_retry(
+    tmp_path: str,
+    container,
+    label: str = "說話人辨識",
+    max_attempts: int = 3,
+) -> Tuple[str, str, Optional[str]]:
+    """有 retry 的 diarize 呼叫。重試策略對齊一般轉錄：
+    - 指數退避 + Full Jitter
+    - 429 / rate limit 優先讀 Retry-After 提示
+    回傳：(diarized_md, plain_text, last_error or None)。成功時 last_error=None。
+    """
+    last_err: Optional[str] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            md, plain = _call_diarize_api(tmp_path)
+            return md, plain, None
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            if attempt >= max_attempts:
+                break
+            # 等待策略：rate limit 優先讀 API 給的 Retry-After，否則用 jitter backoff
+            if _is_rate_limit_error(last_err):
+                hinted = _parse_retry_after_seconds(last_err)
+                if hinted is not None:
+                    wait_sec = hinted + random.uniform(0.5, 2.0)
+                else:
+                    wait_sec = _backoff_with_jitter(base=8.0, attempt=attempt, cap=90.0)
+            else:
+                wait_sec = _backoff_with_jitter(base=3.0, attempt=attempt, cap=30.0)
+            container.markdown(
+                f"*{label} 第 {attempt}/{max_attempts} 次失敗（{last_err[:80]}），"
+                f"等待 {wait_sec:.1f}s 後重試...*"
+            )
+            time.sleep(wait_sec)
+    return "", "", last_err
+
+
+# ── Diarize 段落 cache：成功段落直接快取，下次同 audio 同切法可 resume ──
+def _diarize_seg_cache_key(seg: AudioSegment) -> str:
+    """以段落音訊內容的 hash 為 key（不同切法 → 不同 bytes → 不同 key，天然不衝突）。"""
+    return f"diarize_{MODEL_DIARIZE}_{_hash_bytes(seg.raw_data)}"
+
+
+def cache_get_diarize_segment(seg: AudioSegment) -> Optional[Tuple[str, str]]:
+    raw = cache_get_text(_diarize_seg_cache_key(seg))
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        md = data.get("md", "")
+        plain = data.get("plain", "")
+        if md or plain:
+            return md, plain
+    except Exception:
+        return None
+    return None
+
+
+def cache_set_diarize_segment(seg: AudioSegment, md: str, plain: str) -> None:
+    try:
+        cache_set_text(
+            _diarize_seg_cache_key(seg),
+            json.dumps({"md": md, "plain": plain}, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+
+
+def _max_bytes_per_upload() -> int:
+    """單次上傳大小上限（API 25MB 扣掉 multipart overhead 安全餘量）。"""
+    return API_MAX_UPLOAD_BYTES - SAFETY_MARGIN_BYTES
+
+
+def _estimate_mp3_bytes(duration_sec: float) -> int:
+    """估算 MP3 64kbps 的位元組大小。64 kbps = 8000 bytes/sec。"""
+    return int(duration_sec * 8000)
+
+
+def _plan_diarize_segments(duration_sec: float) -> List[Tuple[int, int]]:
+    """計算 diarize 的分段（毫秒區間清單），以 byte size 為主、duration 為輔。
+    保證每段：MP3 估計大小 < 24MB 且 時長 ≤ DIARIZE_MAX_SEC。
+    """
+    max_bytes = _max_bytes_per_upload()
+    # 反推時長上限：byte 上限 / 8000 bytes/sec
+    max_sec_by_bytes = max_bytes / 8000
+    # 取「byte 上限」「duration 上限」較小者，再打 0.85 折給編碼變動餘量
+    seg_sec = min(max_sec_by_bytes, DIARIZE_MAX_SEC) * 0.85
+    seg_sec = max(60, min(seg_sec, DIARIZE_TARGET_SEGMENT_SEC))  # 最少 60 秒、最多 1200 秒
+
+    plan: List[Tuple[int, int]] = []
+    seg_ms = int(seg_sec * 1000)
+    total_ms = int(duration_sec * 1000)
+    start = 0
+    while start < total_ms:
+        end = min(start + seg_ms, total_ms)
+        plan.append((start, end))
+        start = end
+    return plan
+
+
+def _namespace_speaker_labels(diarized_md: str, seg_idx: int) -> str:
+    """長音檔分段時，將 `[說話者 A]` 改為 `[第 N 段-A]`，避免跨段同字母被誤認為同人。
+    OpenAI 官方文件未提供跨段說話者自動拼接機制（`known_speaker_references[]` 需事先提供樣本），
+    namespace 前綴是最誠實的處理：使用者一看就知道跨段標籤不互通。
+    """
+    # 同時處理「[說話者 A]」與「**[說話者 A]**」兩種格式（含 emoji 前綴）
+    return re.sub(
+        r"\[說話者 ([A-Z0-9]+)\]",
+        rf"[第 {seg_idx + 1} 段-\1]",
+        diarized_md,
+    )
+
+
+def transcribe_diarize(audio: AudioSegment, container, progress_bar) -> Tuple[str, str]:
     """
     說話人辨識轉錄。
-    - 音檔 ≤ DIARIZE_MAX_SEC：單次 API 呼叫。
-    - 音檔 > DIARIZE_MAX_SEC：自動切成 ≤1400 秒的段落分批辨識；
-      各段說話者標籤獨立，不跨段比對，輸出附分段標題。
+    - 統一以 byte-size 為主、duration 為輔規劃分段（OpenAI API 25MB 硬上限）。
+    - MP3 64kbps mono 上傳，使單段最長可達 ~50 分鐘（相較 WAV 的 13 分鐘）。
+    - 跨段說話者標籤帶 segment 前綴（API 無自動拼接機制）。
     """
     duration_sec = len(audio) / 1000
+    plan = _plan_diarize_segments(duration_sec)
+    n_segs = len(plan)
 
-    # ── 短音檔：從已前處理的 audio 匯出後送出（確保與長音檔路徑行為一致）──
-    if duration_sec <= DIARIZE_MAX_SEC:
-        container.markdown("*正在送出整段音檔進行說話人辨識，請稍候...*")
-        progress_bar.progress(0.3)
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp_path = tmp.name
-                audio.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
-            diarized_md, plain_text = _call_diarize_api(tmp_path)
-            progress_bar.progress(1.0)
-        except Exception as e:
-            container.error(f"說話人辨識失敗：{e}")
-            return "", ""
-        finally:
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-        container.markdown(diarized_md)
-        return diarized_md, plain_text
-
-    # ── 長音檔：自動分段 ──
-    n_segs = math.ceil(duration_sec / DIARIZE_MAX_SEC)
-    container.info(
-        f"音檔長度 {int(duration_sec // 60)} 分 {int(duration_sec % 60)} 秒，"
-        f"超過模型上限（{DIARIZE_MAX_SEC // 60} 分鐘），"
-        f"自動分成 {n_segs} 段分別辨識。各段說話者標籤獨立，不跨段比對。"
-    )
+    if n_segs > 1:
+        seg_minutes = (plan[0][1] - plan[0][0]) / 60000
+        container.info(
+            f"音檔長度 {int(duration_sec // 60)} 分 {int(duration_sec % 60)} 秒，"
+            f"超過單次上傳上限（每段 ~{seg_minutes:.0f} 分鐘 / 24MB），"
+            f"自動分成 {n_segs} 段分別辨識。\n\n"
+            f"⚠️ **說話者標籤會帶段落前綴**（如 `第 1 段-A`、`第 2 段-A`），"
+            f"避免跨段同字母被誤認為同一人。OpenAI API 不支援跨段自動拼接說話者身份。"
+        )
 
     all_diarized: List[str] = []
     all_plain: List[str] = []
     failed_segs: List[int] = []
+    failure_errors: Dict[int, str] = {}
+    resumed_count = 0  # 從快取讀取的段數，用於最後提示
 
-    for seg_idx in range(n_segs):
-        start_ms = seg_idx * DIARIZE_MAX_SEC * 1000
-        end_ms = min((seg_idx + 1) * DIARIZE_MAX_SEC * 1000, len(audio))
+    for seg_idx, (start_ms, end_ms) in enumerate(plan):
         seg = audio[start_ms:end_ms]
-
         start_min, end_min = int(start_ms / 60000), int(end_ms / 60000)
-        container.markdown(f"*處理第 {seg_idx + 1}/{n_segs} 段（{start_min}–{end_min} 分鐘）...*")
 
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp_path = tmp.name
-                seg.export(tmp_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
-            seg_md, seg_plain = _call_diarize_api(tmp_path)
+        # ── Resume：先查 cache，命中就跳過 API 呼叫 ──
+        cached = cache_get_diarize_segment(seg)
+        if cached is not None:
+            seg_md, seg_plain = cached
+            resumed_count += 1
+            container.markdown(
+                f"*第 {seg_idx + 1}/{n_segs} 段（{start_min}–{end_min} 分鐘）：✓ 從快取讀取（resume）*"
+            )
+        else:
+            if n_segs > 1:
+                container.markdown(f"*處理第 {seg_idx + 1}/{n_segs} 段（{start_min}–{end_min} 分鐘）...*")
+            else:
+                container.markdown("*正在送出整段音檔進行說話人辨識，請稍候...*")
+
+            tmp_path = None
+            seg_md, seg_plain = "", ""
+            seg_err: Optional[str] = None
+            try:
+                tmp_path = export_for_upload(seg)
+                # Preflight size check：MP3 仍超 25MB 時 fail-fast，避免 API 回 413
+                file_size = os.path.getsize(tmp_path)
+                if file_size > _max_bytes_per_upload():
+                    raise RuntimeError(
+                        f"段落上傳大小 {file_size / 1024 / 1024:.1f}MB 超過 API 上限 "
+                        f"{API_MAX_UPLOAD_BYTES / 1024 / 1024:.0f}MB"
+                    )
+
+                seg_md, seg_plain, seg_err = _call_diarize_api_with_retry(
+                    tmp_path,
+                    container,
+                    label=f"第 {seg_idx + 1}/{n_segs} 段說話人辨識",
+                )
+            except Exception as e:
+                seg_err = f"{type(e).__name__}: {e}"
+            finally:
+                _safe_remove(tmp_path)
+
+            # 成功才寫入 cache（resume 用）；失敗仍進入 failed_segs
+            if not seg_err and (seg_md or seg_plain):
+                cache_set_diarize_segment(seg, seg_md, seg_plain)
+            else:
+                failed_segs.append(seg_idx + 1)
+                failure_errors[seg_idx + 1] = seg_err or "未知錯誤"
+
+        # 顯示與累積（無論成功失敗都附段落標題，方便 resume 後對應）
+        if n_segs > 1 and seg_md:
+            seg_md = _namespace_speaker_labels(seg_md, seg_idx)
             all_diarized.append(
                 f"### 第 {seg_idx + 1} 段（{start_min}–{end_min} 分鐘）\n\n{seg_md}"
             )
-            all_plain.append(seg_plain)
-        except Exception as e:
-            failed_segs.append(seg_idx + 1)
-            all_diarized.append(f"### 第 {seg_idx + 1} 段（{start_min}–{end_min} 分鐘）\n\n*轉錄失敗：{e}*")
-            all_plain.append("")
-        finally:
-            if tmp_path:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+        elif n_segs > 1 and not seg_md:
+            err_msg = failure_errors.get(seg_idx + 1, "未知錯誤")
+            all_diarized.append(
+                f"### 第 {seg_idx + 1} 段（{start_min}–{end_min} 分鐘）\n\n*轉錄失敗：{err_msg}*"
+            )
+        else:
+            all_diarized.append(seg_md or f"*轉錄失敗：{failure_errors.get(seg_idx + 1, '未知錯誤')}*")
+        all_plain.append(seg_plain)
 
         progress_bar.progress((seg_idx + 1) / n_segs)
 
-    diarized_md = "\n\n---\n\n".join(all_diarized)
+    diarized_md = "\n\n---\n\n".join(all_diarized) if n_segs > 1 else (all_diarized[0] if all_diarized else "")
     plain_text = "\n".join(all_plain)
     container.markdown(diarized_md)
 
+    if resumed_count > 0:
+        container.success(
+            f"✓ 已從快取讀取 {resumed_count}/{n_segs} 段（resume，省略重複 API 呼叫）"
+        )
+
     # 任一段失敗時回傳空 plain_text，觸發呼叫端的 st.stop()
     if failed_segs:
+        sample_err = failure_errors.get(failed_segs[0], "未知錯誤")
+        success_count = n_segs - len(failed_segs)
+        resume_hint = (
+            f"\n\n💾 **已成功的 {success_count} 段已存入快取**，"
+            f"重新執行時會自動跳過、只重跑失敗段，不會浪費已完成的工作。"
+        ) if success_count > 0 else ""
         container.error(
-            f"⛔ 第 {', '.join(map(str, failed_segs))} 段說話人辨識失敗，"
-            "無法保證逐字稿完整性，已終止後續摘要生成。請重試或縮短音檔。"
+            f"⛔ 第 {', '.join(map(str, failed_segs))} 段說話人辨識失敗"
+            f"（共 {len(failed_segs)}/{n_segs} 段）。\n\n"
+            f"**首段錯誤訊息：** `{sample_err}`\n\n"
+            f"已重試 3 次仍無法完成。無法保證逐字稿完整性，已終止後續摘要生成。"
+            f"{resume_hint}"
         )
         return diarized_md, ""
 
@@ -820,7 +1161,7 @@ with tab1:
         # ── 說話人辨識模式 ──
         if use_diarize:
             status.update(label="說話人辨識轉錄中（整段音檔送出）...")
-            diarized_md, plain_text = transcribe_diarize(wav_path, audio, transcript_container, progress_bar)
+            diarized_md, plain_text = transcribe_diarize(audio, transcript_container, progress_bar)
             if not plain_text.strip():
                 # transcribe_diarize 已顯示具體錯誤訊息，這裡直接終止
                 st.stop()
