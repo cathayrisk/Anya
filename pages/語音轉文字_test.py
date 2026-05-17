@@ -547,20 +547,22 @@ def transcribe_all(
 
             text, err = _transcribe_chunk(chunk, this_prompt, use_cache=False)
 
-            # 就地重試：失敗時立刻嘗試（含指數退避 + jitter），避免污染下游 rolling_context
-            if not text.strip():
-                container.info(f"第 {i+1} 段轉錄失敗，立即重試（避免污染下游 context）...")
+            # 就地重試「有 exception」的段（API 真的失敗）；
+            # 空字串 + 無錯誤 = 該段無語音內容（合法），不重試、不終止。
+            if not text.strip() and err:
+                container.info(f"第 {i+1} 段轉錄失敗（{err[:80]}），立即重試（避免污染下游 context）...")
                 succ, errs = _retry_chunk_sequential(
                     chunks, [i], this_prompt, use_cache=False,
                     container=container, label="就地重試"
                 )
                 text = succ.get(i, "")
-                if not text.strip():
-                    err_msg = errs.get(i, err or "未知錯誤")
+                retry_err = errs.get(i)
+                # 重試仍是「有 exception」才算失敗；空字串無錯誤視為合法
+                if not text.strip() and retry_err:
                     container.error(
                         f"⛔ 第 {i+1} 段重試後仍失敗，已終止流程"
                         f"（避免下游 chunk 在錯誤 context 下繼續）。\n\n"
-                        f"**錯誤訊息：** `{err_msg}`\n\n"
+                        f"**錯誤訊息：** `{retry_err}`\n\n"
                         "可能原因：API rate limit、網路逾時、音訊內容問題。"
                     )
                     st.stop()
@@ -595,16 +597,17 @@ def transcribe_all(
             progress_bar.progress(done / total)
             container.markdown(f"*{done}/{total} 段完成...*")
 
-    # 重試空段：改為循序、指數退避 + jitter；針對 rate limit 優先讀 Retry-After
-    empty_indices = [i for i in range(total) if not results.get(i, "").strip()]
-    if empty_indices:
+    # 只重試「有 exception」的段（errors 有記錄）；
+    # 空字串 + 無錯誤 = API 成功但這段無語音（如靜音、暫停、無對話），合法狀態，不重試。
+    error_indices = [i for i in range(total) if errors.get(i)]
+    if error_indices:
         # 偵測是否多為 rate limit；若是，先等一個較長視窗讓 quota 回復
-        rl_count = sum(1 for i in empty_indices if _is_rate_limit_error(errors.get(i)))
-        if rl_count >= max(2, len(empty_indices) // 2):
+        rl_count = sum(1 for i in error_indices if _is_rate_limit_error(errors.get(i)))
+        if rl_count >= max(2, len(error_indices) // 2):
             # 嘗試從錯誤訊息中找最大的 Retry-After 提示
             hinted_waits = [
                 _parse_retry_after_seconds(errors.get(i))
-                for i in empty_indices if _is_rate_limit_error(errors.get(i))
+                for i in error_indices if _is_rate_limit_error(errors.get(i))
             ]
             valid_hints = [w for w in hinted_waits if w is not None]
             cool_down = max(valid_hints) + random.uniform(1, 3) if valid_hints else 30.0
@@ -615,9 +618,9 @@ def transcribe_all(
             )
             time.sleep(cool_down)
 
-        container.info(f"開始循序重試失敗段（共 {len(empty_indices)} 段，含指數退避）...")
+        container.info(f"開始循序重試失敗段（共 {len(error_indices)} 段，含指數退避）...")
         succ, errs = _retry_chunk_sequential(
-            chunks, empty_indices, BASE_PROMPT, use_cache=True, container=container
+            chunks, error_indices, BASE_PROMPT, use_cache=True, container=container
         )
         for i, t in succ.items():
             results[i] = t
@@ -625,8 +628,13 @@ def transcribe_all(
         for i, e in errs.items():
             errors[i] = e
 
-    # 統計重試後仍失敗的段
-    still_failed = [i for i in range(total) if not results.get(i, "").strip()]
+    # 統計：只有 errors 仍有記錄才算真正失敗（空字串無錯誤 = 無語音段，視為成功）
+    still_failed = [i for i in range(total) if errors.get(i)]
+    silent_count = sum(
+        1 for i in range(total)
+        if not results.get(i, "").strip() and not errors.get(i)
+    )
+
     if still_failed:
         sample_err = errors.get(still_failed[0], "未知錯誤")
         is_rate = sum(1 for i in still_failed if _is_rate_limit_error(errors.get(i)))
@@ -643,6 +651,12 @@ def transcribe_all(
             f"**首段錯誤訊息：** `{sample_err}`{hint}"
         )
         st.stop()
+
+    if silent_count > 0:
+        container.info(
+            f"ℹ️ 偵測到 {silent_count}/{total} 段為無語音內容（靜音、暫停或無對話），"
+            f"已自動略過。其餘 {total - silent_count} 段轉錄成功。"
+        )
 
     all_text = "\n".join(results.get(i, "") for i in range(total))
     container.markdown(all_text)
