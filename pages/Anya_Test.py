@@ -114,6 +114,31 @@ if _KB_DEPS_OK and st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_K
 st.set_page_config(page_title="Anya Forger", page_icon="🥜", layout="wide")
 inject_rich_styles()  # 注入富文本 CSS（品牌紅色標題、blockquote、表格斑馬紋）
 
+# === status「執行中」label 的 Jelly 動畫 ===
+# st.status 渲染成 [data-testid="stExpander"]；執行中時 header 會有 [data-testid="stExpanderIconSpinner"]，
+# 完成換成 ...IconCheck、錯誤換成 ...IconError。用 :has(spinner) → 只在 running 時掛動畫，完成/錯誤自動停。
+# label 是 Streamlit 內部渲染的純文字（塞不了 HTML），所以動畫掛在它的 markdown 容器上，不改 status.update 寫法。
+# 🎛️ 想調手感：改 anyaJellyStatus 的 scale/translateY（幅度）與 1.25s（一個 jelly 週期，越小越快）。
+st.markdown("""
+<style>
+@keyframes anyaJellyStatus {
+  0%, 100% { transform: translateY(0)    scale(1, 1); }
+  20%      { transform: translateY(-2px) scale(1.06, .94); }
+  40%      { transform: translateY(0)    scale(.97, 1.03); }
+  58%      { transform: translateY(-1px) scale(1.02, .98); }
+  74%      { transform: scale(.99, 1.01); }
+}
+[data-testid="stExpander"]:has([data-testid="stExpanderIconSpinner"]) summary [data-testid="stMarkdownContainer"] {
+  display: inline-block;
+  transform-origin: 50% 100%;
+  animation: anyaJellyStatus 1.25s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-testid="stExpander"]:has([data-testid="stExpanderIconSpinner"]) summary [data-testid="stMarkdownContainer"] { animation: none; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 # =========================
 # 1) ✅ 在主程式 imports 附近（有 os / streamlit 後）新增：DEV_MODE
 # 建議放在 st.set_page_config() 後面或 session defaults 附近
@@ -204,25 +229,29 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty
     return text
 
 # =========================
-# ✅ 整段一次性升起進場（General / Research）
-#   - 動畫掛在「容器」(.st-key-<key>) 上 → 容器只 mount 一次，升起只播一次（不逐字、不逐行、不 flicker）。
-#   - 文字仍用 fake_stream_markdown 餵進「單一 placeholder」串流 → 行距與原生整段 markdown 完全一致。
+# ✅ 整段一次性「彈跳進場」（General / Research）
+#   - 完整答案「一次」render 進帶 key 的容器 → 容器 mount 時內容已存在，彈跳明顯看得到。
+#     （早期版本用逐字串流，容器在「還沒有內容」時就把動畫播完了 → 看不到跳躍，故改為整段渲染。）
+#   - 動畫掛在「容器」(.st-key-<key>) 上，只播一次；用單一 st.markdown(全文) → 行距與原生一致。
 #   - 保留所有 Streamlit 專屬語法（:color[]、:badge[]、:material:、:small[]）。
 # =========================
 def _rise_once_style(scope_key: str) -> str:
-    # 🎛️ 升起手感調整：
-    #   • translateY(12px)：起始上移距離，越大升起越明顯。
-    #   • scale overshoot（1.006）：往上彈過頭幅度，越大越彈。
-    #   • .5s：進場時長。  cubic-bezier(.3,.8,.3,1)：彈性曲線。
+    # 🎛️ 彈跳手感調整（想更彈/更穩改這裡）：
+    #   • translateY(24px)：起始下沉距離，越大彈起越明顯。
+    #   • scale 0%→.90、45%→1.04：縮小起跳 + 衝過頭放大，差距越大越「Q」。
+    #   • 68%/84% 的 translateY/scale：回彈、再微彈的兩段；要更「果凍」可加大或多加關鍵影格。
+    #   • .62s：整體時長，越大越慢越軟。  cubic-bezier(.3,.8,.3,1)：彈性曲線。
     return f"""
 <style>
-@keyframes rjRiseOnce {{
-  0%   {{ opacity: 0; transform: translateY(12px) scale(.985); }}
-  60%  {{ opacity: 1; transform: translateY(-3px) scale(1.006); }}
+@keyframes rjPopIn {{
+  0%   {{ opacity: 0; transform: translateY(24px) scale(.90); }}
+  45%  {{ opacity: 1; transform: translateY(-10px) scale(1.04); }}
+  68%  {{ transform: translateY(3px) scale(.985); }}
+  84%  {{ transform: translateY(-2px) scale(1.008); }}
   100% {{ opacity: 1; transform: translateY(0) scale(1); }}
 }}
 .st-key-{scope_key} {{
-  animation: rjRiseOnce .5s cubic-bezier(.3,.8,.3,1) both;
+  animation: rjPopIn .62s cubic-bezier(.3,.8,.3,1) both;
   transform-origin: bottom center;
 }}
 @media (prefers-reduced-motion: reduce) {{
@@ -231,14 +260,14 @@ def _rise_once_style(scope_key: str) -> str:
 </style>
 """
 
-def fake_stream_markdown_rise(text, parent, scope_key, step_chars=8, delay=0.02,
-                              empty_msg="安妮亞找不到答案～（抱歉啦！）"):
-    """整段一次性升起 + 內部單一 placeholder 串流（行距與原生一致）。回傳完整 text。
+def fake_stream_markdown_rise(text, parent, scope_key, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
+    """整段一次性「彈跳進場」：完整答案一次 mount 進帶 key 的容器 → 容器動畫播一次，整段明顯彈起來。
+    用單一 st.markdown(全文) 渲染 → 行距與原生一致、Streamlit 專屬語法全保留。回傳完整 text。
     parent：放置容器的父層（st / 某 container / 某 empty placeholder 皆可）。"""
     container = parent.container(key=scope_key, gap=None)   # gap=None：避免 style 元素與內文之間多出間距
-    container.markdown(_rise_once_style(scope_key), unsafe_allow_html=True)  # 掛一次性升起動畫
-    ph = container.empty()
-    return fake_stream_markdown(text, ph, step_chars=step_chars, delay=delay, empty_msg=empty_msg)
+    container.markdown(_rise_once_style(scope_key), unsafe_allow_html=True)  # 掛彈跳動畫（scope 在本容器）
+    container.markdown(text if text else empty_msg)         # 完整內容一次 render → 彈跳看得到
+    return text
 
 # =========================
 # ✅ Fast mode 視覺增強（A：思考點點 / B：氣泡一次性升起）
