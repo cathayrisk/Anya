@@ -229,53 +229,6 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty
     return text
 
 # =========================
-# ✅ 逐段 staggered 彈入（General / Research）
-#   - 用「單一 st.markdown(全文)」渲染 → 行距與原生完全一致（不拆塊、不跑版）。
-#   - 再用 CSS 對該 markdown 容器的「各區塊子元素」(<p>/<h2>/<ul>/<blockquote>…) 掛動畫，
-#     用 nth-child 遞延 → 每一段依序彈進來（逐段抖動）。
-#   - 動畫只播一次（fill both）；保留所有 Streamlit 專屬語法（:color[]、:badge[]、:material:、:small[]）。
-#   - 註：<ul> 整個清單算「一段」一起彈；逐「字」做不到（原生 markdown 沒有逐字的 DOM 元素）。
-# =========================
-def _seg_cascade_style(scope_key: str, max_segments: int = 80, stagger: float = 0.07) -> str:
-    # 🎛️ 逐段彈跳手感：
-    #   • stagger 0.07：每段之間的延遲秒數，越大「一段一段冒出」感越明顯、整體越慢。
-    #   • translateY(14px)/scale(.96→1.02)：單段的彈跳幅度，越大越彈。
-    #   • .5s：單段動畫時長。  cubic-bezier(.3,.8,.3,1)：彈性曲線。
-    #   • max_segments：最多套到第幾段；超長報告超過的段落會立即出現（不再延遲），避免尾巴等太久。
-    sel = f'.st-key-{scope_key} [data-testid="stMarkdownContainer"] > *'
-    delays = "\n".join(
-        f'{sel}:nth-child({i + 1}) {{ animation-delay: {round(i * stagger, 3)}s; }}'
-        for i in range(max_segments)
-    )
-    return f"""
-<style>
-@keyframes rjSeg {{
-  0%   {{ opacity: 0; transform: translateY(14px) scale(.96); }}
-  55%  {{ opacity: 1; transform: translateY(-5px) scale(1.02); }}
-  78%  {{ transform: translateY(1px) scale(.995); }}
-  100% {{ opacity: 1; transform: translateY(0) scale(1); }}
-}}
-{sel} {{
-  animation: rjSeg .5s cubic-bezier(.3,.8,.3,1) both;
-  transform-origin: 50% 100%;
-}}
-{delays}
-@media (prefers-reduced-motion: reduce) {{
-  {sel} {{ animation: none; }}
-}}
-</style>
-"""
-
-def fake_stream_markdown_rise(text, parent, scope_key, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
-    """逐段 staggered 彈入：完整答案一次 render 進帶 key 的容器，再靠 CSS nth-child 遞延，讓
-    每個 markdown 區塊依序彈進來。單一 st.markdown(全文) → 行距與原生一致、Streamlit 語法全保留。
-    回傳完整 text。parent：放置容器的父層（st / 某 container / 某 empty placeholder 皆可）。"""
-    container = parent.container(key=scope_key, gap=None)
-    container.markdown(_seg_cascade_style(scope_key), unsafe_allow_html=True)  # 注入逐段動畫（scope 在本容器）
-    container.markdown(text if text else empty_msg)   # 完整內容一次 render；各區塊由上面的 CSS 依序彈入
-    return text
-
-# =========================
 # ✅ Fast mode 視覺增強（A：思考點點 / B：氣泡一次性升起）
 # 關鍵：Fast 是「真串流」——每個 token 都會把整個 buffer 重畫一次。
 #   • 動畫只能掛在「容器」(.st-key-<key>) 上，不能掛在文字元素上，否則每 token 重播會閃。
@@ -4160,7 +4113,7 @@ if prompt is not None:
                         # ── 最終防護：確保 ai_text 不為空 ──
                         if not ai_text:
                             ai_text = "抱歉，安妮亞這次沒有取得回應，請再試一次。"
-                        final_text = fake_stream_markdown_rise(ai_text, placeholder, "rj_general_stream")
+                        final_text = fake_stream_markdown(ai_text, placeholder)
                         
                     
                         # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
@@ -4405,7 +4358,7 @@ if prompt is not None:
                             # ① Executive Summary — 可展開/收起，預設展開
                             with st.expander("📋 Executive Summary", expanded=True):
                                 if _short_summary:
-                                    fake_stream_markdown_rise(_short_summary, st, "rj_research_summary")
+                                    fake_stream_markdown(_short_summary, st.empty())
                                 else:
                                     st.caption(":gray[（無摘要）]")
 
@@ -4413,7 +4366,7 @@ if prompt is not None:
                             if _full_report:
                                 st.markdown("### 📖 完整報告")
                                 st.divider()
-                                fake_stream_markdown_rise(_full_report, st, "rj_research_report")
+                                fake_stream_markdown(_full_report, st.empty())
 
                             # ③ 後續建議問題 — divider 分隔，清單顯示
                             if _follow_ups:
@@ -4501,7 +4454,7 @@ if prompt is not None:
                             )
 
                             ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
-                            final_text = fake_stream_markdown_rise(ai_text, output_area, "rj_general_fallback")
+                            final_text = fake_stream_markdown(ai_text, output_area.empty())
 
                             with sources_container:
                                 if url_in_text:
