@@ -122,11 +122,11 @@ inject_rich_styles()  # 注入富文本 CSS（品牌紅色標題、blockquote、
 st.markdown("""
 <style>
 @keyframes anyaJellyStatus {
-  0%, 100% { transform: translateY(0)    scale(1, 1); }
-  20%      { transform: translateY(-2px) scale(1.06, .94); }
-  40%      { transform: translateY(0)    scale(.97, 1.03); }
-  58%      { transform: translateY(-1px) scale(1.02, .98); }
-  74%      { transform: scale(.99, 1.01); }
+  0%, 100% { transform: translateY(0)    scale(1, 1)      rotate(0deg); }
+  15%      { transform: translateY(-5px) scale(1.13, .87) rotate(0deg); }
+  35%      { transform: translateY(0)    scale(.88, 1.12) rotate(-3deg); }
+  55%      { transform: translateY(-3px) scale(1.07, .94) rotate(2deg); }
+  75%      { transform: translateY(0)    scale(.97, 1.03) rotate(-1deg); }
 }
 [data-testid="stExpander"]:has([data-testid="stExpanderIconSpinner"]) summary [data-testid="stMarkdownContainer"] {
   display: inline-block;
