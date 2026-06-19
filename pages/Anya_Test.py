@@ -229,44 +229,50 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty
     return text
 
 # =========================
-# ✅ 整段一次性「彈跳進場」（General / Research）
-#   - 完整答案「一次」render 進帶 key 的容器 → 容器 mount 時內容已存在，彈跳明顯看得到。
-#     （早期版本用逐字串流，容器在「還沒有內容」時就把動畫播完了 → 看不到跳躍，故改為整段渲染。）
-#   - 動畫掛在「容器」(.st-key-<key>) 上，只播一次；用單一 st.markdown(全文) → 行距與原生一致。
-#   - 保留所有 Streamlit 專屬語法（:color[]、:badge[]、:material:、:small[]）。
+# ✅ 逐段 staggered 彈入（General / Research）
+#   - 用「單一 st.markdown(全文)」渲染 → 行距與原生完全一致（不拆塊、不跑版）。
+#   - 再用 CSS 對該 markdown 容器的「各區塊子元素」(<p>/<h2>/<ul>/<blockquote>…) 掛動畫，
+#     用 nth-child 遞延 → 每一段依序彈進來（逐段抖動）。
+#   - 動畫只播一次（fill both）；保留所有 Streamlit 專屬語法（:color[]、:badge[]、:material:、:small[]）。
+#   - 註：<ul> 整個清單算「一段」一起彈；逐「字」做不到（原生 markdown 沒有逐字的 DOM 元素）。
 # =========================
-def _rise_once_style(scope_key: str) -> str:
-    # 🎛️ 彈跳手感調整（想更彈/更穩改這裡）：
-    #   • translateY(24px)：起始下沉距離，越大彈起越明顯。
-    #   • scale 0%→.90、45%→1.04：縮小起跳 + 衝過頭放大，差距越大越「Q」。
-    #   • 68%/84% 的 translateY/scale：回彈、再微彈的兩段；要更「果凍」可加大或多加關鍵影格。
-    #   • .62s：整體時長，越大越慢越軟。  cubic-bezier(.3,.8,.3,1)：彈性曲線。
+def _seg_cascade_style(scope_key: str, max_segments: int = 80, stagger: float = 0.07) -> str:
+    # 🎛️ 逐段彈跳手感：
+    #   • stagger 0.07：每段之間的延遲秒數，越大「一段一段冒出」感越明顯、整體越慢。
+    #   • translateY(14px)/scale(.96→1.02)：單段的彈跳幅度，越大越彈。
+    #   • .5s：單段動畫時長。  cubic-bezier(.3,.8,.3,1)：彈性曲線。
+    #   • max_segments：最多套到第幾段；超長報告超過的段落會立即出現（不再延遲），避免尾巴等太久。
+    sel = f'.st-key-{scope_key} [data-testid="stMarkdownContainer"] > *'
+    delays = "\n".join(
+        f'{sel}:nth-child({i + 1}) {{ animation-delay: {round(i * stagger, 3)}s; }}'
+        for i in range(max_segments)
+    )
     return f"""
 <style>
-@keyframes rjPopIn {{
-  0%   {{ opacity: 0; transform: translateY(24px) scale(.90); }}
-  45%  {{ opacity: 1; transform: translateY(-10px) scale(1.04); }}
-  68%  {{ transform: translateY(3px) scale(.985); }}
-  84%  {{ transform: translateY(-2px) scale(1.008); }}
+@keyframes rjSeg {{
+  0%   {{ opacity: 0; transform: translateY(14px) scale(.96); }}
+  55%  {{ opacity: 1; transform: translateY(-5px) scale(1.02); }}
+  78%  {{ transform: translateY(1px) scale(.995); }}
   100% {{ opacity: 1; transform: translateY(0) scale(1); }}
 }}
-.st-key-{scope_key} {{
-  animation: rjPopIn .62s cubic-bezier(.3,.8,.3,1) both;
-  transform-origin: bottom center;
+{sel} {{
+  animation: rjSeg .5s cubic-bezier(.3,.8,.3,1) both;
+  transform-origin: 50% 100%;
 }}
+{delays}
 @media (prefers-reduced-motion: reduce) {{
-  .st-key-{scope_key} {{ animation-duration: .001ms; }}
+  {sel} {{ animation: none; }}
 }}
 </style>
 """
 
 def fake_stream_markdown_rise(text, parent, scope_key, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
-    """整段一次性「彈跳進場」：完整答案一次 mount 進帶 key 的容器 → 容器動畫播一次，整段明顯彈起來。
-    用單一 st.markdown(全文) 渲染 → 行距與原生一致、Streamlit 專屬語法全保留。回傳完整 text。
-    parent：放置容器的父層（st / 某 container / 某 empty placeholder 皆可）。"""
-    container = parent.container(key=scope_key, gap=None)   # gap=None：避免 style 元素與內文之間多出間距
-    container.markdown(_rise_once_style(scope_key), unsafe_allow_html=True)  # 掛彈跳動畫（scope 在本容器）
-    container.markdown(text if text else empty_msg)         # 完整內容一次 render → 彈跳看得到
+    """逐段 staggered 彈入：完整答案一次 render 進帶 key 的容器，再靠 CSS nth-child 遞延，讓
+    每個 markdown 區塊依序彈進來。單一 st.markdown(全文) → 行距與原生一致、Streamlit 語法全保留。
+    回傳完整 text。parent：放置容器的父層（st / 某 container / 某 empty placeholder 皆可）。"""
+    container = parent.container(key=scope_key, gap=None)
+    container.markdown(_seg_cascade_style(scope_key), unsafe_allow_html=True)  # 注入逐段動畫（scope 在本容器）
+    container.markdown(text if text else empty_msg)   # 完整內容一次 render；各區塊由上面的 CSS 依序彈入
     return text
 
 # =========================
