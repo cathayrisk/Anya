@@ -188,97 +188,57 @@ st.session_state.setdefault("ds_active_run_id", None)    # str | None
 
 # === 共用：假串流打字效果 ===
 # =========================
-# ✅ Rise + jelly 逐塊彈跳串流（General / Research 專用）
-# 設計重點：
-#   - 用「原生 st.markdown 逐塊 append」渲染 → Streamlit 專屬語法（:color[]、:badge[]、
-#     :material:、:small[]）全部保留（不能包進自繪 <div>，否則這些語法不會被解析）。
-#   - 彈跳動畫靠 CSS @keyframes，透過 st.container(key=...) 產生的 .st-key-<key> class
-#     精準 scope，只讓「這次的答案」彈，不影響整個 UI。
-#   - 逐塊（段落/標題/清單/表格/程式碼）出現；每塊 mount 時各播一次動畫，舊塊不重播。
-#   - graceful degradation：若 CSS 萬一沒生效，最壞只是逐塊依序出現而不彈，格式不受影響。
+# ✅ 共用假串流：單一 placeholder「持續長大」的打字效果
+#   - 用同一個 placeholder.markdown(buf) 把 buffer 逐步餵大 → 等同原生整段 markdown 渲染，
+#     行距/標題/清單間距與「一次 st.markdown(全文)」完全一致（不會因拆塊而跑版）。
+#   - 保留所有 Streamlit 專屬語法（:color[]、:badge[]、:material:、:small[]）。
 # =========================
-def _split_markdown_blocks(text: str):
-    """把 markdown 切成可獨立渲染的區塊：以空行分段，但不切開 ``` / ~~~ 圍欄程式碼區塊。
-    清單／表格（以單一換行連續）會保持在同一塊內，確保獨立渲染時格式不破。"""
+def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
+    buf = ""
+    for i in range(0, len(text), step_chars):
+        buf = text[: i + step_chars]
+        placeholder.markdown(buf)
+        time.sleep(delay)
     if not text:
-        return []
-    blocks = []
-    cur = []
-    in_fence = False
-    fence_token = ""
-    for ln in text.split("\n"):
-        stripped = ln.lstrip()
-        is_fence = stripped.startswith("```") or stripped.startswith("~~~")
-        if is_fence:
-            token = stripped[:3]
-            if not in_fence:
-                in_fence, fence_token = True, token
-            elif token == fence_token:
-                in_fence, fence_token = False, ""
-            cur.append(ln)
-            continue
-        if in_fence:
-            cur.append(ln)
-            continue
-        if ln.strip() == "":
-            if cur:
-                blocks.append("\n".join(cur))
-                cur = []
-            continue
-        cur.append(ln)
-    if cur:
-        blocks.append("\n".join(cur))
-    return blocks
+        placeholder.markdown(empty_msg)
+    return text
 
-def _rise_jelly_style(scope_key: str) -> str:
-    # ────────────────────────────────────────────────────────────────────
-    # 🎛️ 彈跳幅度調整區（要改手感改這裡就好）
-    #   • translateY(14px)：起始上移距離，越大「升起」越明顯。
-    #   • scale 的 overshoot（1.015 / .995）：彈過頭再回彈的差距，差越多越 Q。
-    #   • rotate（±0.6deg）：左右晃動角度。段落級刻意壓很小避免干擾閱讀；想更俏皮可加大。
-    #   • 動畫時長 .52s：越大越慢越「軟」。
-    #   • cubic-bezier(.3,.8,.3,1)：緩動曲線，控制彈性節奏。
-    # ────────────────────────────────────────────────────────────────────
+# =========================
+# ✅ 整段一次性升起進場（General / Research）
+#   - 動畫掛在「容器」(.st-key-<key>) 上 → 容器只 mount 一次，升起只播一次（不逐字、不逐行、不 flicker）。
+#   - 文字仍用 fake_stream_markdown 餵進「單一 placeholder」串流 → 行距與原生整段 markdown 完全一致。
+#   - 保留所有 Streamlit 專屬語法（:color[]、:badge[]、:material:、:small[]）。
+# =========================
+def _rise_once_style(scope_key: str) -> str:
+    # 🎛️ 升起手感調整：
+    #   • translateY(12px)：起始上移距離，越大升起越明顯。
+    #   • scale overshoot（1.006）：往上彈過頭幅度，越大越彈。
+    #   • .5s：進場時長。  cubic-bezier(.3,.8,.3,1)：彈性曲線。
     return f"""
 <style>
-@keyframes rjBlockIn {{
-  0%   {{ opacity: 0; transform: translateY(14px) scale(.97) rotate(-.6deg); }}   /* 起點：偏下、縮小、微傾 */
-  55%  {{ opacity: 1; transform: translateY(-4px) scale(1.015) rotate(.5deg); }}  /* 衝過頭：上彈 + 放大 */
-  74%  {{ transform: translateY(0) scale(.995) rotate(-.2deg); }}                 /* 回彈：縮一點點 */
-  88%  {{ transform: scale(1.004); }}                                             /* 再微彈一下 */
-  100% {{ opacity: 1; transform: translateY(0) scale(1) rotate(0deg); }}          /* 定位歸零 */
+@keyframes rjRiseOnce {{
+  0%   {{ opacity: 0; transform: translateY(12px) scale(.985); }}
+  60%  {{ opacity: 1; transform: translateY(-3px) scale(1.006); }}
+  100% {{ opacity: 1; transform: translateY(0) scale(1); }}
 }}
-.st-key-{scope_key} [data-testid="stMarkdown"] {{
-  animation: rjBlockIn .52s cubic-bezier(.3,.8,.3,1) both;   /* ← .52s = 單塊動畫時長 */
+.st-key-{scope_key} {{
+  animation: rjRiseOnce .5s cubic-bezier(.3,.8,.3,1) both;
   transform-origin: bottom center;
-  will-change: transform, opacity;
 }}
 @media (prefers-reduced-motion: reduce) {{
-  .st-key-{scope_key} [data-testid="stMarkdown"] {{ animation-duration: .001ms; }}
+  .st-key-{scope_key} {{ animation-duration: .001ms; }}
 }}
 </style>
 """
 
-def rise_jelly_stream_markdown(
-    text: str,
-    container,
-    scope_key: str,
-    step_delay: float = 0.10,   # 🎛️ 節奏：每塊之間的間隔秒數。越小越快、越大越有逐塊「打字」感
-    empty_msg: str = "安妮亞找不到答案～（抱歉啦！）",
-):
-    """逐塊以 rise+jelly 彈跳進場，回傳原始 text（與原本逐塊 reveal 的介面相容）。
-    container 必須是 st.container(key=scope_key) 建立的容器，CSS 才掛得上去。"""
-    # 注入 scoped 動畫樣式（零高度、無視覺影響）
-    container.markdown(_rise_jelly_style(scope_key), unsafe_allow_html=True)
-
-    blocks = _split_markdown_blocks(text)
-    if not blocks:
-        container.markdown(empty_msg)
-        return text
-    for blk in blocks:
-        container.markdown(blk)
-        time.sleep(step_delay)
-    return text
+def fake_stream_markdown_rise(text, parent, scope_key, step_chars=8, delay=0.02,
+                              empty_msg="安妮亞找不到答案～（抱歉啦！）"):
+    """整段一次性升起 + 內部單一 placeholder 串流（行距與原生一致）。回傳完整 text。
+    parent：放置容器的父層（st / 某 container / 某 empty placeholder 皆可）。"""
+    container = parent.container(key=scope_key, gap=None)   # gap=None：避免 style 元素與內文之間多出間距
+    container.markdown(_rise_once_style(scope_key), unsafe_allow_html=True)  # 掛一次性升起動畫
+    ph = container.empty()
+    return fake_stream_markdown(text, ph, step_chars=step_chars, delay=delay, empty_msg=empty_msg)
 
 # =========================
 # ✅ Fast mode 視覺增強（A：思考點點 / B：氣泡一次性升起）
@@ -4165,8 +4125,7 @@ if prompt is not None:
                         # ── 最終防護：確保 ai_text 不為空 ──
                         if not ai_text:
                             ai_text = "抱歉，安妮亞這次沒有取得回應，請再試一次。"
-                        rj_general = placeholder.container(key="rj_general_stream", gap=None)
-                        final_text = rise_jelly_stream_markdown(ai_text, rj_general, "rj_general_stream")
+                        final_text = fake_stream_markdown_rise(ai_text, placeholder, "rj_general_stream")
                         
                     
                         # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
@@ -4411,8 +4370,7 @@ if prompt is not None:
                             # ① Executive Summary — 可展開/收起，預設展開
                             with st.expander("📋 Executive Summary", expanded=True):
                                 if _short_summary:
-                                    rj_sum = st.container(key="rj_research_summary", gap=None)
-                                    rise_jelly_stream_markdown(_short_summary, rj_sum, "rj_research_summary")
+                                    fake_stream_markdown_rise(_short_summary, st, "rj_research_summary")
                                 else:
                                     st.caption(":gray[（無摘要）]")
 
@@ -4420,8 +4378,7 @@ if prompt is not None:
                             if _full_report:
                                 st.markdown("### 📖 完整報告")
                                 st.divider()
-                                rj_rep = st.container(key="rj_research_report", gap=None)
-                                rise_jelly_stream_markdown(_full_report, rj_rep, "rj_research_report")
+                                fake_stream_markdown_rise(_full_report, st, "rj_research_report")
 
                             # ③ 後續建議問題 — divider 分隔，清單顯示
                             if _follow_ups:
@@ -4509,8 +4466,7 @@ if prompt is not None:
                             )
 
                             ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
-                            rj_fb = output_area.container(key="rj_general_fallback", gap=None)
-                            final_text = rise_jelly_stream_markdown(ai_text, rj_fb, "rj_general_fallback")
+                            final_text = fake_stream_markdown_rise(ai_text, output_area, "rj_general_fallback")
 
                             with sources_container:
                                 if url_in_text:
