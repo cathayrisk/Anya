@@ -118,20 +118,22 @@ inject_rich_styles()  # 注入富文本 CSS（品牌紅色標題、blockquote、
 # st.status 渲染成 [data-testid="stExpander"]；執行中時 header 會有 [data-testid="stExpanderIconSpinner"]，
 # 完成換成 ...IconCheck、錯誤換成 ...IconError。用 :has(spinner) → 只在 running 時掛動畫，完成/錯誤自動停。
 # label 是 Streamlit 內部渲染的純文字（塞不了 HTML），所以動畫掛在它的 markdown 容器上，不改 status.update 寫法。
-# 🎛️ 想調手感：改 anyaJellyStatus 的 scale/translateY（幅度）與 1.25s（一個 jelly 週期，越小越快）。
+# 🎛️ 想調手感（左右搖晃版）：
+#   • translateX(±2px)：左右擺動距離，越大晃越多。想更小就改 ±1px。
+#   • rotate(±1.5deg)：左右傾斜角度，越大越「甩」。設 0deg 就只平移不傾斜。
+#   • 1.4s：一個搖晃週期，越小越快。
 st.markdown("""
 <style>
 @keyframes anyaJellyStatus {
-  0%, 100% { transform: translateY(0)    scale(1, 1)      rotate(0deg); }
-  15%      { transform: translateY(-5px) scale(1.13, .87) rotate(0deg); }
-  35%      { transform: translateY(0)    scale(.88, 1.12) rotate(-3deg); }
-  55%      { transform: translateY(-3px) scale(1.07, .94) rotate(2deg); }
-  75%      { transform: translateY(0)    scale(.97, 1.03) rotate(-1deg); }
+  0%, 100% { transform: translateX(0)    rotate(0deg); }
+  25%      { transform: translateX(-2px) rotate(-1.5deg); }
+  50%      { transform: translateX(2px)  rotate(1.5deg); }
+  75%      { transform: translateX(-1px) rotate(-0.8deg); }
 }
 [data-testid="stExpander"]:has([data-testid="stExpanderIconSpinner"]) summary [data-testid="stMarkdownContainer"] {
   display: inline-block;
   transform-origin: 50% 100%;
-  animation: anyaJellyStatus 1.25s ease-in-out infinite;
+  animation: anyaJellyStatus 1.4s ease-in-out infinite;
 }
 @media (prefers-reduced-motion: reduce) {
   [data-testid="stExpander"]:has([data-testid="stExpanderIconSpinner"]) summary [data-testid="stMarkdownContainer"] { animation: none; }
