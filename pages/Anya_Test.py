@@ -75,6 +75,13 @@ except ImportError:
 
 HAS_KB = False  # 初始值，init 區段再確認
 
+# 🔌 Supabase 知識庫（knowledge_search）總開關
+#   False = Agent 回答前「不會」去搜尋 Supabase 持久知識庫（在程式碼層直接不把工具加進清單，
+#           不靠 prompt，所以模型根本無法呼叫 → 省掉這段搜尋時間）。
+#   目前 Supabase 文件量不足、查了浪費時間，先關閉；
+#   之後文件夠多時，把這裡改回 True 即可恢復「主動查長期知識庫」的行為。
+ENABLE_KNOWLEDGE_SEARCH = False
+
 # === 0. Trimming / 大小限制（可調） ===
 TRIM_LAST_N_USER_TURNS = 18                 # 短期記憶：最近 N 個 user 回合
 MAX_REQ_TOTAL_BYTES = 48 * 1024 * 1024      # 單次請求總量預警（48MB）
@@ -180,15 +187,155 @@ st.session_state.setdefault("ds_active_run_id", None)    # str | None
 
 
 # === 共用：假串流打字效果 ===
-def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty_msg="安妮亞找不到答案～（抱歉啦！）"):
-    buf = ""
-    for i in range(0, len(text), step_chars):
-        buf = text[: i + step_chars]
-        placeholder.markdown(buf)
-        time.sleep(delay)
+# =========================
+# ✅ Rise + jelly 逐塊彈跳串流（General / Research 專用）
+# 設計重點：
+#   - 用「原生 st.markdown 逐塊 append」渲染 → Streamlit 專屬語法（:color[]、:badge[]、
+#     :material:、:small[]）全部保留（不能包進自繪 <div>，否則這些語法不會被解析）。
+#   - 彈跳動畫靠 CSS @keyframes，透過 st.container(key=...) 產生的 .st-key-<key> class
+#     精準 scope，只讓「這次的答案」彈，不影響整個 UI。
+#   - 逐塊（段落/標題/清單/表格/程式碼）出現；每塊 mount 時各播一次動畫，舊塊不重播。
+#   - graceful degradation：若 CSS 萬一沒生效，最壞只是逐塊依序出現而不彈，格式不受影響。
+# =========================
+def _split_markdown_blocks(text: str):
+    """把 markdown 切成可獨立渲染的區塊：以空行分段，但不切開 ``` / ~~~ 圍欄程式碼區塊。
+    清單／表格（以單一換行連續）會保持在同一塊內，確保獨立渲染時格式不破。"""
     if not text:
-        placeholder.markdown(empty_msg)
+        return []
+    blocks = []
+    cur = []
+    in_fence = False
+    fence_token = ""
+    for ln in text.split("\n"):
+        stripped = ln.lstrip()
+        is_fence = stripped.startswith("```") or stripped.startswith("~~~")
+        if is_fence:
+            token = stripped[:3]
+            if not in_fence:
+                in_fence, fence_token = True, token
+            elif token == fence_token:
+                in_fence, fence_token = False, ""
+            cur.append(ln)
+            continue
+        if in_fence:
+            cur.append(ln)
+            continue
+        if ln.strip() == "":
+            if cur:
+                blocks.append("\n".join(cur))
+                cur = []
+            continue
+        cur.append(ln)
+    if cur:
+        blocks.append("\n".join(cur))
+    return blocks
+
+def _rise_jelly_style(scope_key: str) -> str:
+    # ────────────────────────────────────────────────────────────────────
+    # 🎛️ 彈跳幅度調整區（要改手感改這裡就好）
+    #   • translateY(14px)：起始上移距離，越大「升起」越明顯。
+    #   • scale 的 overshoot（1.015 / .995）：彈過頭再回彈的差距，差越多越 Q。
+    #   • rotate（±0.6deg）：左右晃動角度。段落級刻意壓很小避免干擾閱讀；想更俏皮可加大。
+    #   • 動畫時長 .52s：越大越慢越「軟」。
+    #   • cubic-bezier(.3,.8,.3,1)：緩動曲線，控制彈性節奏。
+    # ────────────────────────────────────────────────────────────────────
+    return f"""
+<style>
+@keyframes rjBlockIn {{
+  0%   {{ opacity: 0; transform: translateY(14px) scale(.97) rotate(-.6deg); }}   /* 起點：偏下、縮小、微傾 */
+  55%  {{ opacity: 1; transform: translateY(-4px) scale(1.015) rotate(.5deg); }}  /* 衝過頭：上彈 + 放大 */
+  74%  {{ transform: translateY(0) scale(.995) rotate(-.2deg); }}                 /* 回彈：縮一點點 */
+  88%  {{ transform: scale(1.004); }}                                             /* 再微彈一下 */
+  100% {{ opacity: 1; transform: translateY(0) scale(1) rotate(0deg); }}          /* 定位歸零 */
+}}
+.st-key-{scope_key} [data-testid="stMarkdown"] {{
+  animation: rjBlockIn .52s cubic-bezier(.3,.8,.3,1) both;   /* ← .52s = 單塊動畫時長 */
+  transform-origin: bottom center;
+  will-change: transform, opacity;
+}}
+@media (prefers-reduced-motion: reduce) {{
+  .st-key-{scope_key} [data-testid="stMarkdown"] {{ animation-duration: .001ms; }}
+}}
+</style>
+"""
+
+def rise_jelly_stream_markdown(
+    text: str,
+    container,
+    scope_key: str,
+    step_delay: float = 0.10,   # 🎛️ 節奏：每塊之間的間隔秒數。越小越快、越大越有逐塊「打字」感
+    empty_msg: str = "安妮亞找不到答案～（抱歉啦！）",
+):
+    """逐塊以 rise+jelly 彈跳進場，回傳原始 text（與原本逐塊 reveal 的介面相容）。
+    container 必須是 st.container(key=scope_key) 建立的容器，CSS 才掛得上去。"""
+    # 注入 scoped 動畫樣式（零高度、無視覺影響）
+    container.markdown(_rise_jelly_style(scope_key), unsafe_allow_html=True)
+
+    blocks = _split_markdown_blocks(text)
+    if not blocks:
+        container.markdown(empty_msg)
+        return text
+    for blk in blocks:
+        container.markdown(blk)
+        time.sleep(step_delay)
     return text
+
+# =========================
+# ✅ Fast mode 視覺增強（A：思考點點 / B：氣泡一次性升起）
+# 關鍵：Fast 是「真串流」——每個 token 都會把整個 buffer 重畫一次。
+#   • 動畫只能掛在「容器」(.st-key-<key>) 上，不能掛在文字元素上，否則每 token 重播會閃。
+#   • 容器只在開串時 mount 一次 → 升起動畫只播一次；裡面的文字照常逐 token 串流。
+#   • 思考點點是「第一個 token 之前」顯示，第一個 token 一到就被蓋掉，完全不碰串流本體。
+# =========================
+# A：思考中點點（HTML，靠下方 .rj-dots CSS 跳動）
+FAST_THINKING_DOTS = '<span class="rj-dots"><i></i><i></i><i></i></span>'
+
+def _fast_stream_style(scope_key: str) -> str:
+    # ────────────────────────────────────────────────────────────────────
+    # 🎛️ Fast 手感調整區
+    #   【B 氣泡升起】rjFastRise：
+    #     • translateY(12px)：起始上移距離，越大升起越明顯。
+    #     • scale overshoot（1.006）：往上彈過頭的幅度，越大越彈。
+    #     • .5s：一次性進場時長。
+    #   【A 思考點點】rjDot：
+    #     • translateY(-5px)：點點跳多高。
+    #     • 1.2s：一個跳動週期；越小跳越快。
+    #     • .rj-dots i 的 width/height/background：點點大小與顏色。
+    # ────────────────────────────────────────────────────────────────────
+    return f"""
+<style>
+/* B：整個 Fast 氣泡一次性升起（掛在容器、不掛文字 → 不會每 token 重播） */
+@keyframes rjFastRise {{
+  0%   {{ opacity: 0; transform: translateY(12px) scale(.985); }}
+  60%  {{ opacity: 1; transform: translateY(-3px) scale(1.006); }}
+  100% {{ opacity: 1; transform: translateY(0) scale(1); }}
+}}
+.st-key-{scope_key} {{
+  animation: rjFastRise .5s cubic-bezier(.3,.8,.3,1) both;
+  transform-origin: bottom center;
+}}
+
+/* A：開串前的思考點點 */
+.rj-dots {{ display: inline-flex; gap: 4px; align-items: center; padding: 4px 2px; }}
+.rj-dots i {{
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #b3a0a0;            /* 點點顏色（偏 Anya 紅灰，可改） */
+  display: inline-block;
+  animation: rjDot 1.2s ease-in-out infinite;
+}}
+.rj-dots i:nth-child(2) {{ animation-delay: .18s; }}
+.rj-dots i:nth-child(3) {{ animation-delay: .36s; }}
+@keyframes rjDot {{
+  0%,80%,100% {{ transform: translateY(0);   opacity: .4; }}
+  40%         {{ transform: translateY(-5px); opacity: 1; }}
+}}
+
+@media (prefers-reduced-motion: reduce) {{
+  .st-key-{scope_key} {{ animation-duration: .001ms; }}
+  .rj-dots i {{ animation: none; opacity: .6; }}
+}}
+</style>
+"""
 
 class AsyncLoopRunner:
     """
@@ -1823,7 +1970,8 @@ def run_general_with_webpage_tool(
 
     tools = [DOC_LIST_TOOL, DOC_SEARCH_TOOL, DOC_GET_FULLTEXT_TOOL, FETCH_WEBPAGE_TOOL, THINK_TOOL,
              CRITIQUE_ANALYSIS_TOOL, CHECK_SOURCE_FRAMEWORK_TOOL]
-    if use_kb and HAS_KB and KNOWLEDGE_SEARCH_TOOL:
+    # ENABLE_KNOWLEDGE_SEARCH=False 時，無論如何都不加入 knowledge_search（總開關，見檔案最上方）
+    if ENABLE_KNOWLEDGE_SEARCH and use_kb and HAS_KB and KNOWLEDGE_SEARCH_TOOL:
         tools.append(KNOWLEDGE_SEARCH_TOOL)
     if need_web:
         tools.insert(0, {"type": "web_search"})
@@ -3468,7 +3616,9 @@ with st.popover("📚 引用資料夾"):
 # === 6.5 General 分支 instructions 輔助函式 ===
 
 def _build_general_instructions() -> str:
-    """回傳 general 分支的 instructions 字串（依賴 HAS_KB，其餘為靜態）。"""
+    """回傳 general 分支的 instructions 字串（依賴 HAS_KB / ENABLE_KNOWLEDGE_SEARCH，其餘為靜態）。"""
+    # knowledge_search（Supabase）總開關連動：關閉時 prompt 完全不提及，避免叫模型查一個不存在的工具
+    _kb_on = HAS_KB and ENABLE_KNOWLEDGE_SEARCH
     DOCSTORE_RULES = (
         "\n\n"
         "【文件庫工具使用規則（重要）】\n"
@@ -3488,7 +3638,7 @@ def _build_general_instructions() -> str:
             "  直接使用 web_search；knowledge_search 僅用於補充背景脈絡，不做為主要來源。\n"
             "- 兩者互補，可同時使用；知識庫引用格式：[KB:文件名 pN]。\n"
             "- 若 knowledge_search 工具不在清單中，代表使用者已限制只看上傳文件，請勿強行查詢。\n"
-            if HAS_KB else ""
+            if _kb_on else ""
         )
     )
     THINK_TOOL_RULES = (
@@ -3496,8 +3646,8 @@ def _build_general_instructions() -> str:
         "【think 工具使用規則（必須遵守）】\n"
         "每次呼叫以下任何工具之後，你必須緊接著呼叫 `think` 工具進行反思，再決定下一步：\n"
         "- doc_search、doc_get_fulltext、doc_list\n"
-        "- knowledge_search\n"
-        "- fetch_webpage\n"
+        + ("- knowledge_search\n" if _kb_on else "")
+        + "- fetch_webpage\n"
         "- web_search\n"
         "\n"
         "reflection 欄位請涵蓋五個面向：\n"
@@ -3521,8 +3671,8 @@ def _build_general_instructions() -> str:
         "\n"
         "停止搜尋的條件（滿足任一即停止，直接作答）：\n"
         "- confidence ≥ 80\n"
-        "- knowledge_search / doc_search 已使用 ≥ 2 次且 confidence ≤ 45% → 停止使用這些工具，改用 web_search\n"
-        "- web_search 已使用 ≥ 10 次 → 停止搜尋，以現有資料作答\n"
+        + (f"- {'knowledge_search / ' if _kb_on else ''}doc_search 已使用 ≥ 2 次且 confidence ≤ 45% → 停止使用這些工具，改用 web_search\n")
+        + "- web_search 已使用 ≥ 10 次 → 停止搜尋，以現有資料作答\n"
         "- 連續兩次搜尋結果高度重疊\n"
     )
     CRITIQUE_RULES = (
@@ -3588,6 +3738,9 @@ async def fast_agent_stream(query: str, placeholder):
     meta = {"web_calls": 0, "web_used": False}
     seen_call_ids: set = set()   # 用 call_id 去重，避免同一次呼叫的多個生命週期事件重複計數
     debug_log = [] if DEV_MODE else None
+
+    # A：第一個 token 之前先顯示「思考中」點點；token 一到 placeholder.markdown(buf) 會自動蓋掉
+    placeholder.markdown(FAST_THINKING_DOTS, unsafe_allow_html=True)
 
     result = Runner.run_streamed(fast_agent, input=query)
 
@@ -3818,8 +3971,13 @@ if prompt is not None:
                             max_history_messages=18,
                         )
                         fast_query_runtime = f"{today_line}\n\n{fast_query_with_history}".strip()
-                    
-                        final_text, fast_meta = run_async(fast_agent_stream(fast_query_runtime, placeholder))
+
+                        # B：把串流 placeholder 包進帶 key 的容器 → 容器只 mount 一次，升起動畫只播一次；
+                        #    裡面的文字照常逐 token 真串流，不會 flicker。樣式同時帶 A 的思考點點。
+                        rj_fast = placeholder.container(key="rj_fast_stream", gap=None)
+                        rj_fast.markdown(_fast_stream_style("rj_fast_stream"), unsafe_allow_html=True)
+                        fast_stream_ph = rj_fast.empty()
+                        final_text, fast_meta = run_async(fast_agent_stream(fast_query_runtime, fast_stream_ph))
                     
                         # 更新 badges（fast 沒有 DB；web 看 best-effort meta）
                         badges_ph.markdown(
@@ -4007,7 +4165,8 @@ if prompt is not None:
                         # ── 最終防護：確保 ai_text 不為空 ──
                         if not ai_text:
                             ai_text = "抱歉，安妮亞這次沒有取得回應，請再試一次。"
-                        final_text = fake_stream_markdown(ai_text, placeholder)
+                        rj_general = placeholder.container(key="rj_general_stream", gap=None)
+                        final_text = rise_jelly_stream_markdown(ai_text, rj_general, "rj_general_stream")
                         
                     
                         # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
@@ -4252,7 +4411,8 @@ if prompt is not None:
                             # ① Executive Summary — 可展開/收起，預設展開
                             with st.expander("📋 Executive Summary", expanded=True):
                                 if _short_summary:
-                                    fake_stream_markdown(_short_summary, st.empty())
+                                    rj_sum = st.container(key="rj_research_summary", gap=None)
+                                    rise_jelly_stream_markdown(_short_summary, rj_sum, "rj_research_summary")
                                 else:
                                     st.caption(":gray[（無摘要）]")
 
@@ -4260,7 +4420,8 @@ if prompt is not None:
                             if _full_report:
                                 st.markdown("### 📖 完整報告")
                                 st.divider()
-                                fake_stream_markdown(_full_report, st.empty())
+                                rj_rep = st.container(key="rj_research_report", gap=None)
+                                rise_jelly_stream_markdown(_full_report, rj_rep, "rj_research_report")
 
                             # ③ 後續建議問題 — divider 分隔，清單顯示
                             if _follow_ups:
@@ -4348,7 +4509,8 @@ if prompt is not None:
                             )
 
                             ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
-                            final_text = fake_stream_markdown(ai_text, output_area.empty())
+                            rj_fb = output_area.container(key="rj_general_fallback", gap=None)
+                            final_text = rise_jelly_stream_markdown(ai_text, rj_fb, "rj_general_fallback")
 
                             with sources_container:
                                 if url_in_text:
