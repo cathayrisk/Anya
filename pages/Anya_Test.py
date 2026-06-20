@@ -281,7 +281,7 @@ def _two_phase_tokens(plain: str, cjk_chunk: int = 2):
 def _esc_html(s: str) -> str:
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def fake_stream_two_phase(text, placeholder, max_total: float = 3.2, word_anim: float = 0.7,
+def fake_stream_two_phase(text, placeholder, max_total: float = 3.2, word_anim: float = 0.9,
                           empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
     """兩階段假串流：Phase 1 純文字逐詞 shimmer sweep（一道光掃過文字，特效）→ Phase 2 完整 markdown（版面）。
     用同一個 placeholder 先後渲染兩階段（等同兩個顯示層）。回傳完整 text。
