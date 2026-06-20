@@ -281,7 +281,7 @@ def _two_phase_tokens(plain: str, cjk_chunk: int = 2):
 def _esc_html(s: str) -> str:
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def fake_stream_two_phase(text, placeholder, max_total: float = 2.4, word_anim: float = 0.5,
+def fake_stream_two_phase(text, placeholder, max_total: float = 3.2, word_anim: float = 0.7,
                           empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
     """兩階段假串流：Phase 1 純文字逐詞 rise+jelly 彈入（特效）→ Phase 2 完整 markdown（版面）。
     用同一個 placeholder 先後渲染兩階段（等同兩個顯示層）。回傳完整 text。
@@ -293,7 +293,7 @@ def fake_stream_two_phase(text, placeholder, max_total: float = 2.4, word_anim: 
 
     toks = _two_phase_tokens(_markdown_to_plain(text))
     nwords = sum(1 for k, _ in toks if k == 'word')
-    stagger = min(0.05, max_total / max(nwords, 1))   # 依長度壓縮 → 整段特效有時間上限
+    stagger = min(0.08, max_total / max(nwords, 1))   # 依長度壓縮 → 整段特效有時間上限
 
     style = (
         "<style>"
@@ -318,7 +318,7 @@ def fake_stream_two_phase(text, placeholder, max_total: float = 2.4, word_anim: 
 
     placeholder.markdown(''.join(parts), unsafe_allow_html=True)                  # Phase 1：特效
     time.sleep(min(max(nwords - 1, 0) * stagger + word_anim, max_total + word_anim))
-    placeholder.markdown(text)                                                    # Phase 2：完整格式
+    placeholder.markdown(normalize_markdown_for_streamlit(text))                  # Phase 2：完整格式（含 CJK 粗體修正）
     return text
 
 # =========================
@@ -517,6 +517,17 @@ def normalize_markdown_for_streamlit(text: str) -> str:
 
     # 4) 常見跳脫還原：\*\*TL;DR\*\* -> **TL;DR**
     t = re.sub(r"\\([*_`])", r"\1", t)
+
+    # 5) CJK／全形標點緊貼 ** 或 * 時補零寬空格（U+200B）：
+    #    CommonMark 的粗體/斜體 flanking 規則對 CJK 不友善——例如「…品鍋貼。**🥜」
+    #    閉合 ** 前是全形句號、後接 emoji，會不渲染、直接吐出 **。在標點與 * 之間插入
+    #    隱形的零寬空格即可讓 ** 正常配對（ZWSP 用 chr(0x200b) 產生，原始碼不留隱形字元；Playwright 驗證過）。
+    _cjk = "一-鿿　-〿぀-ヿ가-힯＀-￯"
+    t = re.sub(
+        "([" + _cjk + "])([*_]+)",
+        lambda m: m.group(1) + chr(0x200b) + m.group(2),
+        t,
+    )
 
     return t
 
