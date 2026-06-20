@@ -231,6 +231,97 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty
     return text
 
 # =========================
+# ✅ 兩階段假串流（General / Research）
+#   Phase 1（特效）：答案轉「純文字」→ 逐詞包 <span> + CSS 交錯延遲做 rise+jelly 彈入。
+#       純文字才能安全包 span（不會破壞 :color[]/徽章/標題等 Streamlit 語法），逐詞彈跳因此可行。
+#   Phase 2（版面）：特效跑完，同一個 placeholder 換成完整 st.markdown(全文) → 所有格式/彩色字正常。
+#   逐「詞」而非逐「字」：長報告不會太慢；stagger 依長度自動壓縮，整段特效時長有上限。
+# =========================
+def _markdown_to_plain(md: str) -> str:
+    """把 markdown（含 Streamlit :color[]/徽章/:material:）粗略轉成乾淨純文字，給 Phase 1 動畫用。
+    不必完美——只是特效期間的暫時呈現，Phase 2 會用完整格式覆蓋。"""
+    t = md or ""
+    t = re.sub(r'```[a-zA-Z]*\n?', '', t); t = t.replace('```', '')
+    t = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', t)               # 圖片
+    t = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', t)                # 連結
+    for _ in range(2):                                            # Streamlit :color[]/:small[]/badge（跑兩次處理巢狀）
+        t = re.sub(r':[a-zA-Z\-]+\[([^\[\]]*)\]', r'\1', t)
+    t = re.sub(r':material[/_][a-zA-Z0-9_]+:', '', t)             # material 圖示
+    t = re.sub(r'^[ \t]*#{1,6}[ \t]*', '', t, flags=re.M)         # 標題
+    t = re.sub(r'^[ \t]*>[ \t]?', '', t, flags=re.M)              # 引用
+    t = re.sub(r'^[ \t]*[-*+][ \t]+', '', t, flags=re.M)          # 無序清單
+    t = re.sub(r'^[ \t]*\d+\.[ \t]+', '', t, flags=re.M)          # 有序清單
+    t = re.sub(r'^[ \t]*([-*_])\1{2,}[ \t]*$', '', t, flags=re.M) # 分隔線
+    t = re.sub(r'\*\*([^*]+)\*\*', r'\1', t)                      # 粗體
+    t = re.sub(r'\*([^*]+)\*', r'\1', t)                          # 斜體
+    t = re.sub(r'__([^_]+)__', r'\1', t)
+    t = t.replace('`', '')                                        # 行內 code
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+_CJK_RANGE = '一-鿿぀-ヿ가-힯＀-￯'
+
+def _two_phase_tokens(plain: str, cjk_chunk: int = 2):
+    """切成動畫單位：英數以空白分詞、CJK 每 cjk_chunk 字一組；保留空白與換行。
+    回傳 list[(kind, text)]，kind ∈ {'word','space','br'}。"""
+    out = []
+    for li, line in enumerate(plain.split('\n')):
+        if li > 0:
+            out.append(('br', ''))
+        for p in re.findall(rf'[{_CJK_RANGE}]+|[^\s{_CJK_RANGE}]+|\s+', line):
+            if re.match(rf'[{_CJK_RANGE}]', p):
+                for j in range(0, len(p), cjk_chunk):
+                    out.append(('word', p[j:j + cjk_chunk]))
+            elif p.strip() == '':
+                out.append(('space', p))
+            else:
+                out.append(('word', p))
+    return out
+
+def _esc_html(s: str) -> str:
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+def fake_stream_two_phase(text, placeholder, max_total: float = 2.4, word_anim: float = 0.5,
+                          empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
+    """兩階段假串流：Phase 1 純文字逐詞 rise+jelly 彈入（特效）→ Phase 2 完整 markdown（版面）。
+    用同一個 placeholder 先後渲染兩階段（等同兩個顯示層）。回傳完整 text。
+    🎛️ word_anim：單詞彈跳時長（越大越軟）；max_total：整段特效時間上限（長報告自動壓縮 stagger）。
+    🎛️ 逐詞改逐字：把 _two_phase_tokens 的 cjk_chunk 改 1。"""
+    if not text:
+        placeholder.markdown(empty_msg)
+        return text
+
+    toks = _two_phase_tokens(_markdown_to_plain(text))
+    nwords = sum(1 for k, _ in toks if k == 'word')
+    stagger = min(0.05, max_total / max(nwords, 1))   # 依長度壓縮 → 整段特效有時間上限
+
+    style = (
+        "<style>"
+        ".rjw{display:inline-block;opacity:0;transform:translateY(10px) scale(.6);"
+        f"animation:rjWord {word_anim}s cubic-bezier(.34,1.56,.64,1) both;{'}'}"
+        "@keyframes rjWord{0%{opacity:0;transform:translateY(10px) scale(.6);}"
+        "60%{opacity:1;transform:translateY(-3px) scale(1.08);}"
+        "100%{opacity:1;transform:translateY(0) scale(1);}}"
+        "@media (prefers-reduced-motion:reduce){.rjw{animation:none;opacity:1;transform:none;}}"
+        "</style>"
+    )
+    parts = [style]
+    i = 0
+    for kind, t in toks:
+        if kind == 'br':
+            parts.append('<br>')
+        elif kind == 'space':
+            parts.append(t)
+        else:
+            parts.append(f'<span class="rjw" style="animation-delay:{i * stagger:.3f}s">{_esc_html(t)}</span>')
+            i += 1
+
+    placeholder.markdown(''.join(parts), unsafe_allow_html=True)                  # Phase 1：特效
+    time.sleep(min(max(nwords - 1, 0) * stagger + word_anim, max_total + word_anim))
+    placeholder.markdown(text)                                                    # Phase 2：完整格式
+    return text
+
+# =========================
 # ✅ Fast mode 視覺增強（A：思考點點 / B：氣泡一次性升起）
 # 關鍵：Fast 是「真串流」——每個 token 都會把整個 buffer 重畫一次。
 #   • 動畫只能掛在「容器」(.st-key-<key>) 上，不能掛在文字元素上，否則每 token 重播會閃。
@@ -4115,7 +4206,7 @@ if prompt is not None:
                         # ── 最終防護：確保 ai_text 不為空 ──
                         if not ai_text:
                             ai_text = "抱歉，安妮亞這次沒有取得回應，請再試一次。"
-                        final_text = fake_stream_markdown(ai_text, placeholder)
+                        final_text = fake_stream_two_phase(ai_text, placeholder)
                         
                     
                         # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
@@ -4360,7 +4451,7 @@ if prompt is not None:
                             # ① Executive Summary — 可展開/收起，預設展開
                             with st.expander("📋 Executive Summary", expanded=True):
                                 if _short_summary:
-                                    fake_stream_markdown(_short_summary, st.empty())
+                                    fake_stream_two_phase(_short_summary, st.empty())
                                 else:
                                     st.caption(":gray[（無摘要）]")
 
@@ -4368,7 +4459,7 @@ if prompt is not None:
                             if _full_report:
                                 st.markdown("### 📖 完整報告")
                                 st.divider()
-                                fake_stream_markdown(_full_report, st.empty())
+                                fake_stream_two_phase(_full_report, st.empty())
 
                             # ③ 後續建議問題 — divider 分隔，清單顯示
                             if _follow_ups:
@@ -4456,7 +4547,7 @@ if prompt is not None:
                             )
 
                             ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
-                            final_text = fake_stream_markdown(ai_text, output_area.empty())
+                            final_text = fake_stream_two_phase(ai_text, output_area.empty())
 
                             with sources_container:
                                 if url_in_text:
