@@ -232,7 +232,7 @@ def fake_stream_markdown(text: str, placeholder, step_chars=8, delay=0.02, empty
 
 # =========================
 # ✅ 兩階段假串流（General / Research）
-#   Phase 1（特效）：答案轉「純文字」→ 逐詞包 <span> + CSS 交錯延遲做 rise+jelly 彈入。
+#   Phase 1（特效）：答案轉「純文字」→ 逐詞包 <span> + CSS 交錯延遲做 shimmer sweep（光掃過文字）。
 #       純文字才能安全包 span（不會破壞 :color[]/徽章/標題等 Streamlit 語法），逐詞彈跳因此可行。
 #   Phase 2（版面）：特效跑完，同一個 placeholder 換成完整 st.markdown(全文) → 所有格式/彩色字正常。
 #   逐「詞」而非逐「字」：長報告不會太慢；stagger 依長度自動壓縮，整段特效時長有上限。
@@ -283,10 +283,10 @@ def _esc_html(s: str) -> str:
 
 def fake_stream_two_phase(text, placeholder, max_total: float = 3.2, word_anim: float = 0.7,
                           empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
-    """兩階段假串流：Phase 1 純文字逐詞 rise+jelly 彈入（特效）→ Phase 2 完整 markdown（版面）。
+    """兩階段假串流：Phase 1 純文字逐詞 shimmer sweep（一道光掃過文字，特效）→ Phase 2 完整 markdown（版面）。
     用同一個 placeholder 先後渲染兩階段（等同兩個顯示層）。回傳完整 text。
-    🎛️ word_anim：單詞彈跳時長（越大越軟）；max_total：整段特效時間上限（長報告自動壓縮 stagger）。
-    🎛️ 逐詞改逐字：把 _two_phase_tokens 的 cjk_chunk 改 1。"""
+    🎛️ word_anim：單詞 shimmer 時長（越大掃越慢）；max_total：整段特效時間上限（長報告自動壓縮 stagger）。
+    🎛️ 逐詞改逐字：把 _two_phase_tokens 的 cjk_chunk 改 1；換色改 style 裡的兩個 hex。"""
     if not text:
         placeholder.markdown(empty_msg)
         return text
@@ -295,14 +295,18 @@ def fake_stream_two_phase(text, placeholder, max_total: float = 3.2, word_anim: 
     nwords = sum(1 for k, _ in toks if k == 'word')
     stagger = min(0.08, max_total / max(nwords, 1))   # 依長度壓縮 → 整段特效有時間上限
 
+    # 🎛️ Shimmer sweep：一道淺色光掃過文字。深褐底 #211c18、暖光條 #cdc6bd（想換色改這兩個）。
     style = (
         "<style>"
-        ".rjw{display:inline-block;opacity:0;transform:translateY(10px) scale(.6);"
-        f"animation:rjWord {word_anim}s cubic-bezier(.34,1.56,.64,1) both;{'}'}"
-        "@keyframes rjWord{0%{opacity:0;transform:translateY(10px) scale(.6);}"
-        "60%{opacity:1;transform:translateY(-3px) scale(1.08);}"
-        "100%{opacity:1;transform:translateY(0) scale(1);}}"
-        "@media (prefers-reduced-motion:reduce){.rjw{animation:none;opacity:1;transform:none;}}"
+        ".rjw{display:inline-block;opacity:0;color:transparent;"
+        "background:linear-gradient(100deg,#211c18 0%,#211c18 38%,#cdc6bd 50%,#211c18 62%,#211c18 100%);"
+        "background-size:260% 100%;background-position:100% 0;"
+        "-webkit-background-clip:text;background-clip:text;"
+        f"animation:rjShimmer {word_anim}s cubic-bezier(.3,.7,.3,1) both;{'}'}"
+        "@keyframes rjShimmer{0%{opacity:0;background-position:100% 0;}"
+        "20%{opacity:1;}"
+        "100%{opacity:1;background-position:0% 0;}}"
+        "@media (prefers-reduced-motion:reduce){.rjw{animation:none;opacity:1;color:inherit;background:none;}}"
         "</style>"
     )
     parts = [style]
