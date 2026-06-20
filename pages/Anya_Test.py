@@ -281,12 +281,34 @@ def _two_phase_tokens(plain: str, cjk_chunk: int = 2):
 def _esc_html(s: str) -> str:
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def fake_stream_two_phase(text, placeholder, max_total: float = 3.2, word_anim: float = 0.9,
-                          empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
-    """兩階段假串流：Phase 1 純文字逐詞 shimmer sweep（一道光掃過文字，特效）→ Phase 2 完整 markdown（版面）。
-    用同一個 placeholder 先後渲染兩階段（等同兩個顯示層）。回傳完整 text。
-    🎛️ word_anim：單詞 shimmer 時長（越大掃越慢）；max_total：整段特效時間上限（長報告自動壓縮 stagger）。
-    🎛️ 逐詞改逐字：把 _two_phase_tokens 的 cjk_chunk 改 1；換色改 style 裡的兩個 hex。"""
+def render_thinking_skeleton(placeholder) -> None:
+    """在 LLM 仍在跑的等待期，於答案位置放「流光骨架條」填補死空白（之後會被 Phase 1 覆蓋）。
+    🎛️ 想改數量/寬度改下面的 <span class='b'> 行；想改顏色改漸層三個 hex。"""
+    placeholder.markdown(
+        "<style>"
+        ".rjsk{display:flex;flex-direction:column;gap:9px;padding:6px 0;}"
+        ".rjsk .b{height:11px;border-radius:6px;"
+        "background:linear-gradient(90deg,#efe7e3 0%,#faf4f1 50%,#efe7e3 100%);"
+        "background-size:220% 100%;animation:rjShine 1.15s linear infinite;}"
+        "@keyframes rjShine{0%{background-position:120% 0;}100%{background-position:-120% 0;}}"
+        "@media (prefers-reduced-motion:reduce){.rjsk .b{animation:none;}}"
+        "</style>"
+        "<div class='rjsk'>"
+        "<span class='b' style='width:92%'></span>"
+        "<span class='b' style='width:78%'></span>"
+        "<span class='b' style='width:85%'></span>"
+        "<span class='b' style='width:55%'></span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+def fake_stream_two_phase(text, placeholder, scope_key: str = "rj_p2", max_total: float = 3.2,
+                          word_anim: float = 0.95, empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
+    """兩階段假串流：Phase 1 純文字逐詞 shimmer sweep（金色光掃過＋模糊轉清，特效）
+    → 淡出 → Phase 2 完整 markdown 淡入＋微升（版面）。回傳完整 text。
+    scope_key：Phase 2 容器的唯一 key（同一輪多次呼叫需各自不同，例如 Research 的摘要/報告）。
+    🎛️ word_anim：單詞 shimmer 時長；max_total：整段特效時間上限（長報告自動壓縮 stagger）。
+    🎛️ 逐詞改逐字：_two_phase_tokens 的 cjk_chunk 改 1；換色改 shimmer 的兩個 hex（底色/光條）。"""
     if not text:
         placeholder.markdown(empty_msg)
         return text
@@ -295,34 +317,51 @@ def fake_stream_two_phase(text, placeholder, max_total: float = 3.2, word_anim: 
     nwords = sum(1 for k, _ in toks if k == 'word')
     stagger = min(0.08, max_total / max(nwords, 1))   # 依長度壓縮 → 整段特效有時間上限
 
-    # 🎛️ Shimmer sweep：一道淺色光掃過文字。深褐底 #211c18、暖光條 #cdc6bd（想換色改這兩個）。
-    style = (
+    # 🎛️ Shimmer sweep：金色光掃過文字 + 模糊轉清。底色 #2a241f、光條 #e8c878（想換色改這兩個）。
+    shimmer_style = (
         "<style>"
         ".rjw{display:inline-block;opacity:0;color:transparent;"
-        "background:linear-gradient(100deg,#211c18 0%,#211c18 38%,#cdc6bd 50%,#211c18 62%,#211c18 100%);"
-        "background-size:260% 100%;background-position:100% 0;"
+        "background:linear-gradient(100deg,#2a241f 0%,#2a241f 38%,#e8c878 50%,#2a241f 62%,#2a241f 100%);"
+        "background-size:260% 100%;background-position:100% 0;filter:blur(2px);"
         "-webkit-background-clip:text;background-clip:text;"
         f"animation:rjShimmer {word_anim}s cubic-bezier(.3,.7,.3,1) both;{'}'}"
-        "@keyframes rjShimmer{0%{opacity:0;background-position:100% 0;}"
+        "@keyframes rjShimmer{0%{opacity:0;background-position:100% 0;filter:blur(2px);}"
         "20%{opacity:1;}"
-        "100%{opacity:1;background-position:0% 0;}}"
-        "@media (prefers-reduced-motion:reduce){.rjw{animation:none;opacity:1;color:inherit;background:none;}}"
+        "100%{opacity:1;background-position:0% 0;filter:blur(0);}}"
+        ".rjfo{animation:rjFadeOut .18s ease forwards;}@keyframes rjFadeOut{to{opacity:0;}}"
+        "@media (prefers-reduced-motion:reduce){.rjw{animation:none;opacity:1;color:inherit;background:none;filter:none;}}"
         "</style>"
     )
-    parts = [style]
+    span_parts, plain_parts = [shimmer_style], []
     i = 0
     for kind, t in toks:
         if kind == 'br':
-            parts.append('<br>')
+            span_parts.append('<br>'); plain_parts.append('<br>')
         elif kind == 'space':
-            parts.append(t)
+            span_parts.append(t); plain_parts.append(t)
         else:
-            parts.append(f'<span class="rjw" style="animation-delay:{i * stagger:.3f}s">{_esc_html(t)}</span>')
+            span_parts.append(f'<span class="rjw" style="animation-delay:{i * stagger:.3f}s">{_esc_html(t)}</span>')
+            plain_parts.append(_esc_html(t))
             i += 1
 
-    placeholder.markdown(''.join(parts), unsafe_allow_html=True)                  # Phase 1：特效
+    # Phase 1：shimmer 掃過
+    placeholder.markdown(''.join(span_parts), unsafe_allow_html=True)
     time.sleep(min(max(nwords - 1, 0) * stagger + word_anim, max_total + word_anim))
-    placeholder.markdown(normalize_markdown_for_streamlit(text))                  # Phase 2：完整格式（含 CJK 粗體修正）
+
+    # 過場：純文字快速淡出（避免硬切；之後 Phase 2 從近乎透明淡入，接縫平滑）
+    placeholder.markdown(shimmer_style + "<div class='rjfo'>" + ''.join(plain_parts) + "</div>",
+                         unsafe_allow_html=True)
+    time.sleep(0.18)
+
+    # Phase 2：完整 markdown（含 CJK 粗體修正），用 keyed 容器淡入＋微升
+    p2_style = (
+        "<style>.st-key-" + scope_key + "{animation:rjP2In .42s cubic-bezier(.2,.7,.3,1) both;}"
+        "@keyframes rjP2In{0%{opacity:0;transform:translateY(8px);}100%{opacity:1;transform:none;}}"
+        "@media (prefers-reduced-motion:reduce){.st-key-" + scope_key + "{animation:none;}}</style>"
+    )
+    cont = placeholder.container(key=scope_key)
+    cont.markdown(p2_style, unsafe_allow_html=True)
+    cont.markdown(normalize_markdown_for_streamlit(text))
     return text
 
 # =========================
@@ -4173,6 +4212,9 @@ if prompt is not None:
                         else:
                             gif_in_status_ph.image("anime/anya-jumping-rope.gif")
 
+                        # ✅ 等待期：在答案位置放流光骨架條填補死空白（LLM 回來後被 Phase 1 覆蓋）
+                        render_thinking_skeleton(placeholder)
+
                         # ✅ 使用 tool-calling 迴圈（含 fetch_webpage + doc tools）
                         resp, meta = run_general_with_webpage_tool(
                             client=client,
@@ -4221,7 +4263,7 @@ if prompt is not None:
                         # ── 最終防護：確保 ai_text 不為空 ──
                         if not ai_text:
                             ai_text = "抱歉，安妮亞這次沒有取得回應，請再試一次。"
-                        final_text = fake_stream_two_phase(ai_text, placeholder)
+                        final_text = fake_stream_two_phase(ai_text, placeholder, scope_key="rj_general")
                         
                     
                         # ✅ 3) 把「📚 證據/檢索/來源」與「🔎 檢索命中」搬到 status 區（你要的位置）
@@ -4466,7 +4508,7 @@ if prompt is not None:
                             # ① Executive Summary — 可展開/收起，預設展開
                             with st.expander("📋 Executive Summary", expanded=True):
                                 if _short_summary:
-                                    fake_stream_two_phase(_short_summary, st.empty())
+                                    fake_stream_two_phase(_short_summary, st.empty(), scope_key="rj_res_sum")
                                 else:
                                     st.caption(":gray[（無摘要）]")
 
@@ -4474,7 +4516,7 @@ if prompt is not None:
                             if _full_report:
                                 st.markdown("### 📖 完整報告")
                                 st.divider()
-                                fake_stream_two_phase(_full_report, st.empty())
+                                fake_stream_two_phase(_full_report, st.empty(), scope_key="rj_res_rep")
 
                             # ③ 後續建議問題 — divider 分隔，清單顯示
                             if _follow_ups:
@@ -4562,7 +4604,7 @@ if prompt is not None:
                             )
 
                             ai_text, url_cits, file_cits = parse_response_text_and_citations(resp)
-                            final_text = fake_stream_two_phase(ai_text, output_area.empty())
+                            final_text = fake_stream_two_phase(ai_text, output_area.empty(), scope_key="rj_fb")
 
                             with sources_container:
                                 if url_in_text:
