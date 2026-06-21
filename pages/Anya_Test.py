@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import base64
 import re
 import time
@@ -281,6 +282,18 @@ def _two_phase_tokens(plain: str, cjk_chunk: int = 2):
 def _esc_html(s: str) -> str:
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
+def _scroll_to_answer_top() -> None:
+    """把畫面捲到本回合答案最上方的錨點 #rj-answer-top，避免假串流把畫面拖到最底端。
+    st.markdown 會過濾 <script>，所以用 components.html 的 iframe 跑 script，透過 window.parent
+    操作主頁面；setTimeout 兩次以蓋過 Streamlit 自身的「捲到底」。錨點在助理 bubble 最上方。"""
+    components.html(
+        "<script>(function(){var d=window.parent.document;"
+        "function go(){var el=d.getElementById('rj-answer-top');"
+        "if(el)el.scrollIntoView({block:'start'});}"
+        "setTimeout(go,60);setTimeout(go,220);})();</script>",
+        height=0,
+    )
+
 def render_thinking_skeleton(placeholder) -> None:
     """在 LLM 仍在跑的等待期，於答案位置放「流光骨架條」填補死空白（之後會被 Phase 1 覆蓋）。
     🎛️ 想改數量/寬度改下面的 <span class='b'> 行；想改顏色改漸層三個 hex。"""
@@ -301,9 +314,10 @@ def render_thinking_skeleton(placeholder) -> None:
         "</div>",
         unsafe_allow_html=True,
     )
+    _scroll_to_answer_top()   # 等待期就先把畫面定在答案頂端
 
 def fake_stream_two_phase(text, placeholder, scope_key: str = "rj_p2", max_total: float = 3.2,
-                          word_anim: float = 0.95, empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
+                          word_anim: float = 0.7, empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
     """兩階段假串流：Phase 1 純文字逐詞 shimmer sweep（金色光掃過＋模糊轉清，特效）
     → 淡出 → Phase 2 完整 markdown 淡入＋微升（版面）。回傳完整 text。
     scope_key：Phase 2 容器的唯一 key（同一輪多次呼叫需各自不同，例如 Research 的摘要/報告）。
@@ -362,6 +376,7 @@ def fake_stream_two_phase(text, placeholder, scope_key: str = "rj_p2", max_total
     cont = placeholder.container(key=scope_key)
     cont.markdown(p2_style, unsafe_allow_html=True)
     cont.markdown(normalize_markdown_for_streamlit(text))
+    _scroll_to_answer_top()   # 輸出完把畫面定回答案頂端，不被拖到底
     return text
 
 # =========================
@@ -4015,6 +4030,10 @@ if prompt is not None:
 
     # 助理區塊
     with st.chat_message("assistant"):
+        st.markdown(
+            "<div id='rj-answer-top' style='scroll-margin-top:70px'></div>",  # 捲動錨點：答案最上方（留 70px 避開頂部工具列）
+            unsafe_allow_html=True,
+        )
         status_area = st.container()
         output_area = st.container()
         sources_container = st.container()
