@@ -360,6 +360,7 @@ def fake_stream_two_phase(text, placeholder, scope_key: str = "rj_p2", max_total
 
     # Phase 1：shimmer 掃過
     placeholder.markdown(''.join(span_parts), unsafe_allow_html=True)
+    _scroll_to_answer_top()   # Phase 1 一出現就把畫面定回答案頂端（不等到 Phase 2）
     time.sleep(min(max(nwords - 1, 0) * stagger + word_anim, max_total + word_anim))
 
     # 過場：純文字快速淡出（避免硬切；之後 Phase 2 從近乎透明淡入，接縫平滑）
