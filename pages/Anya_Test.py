@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import base64
 import re
 import time
@@ -282,18 +281,6 @@ def _two_phase_tokens(plain: str, cjk_chunk: int = 2):
 def _esc_html(s: str) -> str:
     return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def _scroll_to_answer_top() -> None:
-    """把畫面捲到本回合答案最上方的錨點 #rj-answer-top，避免假串流把畫面拖到最底端。
-    st.markdown 會過濾 <script>，所以用 components.html 的 iframe 跑 script，透過 window.parent
-    操作主頁面；setTimeout 兩次以蓋過 Streamlit 自身的「捲到底」。錨點在助理 bubble 最上方。"""
-    components.html(
-        "<script>(function(){var d=window.parent.document;"
-        "function go(){var el=d.getElementById('rj-answer-top');"
-        "if(el)el.scrollIntoView({block:'start'});}"
-        "setTimeout(go,60);setTimeout(go,220);})();</script>",
-        height=0,
-    )
-
 def render_thinking_skeleton(placeholder) -> None:
     """在 LLM 仍在跑的等待期，於答案位置放「流光骨架條」填補死空白（之後會被 Phase 1 覆蓋）。
     🎛️ 想改數量/寬度改下面的 <span class='b'> 行；想改顏色改漸層三個 hex。"""
@@ -314,7 +301,6 @@ def render_thinking_skeleton(placeholder) -> None:
         "</div>",
         unsafe_allow_html=True,
     )
-    _scroll_to_answer_top()   # 等待期就先把畫面定在答案頂端
 
 def fake_stream_two_phase(text, placeholder, scope_key: str = "rj_p2", max_total: float = 3.2,
                           word_anim: float = 0.7, empty_msg: str = "安妮亞找不到答案～（抱歉啦！）"):
@@ -360,7 +346,6 @@ def fake_stream_two_phase(text, placeholder, scope_key: str = "rj_p2", max_total
 
     # Phase 1：shimmer 掃過
     placeholder.markdown(''.join(span_parts), unsafe_allow_html=True)
-    _scroll_to_answer_top()   # Phase 1 一出現就把畫面定回答案頂端（不等到 Phase 2）
     time.sleep(min(max(nwords - 1, 0) * stagger + word_anim, max_total + word_anim))
 
     # 過場：純文字快速淡出（避免硬切；之後 Phase 2 從近乎透明淡入，接縫平滑）
@@ -376,8 +361,7 @@ def fake_stream_two_phase(text, placeholder, scope_key: str = "rj_p2", max_total
     )
     cont = placeholder.container(key=scope_key)
     cont.markdown(p2_style, unsafe_allow_html=True)
-    cont.markdown(normalize_markdown_for_streamlit(text))
-    _scroll_to_answer_top()   # 輸出完把畫面定回答案頂端，不被拖到底
+    cont.markdown(_emphasis_to_html(normalize_markdown_for_streamlit(text)), unsafe_allow_html=True)
     return text
 
 # =========================
@@ -577,17 +561,23 @@ def normalize_markdown_for_streamlit(text: str) -> str:
     # 4) 常見跳脫還原：\*\*TL;DR\*\* -> **TL;DR**
     t = re.sub(r"\\([*_`])", r"\1", t)
 
-    # 5) CJK／全形標點緊貼 ** 或 * 時補零寬空格（U+200B）：
-    #    CommonMark 的粗體/斜體 flanking 規則對 CJK 不友善——例如「…品鍋貼。**🥜」
-    #    閉合 ** 前是全形句號、後接 emoji，會不渲染、直接吐出 **。在標點與 * 之間插入
-    #    隱形的零寬空格即可讓 ** 正常配對（ZWSP 用 chr(0x200b) 產生，原始碼不留隱形字元；Playwright 驗證過）。
-    _cjk = "一-鿿　-〿぀-ヿ가-힯＀-￯"
-    t = re.sub(
-        "([" + _cjk + "])([*_]+)",
-        lambda m: m.group(1) + chr(0x200b) + m.group(2),
-        t,
-    )
+    return t
 
+def _emphasis_to_html(t: str) -> str:
+    """把 **粗體** 轉成 <strong>（避開程式碼區塊與行內 code），徹底解決 CommonMark 對 CJK 粗體
+    的 flanking 規則不渲染問題（例如「…名詞**；」或「…貼。**🥜」）。需搭配 markdown(unsafe_allow_html=True)。
+    比先前的零寬空格法可靠：不依賴 flanking、不會修好一種又弄壞另一種。
+    只轉粗體（雙星號鮮少誤用）；斜體交給 Streamlit 原生，避免誤傷 snake_case / 數學式。"""
+    if not t:
+        return t
+    blocks = []
+    def _stash(m):
+        blocks.append(m.group(0))
+        return "\x00%d\x00" % (len(blocks) - 1)
+    t = re.sub(r"```.*?```", _stash, t, flags=re.S)   # 圍欄程式碼
+    t = re.sub(r"`[^`]*`", _stash, t)                 # 行內 code
+    t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t, flags=re.S)
+    t = re.sub(r"\x00(\d+)\x00", lambda m: blocks[int(m.group(1))], t)
     return t
 
 def fake_stream_markdown_replace(
@@ -3811,7 +3801,7 @@ for msg in st.session_state.get("chat_history", []):
     with st.chat_message(msg.get("role", "assistant")):
         if msg.get("text"):
             _display_text = _RE_HTML_COMMENT.sub("", msg["text"]).strip()
-            st.markdown(normalize_markdown_for_streamlit(_display_text))
+            st.markdown(_emphasis_to_html(normalize_markdown_for_streamlit(_display_text)), unsafe_allow_html=True)
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
@@ -4031,10 +4021,6 @@ if prompt is not None:
 
     # 助理區塊
     with st.chat_message("assistant"):
-        st.markdown(
-            "<div id='rj-answer-top' style='scroll-margin-top:70px'></div>",  # 捲動錨點：答案最上方（留 70px 避開頂部工具列）
-            unsafe_allow_html=True,
-        )
         status_area = st.container()
         output_area = st.container()
         sources_container = st.container()
