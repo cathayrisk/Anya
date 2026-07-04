@@ -1623,7 +1623,7 @@ def think(reflection: str, key_finding: str, next_action: str, confidence: int) 
     action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
 
     _status(
-        f"💭 安妮亞在想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
+        f"💭 安妮亞再想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
         write=f"💭 **第 {think_count} 次反思**",
     )
     _step_done(f"💡 **發現**：{key_finding[:80]}{'…' if len(key_finding) > 80 else ''}")
