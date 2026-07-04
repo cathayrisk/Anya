@@ -89,6 +89,17 @@ except Exception:
     WIDGET_RULES = ""
     WIDGET_HINT_RE = None
 
+# Python best-practices skill（skills/ 資料夾單一事實來源；缺檔時只是少一個 skill）
+try:
+    with open(os.path.join(_PROJECT_ROOT, "skills", "python-best-practices", "SKILL.md"),
+              encoding="utf-8") as _f:
+        SKILLS = {**SKILLS, "python_best_practices": {
+            "description": "Python 程式碼品質規範（型別/例外/logging/PEP8/函式設計）",
+            "content": _f.read(),
+        }}
+except Exception:
+    pass
+
 # =============================================================================
 # §B 常數
 # =============================================================================
@@ -123,6 +134,12 @@ DR_PHASES = [                          # (todo 文案, status 文案)
 ]
 DEEP_RESEARCH_HINT_RE = re.compile(
     r"深度研究|研究報告|文獻回顧|文獻探討|系統性(?:回顧|調查)|deep\s*research|literature\s*review"
+)
+# 明確的「寫程式」請求：直送 General（有 run_python 驗證迴路與 coding_expert）
+CODING_HINT_RE = re.compile(
+    r"(?:寫|幫我做|產生|生成).{0,8}(?:程式|腳本|函式|巨集|macro|script|function)|"
+    r"(?:python|vba|pandas).{0,12}(?:程式|腳本|函式|巨集|寫)|debug|除錯|重構",
+    re.IGNORECASE,
 )
 # 明顯需要深思模式的關鍵詞：直接進 General，省一次 Fast 升級呼叫
 GENERAL_HINT_RE = re.compile(
@@ -1781,6 +1798,57 @@ def create_widget(title: str, height: int, html: str) -> str:
         "note": "元件已渲染在回答下方。正文用 1-2 句說明元件用途與操作方式即可，不要用文字重複元件內容。",
     }, ensure_ascii=False)
 
+
+# --- run_python：沙箱執行（寫→跑→修 驗證迴路）---
+CODE_RUN_TIMEOUT_S = 10
+MAX_CODE_RUNS_PER_TURN = 4
+
+@tool
+def run_python(code: str) -> str:
+    """在隔離的 subprocess 沙箱執行 Python 程式碼，回傳 stdout/stderr（驗證你寫的程式）。
+
+    【何時使用】你生成 Python 程式碼後，必須附上最小測試（assert + print 結果）用本工具
+    實際執行驗證；測試失敗就修正再驗（最多修 2 輪），通過後才把最終程式碼交給使用者。
+    【限制】10 秒逾時；在獨立暫存目錄執行；只能用標準庫與已安裝套件；
+    禁止存取使用者檔案、網路請求、無限迴圈。
+    """
+    import subprocess as _sp
+    import tempfile as _tf
+    meta = _rt_meta()
+    if meta.get("code_runs", 0) >= MAX_CODE_RUNS_PER_TURN:
+        return json.dumps({"error": f"本回合 run_python 已達上限（{MAX_CODE_RUNS_PER_TURN} 次），"
+                                     "請依既有結果收尾。"}, ensure_ascii=False)
+    c = (code or "").strip()
+    if not c:
+        return json.dumps({"error": "code 不可為空"}, ensure_ascii=False)
+    meta["tool_step"] += 1
+    meta["code_runs"] = meta.get("code_runs", 0) + 1
+    _status(f"[{meta['tool_step']}] 🐍 執行程式驗證中…（第 {meta['code_runs']} 次）",
+            write=f"🐍 run_python 第 {meta['code_runs']} 次")
+    tmpdir = _tf.mkdtemp(prefix="anya_run_")
+    script = os.path.join(tmpdir, "snippet.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(c)
+    try:
+        # -I：isolated mode（忽略環境變數與 user site-packages，降低沙箱外洩面）
+        proc = _sp.run([sys.executable, "-I", script], capture_output=True,
+                       timeout=CODE_RUN_TIMEOUT_S, cwd=tmpdir,
+                       encoding="utf-8", errors="replace")
+        out = {
+            "exit_code": proc.returncode,
+            "stdout": (proc.stdout or "")[-3000:],
+            "stderr": (proc.stderr or "")[-2000:],
+        }
+        ok = proc.returncode == 0
+        _step_done(("✅" if ok else "❌") + f" run_python 第 {meta['code_runs']} 次 → exit {proc.returncode}")
+        return json.dumps(out, ensure_ascii=False)
+    except _sp.TimeoutExpired:
+        _step_done(f"⏱ run_python 第 {meta['code_runs']} 次逾時（{CODE_RUN_TIMEOUT_S}s）")
+        return json.dumps({"error": f"執行逾時（>{CODE_RUN_TIMEOUT_S} 秒）——檢查是否有無限迴圈或阻塞呼叫。"},
+                          ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+
 # =============================================================================
 # §K'' Subagent 執行器 + deep research pipeline
 # =============================================================================
@@ -2360,6 +2428,7 @@ FAST_GEMMA_PROMPT = """
 （不得輸出任何其他文字、標點或說明）：
 - 需要閱讀、引用或分析使用者上傳的文件
 - 需要多步驟工具操作、系統性比較、完整研究報告或文獻回顧
+- 撰寫或除錯程式碼（Python／VBA／腳本）——深思模式有程式實測驗證迴路，交付品質更可靠
 - 使用者指名要「魔鬼代言人／蘇格拉底導師／研究團隊專家」等特定角色出馬（深思模式才有專家團隊）
 - 涉及嚴肅專業領域（法律、醫療、財經投資、學術研究）且需要嚴謹論證與大量查證
 - 你判斷無法在一則訊息內給出可靠、完整的答案
@@ -2884,7 +2953,7 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     rt["dr_report"] = None
     rt["dr_summary_line"] = None
     rt["t_start"] = time.time()
-    rt["meta"] = {"db_used": False, "web_used": False, "doc_calls": 0, "web_calls": 0, "tool_step": 0}
+    rt["meta"] = {"db_used": False, "web_used": False, "doc_calls": 0, "web_calls": 0, "tool_step": 0, "code_runs": 0}
 
     # 動態 fulltext budget（Gemma 256K context；免費額度下保守設定）
     MAX_CONTEXT_TOKENS = 200_000
@@ -2895,7 +2964,7 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     rt["doc_fulltext_budget_hint"] = max(0, min(budget, 60_000))
 
     # 工具清單（有 URL 時禁用 web_search，改導向 fetch_webpage —— 同 Anya_Test 行為）
-    tools = [fetch_webpage, think, write_todos]
+    tools = [fetch_webpage, think, write_todos, run_python]
     if not url_in_text:
         tools.append(web_search)
     if gm_has_docstore_index():
@@ -2930,6 +2999,18 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
                 "\n\n【本回合注意】使用者明確要求互動元件。請先用 load_skill 載入最符合需求的"
                 " widget_* 模板，替換資料區後呼叫 create_widget，不需要再向使用者確認。"
             )
+    instructions += (
+        "\n\n## 程式碼任務規範（硬性）\n"
+        "- 撰寫 Python 前先 load_skill(\"python_best_practices\") 對齊品質規範。\n"
+        "- 你交付的 Python 程式碼【必須】先附最小測試（assert）並用 run_python 實際執行驗證；"
+        "失敗→修正→重驗（最多 2 輪），通過才輸出最終答案，並註明「✅ 已實測通過」。\n"
+        "- VBA 無法執行：完成後改用 consult_expert(role=\"coding_expert\") 做靜態複審，"
+        "把審查結論整合進回答。\n"
+        "- 動手前先把需求拆成檢查表，交付前逐條核對（隱含需求如「總金額」=聚合也要覆蓋）。\n"
+        "- 程式碼裡的【官方常數／對照表／費率／法規數值】不得憑記憶硬編——先用 web_search 查證，"
+        "或明確請使用者提供權威來源；查證不到就在程式碼註解標「（未查證，請核對官方來源）」。"
+        "run_python 只能驗證邏輯，驗證不了你記錯的常數。"
+    )
 
     # ✅ 手動 sequential tool loop（不用 LangGraph ToolNode：它在 worker thread 執行工具，
     #    st.session_state / st.status 會靜默失效 → 計數器、log、進度 UI 全部丟失，實測確認）
@@ -2956,6 +3037,7 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     searches_since_think = 0
     think_nudged = False    # nudge 只注入一次，think 執行後重置
     think_demanded = False  # 守門重試只做一次，避免無限迴圈
+    code_run_demanded = False  # 程式碼未驗證守門，同樣只重試一次
 
     for _round in range(MAX_TOOL_ROUNDS):
         resp = invoke_with_backoff(_consume_round)
@@ -2973,6 +3055,20 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
                     "（系統提示）流程的硬性要求：輸出最終答案前必須先呼叫一次 think 工具反思"
                     "（reflection 五面向、key_finding、next_action、confidence）。"
                     "你剛才略過了這一步。現在請【只呼叫 think 工具】，不要輸出任何文字答案。"
+                ))
+                continue
+            # 守門：答案含 Python 程式碼卻沒跑過 run_python → 退回要求先驗證（僅重試一次）
+            _resp_text = extract_text_from_content(resp.content)
+            if ("```python" in _resp_text and rt["meta"].get("code_runs", 0) == 0
+                    and not code_run_demanded):
+                code_run_demanded = True
+                _step_done("🔁 程式碼還沒實測，先用 run_python 驗證")
+                renderer.reset()
+                render_thinking_skeleton(placeholder)
+                msgs.append(HumanMessage(
+                    "（系統提示）流程的硬性要求：交付 Python 程式碼前必須先用 run_python 工具"
+                    "實際執行驗證（附 assert 測試）。你剛才略過了這一步。"
+                    "現在請【只呼叫 run_python 工具】驗證你的程式碼，不要輸出文字答案。"
                 ))
                 continue
             final_resp = resp
@@ -3110,15 +3206,16 @@ if prompt or retry_payload:
         mode = "general"
         escalate_reason = "docstore_indexed_prefer_general"
     elif (DEEP_RESEARCH_HINT_RE.search(user_text or "") or GENERAL_HINT_RE.search(user_text or "")
+          or CODING_HINT_RE.search(user_text or "")
           or (WIDGET_HINT_RE and WIDGET_HINT_RE.search(user_text or ""))):
-        # 明顯需要深思模式的關鍵詞（含互動元件請求）：直送 General，省掉一次 Fast 升級呼叫
+        # 明顯需要深思模式的關鍵詞（含寫程式/互動元件請求）：直送 General，省掉一次 Fast 升級呼叫
         mode = "general"
         escalate_reason = "keyword_hint"
     else:
         mode = "fast"
 
     # 助理區塊（avatar 依模式：⚡ Fast / 💬 General；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=("⚡" if mode == "fast" else "💬")):
         status_area = st.container()
         output_area = st.container()
 
