@@ -3118,7 +3118,7 @@ if prompt or retry_payload:
         mode = "fast"
 
     # 助理區塊（avatar 依模式：⚡ Fast / 💬 General；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
-    with st.chat_message("assistant", avatar=("⚡" if mode == "fast" else "💬")):
+    with st.chat_message("assistant"):
         status_area = st.container()
         output_area = st.container()
 
