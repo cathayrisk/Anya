@@ -1,0 +1,75 @@
+# utils/weather_toast.py
+# -*- coding: utf-8 -*-
+"""
+氣象通知 st.toast watcher（全 App 共用）
+
+資料來源：外部 GitHub Actions 收集器輪詢 CWA 開放資料後寫入 Supabase 的
+`weather_alerts` 表。這裡只負責「讀取 + st.toast」，不做任何輪詢/收集邏輯。
+
+公開函式：
+  render_weather_toast_watcher()  — 在每個頁面 st.set_page_config() 之後呼叫一次
+"""
+
+from __future__ import annotations
+
+import streamlit as st
+from supabase import Client, create_client
+
+_CATEGORY_ICON = {
+    "earthquake": "🌐",
+    "warning": "⚠️",
+    "rain": "🌧️",
+    "forecast": "☀️",
+}
+
+
+@st.cache_resource(show_spinner=False)
+def _get_weather_supabase_client() -> Client:
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+
+def _latest_alert_id(client: Client) -> int:
+    resp = client.table("weather_alerts").select("id").order("id", desc=True).limit(1).execute()
+    return resp.data[0]["id"] if resp.data else 0
+
+
+def _fetch_new_alerts(client: Client, since_id: int) -> list[dict]:
+    resp = (
+        client.table("weather_alerts")
+        .select("id, category, title, body, extra_url")
+        .gt("id", since_id)
+        .order("id")
+        .execute()
+    )
+    return resp.data or []
+
+
+@st.fragment(run_every="15s")
+def _weather_toast_fragment() -> None:
+    if not (st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_KEY")):
+        return  # Supabase not configured in this environment (e.g. local dev) — stay silent
+
+    try:
+        client = _get_weather_supabase_client()
+
+        if "_weather_last_alert_id" not in st.session_state:
+            # First run for this session: don't replay historical alerts, just
+            # remember where "new" starts from.
+            st.session_state["_weather_last_alert_id"] = _latest_alert_id(client)
+            return
+
+        new_rows = _fetch_new_alerts(client, st.session_state["_weather_last_alert_id"])
+    except Exception:
+        return  # network/Supabase hiccup shouldn't break the page
+
+    for row in new_rows:
+        icon = _CATEGORY_ICON.get(row["category"], "🔔")
+        st.toast(f"{row['title']}：{row['body']}", icon=icon)
+        st.session_state["_weather_last_alert_id"] = row["id"]
+
+
+def render_weather_toast_watcher() -> None:
+    """Call near the top of every page (right after st.set_page_config) to get
+    app-wide st.toast alerts for new CWA earthquake/warning/rain/forecast
+    events collected externally into Supabase."""
+    _weather_toast_fragment()
