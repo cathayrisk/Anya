@@ -60,6 +60,7 @@ from docstore import (
 import uuid as _uuid
 
 from utils.rich_styles import inject_rich_styles
+from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
 
 # subagent persona / skills 常數模組（缺檔時降級：deep research 與 skills 功能停用）
 try:
@@ -190,11 +191,21 @@ if not GOOGLE_API_KEY:
     st.stop()
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY  # 讓 langchain-google-genai 讀到
 
+# 氣象/地震/颱風查詢工具用的 CWA key（附加功能，缺 key 只是不註冊那三個工具，不擋整頁）
+CWA_API_KEY = (
+    _get_secret("CWA_API_KEY")
+    or os.getenv("CWA_API_KEY")
+    or _load_key_from_dotenv("CWA_API_KEY")
+)
+
 # =============================================================================
 # §D 頁面設定 + CSS
 # =============================================================================
 st.set_page_config(page_title="Anya Gemma", page_icon="🥜", layout="wide")
 inject_rich_styles()
+
+from utils.weather_toast import render_weather_toast_watcher
+render_weather_toast_watcher()
 
 # status「執行中」label 的流光動畫（與輸出文字的 shimmer 同款：金色光循環掃過文字）
 # 🎛️ 手感調整：底色 #a05553（品牌紅灰）、光條 #ffd98a（金）；1.8s 一個掃動週期，越小越快。
@@ -1607,6 +1618,78 @@ def doc_get_fulltext(title: str, token_budget: int = 20000) -> str:
 
 
 @tool
+def get_weather(location: str) -> str:
+    """查詢台灣某地點目前的天氣概況（中央氣象署開放資料，即時查詢）。
+
+    【何時使用】使用者詢問任何台灣地點的天氣、降雨、氣溫、天氣特報時。
+    【輸入建議】location 用使用者說的地名即可，例如「板橋」「新北市板橋區」「台南」，
+    不需要先自己轉換成縣市；系統會自動定位到縣市與座標。
+    【輸出】JSON：解析出的縣市與座標、36小時預報（天氣現象/降雨機率/氣溫）、
+    目前生效中的天氣特報、未來1小時降雨網格預測與過去1小時觀測雨量。
+    """
+    meta = _rt_meta()
+    meta["tool_step"] += 1
+    loc = (location or "").strip()
+    _status(f"[{meta['tool_step']}] 🌦️ 安妮亞查天氣中…（{loc}）", write=f"🌦️ 安妮亞查天氣：{loc}")
+    t0 = time.time()
+    try:
+        output = get_weather_impl(loc)
+    except Exception as e:
+        _step_done(f"⚠️ get_weather 失敗：{type(e).__name__}")
+        return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+    elapsed = time.time() - t0
+    _step_done(f"✅ get_weather `{loc}` → {output.get('resolved_county')} ⏱ {elapsed:.1f}s")
+    return json.dumps(output, ensure_ascii=False, default=str)
+
+
+@tool
+def get_earthquake_info() -> str:
+    """查詢最新一筆顯著有感地震資訊（中央氣象署開放資料，即時查詢）。
+
+    【何時使用】使用者詢問「最近有沒有地震」「剛剛的地震多大」等地震相關問題時。
+    【輸入建議】無需參數。
+    【輸出】JSON：地震編號、發生時間、震央位置、規模、深度、各縣市震度、震度圖網址。
+    """
+    meta = _rt_meta()
+    meta["tool_step"] += 1
+    _status(f"[{meta['tool_step']}] 🌐 安妮亞查地震中…")
+    t0 = time.time()
+    try:
+        output = get_earthquake_impl()
+    except Exception as e:
+        _step_done(f"⚠️ get_earthquake_info 失敗：{type(e).__name__}")
+        return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+    elapsed = time.time() - t0
+    _step_done(f"✅ get_earthquake_info ⏱ {elapsed:.1f}s")
+    return json.dumps(output, ensure_ascii=False, default=str)
+
+
+@tool
+def get_typhoon_info() -> str:
+    """查詢目前颱風狀態（中央氣象署開放資料，即時查詢）。
+
+    【何時使用】使用者詢問「現在有沒有颱風」「颱風動態/路徑」等颱風相關問題時。
+    【輸入建議】無需參數。
+    【輸出】JSON：`has_active_taiwan_warning`（台灣是否有生效中的颱風警報），
+    若有效則附完整警報描述與影響區域；另外無論台灣是否已發布警報，都會附上
+    `tracked_cyclones`（西太平洋目前追蹤中的熱帶氣旋，含最新位置/強度與未來預測點，
+    可能是尚未達對台發布門檻但已在追蹤的系統）。
+    """
+    meta = _rt_meta()
+    meta["tool_step"] += 1
+    _status(f"[{meta['tool_step']}] 🌀 安妮亞查颱風中…")
+    t0 = time.time()
+    try:
+        output = get_typhoon_impl()
+    except Exception as e:
+        _step_done(f"⚠️ get_typhoon_info 失敗：{type(e).__name__}")
+        return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
+    elapsed = time.time() - t0
+    _step_done(f"✅ get_typhoon_info ⏱ {elapsed:.1f}s")
+    return json.dumps(output, ensure_ascii=False, default=str)
+
+
+@tool
 def think(reflection: str, key_finding: str, next_action: str, confidence: int) -> str:
     """策略性反思工具：在工具呼叫之後分析取得的資訊、評估是否足以作答並規劃下一步（不取得新資訊）。
 
@@ -2967,6 +3050,8 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     tools = [fetch_webpage, think, write_todos, run_python]
     if not url_in_text:
         tools.append(web_search)
+    if CWA_API_KEY:
+        tools.extend([get_weather, get_earthquake_info, get_typhoon_info])
     if gm_has_docstore_index():
         tools.extend([doc_list, doc_search, doc_get_fulltext])
     if SKILLS:
@@ -3215,7 +3300,7 @@ if prompt or retry_payload:
         mode = "fast"
 
     # 助理區塊（avatar 依模式：⚡ Fast / 💬 General；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
-    with st.chat_message("assistant"):
+    with st.chat_message("assistant", avatar=("⚡" if mode == "fast" else "💬")):
         status_area = st.container()
         output_area = st.container()
 
