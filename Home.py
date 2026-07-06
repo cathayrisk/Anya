@@ -2952,7 +2952,7 @@ for msg in st.session_state.get("gm_chat_history", []):
                 pass
 
 prompt = st.chat_input(
-    "wakuwaku！輸入你的問題吧～",
+    "wakuwaku！輸入你的問題吧～要小心資料會回傳Google唷!",
     accept_file="multiple",
     file_type=["jpg", "jpeg", "png", "webp", "gif"],
 )
