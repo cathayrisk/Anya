@@ -31,6 +31,7 @@ import ipaddress
 from io import BytesIO
 from urllib.parse import urlparse
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Optional
 
 import requests
@@ -107,6 +108,20 @@ try:
         }}
 except Exception:
     pass
+
+# skills/ 與 .claude/agents/ 掃描器（白名單制、惰性載入；缺模組時只是少一批 skills 與顧問角色）
+try:
+    from utils.skill_loader import (
+        discover_skills, discover_agents, load_skill_content, resolve_role_prompt,
+    )
+    SKILLS = {**discover_skills(), **SKILLS}          # 重名時既有寫死條目優先
+    CONSULT_ROLES = {**CONSULT_ROLES, **discover_agents()}
+except Exception:
+    def load_skill_content(entry: dict) -> str:       # 降級：只認得已在記憶體的 content
+        return entry.get("content") or ""
+
+    def resolve_role_prompt(role_entry: dict, skills: dict) -> str:
+        return role_entry.get("prompt") or ""
 
 # =============================================================================
 # §B 常數
@@ -283,8 +298,12 @@ def _get_query_param(name: str) -> str:
 DEV_MODE = (_get_query_param("dev").strip() == "1")
 
 def get_today_str() -> str:
-    now = datetime.now()
-    day = now.strftime("%d").lstrip("0")
+    """Get current date string like 'Sun Dec 14, 2025' — always in Taipei
+    local time, not the server's own timezone (Streamlit Cloud runs UTC,
+    which is 8hr behind and would show yesterday's date during Taipei's
+    00:00-08:00 window if left naive)."""
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    day = now.strftime("%d").lstrip("0")  # Windows-safe (no %-d)
     return f"{now.strftime('%a %b')} {day}, {now.strftime('%Y')}"
 
 def build_today_line() -> str:
@@ -1781,7 +1800,7 @@ def think(reflection: str, key_finding: str, next_action: str, confidence: int) 
     action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
 
     _status(
-        f"💭 安妮亞再想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
+        f"💭 安妮亞在想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
         write=f"💭 **第 {think_count} 次反思**",
     )
     _step_done(f"💡 **發現**：{key_finding[:80]}{'…' if len(key_finding) > 80 else ''}")
@@ -1884,8 +1903,11 @@ def load_skill(skill_name: str) -> str:
             {"error": f"找不到 skill「{name}」", "available": list(SKILLS.keys())},
             ensure_ascii=False,
         )
+    content = sk.get("content") or load_skill_content(sk)   # 掃描條目惰性讀檔
+    if not content:
+        return json.dumps({"error": f"skill「{name}」內容讀取失敗"}, ensure_ascii=False)
     _step_done(f"📖 載入 skill：{name}")
-    return f"已載入 skill「{name}」：\n\n{sk['content']}"
+    return f"已載入 skill「{name}」：\n\n{content}"
 
 
 # --- 跨 session 長期記憶（Supabase anya_lessons）---
@@ -2488,13 +2510,12 @@ def deep_research(topic: str, focus: str = "") -> str:
 
 @tool
 def consult_expert(role: str, task: str) -> str:
-    """專家諮詢：指派單一研究團隊角色（單次呼叫）處理指定任務。
+    """專家諮詢：指派單一顧問角色（單次呼叫）處理指定任務。
 
-    【可用角色】research_question（研究問題架構師）/ devils_advocate（魔鬼代言人）/
-    bibliography（書目專員）/ source_verify（來源驗證）/ synthesis（綜整專員）/
-    report_compiler（報告專員）/ socratic_mentor（蘇格拉底導師）/ ethics_review（倫理審查）。
-    【何時使用】使用者要求特定視角時（「讓魔鬼代言人挑戰這個結論」「用蘇格拉底方式引導我」）。
-    【task 要求】必須自帶完整脈絡——專家看不到對話歷史，要把被挑戰的結論/被引導的主題完整寫入。
+    【可用角色】完整清單見系統提示的【consult_expert 專家諮詢規則】，role 用括號內的英文鍵，
+    例如 devils_advocate（魔鬼代言人）/ socratic_mentor（蘇格拉底導師）/ financial_analyst（財務分析師）。
+    【何時使用】使用者要求特定視角時（「讓魔鬼代言人挑戰這個結論」「請財務分析師估個值」）。
+    【task 要求】必須自帶完整脈絡——專家看不到對話歷史，要把被挑戰的結論/被分析的資料完整寫入。
     """
     meta = _rt_meta()
     meta["tool_step"] += 1
@@ -2504,11 +2525,14 @@ def consult_expert(role: str, task: str) -> str:
             {"error": f"未知角色：{role}", "available": list(CONSULT_ROLES.keys())},
             ensure_ascii=False,
         )
+    persona = resolve_role_prompt(r, SKILLS)   # 寫死角色原樣回傳；掃描角色惰性讀檔＋配對 skill
+    if not persona:
+        return json.dumps({"error": f"角色「{role}」的 persona 讀取失敗"}, ensure_ascii=False)
     _gif("anime/anya-smug-scheming.gif")
     _status(f"[{meta['tool_step']}] {r['label']} 出動中…", write=f"{r['label']}：{(task or '')[:60]}")
     t0 = time.time()
     try:
-        out = _run_subagent(r["prompt"], (task or "").strip(), get_general_llm())
+        out = _run_subagent(persona, (task or "").strip(), get_general_llm())
     except Exception as e:
         _step_done(f"⚠️ {r['label']} 失敗：{type(e).__name__}")
         return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
@@ -2908,10 +2932,13 @@ def _build_general_instructions(socratic: bool = False) -> str:
                 "不要憑截斷的歷史臆測、也不要重跑 deep_research。\n"
             )
         if CONSULT_ROLES:
-            roles = "、".join(f"{v['label']}（{k}）" for k, v in CONSULT_ROLES.items())
+            roles = "\n".join(
+                f"  - {k}：{v['label']}——{v.get('description', '')}"
+                for k, v in CONSULT_ROLES.items()
+            )
             DEEP_RESEARCH_RULES += (
                 "\n【consult_expert 專家諮詢規則】\n"
-                f"- 可用角色：{roles}。\n"
+                f"- 可用角色：\n{roles}\n"
                 "- 使用者要求特定視角時呼叫 consult_expert(role, task)：例如「讓魔鬼代言人挑戰這個結論」"
                 "→ role='devils_advocate'；「用蘇格拉底方式引導我」→ role='socratic_mentor'。\n"
                 "- task 要含完整脈絡（對方看不到對話歷史），把要被挑戰的結論/要被引導的主題完整帶入。\n"
