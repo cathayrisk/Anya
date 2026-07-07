@@ -339,11 +339,72 @@ _WX_CSS = """
 .wx-p-feel{font-size:.78rem;color:#B26A55;}
 .wx-p-comfort{font-size:.76rem;color:#8A7A6E;}
 .wx-src{margin-top:12px;font-size:.72rem;color:#B0A399;}
-@media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:1fr;}}
+.wx-t-row{display:flex;align-items:center;gap:7px;font-size:.8rem;color:#7A6A5F;}
+.wx-t-row .t{font-weight:600;}
+.wx-t-track{flex:1;height:6px;border-radius:99px;background:#F1EDEA;position:relative;min-width:50px;}
+.wx-t-fill{position:absolute;top:0;height:100%;border-radius:99px;}
+.wx-wk{display:flex;flex-direction:column;gap:2px;}
+.wx-wk-row{display:grid;grid-template-columns:104px 26px minmax(70px,1fr) 46px 34px minmax(80px,1.4fr) 34px;
+  align-items:center;gap:8px;padding:7px 10px;border-radius:10px;font-size:.86rem;color:#4A2F1A;}
+.wx-wk-row:nth-child(even){background:#FDF0ED;}
+.wx-wk-day{font-weight:600;}
+.wx-wk-desc{color:#7A6A5F;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.wx-wk-pop{color:#5B8DB8;font-size:.8rem;text-align:right;}
+.wx-wk-t{color:#7A6A5F;font-weight:600;text-align:right;}
+@media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:1fr;}
+  .wx-wk-row{grid-template-columns:88px 24px 42px 30px 1fr 30px;}.wx-wk-desc{display:none;}}
 </style>
 """
 
 _RAIN_CHIP_CLASS = {"raining": "rain-on", "soon_rain": "rain-soon", "dry": "rain-off"}
+
+# 溫度 → 端點顏色（冷藍 → 金 → 暖橘 → 珊瑚紅），溫度帶兩端各取自己溫度的顏色
+_TEMP_STOPS = [(12, (110, 159, 197)), (22, (200, 164, 58)), (30, (224, 138, 99)), (36, (192, 90, 80))]
+
+
+def _temp_color(t: float) -> str:
+    if t <= _TEMP_STOPS[0][0]:
+        rgb = _TEMP_STOPS[0][1]
+    elif t >= _TEMP_STOPS[-1][0]:
+        rgb = _TEMP_STOPS[-1][1]
+    else:
+        rgb = _TEMP_STOPS[-1][1]
+        for (t0, c0), (t1, c1) in zip(_TEMP_STOPS, _TEMP_STOPS[1:]):
+            if t0 <= t <= t1:
+                k = (t - t0) / (t1 - t0)
+                rgb = tuple(round(a + (b - a) * k) for a, b in zip(c0, c1))
+                break
+    return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+
+def _temp_scale(periods: list[dict]) -> tuple[float, float] | None:
+    """卡片/週列共用刻度：取所有時段的最低~最高溫，兩端各留 1°C。"""
+    vals = []
+    for p in periods:
+        for k in ("min_temp", "max_temp"):
+            try:
+                vals.append(float(p.get(k)))
+            except (TypeError, ValueError):
+                pass
+    if not vals:
+        return None
+    return min(vals) - 1.0, max(vals) + 1.0
+
+
+def _temp_bar_html(min_t, max_t, scale_min: float, scale_max: float) -> str:
+    """共同刻度上的溫度帶；溫度缺漏時回空字串（呼叫端退回純文字）。"""
+    try:
+        lo, hi = float(min_t), float(max_t)
+    except (TypeError, ValueError):
+        return ""
+    span = max(scale_max - scale_min, 1e-6)
+    left = min(max(0.0, (lo - scale_min) / span * 100), 96.0)
+    width = max(4.0, (hi - lo) / span * 100)
+    width = min(width, 100.0 - left)
+    return (
+        f"<span class='wx-t-track'><span class='wx-t-fill' style='left:{left:.1f}%;width:{width:.1f}%;"
+        f"background:linear-gradient(90deg,{_temp_color(lo)},{_temp_color(hi)});'></span></span>"
+    )
 
 
 def _build_location_card_html(name, county, current, rain, periods, source_bits) -> str:
@@ -392,6 +453,9 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits)
           {rain_chip}
         </div>"""
 
+    # 同一張卡的三個時段共用刻度，溫度帶位置/長度可直接互相比較
+    card_scale = _temp_scale(periods[:3])
+
     def _period_cell(p: dict) -> str:
         hours = _period_hours(p.get("start_time"), p.get("end_time"))
         hours_html = f"<div class='wx-p-hours'>{e(hours)}</div>" if hours else ""
@@ -405,13 +469,23 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits)
                 f"<div class='wx-p-feel'>{_feel_emoji(p.get('max_feel'), p.get('min_feel'))} "
                 f"體感 {e(str(p.get('min_feel')))} ~ {e(str(p.get('max_feel')))}°C</div>"
             )
+        bar = _temp_bar_html(p.get("min_temp"), p.get("max_temp"), *card_scale) if card_scale else ""
+        if bar:
+            temp_html = (
+                f"<div class='wx-t-row'><span class='t'>{e(str(p.get('min_temp')))}°</span>{bar}"
+                f"<span class='t'>{e(str(p.get('max_temp')))}°</span></div>"
+            )
+        else:
+            temp_html = (
+                f"<div class='wx-p-temp'>🌡️ {e(str(p.get('min_temp', '—')))} ~ {e(str(p.get('max_temp', '—')))}°C</div>"
+            )
         return f"""
         <div class="wx-period">
           <div class="wx-p-head"><span class="wx-p-label">{e(_period_label(p.get('start_time')))}</span>
             <span class="wx-p-pop">☔ {e(str(p.get('pop', '—')))}%</span></div>
           {hours_html}
           <div class="wx-p-wx">{_weather_emoji(p.get('weather', ''))} {e(p.get('weather', '—'))}</div>
-          <div class="wx-p-temp">🌡️ {e(str(p.get('min_temp', '—')))} ~ {e(str(p.get('max_temp', '—')))}°C</div>
+          {temp_html}
           {feel_html}
           {comfort_html}
         </div>"""
@@ -491,7 +565,8 @@ for loc in locations:
         )
 
 if not has_alert:
-    st.success("目前無生效中的颱風警報與天氣特報", icon="✅")
+    # 「沒事」是常態，不佔一整條橫幅——例外才浮出
+    st.markdown(":small[:green[✅ 目前無生效中的颱風警報與天氣特報]]")
 
 # ── 我的地點（常駐：現在觀測 + 降雨現況 + 今明36小時預報） ──────────────
 st.subheader("📍 我的地點")
@@ -521,31 +596,67 @@ for loc in locations:
         unsafe_allow_html=True,
     )
 
-    # 卡片只放最近 3 個時段；其餘的一週預報收進 expander，想看才展開
-    later_periods = periods[3:]
-    if later_periods:
-        with st.expander(f"📅 未來一週預報（{county or loc['name']}）"):
-            rows = [
-                "| 時段 | 天氣 | ☔ 降雨 | 🌡️ 溫度 | 體感 | 舒適度 |",
-                "|---|---|---|---|---|---|",
-            ]
-            for p in later_periods:
-                weather = p.get("weather") or "—"
-                pop = p.get("pop")
-                pop_txt = f"{pop}%" if pop not in (None, "", " ", "-") else "—"
-                temp = f"{p.get('min_temp', '—')} ~ {p.get('max_temp', '—')}°C"
-                if p.get("min_feel") and p.get("max_feel"):
-                    feel = f"{p.get('min_feel')} ~ {p.get('max_feel')}°C"
-                else:
-                    feel = "—"
-                comfort = p.get("comfort")
-                comfort_txt = f"{_comfort_emoji(comfort)} {comfort}" if comfort else "—"
-                rows.append(
-                    f"| {_period_label(p.get('start_time'))} "
-                    f"| {_weather_emoji(weather)} {weather} "
-                    f"| {pop_txt} | {temp} | {feel} | {comfort_txt} |"
-                )
-            st.markdown("\n".join(rows))
+    # 卡片只放最近 3 個時段；一週預報（一天一列，白天/晚上合併）收進 expander
+    if len(periods) > 3:
+        days: dict[str, dict] = {}
+        for p in periods:
+            try:
+                start = datetime.fromisoformat(p.get("start_time"))
+            except (TypeError, ValueError):
+                continue
+            d = days.setdefault(
+                start.strftime("%Y-%m-%d"),
+                {"date": start, "min": None, "max": None, "pops": [], "day_wx": None, "any_wx": None},
+            )
+            try:
+                v = float(p.get("min_temp"))
+                d["min"] = v if d["min"] is None else min(d["min"], v)
+            except (TypeError, ValueError):
+                pass
+            try:
+                v = float(p.get("max_temp"))
+                d["max"] = v if d["max"] is None else max(d["max"], v)
+            except (TypeError, ValueError):
+                pass
+            pop = p.get("pop")
+            if pop not in (None, "", " ", "-"):
+                try:
+                    d["pops"].append(int(pop))
+                except ValueError:
+                    pass
+            wx = p.get("weather")
+            if wx:
+                if d["any_wx"] is None:
+                    d["any_wx"] = wx
+                if 6 <= start.hour < 18:
+                    d["day_wx"] = wx  # 一天的代表天氣以白天時段為準
+
+        wk_scale = _temp_scale(periods)
+        rows_html = []
+        for key in sorted(days):
+            d = days[key]
+            dt = d["date"]
+            wx = d["day_wx"] or d["any_wx"] or "—"
+            pop_txt = f"{max(d['pops'])}%" if d["pops"] else "—"
+            min_txt = f"{d['min']:.0f}°" if d["min"] is not None else "—"
+            max_txt = f"{d['max']:.0f}°" if d["max"] is not None else "—"
+            bar = (
+                _temp_bar_html(d["min"], d["max"], *wk_scale)
+                if wk_scale and d["min"] is not None and d["max"] is not None
+                else "<span></span>"
+            )
+            rows_html.append(
+                f"<div class='wx-wk-row'>"
+                f"<span class='wx-wk-day'>{dt.month}/{dt.day}（{_WEEKDAY[dt.weekday()]}）</span>"
+                f"<span>{_weather_emoji(wx)}</span>"
+                f"<span class='wx-wk-desc'>{_html.escape(wx)}</span>"
+                f"<span class='wx-wk-pop'>☔ {pop_txt}</span>"
+                f"<span class='wx-wk-t'>{min_txt}</span>{bar}<span class='wx-wk-t'>{max_txt}</span>"
+                f"</div>"
+            )
+
+        with st.expander(f"📅 一週預報（{county or loc['name']}）"):
+            st.markdown(f"<div class='wx-wk'>{''.join(rows_html)}</div>", unsafe_allow_html=True)
 
 # ── 最近地震（一行式，震度圖收進 expander） ─────────────────────────────
 st.subheader("🌐 最近地震")
