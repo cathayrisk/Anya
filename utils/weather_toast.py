@@ -12,8 +12,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import streamlit as st
-from supabase import Client, create_client
+
+if TYPE_CHECKING:
+    from supabase import Client
 
 _CATEGORY_ICON = {
     "earthquake": "🌐",
@@ -35,6 +39,9 @@ def get_secret_safe(name: str):
 
 @st.cache_resource(show_spinner=False)
 def _get_weather_supabase_client() -> Client:
+    # 惰性 import：supabase 套件缺失時只讓氣象通知靜默停用（呼叫端 try/except 接住），
+    # 不在模組載入期炸掉 import 本模組的所有頁面
+    from supabase import create_client
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 
@@ -74,7 +81,8 @@ def _weather_toast_fragment() -> None:
 
     for row in new_rows:
         icon = _CATEGORY_ICON.get(row["category"], "🔔")
-        st.toast(f"{row['title']}：{row['body']}", icon=icon)
+        # duration="infinite"：不自動消失，使用者要自己按掉右上角關閉鈕才會解除
+        st.toast(f"{row['title']}：{row['body']}", icon=icon, duration="infinite")
         st.session_state["_weather_last_alert_id"] = row["id"]
 
 
