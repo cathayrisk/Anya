@@ -17,10 +17,20 @@ from supabase import Client, create_client
 
 _CATEGORY_ICON = {
     "earthquake": "🌐",
+    "typhoon": "🌀",
     "warning": "⚠️",
     "rain": "🌧️",
     "forecast": "☀️",
 }
+
+
+def get_secret_safe(name: str):
+    """st.secrets.get 在 secrets.toml 完全不存在時會直接拋例外（不是回傳 None），
+    本機沒設定 secrets 跑 demo 時會炸頁面，包一層。"""
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -46,7 +56,7 @@ def _fetch_new_alerts(client: Client, since_id: int) -> list[dict]:
 
 @st.fragment(run_every="15s")
 def _weather_toast_fragment() -> None:
-    if not (st.secrets.get("SUPABASE_URL") and st.secrets.get("SUPABASE_KEY")):
+    if not (get_secret_safe("SUPABASE_URL") and get_secret_safe("SUPABASE_KEY")):
         return  # Supabase not configured in this environment (e.g. local dev) — stay silent
 
     try:

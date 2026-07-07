@@ -7,13 +7,14 @@
 不做輪詢/去重/狀態機，所以不依賴 weather/ repo，也不需要 Supabase。
 
 公開函式：
-  get_weather_impl(location)   — 任意地點的天氣現況（預報＋特報＋降雨網格）
+  get_weather_impl(location)   — 任意地點的天氣現況（即時觀測＋預報＋特報＋降雨網格）
   get_earthquake_impl()        — 最新地震
   get_typhoon_impl()           — 目前颱風狀態（含追蹤中但尚未對台發布警報的熱帶氣旋）
 """
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,7 +27,9 @@ REST_BASE = "https://opendata.cwa.gov.tw/api/v1/rest/datastore"
 FILE_BASE = "https://opendata.cwa.gov.tw/fileapi/v1/opendataapi"
 NODATA = -99.0
 
-_WANTED_FORECAST_ELEMENTS = {"Wx": "weather", "PoP": "pop", "MinT": "min_temp", "MaxT": "max_temp"}
+_WANTED_FORECAST_ELEMENTS = {
+    "Wx": "weather", "PoP": "pop", "MinT": "min_temp", "MaxT": "max_temp", "CI": "comfort",
+}
 
 # 22 縣市官方名稱 → 縣市政府座標（geocode 的 fallback）。
 # 名稱已用 CWA 實際回傳資料核對過（W-C0033-001 / W-C0034-001 的 areaDesc）。
@@ -152,8 +155,13 @@ def _grid(resource_id: str) -> GridDataset:
 
 
 # --------------------------------------------------------------------------
-# geocode：自由地名 → (縣市官方名稱, lat, lon)
+# 地點解析：自由地名 → 縣市 + 座標，並區分「台灣以外」「查不到」
 # --------------------------------------------------------------------------
+# 使用者沒指定地點時的預設地點（臺北市大安區；對應收集器與頁面的預設地點）。
+DEFAULT_LOCATION_NAME = "預設地點"
+DEFAULT_COORDS = (25.037438, 121.553563)
+
+
 def _match_county_in_text(text: str) -> Optional[str]:
     for county in _COUNTY_CENTROIDS:
         if county in text:
@@ -168,43 +176,82 @@ def _nearest_county(lat: float, lon: float) -> str:
     )
 
 
-def _nominatim_geocode(location: str):
+def _nominatim(query: str, tw_only: bool):
+    """回傳 Nominatim 第一筆結果（含 address），失敗回 None。"""
+    params = {"q": query, "format": "json", "limit": 1, "addressdetails": 1}
+    if tw_only:
+        params["countrycodes"] = "tw"
     try:
         resp = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": f"{location}, Taiwan", "format": "json", "limit": 1},
+            params=params,
             headers={"User-Agent": "AnyaWeatherTool/1.0 (personal use)"},
-            timeout=5,
+            timeout=6,
         )
         resp.raise_for_status()
         results = resp.json()
         if results:
-            return float(results[0]["lat"]), float(results[0]["lon"])
+            return results[0]
     except Exception:
         pass
     return None
 
 
-def geocode(location: str) -> tuple[str, float, float]:
-    """回傳 (縣市官方名稱, lat, lon)。找不到會丟 ValueError。"""
+def resolve_location(location: str) -> dict:
+    """把使用者說的地名解析成天氣查詢用的座標。回傳：
+    - {"status":"ok", "county", "lat", "lon", "is_default"}
+    - {"status":"outside_taiwan", "country"}   台灣以外的真實地點
+    - {"status":"not_found"}                    查不到、無法確定在台灣哪裡
+
+    location 空字串 → 用預設地點。
+    """
     location = (location or "").strip()
     if not location:
-        raise ValueError("location 不可為空")
+        lat, lon = DEFAULT_COORDS
+        return {"status": "ok", "county": _nearest_county(lat, lon),
+                "lat": lat, "lon": lon, "is_default": True}
 
+    # 快速路徑：文字含 22 縣市官方名稱 → 一定在台灣；再抓精確座標，抓不到用縣市中心
     county = _match_county_in_text(location)
-    coords = _nominatim_geocode(location)
-
-    if coords is not None:
-        lat, lon = coords
-        if county is None:
-            county = _nearest_county(lat, lon)
-        return county, lat, lon
-
     if county is not None:
+        hit = _nominatim(f"{location}, Taiwan", tw_only=True)
+        if hit:
+            return {"status": "ok", "county": county,
+                    "lat": float(hit["lat"]), "lon": float(hit["lon"]), "is_default": False}
         lat, lon = _COUNTY_CENTROIDS[county]
-        return county, lat, lon
+        return {"status": "ok", "county": county, "lat": lat, "lon": lon, "is_default": False}
 
-    raise ValueError(f"無法辨識地點「{location}」，請提供更明確的縣市名稱。")
+    # 限台灣查（countrycodes=tw，避免「板橋」被解到東京板橋区）＋不限國家查（判斷是否台灣以外）
+    hit_tw = _nominatim(location, tw_only=True)
+    hit_any = _nominatim(location, tw_only=False)
+
+    def _imp(h) -> float:
+        try:
+            return float(h.get("importance", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _cc(h) -> str:
+        return ((h.get("address", {}) or {}).get("country_code") or "").lower()
+
+    # 全球最佳解在台灣以外，且明顯比台灣解更強（或台灣根本查不到）→ 台灣以外。
+    # 例：「日本」台灣只撈到含「日本」的 POI(imp≈0.42)，全球是日本國(imp≈0.94)，差距明顯。
+    # 「板橋」全球最佳解本身就在台灣，不會誤判。
+    if hit_any and _cc(hit_any) != "tw" and (hit_tw is None or _imp(hit_any) >= _imp(hit_tw) + 0.25):
+        address = hit_any.get("address", {}) or {}
+        return {"status": "outside_taiwan", "country": address.get("country") or location}
+
+    if hit_tw:
+        lat, lon = float(hit_tw["lat"]), float(hit_tw["lon"])
+        return {"status": "ok", "county": _nearest_county(lat, lon),
+                "lat": lat, "lon": lon, "is_default": False}
+
+    if hit_any and _cc(hit_any) == "tw":
+        lat, lon = float(hit_any["lat"]), float(hit_any["lon"])
+        return {"status": "ok", "county": _nearest_county(lat, lon),
+                "lat": lat, "lon": lon, "is_default": False}
+
+    return {"status": "not_found"}
 
 
 # --------------------------------------------------------------------------
@@ -231,6 +278,61 @@ def get_forecast(county: str):
     if not values:
         return None
     return {**values, **window}
+
+
+# 一週鄉鎮預報 F-D0047-091：新式 JSON（Locations/Location/WeatherElement/Time），
+# 12小時時段，內容比 36 小時的 F-C0032-001 豐富（含體感溫度、綜合描述）。
+# (ElementName, ElementValue 的鍵, 回傳欄位名)
+_FD0047_ELEMENTS = {
+    "天氣現象": ("Weather", "weather"),
+    "12小時降雨機率": ("ProbabilityOfPrecipitation", "pop"),
+    "最高溫度": ("MaxTemperature", "max_temp"),
+    "最低溫度": ("MinTemperature", "min_temp"),
+    "最高體感溫度": ("MaxApparentTemperature", "max_feel"),
+    "最低體感溫度": ("MinApparentTemperature", "min_feel"),
+    "最大舒適度指數": ("MaxComfortIndexDescription", "comfort_max"),
+    "最小舒適度指數": ("MinComfortIndexDescription", "comfort_min"),
+    "天氣預報綜合描述": ("WeatherDescription", "description"),
+}
+
+
+def get_forecast_periods(county: str) -> list:
+    """一週鄉鎮預報（F-D0047-091）的全部 12 小時時段，依時間排序。
+    每段含天氣現象/降雨機率/溫度/體感溫度/舒適度/綜合描述。
+    頁面通常只取前幾段當「今明」預報。"""
+    raw = _rest("F-D0047-091", locationName=county)
+    groups = raw.get("records", {}).get("Locations", [])
+    if not groups:
+        return []
+    loc_list = groups[0].get("Location", [])
+    loc = next((l for l in loc_list if l.get("LocationName") == county), loc_list[0] if loc_list else None)
+    if not loc:
+        return []
+
+    by_start: dict[str, dict] = {}
+    for el in loc.get("WeatherElement", []):
+        mapping = _FD0047_ELEMENTS.get(el.get("ElementName"))
+        if not mapping:
+            continue
+        value_key, field = mapping
+        for t in el.get("Time", []):
+            start = t.get("StartTime")
+            values = t.get("ElementValue") or []
+            if not start or not values:
+                continue
+            slot = by_start.setdefault(start, {"start_time": start, "end_time": t.get("EndTime")})
+            slot[field] = values[0].get(value_key)
+
+    result = []
+    for start in sorted(by_start):
+        p = by_start[start]
+        cmin, cmax = p.pop("comfort_min", None), p.pop("comfort_max", None)
+        if cmin and cmax and cmin != cmax:
+            p["comfort"] = f"{cmin}至{cmax}"
+        else:
+            p["comfort"] = cmax or cmin
+        result.append(p)
+    return result
 
 
 def get_warnings(county: str) -> list:
@@ -261,13 +363,94 @@ def get_rain(lat: float, lon: float) -> dict:
     }
 
 
-def get_weather_impl(location: str) -> dict:
-    county, lat, lon = geocode(location)
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def get_current_conditions(lat: float, lon: float):
+    """最近測站的即時觀測（O-A0003-001，10分鐘綜觀氣象資料）——跟 get_forecast 不同，
+    這是「現在實際量到的」而不是預報值。找不到座標可用的測站就回傳 None。"""
+    raw = _rest("O-A0003-001")
+    stations = raw.get("records", {}).get("Station", [])
+
+    nearest = None
+    nearest_km = float("inf")
+    for s in stations:
+        coords = s.get("GeoInfo", {}).get("Coordinates", [])
+        wgs84 = next((c for c in coords if c.get("CoordinateName") == "WGS84"), None)
+        if not wgs84:
+            continue
+        try:
+            s_lat = float(wgs84["StationLatitude"])
+            s_lon = float(wgs84["StationLongitude"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        dist_km = _haversine_km(lat, lon, s_lat, s_lon)
+        if dist_km < nearest_km:
+            nearest_km = dist_km
+            nearest = s
+
+    if nearest is None:
+        return None
+
+    def _val(v):
+        # 這個測站類型沒有該感測器時，CWA 回傳字串 "-99" 當無效值標記。
+        try:
+            return None if float(v) <= NODATA else v
+        except (TypeError, ValueError):
+            return v
+
+    we = nearest.get("WeatherElement", {})
     return {
-        "location_input": location,
+        "station_name": nearest.get("StationName"),
+        "station_distance_km": round(nearest_km, 1),
+        "obs_time": nearest.get("ObsTime", {}).get("DateTime"),
+        "weather": _val(we.get("Weather")),
+        "air_temperature_c": _val(we.get("AirTemperature")),
+        "relative_humidity_pct": _val(we.get("RelativeHumidity")),
+        "wind_speed_mps": _val(we.get("WindSpeed")),
+        "wind_direction_deg": _val(we.get("WindDirection")),
+        "air_pressure_hpa": _val(we.get("AirPressure")),
+        "uv_index": _val(we.get("UVIndex")),
+        "precipitation_now_mm": _val(we.get("Now", {}).get("Precipitation")),
+        "visibility": _val(we.get("VisibilityDescription")),
+    }
+
+
+def get_weather_impl(location: str = "") -> dict:
+    """location 空 → 用預設地點；台灣以外或查不到 → 回傳對應 status 讓 agent 處理。
+    正常情況一次給足所有資料，讓 agent 依使用者需求自行取用。"""
+    loc = resolve_location(location)
+
+    if loc["status"] == "outside_taiwan":
+        return {
+            "status": "outside_taiwan",
+            "location_input": location,
+            "message": f"「{location}」在台灣以外（{loc.get('country', '')}），"
+                       f"本服務只提供台灣的氣象資料。",
+        }
+    if loc["status"] == "not_found":
+        return {
+            "status": "not_found",
+            "location_input": location,
+            "message": f"無法確定「{location}」在台灣的哪個縣市，"
+                       f"請補充更明確的地名（例如縣市或鄉鎮）。",
+        }
+
+    county, lat, lon = loc["county"], loc["lat"], loc["lon"]
+    return {
+        "status": "ok",
+        "location_input": location or DEFAULT_LOCATION_NAME,
+        "used_default_location": loc.get("is_default", False),
         "resolved_county": county,
         "coordinates": {"lat": lat, "lon": lon},
-        "forecast": get_forecast(county),
+        "current_conditions": get_current_conditions(lat, lon),
+        "forecast": get_forecast_periods(county),
         "warnings": get_warnings(county),
         "rain": get_rain(lat, lon),
     }
