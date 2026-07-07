@@ -8,7 +8,7 @@
 
 資料來源：
 - 儀表板顯示（現在天氣/預報/降雨/地震/颱風/特報）→ 直接向 CWA 即時查詢（需 CWA_API_KEY）。
-  比收集器 5 分鐘快照更即時，且不依賴 Supabase。
+  比收集器快照更即時，且不依賴 Supabase。
 - 「通知歷史」與全頁 st.toast → Supabase（GitHub Actions 收集器寫入的推播事件流）。
 
 沒有 CWA_API_KEY 時自動切換示範資料（頂部會標示），?demo=1 也可強制預覽。
@@ -244,7 +244,12 @@ def _period_label(start_str: str) -> str:
         start = datetime.fromisoformat(start_str)
     except (TypeError, ValueError):
         return str(start_str)
-    part = "白天" if 6 <= start.hour < 18 else "晚上"
+    if 6 <= start.hour < 18:
+        part = "白天"
+    elif start.hour < 6:
+        part = "凌晨"
+    else:
+        part = "晚上"
     return f"{start.month}/{start.day}（{_WEEKDAY[start.weekday()]}）{part}"
 
 
@@ -334,7 +339,7 @@ _WX_CSS = """
 .wx-p-feel{font-size:.78rem;color:#B26A55;}
 .wx-p-comfort{font-size:.76rem;color:#8A7A6E;}
 .wx-src{margin-top:12px;font-size:.72rem;color:#B0A399;}
-@media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:repeat(3,minmax(0,1fr));}}
+@media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:1fr;}}
 </style>
 """
 
@@ -345,10 +350,19 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits)
     e = _html.escape
 
     rain_state = rain.get("state", "dry")
+    # 乾的時候不列一串 0.0mm——數字只在真的有雨量意義時才出現
+    if rain_state == "raining":
+        rain_amounts = (
+            f"　{e(str(rain.get('observed_mm', 0)))} mm"
+            f"・未來1hr {e(str(rain.get('forecast_mm', 0)))} mm"
+        )
+    elif rain_state == "soon_rain":
+        rain_amounts = f"　未來1hr 約 {e(str(rain.get('forecast_mm', 0)))} mm"
+    else:
+        rain_amounts = ""
     rain_chip = (
         f"<span class='wx-chip {_RAIN_CHIP_CLASS.get(rain_state, 'rain-off')}'>"
-        f"{e(RAIN_STATE_LABEL.get(rain_state, '降雨'))}　{e(str(rain.get('observed_mm', 0)))} mm"
-        f"・未來1hr {e(str(rain.get('forecast_mm', 0)))} mm</span>"
+        f"{e(RAIN_STATE_LABEL.get(rain_state, '降雨'))}{rain_amounts}</span>"
     )
 
     if current:
@@ -507,6 +521,32 @@ for loc in locations:
         unsafe_allow_html=True,
     )
 
+    # 卡片只放最近 3 個時段；其餘的一週預報收進 expander，想看才展開
+    later_periods = periods[3:]
+    if later_periods:
+        with st.expander(f"📅 未來一週預報（{county or loc['name']}）"):
+            rows = [
+                "| 時段 | 天氣 | ☔ 降雨 | 🌡️ 溫度 | 體感 | 舒適度 |",
+                "|---|---|---|---|---|---|",
+            ]
+            for p in later_periods:
+                weather = p.get("weather") or "—"
+                pop = p.get("pop")
+                pop_txt = f"{pop}%" if pop not in (None, "", " ", "-") else "—"
+                temp = f"{p.get('min_temp', '—')} ~ {p.get('max_temp', '—')}°C"
+                if p.get("min_feel") and p.get("max_feel"):
+                    feel = f"{p.get('min_feel')} ~ {p.get('max_feel')}°C"
+                else:
+                    feel = "—"
+                comfort = p.get("comfort")
+                comfort_txt = f"{_comfort_emoji(comfort)} {comfort}" if comfort else "—"
+                rows.append(
+                    f"| {_period_label(p.get('start_time'))} "
+                    f"| {_weather_emoji(weather)} {weather} "
+                    f"| {pop_txt} | {temp} | {feel} | {comfort_txt} |"
+                )
+            st.markdown("\n".join(rows))
+
 # ── 最近地震（一行式，震度圖收進 expander） ─────────────────────────────
 st.subheader("🌐 最近地震")
 if earthquake:
@@ -558,7 +598,7 @@ with st.expander("📋 通知規則說明"):
 | ☀️ 預報 | 預報**內容有變化**才通知 | 與上一次快照比對 |
 | 🌀 颱風 | 氣象署發布**新的颱風公告**（含發布與解除） | 公告時戳，保留30天 |
 
-- 收集器約 **每 5 分鐘一輪**；門檻值（震度、雨量）在收集器的 `config.yaml` 調整。
+- 收集器由 cron-job.org 定時觸發 GitHub Actions，約 **每 10 分鐘一輪**；門檻值（震度、雨量）在收集器的 `config.yaml` 調整。
 - 通知會即時出現在 Anya **所有頁面**的右下角 toast；本頁「通知歷史」保留最近 20 筆。
 """
     )
