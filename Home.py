@@ -90,6 +90,13 @@ except Exception:
     WIDGET_RULES = ""
     WIDGET_HINT_RE = None
 
+# 跨 session 教訓筆記（Supabase；缺套件或未設金鑰時降級：長期記憶功能停用，不擋頁面）
+try:
+    from utils.lessons_store import LessonsStore
+    HAS_LESSONS_MODULE = True
+except Exception:
+    HAS_LESSONS_MODULE = False
+
 # Python best-practices skill（skills/ 資料夾單一事實來源；缺檔時只是少一個 skill）
 try:
     with open(os.path.join(_PROJECT_ROOT, "skills", "python-best-practices", "SKILL.md"),
@@ -147,6 +154,21 @@ GENERAL_HINT_RE = re.compile(
     r"系統性比較|深入分析|完整報告|全面評估|交叉比對|魔鬼代言人|蘇格拉底|專家團隊"
 )
 
+# --- 提問引導（socratic）模式 ---
+# 模式狀態放 harness（gm_mode_sticky session key），不指望弱模型跨回合記得自己在什麼模式。
+# 顯性觸發詞 regex 切換（零 LLM 呼叫）；Fast 偵測隱性「卡住」訊號時輸出 SOCRATIC_SENTINEL 升級。
+SOCRATIC_ENTER_RE = re.compile(
+    r"陪我想|幫我釐清|別給答案|不要給答案|不要直接(?:給|說)|引導我(?:想|思考)?|蘇格拉底"
+)
+SOCRATIC_EXIT_RE = re.compile(
+    r"直接說|直接講|直接寫|給我範例|幫我列選項|給我答案|直接給(?:我)?(?:答案|結論)"
+)
+ESCALATE_PREFIX = "[[ESCALATE"                 # sentinel 前綴（涵蓋 [[ESCALATE]] 與 [[ESCALATE:SOCRATIC]]）
+SOCRATIC_SENTINEL = "[[ESCALATE:SOCRATIC]]"    # Fast 判斷使用者「卡住需要引導」時輸出的變體
+
+# --- deep_research 訪談守門 ---
+DR_MIN_FOCUS_CHARS = 15   # focus 短於此值視為空泛 → pipeline 不開跑，先反問使用者（每個 topic 只擋一次）
+
 # --- 對話歷史壓縮 ---
 HISTORY_SUMMARY_TRIGGER_TOKENS = 6_000   # 歷史估算超過此值就觸發滾動摘要（免費層 TPM／token 經濟保護）
 HISTORY_KEEP_RECENT_USER_TURNS = 4       # 摘要時保留原文的近期使用者回合數
@@ -197,6 +219,20 @@ CWA_API_KEY = (
     or os.getenv("CWA_API_KEY")
     or _load_key_from_dotenv("CWA_API_KEY")
 )
+
+# Supabase 長期記憶（同 Home.py 的 SUPABASE_URL/SUPABASE_KEY；缺 key 只是停用 save_lesson 與開場注入）
+SUPABASE_URL = (
+    _get_secret("SUPABASE_URL") or os.getenv("SUPABASE_URL") or _load_key_from_dotenv("SUPABASE_URL")
+)
+SUPABASE_KEY = (
+    _get_secret("SUPABASE_KEY") or os.getenv("SUPABASE_KEY") or _load_key_from_dotenv("SUPABASE_KEY")
+)
+LESSONS_STORE = None
+if HAS_LESSONS_MODULE and SUPABASE_URL and SUPABASE_KEY:
+    try:
+        LESSONS_STORE = LessonsStore(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        LESSONS_STORE = None  # supabase 套件缺失或初始化失敗：靜默降級
 
 # =============================================================================
 # §D 頁面設定 + CSS
@@ -291,6 +327,10 @@ st.session_state.setdefault("gm_last_research", None)       # 最近一次完成
 st.session_state.setdefault("gm_web_cache", {})             # query -> (ts, text, sources)
 st.session_state.setdefault("gm_history_summary", None)     # {"count": int, "summary": str} 滾動摘要快取
 st.session_state.setdefault("gm_grounding_down", False)      # grounding 配額拒絕後改走 DDG（免費層實測不可用）
+st.session_state.setdefault("gm_mode_sticky", "assist")       # 'assist' | 'socratic'（提問引導；狀態放 harness 不放模型腦內）
+st.session_state.setdefault("gm_dr_pending_interview", False)  # deep_research 訪談後等使用者回覆（一次性旗標：下回合強制 General）
+st.session_state.setdefault("gm_dr_gate_asked", set())        # deep_research 訪談守門：問過的 topic hash（每題只擋一次）
+st.session_state.setdefault("gm_lessons_cache", None)         # (ts, rows) 長期記憶注入快取（TTL 內不重查 Supabase）
 
 # =============================================================================
 # §F UI 助手函式（複製自 Anya_Test.py，行為一致）
@@ -1618,19 +1658,36 @@ def doc_get_fulltext(title: str, token_budget: int = 20000) -> str:
 
 
 @tool
-def get_weather(location: str) -> str:
+def get_weather(location: str = "") -> str:
     """查詢台灣某地點目前的天氣概況（中央氣象署開放資料，即時查詢）。
 
-    【何時使用】使用者詢問任何台灣地點的天氣、降雨、氣溫、天氣特報時。
-    【輸入建議】location 用使用者說的地名即可，例如「板橋」「新北市板橋區」「台南」，
-    不需要先自己轉換成縣市；系統會自動定位到縣市與座標。
-    【輸出】JSON：解析出的縣市與座標、36小時預報（天氣現象/降雨機率/氣溫）、
-    目前生效中的天氣特報、未來1小時降雨網格預測與過去1小時觀測雨量。
+    【何時使用】使用者詢問任何台灣地點的天氣、降雨、氣溫、體感、紫外線、颱風以外的
+    天氣特報、未來幾天預報時。一次回傳完整資料，依使用者實際問的部分回答即可。
+    【輸入建議】
+      - 使用者**有指定地點**才填 location（例如「板橋」「新北市板橋區」「台南」），
+        不需要先自己轉換成縣市；系統會自動定位。
+      - 使用者**沒指定地點**時，location 留空（不要填），系統會用預設地點。
+    【回傳 status 的處理（重要）】
+      - status="ok"：正常，直接依使用者問的部分回答。若 used_default_location=true，
+        回答時可提一句「（以預設地點 XX 為準）」。
+      - status="not_found"：查不到這個地點在台灣哪裡 → 反問使用者是**台灣的哪個縣市/鄉鎮**，
+        不要亂猜、也不要編天氣。
+      - status="outside_taiwan"：該地點在台灣以外（例如有人問日本、東京）→ 直接告知
+        本服務只提供台灣氣象資料，不要編造。
+    【輸出（status=ok 時）】JSON：
+      - resolved_county / coordinates / used_default_location
+      - current_conditions：最近測站的即時觀測（現在實際氣溫/濕度/風速風向/氣壓/
+        UV指數/現在雨量，非預報值）
+      - forecast：未來一週逐 12 小時時段的清單，每段含天氣現象、降雨機率、
+        最高/最低溫、最高/最低體感溫度、舒適度、綜合描述文字
+      - warnings：該縣市目前生效中的天氣特報
+      - rain：該座標點的雷達降雨網格（過去1小時觀測 mm、未來1小時預測 mm）
     """
     meta = _rt_meta()
     meta["tool_step"] += 1
     loc = (location or "").strip()
-    _status(f"[{meta['tool_step']}] 🌦️ 安妮亞查天氣中…（{loc}）", write=f"🌦️ 安妮亞查天氣：{loc}")
+    label = loc or "預設地點"
+    _status(f"[{meta['tool_step']}] 🌦️ 安妮亞查天氣中…（{label}）", write=f"🌦️ 安妮亞查天氣：{label}")
     t0 = time.time()
     try:
         output = get_weather_impl(loc)
@@ -1638,7 +1695,8 @@ def get_weather(location: str) -> str:
         _step_done(f"⚠️ get_weather 失敗：{type(e).__name__}")
         return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
     elapsed = time.time() - t0
-    _step_done(f"✅ get_weather `{loc}` → {output.get('resolved_county')} ⏱ {elapsed:.1f}s")
+    resolved = output.get("resolved_county") or output.get("status", "—")
+    _step_done(f"✅ get_weather `{label}` → {resolved} ⏱ {elapsed:.1f}s")
     return json.dumps(output, ensure_ascii=False, default=str)
 
 
@@ -1828,6 +1886,109 @@ def load_skill(skill_name: str) -> str:
         )
     _step_done(f"📖 載入 skill：{name}")
     return f"已載入 skill「{name}」：\n\n{sk['content']}"
+
+
+# --- 跨 session 長期記憶（Supabase anya_lessons）---
+MAX_LESSONS_PER_TURN = 2
+LESSONS_INJECT_LIMIT = 8          # 開場注入上限：lessons 是給弱模型的補丁，注入太多吃 TPM 又稀釋注意力
+LESSONS_CACHE_TTL_S = 300
+
+@tool
+def save_lesson(category: str, summary: str, content: str) -> str:
+    """跨 session 長期記憶：記下「之後每次對話都仍然適用」的教訓或使用者偏好（存 Supabase，重開對話仍在）。
+
+    【何時使用】使用者糾正你的做法或表達偏好（category='user_pref'）、確認了某種固定作法
+    （category='workflow'）、你發現某領域的重要查證要點（category='domain'）。
+    【何時禁用】本次任務的一次性事實、對話歷史已記錄的內容、與使用者無關的常識。
+    【summary】一句話（≤60 字）：觸發情境＋該怎麼做。【content】2-4 句補充為什麼。
+    同主題已有記憶時系統會自動合併更新，不會重複。
+    """
+    if LESSONS_STORE is None:
+        return json.dumps({"error": "長期記憶未啟用（未設定 Supabase）"}, ensure_ascii=False)
+    rt = _rt()
+    n = rt.get("lessons_saved", 0)
+    if n >= MAX_LESSONS_PER_TURN:
+        return json.dumps({"error": f"本回合 save_lesson 已達上限（{MAX_LESSONS_PER_TURN} 次）"}, ensure_ascii=False)
+    rt["lessons_saved"] = n + 1
+    meta = _rt_meta()
+    meta["tool_step"] += 1
+    out = LESSONS_STORE.save(category, summary, content)
+    if out.get("ok"):
+        st.session_state["gm_lessons_cache"] = None  # 失效快取：下回合注入最新
+        _step_done(f"🧠 記住了（{out.get('action')}）：{(summary or '')[:50]}")
+    else:
+        _step_done(f"⚠️ save_lesson 失敗：{(out.get('error') or '')[:60]}")
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _get_lessons_block() -> str:
+    """長期記憶開場注入（TTL 快取，避免每回合都打 Supabase）。未啟用或無資料回空字串。"""
+    if LESSONS_STORE is None:
+        return ""
+    cache = st.session_state.get("gm_lessons_cache")
+    now = time.time()
+    if not (cache and now - cache[0] < LESSONS_CACHE_TTL_S):
+        rows = LESSONS_STORE.fetch(limit=LESSONS_INJECT_LIMIT)
+        cache = (now, rows)
+        st.session_state["gm_lessons_cache"] = cache
+    rows = cache[1]
+    if not rows:
+        return ""
+    lines = "\n".join(f"- [{r.get('category')}] {r.get('summary')}" for r in rows)
+    return (
+        "\n\n【長期記憶（過往 session 的教訓，開場自動載入）】\n" + lines +
+        "\n（這些是過往經驗；與使用者當前明確指示衝突時，一律以當前指示為準。）"
+    )
+
+
+def _maybe_distill_search_lesson(run_id: str) -> None:
+    """確定性教訓萃取：本回合 think log 出現過策略警告（卡關）、且最終 confidence 恢復 ≥ 70（解決了）
+    → 用背景池 26b 蒸餾一條 search_strategy 教訓，fire-and-forget thread 寫入 Supabase。
+    worker 內不碰任何 st.*（所有資料在主線程先取好），失敗靜默。"""
+    thinks = [x for x in (st.session_state.get("gm_ds_think_log") or []) if x.get("run_id") == run_id]
+    if not thinks or not any(x.get("strategy_hint") for x in thinks):
+        return  # 沒卡關：沒有教訓可學
+    if (thinks[-1].get("confidence") or 0) < 70:
+        return  # 卡關但沒解決：學不到「怎麼解」
+    queries = [
+        (r.get("query") or "") for r in (st.session_state.get("gm_ds_web_search_log") or [])
+        if r.get("run_id") == run_id
+    ]
+    trail = "\n".join(
+        f"- 反思{i + 1}（信心 {x.get('confidence', 0)}%）：{(x.get('key_finding') or '')[:150]}"
+        + (f"\n  ↳ 系統警告：{(x.get('strategy_hint') or '')[:150]}" if x.get("strategy_hint") else "")
+        for i, x in enumerate(thinks)
+    )
+    payload = (
+        "搜尋任務軌跡（過程曾卡關、最終解決）：\n"
+        f"使用過的查詢：{'；'.join(q[:60] for q in queries[:8])}\n\n{trail}"
+    )
+    llm = get_background_llm()   # cache_resource 在主線程解析後傳入 worker
+    store = LESSONS_STORE
+
+    def _worker():
+        try:
+            resp = llm.invoke([
+                SystemMessage(
+                    "你是教訓萃取員。根據一次搜尋任務的卡關與解決軌跡，萃取「下次遇到類似情況可直接套用」的通則教訓。"
+                    "第一行：一句話教訓（≤60 字，具體可執行，例如「查台灣法規數值時直接搜官方機關英文站名」）。"
+                    "第二行起：2-3 行說明原本卡在哪、後來怎麼解。"
+                    "若軌跡沒有可一般化的教訓，只輸出 NONE。"
+                ),
+                HumanMessage(payload),
+            ])
+            text = extract_text_from_content(resp.content).strip()
+            if not text or text.upper().startswith("NONE"):
+                return
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+            summary = lines[0].strip()[:120]
+            content = "\n".join(lines[1:]).strip()[:800] or summary
+            store.save("search_strategy", summary, content)
+        except Exception:
+            pass  # 背景蒸餾失敗不影響主流程
+
+    import threading
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # --- 互動 widget（自包含 HTML，components.html iframe 渲染）---
@@ -2282,11 +2443,37 @@ def deep_research(topic: str, focus: str = "") -> str:
         return json.dumps({"error": "research_personas 模組不可用，請改用 web_search"}, ensure_ascii=False)
     meta = _rt_meta()
     meta["tool_step"] += 1
+
+    # ── 訪談守門（確定性，不靠 prompt）：focus 空泛且此 topic 沒問過 → 不開跑，先反問使用者。
+    #    每個 topic 只擋一次（gm_dr_gate_asked）：使用者答完（或說「照你判斷」）後第二次呼叫必放行，
+    #    避免「focus 永遠不夠具體 → 無限循環」。
+    import hashlib as _hashlib
+    topic_clean = (topic or "").strip()
+    focus_clean = (focus or "").strip()
+    gate_key = _hashlib.md5(topic_clean.encode()).hexdigest()[:10]
+    asked = st.session_state.setdefault("gm_dr_gate_asked", set())
+    if len(focus_clean) < DR_MIN_FOCUS_CHARS and gate_key not in asked:
+        asked.add(gate_key)
+        st.session_state["gm_dr_pending_interview"] = True  # 下回合（使用者的回答）強制走 General
+        _step_done("🎤 研究題目還太空泛，先訪談使用者釐清 focus（pipeline 未啟動）")
+        return json.dumps({
+            "status": "needs_clarification",
+            "instruction": (
+                "研究 focus 尚未釐清，pipeline 未啟動、未消耗研究額度。"
+                "請在本回合【直接向使用者】一次問完以下 2-3 題（條列呈現，然後結束回合等回覆，不要自問自答）：\n"
+                "1. 這份研究要回答什麼決策或問題？成果給誰看？\n"
+                "2. 已經有初步立場或假設了嗎？最想驗證或反駁什麼？\n"
+                "3. 要概覽級（快速掃描重點）還是完整文獻級（嚴謹交叉比對）？\n"
+                "使用者回覆後，下一回合把回答整理進 focus 參數重新呼叫 deep_research。"
+                "若使用者說「照你判斷／都可以」，focus 填「使用者授權由安妮亞界定範圍：（你的合理推斷）」。"
+            ),
+        }, ensure_ascii=False)
+
     try:
         st.toast("**深度研究啟動**（約需 10 分鐘，請勿操作頁面）", icon=":material/science:")
     except Exception:
         pass
-    result = run_deep_research_pipeline((topic or "").strip(), (focus or "").strip())
+    result = run_deep_research_pipeline(topic_clean, focus_clean)
     if result.get("ok"):
         _rt()["dr_report"] = result["report_md"]
         return json.dumps(
@@ -2366,7 +2553,7 @@ ANYA_SYSTEM_PROMPT = r"""
 - **引用格式**：已上傳文件用 [文件標題 pN]
 - **長度**：簡單問 1–3 句；研究型 500–1500 字；文件摘要依文件長度決定
 - **禁止**：不輸出空行佔位符「來源：」；不重複前一輪已說的事；不在沒有資訊時猜測；工具呼叫期間不輸出「下一步要補查…」等進度說明文字（進度只寫在 think 工具的 key_finding）
-- **回答策略**：收到模糊需求時，自行推斷最可能的意圖並直接給出完整答案；若有替代方向，在答案最後附一句話邀請調整，不得列條列選項讓使用者選版本
+- **回答策略**：收到模糊需求時，自行推斷最可能的意圖並直接給出完整答案；若有替代方向，在答案最後附一句話邀請調整，不得列條列選項讓使用者選版本（例外：符合【開工前訪談規則】的多階段任務、deep_research 的 needs_clarification 訪談、提問引導模式——依各該規則處理，允許提問與列選項）
 - **Markdown 清單格式**：需要巢狀清單時，必須使用真正的縮排語法（子項目前加 2–4 個空白），不得用粗體文字模擬層級。
 
 ---
@@ -2517,6 +2704,13 @@ FAST_GEMMA_PROMPT = """
 - 你判斷無法在一則訊息內給出可靠、完整的答案
 一般翻譯、摘要、改寫、簡單問答、時事快查：不需要升級，直接回答。
 
+✅ **引導升級（特殊變體）**
+若使用者看起來「卡住了、需要被引導思考」而不是要一個答案——符合以下任一訊號：
+- 對你剛講過的同一個點反覆追問（「所以呢」「什麼意思」「還是不懂」「看不懂」）
+- 在表達還沒成形的想法（「我在想要不要…」「總覺得哪裡怪怪的」「不知道該怎麼開始」）
+則你「整則回覆」改為只輸出這一串字元：[[ESCALATE:SOCRATIC]]
+（不得輸出任何其他文字——深思模式的蘇格拉底引導者會用提問幫使用者自己想通）
+
 ✅ **搜尋能力（系統已自動接上 Google 搜尋）**
 - 需要最新資訊（新聞、行情、版本、日期）時直接作答即可，系統會自動搜尋並把結果提供給你。
 - 涉及時效性事實（價格、匯率、法規、統計數字、日期、現任職位）時，【優先使用搜尋查證】而非憑記憶回答——
@@ -2584,7 +2778,37 @@ TL;DR 格式必須完全如下（不要改結構）：
 ⚠️ **嚴格禁止**：絕對不可在繁中回覆中混入韓文（한글）、日文假名（ひらがな・カタカナ）或簡體中文字。
 """
 
-def _build_general_instructions() -> str:
+# 提問引導模式 overlay（General instructions 末端附加 → 位置優先權最高）
+# 移植自使用者公司的 ChatGPT 自訂參數「提問引導模式」，硬性禁止清單為弱模型必要護欄，勿刪。
+SOCRATIC_OVERLAY = """
+【本回合模式：提問引導（最高優先，覆蓋 Output Contract 的「直接給完整答案」與「不得列選項」規則）】
+你現在是「蘇格拉底引導者」：任務是幫使用者自己想清楚，不是給答案。
+
+流程（每回合固定）：
+1. 先用 1 句肯定或複述對方剛說的內容（不加新觀點）。
+2. 再問最多 2 個聚焦問題（不可超過 2 題），然後停下來等回答。
+3. 問題要天真但精準地戳核心：「為什麼？」「所以會怎樣？」「如果剛好相反呢？」
+
+提問的推進順序（依對話進度挑當前階段，不用一次走完）：
+① 想回答什麼、對誰重要 → ② 打算怎麼做、最弱的環節在哪 → ③ 什麼證據會說服你或讓你改變想法
+→ ④ 假設若不成立會怎樣、反對者會怎麼說 → ⑤ 為什麼別人該在意。
+
+硬性禁止（此模式的鐵律）：
+- 不可列出成形的方向/題目選單讓使用者挑。
+- 不可代擬研究問題、大綱或答案。
+- 不可說「我幫你寫一個更好的版本」。
+- 只能用單純的追問幫對方自己想。
+- 不要呼叫搜尋或其他工具（除非使用者明確要求查證某個事實）。
+
+對話紀律：
+- 別一直附和。對方連續同意、或用「一定／顯然」等絕對立場時，天真地丟一個反例：
+  「可是～反過來呢？安妮亞想不通～」，再用 1-2 個反問讓對方自己重想；不因此代勞或幫他收斂題目。
+- 使用者說「直接說」「給我範例」「幫我列選項」「直接寫」時，系統會自動切回一般模式，
+  屆時直接依一般規則給完整答案即可。
+- 維持安妮亞口吻，但問題本身要準。每回合輸出要短：肯定 1 句＋最多 2 題，不寫長段分析。
+"""
+
+def _build_general_instructions(socratic: bool = False) -> str:
     """General 分支 instructions（ANYA_SYSTEM_PROMPT + 工具規則）。"""
     WEB_SEARCH_RULES = (
         "\n\n"
@@ -2636,6 +2860,24 @@ def _build_general_instructions() -> str:
         "- 單一步驟任務、純問答、翻譯：禁止使用。\n"
         "- 每輪最多呼叫一次，把所有更新合併在同一次。\n"
     )
+    INTERVIEW_RULES = (
+        "\n\n"
+        "【開工前訪談規則】\n"
+        "- 僅適用「3 步以上的多階段任務」（會用 write_todos 的那種）：若「範圍、受眾、成品格式」"
+        "三項關鍵資訊缺兩項以上，先【一次問完】最多 3 題再開工；使用者回答後直接開工，不再重複確認。\n"
+        "- 單一步驟任務、翻譯、問答、使用者已給明確規格 → 禁止訪談，直接做。\n"
+        "- 此規則優先於 Output Contract 的「不得列條列選項」；訪談情境允許列選項。\n"
+    )
+    LESSON_RULES = ""
+    if LESSONS_STORE is not None:
+        LESSON_RULES = (
+            "\n\n"
+            "【save_lesson 長期記憶規則】\n"
+            "- 出現以下情況呼叫 save_lesson：使用者糾正你的做法或表達偏好（category='user_pref'）、"
+            "確認了固定作法（'workflow'）、你發現某領域的重要查證要點（'domain'）。\n"
+            "- 只記「下次對話仍然適用」的通則；不記本次任務的一次性事實、不記對話裡已有的內容。\n"
+            "- summary 一句話（觸發情境＋該怎麼做）；content 2-4 句補充為什麼。每回合最多 1 次。\n"
+        )
     skills_index = ""
     if SKILLS:
         lines = "\n".join(f"- {name}：{sk['description']}" for name, sk in SKILLS.items())
@@ -2656,6 +2898,8 @@ def _build_general_instructions() -> str:
             "- 若是你自己判斷需要（使用者沒明講）：先用一句話確認「這需要約 10 分鐘的深度研究，要進行嗎？」，"
             "等使用者同意後才呼叫。\n"
             "- 每回合最多一次；呼叫前不必自己 write_todos——pipeline 會自動建立進度清單。\n"
+            "- 若工具回傳 needs_clarification：照其指示【一次問完】訪談問題後結束回合等使用者回覆；"
+            "不要自問自答、不要跳過訪談、不要在同一回合重呼叫。下一回合把回答整理進 focus 再呼叫。\n"
         )
         if st.session_state.get("gm_last_research"):
             DEEP_RESEARCH_RULES += (
@@ -2672,7 +2916,14 @@ def _build_general_instructions() -> str:
                 "→ role='devils_advocate'；「用蘇格拉底方式引導我」→ role='socratic_mentor'。\n"
                 "- task 要含完整脈絡（對方看不到對話歷史），把要被挑戰的結論/要被引導的主題完整帶入。\n"
             )
-    return ANYA_SYSTEM_PROMPT + WEB_SEARCH_RULES + DOCSTORE_RULES + THINK_TOOL_RULES + TODO_RULES + skills_index + DEEP_RESEARCH_RULES
+    base = (
+        ANYA_SYSTEM_PROMPT + WEB_SEARCH_RULES + DOCSTORE_RULES + THINK_TOOL_RULES
+        + TODO_RULES + INTERVIEW_RULES + LESSON_RULES + skills_index + DEEP_RESEARCH_RULES
+        + _get_lessons_block()
+    )
+    if socratic:
+        base += "\n\n" + SOCRATIC_OVERLAY  # 放最末端：位置優先權最高，覆蓋前面的「直接給答案」規則
+    return base
 
 # =============================================================================
 # §M 對話歷史 → LangChain messages
@@ -2892,7 +3143,7 @@ with st.popover("📚 引用資料夾"):
 # =============================================================================
 # §O 顯示歷史 + 輸入框
 # =============================================================================
-_MODE_AVATAR = {"fast": "⚡", "general": "💬", "research": "🔬"}
+_MODE_AVATAR = {"fast": "⚡", "general": "💬", "research": "🔬", "socratic": "🧭"}
 
 def _render_history_process(proc: dict):
     """歷史回合的過程記錄（快照回放：摘要/todo/搜尋/反思/研究產物）。"""
@@ -2951,8 +3202,19 @@ for msg in st.session_state.get("gm_chat_history", []):
             except Exception:
                 pass
 
+# 提問引導模式指示器（模式狀態放 harness；按鈕或說「直接說」都能退出）
+if st.session_state.get("gm_mode_sticky") == "socratic":
+    _sc_l, _sc_r = st.columns([5, 1])
+    _sc_l.markdown(
+        ":violet-badge[🧭 提問引導模式] "
+        ":small[:gray[安妮亞只提問不給答案，幫你自己想清楚；說「直接說」或按右邊按鈕結束。]]"
+    )
+    if _sc_r.button("直接說", key="gm_socratic_exit_btn", width="stretch"):
+        st.session_state["gm_mode_sticky"] = "assist"
+        st.rerun()
+
 prompt = st.chat_input(
-    "wakuwaku！輸入你的問題吧～要小心資料會回傳Google唷!",
+    "wakuwaku！輸入你的問題吧～",
     accept_file="multiple",
     file_type=["jpg", "jpeg", "png", "webp", "gif"],
 )
@@ -2993,15 +3255,20 @@ def run_fast_turn_streaming(lc_msgs: list, renderer: "ShimmerStreamRenderer") ->
                 continue
             if not gate_open:
                 gate_buf += delta
-                if ESCALATE_SENTINEL in gate_buf:
-                    return full, True  # 升級：提前中斷，省 token
+                e_idx = gate_buf.find(ESCALATE_PREFIX)
+                if e_idx != -1:
+                    # 偵測到 sentinel 前綴：等後綴收齊（]] 到達或再多 40 字）才中斷，
+                    # 讓主流程能從完整 sentinel 判讀升級原因（[[ESCALATE]] vs [[ESCALATE:SOCRATIC]]）
+                    if "]]" in gate_buf[e_idx:] or len(gate_buf) - e_idx >= 40:
+                        return full, True  # 升級：提前中斷，省 token
+                    continue  # sentinel 尚未收齊：暫不開閘，等下一個 chunk
                 if len(gate_buf) >= SENTINEL_GATE_CHARS:
                     gate_open = True
                     renderer.feed(gate_buf)
             else:
                 renderer.feed(delta)
         if not gate_open and gate_buf:  # 短回覆：整段都在閘門內結束
-            if ESCALATE_SENTINEL in gate_buf[:SENTINEL_GATE_CHARS]:
+            if ESCALATE_PREFIX in gate_buf[:SENTINEL_GATE_CHARS + 24]:  # +24 容納 :SOCRATIC 變體長度
                 return full, True
             renderer.feed(gate_buf)
         return full, False
@@ -3023,7 +3290,8 @@ def run_fast_turn_streaming(lc_msgs: list, renderer: "ShimmerStreamRenderer") ->
 def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
                      renderer: "ShimmerStreamRenderer", placeholder,
                      todo_ph=None, deep_research_requested: bool = False,
-                     widget_area=None, widget_requested: bool = False) -> tuple[str, dict]:
+                     widget_area=None, widget_requested: bool = False,
+                     socratic: bool = False) -> tuple[str, dict]:
     """General：手動 tool loop + 真串流。回傳 (ai_text, meta)。"""
     rt = st.session_state["_gm_rt"]
     rt["status"] = status
@@ -3064,8 +3332,10 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
             tools.append(consult_expert)
     if st.session_state.get("gm_last_research"):
         tools.append(get_research_artifact)
+    if LESSONS_STORE is not None:
+        tools.append(save_lesson)
 
-    instructions = _build_general_instructions() + "\n\n" + build_today_line()
+    instructions = _build_general_instructions(socratic=socratic) + "\n\n" + build_today_line()
     if url_in_text:
         instructions += (
             "\n\n【本回合注意】使用者訊息含 URL。請用 fetch_webpage 讀取該網頁。"
@@ -3074,8 +3344,10 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
         )
     if deep_research_requested and HAS_PERSONAS:
         instructions += (
-            "\n\n【本回合注意】使用者明確要求深度研究。請直接呼叫 deep_research(topic=..., focus=...)，"
-            "不需要再向使用者確認。topic 用使用者的研究主題原文。"
+            "\n\n【本回合注意】使用者明確要求深度研究（或剛回覆了研究訪談）。"
+            "請呼叫 deep_research(topic=..., focus=...)，不需要先徵求同意。"
+            "topic 用使用者的研究主題原文；focus 盡量從對話中整理出「要回答的決策、受眾、深度」。"
+            "若工具回傳 needs_clarification，依其指示向使用者一次問完訪談問題後結束本回合。"
         )
     if HAS_WIDGETS:
         instructions += "\n\n" + WIDGET_RULES
@@ -3282,11 +3554,34 @@ if prompt or retry_payload:
         "docs": []
     })
 
+    # ── 提問引導模式切換（零 LLM 呼叫；顯性觸發詞優先，具體交付請求自動退出）──
+    _ut = user_text or ""
+    if (SOCRATIC_EXIT_RE.search(_ut) or CODING_HINT_RE.search(_ut)
+            or DEEP_RESEARCH_HINT_RE.search(_ut)
+            or (WIDGET_HINT_RE and WIDGET_HINT_RE.search(_ut))):
+        # 退出詞、或使用者要求具體交付物（程式/研究/元件）→ 引導模式結束
+        st.session_state["gm_mode_sticky"] = "assist"
+    elif SOCRATIC_ENTER_RE.search(_ut):
+        st.session_state["gm_mode_sticky"] = "socratic"
+    socratic_active = (st.session_state.get("gm_mode_sticky") == "socratic")
+
     # ── 模式決定（零 LLM 呼叫的 heuristic；在 bubble 建立前決定 → avatar 可反映模式）──
     escalate_reason = None
-    if images_for_history:
+    dr_interview_followup = False
+    if socratic_active:
+        # 引導對話需要 31b 撐住「只問不答」的硬性禁止清單，flash-lite 撐不住會漏答案
+        mode = "general"
+        escalate_reason = "socratic_mode"
+    elif images_for_history:
         mode = "general"
         escalate_reason = "contains_image"
+    elif st.session_state.get("gm_dr_pending_interview"):
+        # 上一回合 deep_research 訪談了使用者 → 這一回合（回答）必須回到 General 接手，
+        # 否則會落到 Fast 而斷鏈。一次性旗標：讀取即消耗。
+        st.session_state["gm_dr_pending_interview"] = False
+        dr_interview_followup = True
+        mode = "general"
+        escalate_reason = "dr_interview_followup"
     elif gm_has_docstore_index():
         mode = "general"
         escalate_reason = "docstore_indexed_prefer_general"
@@ -3299,8 +3594,8 @@ if prompt or retry_payload:
     else:
         mode = "fast"
 
-    # 助理區塊（avatar 依模式：⚡ Fast / 💬 General；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
-    with st.chat_message("assistant", avatar=("⚡" if mode == "fast" else "💬")):
+    # 助理區塊（avatar 依模式：⚡ Fast / 💬 General / 🧭 引導；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
+    with st.chat_message("assistant", avatar=("🧭" if socratic_active else "⚡" if mode == "fast" else "💬")):
         status_area = st.container()
         output_area = st.container()
 
@@ -3332,15 +3627,20 @@ if prompt or retry_payload:
                     fast_sources = extract_grounding_sources(fast_resp) if fast_resp is not None else []
                     fast_queries = extract_grounding_queries(fast_resp) if fast_resp is not None else []
 
-                    if fast_escalate or (not fast_text) or (ESCALATE_SENTINEL in fast_text[:SENTINEL_GATE_CHARS]):
+                    if fast_escalate or (not fast_text) or (ESCALATE_PREFIX in fast_text[:SENTINEL_GATE_CHARS + 24]):
                         # 升級 General：清掉可能已渲染的內容，回到骨架
                         mode = "general"
                         escalated_from_fast = True
                         escalate_reason = "fast_escalated"
+                        if SOCRATIC_SENTINEL in fast_text:
+                            # Fast 判定使用者「卡住需要引導」→ 進入 sticky 引導模式（之後回合維持，直到退出詞）
+                            st.session_state["gm_mode_sticky"] = "socratic"
+                            socratic_active = True
+                            escalate_reason = "fast_escalated_socratic"
                         renderer.reset()
                         render_thinking_skeleton(placeholder)
                     else:
-                        fast_text = fast_text.replace(ESCALATE_SENTINEL, "").strip()  # 防呆
+                        fast_text = re.sub(r"\[\[ESCALATE[^\]]*\]\]", "", fast_text).strip()  # 防呆（含 :SOCRATIC 變體）
                         fast_text = strip_trailing_sources_section(fast_text)
                         fast_text = cleanup_report_markdown(fast_text)
                         fast_text = (fast_text + build_web_sources_footer(fast_sources)).strip()
@@ -3383,7 +3683,10 @@ if prompt or retry_payload:
                 if mode == "general":
                     renderer.plain = True  # General（含 deep research 報告）走真串流直出，不做流光特效
                     # General 執行期間 status 保持展開（看得到工具進度），完成時才收合
-                    status.update(label="↗️ 切換到深思模式（gemma-4-31b）", state="running", expanded=True)
+                    status.update(
+                        label=("🧭 提問引導模式（gemma-4-31b）" if socratic_active
+                               else "↗️ 切換到深思模式（gemma-4-31b）"),
+                        state="running", expanded=True)
                     if escalated_from_fast:
                         try:
                             st.toast("**升級到深思模式**", icon=":material/psychology:", duration="long")
@@ -3398,9 +3701,10 @@ if prompt or retry_payload:
                     st.session_state.gm_ds_think_log = []
                     st.session_state.gm_ds_research_log = []
 
-                    # badges_markdown 只認 fast/general/research，升級標記用額外徽章附加
+                    # badges_markdown 只認 fast/general/research，升級/引導標記用額外徽章附加
                     escalate_badge = " :orange-badge[↑ 自動升級]" if escalated_from_fast else ""
-                    badges_ph.markdown(badges_markdown(mode="General", db_used=False, web_used=False, doc_calls=0, web_calls=0) + escalate_badge)
+                    socratic_badge = " :violet-badge[🧭 引導]" if socratic_active else ""
+                    badges_ph.markdown(badges_markdown(mode="General", db_used=False, web_used=False, doc_calls=0, web_calls=0) + escalate_badge + socratic_badge)
 
                     gif_in_status_ph = status.empty()
                     gif_in_status_ph.image("anime/anya-jumping-rope.gif")
@@ -3415,9 +3719,12 @@ if prompt or retry_payload:
                         renderer=renderer,
                         placeholder=placeholder,
                         todo_ph=todo_ph,
-                        deep_research_requested=bool(DEEP_RESEARCH_HINT_RE.search(user_text or "")),
+                        deep_research_requested=(
+                            bool(DEEP_RESEARCH_HINT_RE.search(user_text or "")) or dr_interview_followup
+                        ),
                         widget_area=widget_area,
                         widget_requested=bool(WIDGET_HINT_RE and WIDGET_HINT_RE.search(user_text or "")),
+                        socratic=socratic_active,
                     )
 
                     gif_in_status_ph.empty()
@@ -3430,7 +3737,7 @@ if prompt or retry_payload:
                         doc_calls=int(meta.get("doc_calls") or 0),
                         web_calls=int(meta.get("web_calls") or 0),
                         elapsed_s=round(time.time() - t_start, 1),
-                    ) + escalate_badge
+                    ) + escalate_badge + socratic_badge
                     badges_ph.markdown(general_badges_md)
                     # 深度研究過程摘要行（來源數 / CP1 / CP2 / 降級）
                     dr_summary_line = st.session_state["_gm_rt"].get("dr_summary_line")
@@ -3511,11 +3818,20 @@ if prompt or retry_payload:
                         "text": _stored_text,
                         "images": [],
                         "docs": [],
-                        "mode": "research" if was_deep else "general",
+                        "mode": ("research" if was_deep
+                                 else "socratic" if socratic_active else "general"),
                         "badges": general_badges_md,
                         "process": process_snapshot,
                         "widget": st.session_state["_gm_rt"].get("widget"),
                     })
+
+                    # 跨 session 教訓：本回合若「策略卡關→最終解決」，背景蒸餾一條 search_strategy（fire-and-forget）
+                    if LESSONS_STORE is not None and not was_deep:
+                        try:
+                            _maybe_distill_search_lesson(run_id)
+                        except Exception:
+                            pass
+
                     status.update(label="✅ 安妮亞想好了！", state="complete", expanded=False)
                     st.stop()
 
