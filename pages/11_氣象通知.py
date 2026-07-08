@@ -343,7 +343,7 @@ _WX_CSS = """
 .wx-name{font-size:1.05rem;font-weight:700;color:#4A2F1A;}
 .wx-county{font-size:.85rem;color:#9A8478;}
 .wx-body{display:flex;gap:16px;flex-wrap:wrap;}
-.wx-now{flex:0 0 230px;display:flex;flex-direction:column;justify-content:center;gap:6px;
+.wx-now{flex:0 0 320px;display:flex;flex-direction:column;justify-content:center;gap:6px;
   padding:14px 18px;border-radius:12px;background:#FFF1EC;}
 .wx-now-main{display:flex;align-items:center;gap:12px;}
 .wx-now-emoji{font-size:2.4rem;line-height:1;}
@@ -351,12 +351,13 @@ _WX_CSS = """
 .wx-now-desc{font-size:1rem;font-weight:600;color:#C05A50;}
 .wx-now-feel{font-size:.8rem;color:#B26A55;}
 .wx-now-range{font-size:.78rem;color:#7A6A5F;display:flex;gap:8px;}
-.wx-now-stats{display:flex;gap:14px;font-size:.82rem;color:#7A6A5F;}
+.wx-now-stats{display:grid;grid-template-columns:repeat(2,auto);column-gap:14px;row-gap:4px;font-size:.82rem;color:#7A6A5F;}
+.wx-now-stats span{white-space:nowrap;}
 .wx-chip{display:inline-block;margin-top:4px;padding:4px 10px;border-radius:99px;font-size:.8rem;font-weight:600;width:fit-content;}
 .wx-chip.rain-on{background:#E3F2FD;color:#1565C0;}
 .wx-chip.rain-soon{background:#FFF3E0;color:#B26A00;}
 .wx-chip.rain-off{background:#F1EDEA;color:#8A7A6E;}
-.wx-periods{flex:1;min-width:280px;display:grid;grid-template-columns:repeat(3,1fr);gap:12px;}
+.wx-periods{flex:1;min-width:220px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
 .wx-period{border:1px solid #F2D5CF;border-radius:12px;background:#FFFFFF;padding:12px 14px;
   display:flex;flex-direction:column;gap:5px;}
 .wx-p-head{display:flex;justify-content:space-between;align-items:baseline;gap:6px;}
