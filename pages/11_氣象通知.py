@@ -337,6 +337,10 @@ def _comfort_emoji(desc: str) -> str:
 
 _WX_CSS = """
 <style>
+/* 超寬螢幕不讓內容無限拉開：整頁內容上限 1280px 置中，所有區塊比例一致。
+   預報卡在無上限的 flex:1 下會被拉到 500px+ 全是空白，這才是排版鬆散的根因。 */
+.stMain .block-container, div[data-testid="stMainBlockContainer"]{
+  max-width:1280px;margin-left:auto;margin-right:auto;}
 .wx-card{border:1px solid #F2D5CF;border-radius:14px;background:linear-gradient(180deg,#FFFFFF 0%,#FFF7F4 100%);
   padding:18px 20px 14px;margin-bottom:14px;}
 .wx-head{display:flex;align-items:baseline;gap:10px;margin-bottom:14px;}
