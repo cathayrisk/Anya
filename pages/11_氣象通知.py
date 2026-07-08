@@ -20,6 +20,7 @@ import html as _html
 import os
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # 讓本頁可獨立執行（streamlit run pages/11_氣象通知.py）：把專案根目錄加進 sys.path
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +37,7 @@ from utils.cwa_weather import (
     get_forecast_periods,
     get_rain,
     get_typhoon_impl,
+    get_warning_details,
     get_warnings,
 )
 from utils.rich_styles import inject_rich_styles
@@ -134,6 +136,15 @@ def _live_typhoon():
     }
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _live_warning_details() -> list:
+    """全台各別特報公告（W-C0033-002），含內容全文與影響區域。失敗回空 list。"""
+    try:
+        return get_warning_details()
+    except Exception:
+        return []
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_alerts() -> list:
     client = _get_weather_supabase_client()
@@ -164,7 +175,7 @@ def _demo_current_conditions() -> dict:
     return {
         "station_name": "臺北", "station_distance_km": 1.8,
         "obs_time": (now - timedelta(minutes=12)).isoformat(timespec="seconds"),
-        "weather": "陰", "air_temperature_c": "27.4",
+        "weather": "陰", "air_temperature_c": "27.4", "feels_like_c": 31.5,
         "relative_humidity_pct": "88", "wind_speed_mps": "2.3", "uv_index": "3",
     }
 
@@ -210,6 +221,12 @@ def _demo_bundle():
         "report_image_uri": "https://scweb.cwa.gov.tw/webdata/OLDEQ/202607/2026070207060640048_H.png",
     }
     typhoon = {"active": True, "headline": "海上颱風警報", "effective": ago(hours=5)}
+    warning_details = [{
+        "title": "豪雨特報",
+        "content": "一、概述：受鋒面影響，臺北市、新北市山區有局部大雨或豪雨發生的機率，請注意坍方及落石。\n\n二、注意(警戒)事項：山區請防範坍方、落石、土石流；低窪地區請慎防淹水。",
+        "affected": ["臺北市", "新北市"],
+        "issue_time": ago(hours=2), "start_time": ago(hours=2), "end_time": ago(hours=-4),
+    }]
     alerts = [
         {"id": 5, "ts": ago(minutes=8), "category": "rain",
          "title": "降雨提醒 - 預設地點", "body": "偵測到降雨中,過去1小時累積雨量約 4.2mm。", "extra_url": None},
@@ -223,14 +240,24 @@ def _demo_bundle():
         {"id": 1, "ts": ago(hours=5), "category": "typhoon",
          "title": "颱風公告 - 海上颱風警報", "body": "第7號颱風海上警報發布，暴風圈朝台灣東部海面接近，請注意後續動態。", "extra_url": None},
     ]
-    return locations, earthquake, typhoon, alerts
+    return locations, earthquake, typhoon, warning_details, alerts
+
+
+_TAIPEI = ZoneInfo("Asia/Taipei")
 
 
 def _fmt_time(value) -> str:
+    """格式化顯示時間，統一轉成台北時間。
+    Supabase 的 ts 存的是 UTC（帶 +00:00），CWA 自己的欄位大多是不含時區的
+    naive 字串但本來就是台北當地時間——只對「有時區資訊」的值做轉換，
+    naive 值視為已經是台北時間，不再二次位移。"""
     if not value:
         return "—"
     try:
-        return datetime.fromisoformat(str(value)).strftime("%m/%d %H:%M")
+        dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_TAIPEI)
+        return dt.strftime("%m/%d %H:%M")
     except ValueError:
         return str(value)
 
@@ -322,6 +349,8 @@ _WX_CSS = """
 .wx-now-emoji{font-size:2.4rem;line-height:1;}
 .wx-now-temp{font-size:2.5rem;font-weight:700;color:#4A2F1A;line-height:1;}
 .wx-now-desc{font-size:1rem;font-weight:600;color:#C05A50;}
+.wx-now-feel{font-size:.8rem;color:#B26A55;}
+.wx-now-range{font-size:.78rem;color:#7A6A5F;display:flex;gap:8px;}
 .wx-now-stats{display:flex;gap:14px;font-size:.82rem;color:#7A6A5F;}
 .wx-chip{display:inline-block;margin-top:4px;padding:4px 10px;border-radius:99px;font-size:.8rem;font-weight:600;width:fit-content;}
 .wx-chip.rain-on{background:#E3F2FD;color:#1565C0;}
@@ -343,16 +372,8 @@ _WX_CSS = """
 .wx-t-row .t{font-weight:600;}
 .wx-t-track{flex:1;height:6px;border-radius:99px;background:#F1EDEA;position:relative;min-width:50px;}
 .wx-t-fill{position:absolute;top:0;height:100%;border-radius:99px;}
-.wx-wk{display:flex;flex-direction:column;gap:2px;}
-.wx-wk-row{display:grid;grid-template-columns:104px 26px minmax(70px,1fr) 46px 34px minmax(80px,1.4fr) 34px;
-  align-items:center;gap:8px;padding:7px 10px;border-radius:10px;font-size:.86rem;color:#4A2F1A;}
-.wx-wk-row:nth-child(even){background:#FDF0ED;}
-.wx-wk-day{font-weight:600;}
-.wx-wk-desc{color:#7A6A5F;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.wx-wk-pop{color:#5B8DB8;font-size:.8rem;text-align:right;}
-.wx-wk-t{color:#7A6A5F;font-weight:600;text-align:right;}
-@media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:1fr;}
-  .wx-wk-row{grid-template-columns:88px 24px 42px 30px 1fr 30px;}.wx-wk-desc{display:none;}}
+.wx-week-wrap{overflow-x:auto;padding-bottom:4px;}
+@media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:1fr;}}
 </style>
 """
 
@@ -407,6 +428,92 @@ def _temp_bar_html(min_t, max_t, scale_min: float, scale_max: float) -> str:
     )
 
 
+def _week_chart_svg(days: dict, scale: tuple[float, float] | None) -> str:
+    """一週溫度趨勢：高溫線（珊瑚）+ 低溫線（藍）連線圖，仿手機天氣 App 的
+    「逐點連線＋氣泡標數值」風格，X 軸間隔是「天」（12小時預報聚合後的日資料），
+    不是逐小時——CWA 沒有逐小時預報，這是我們資料粒度下最接近的呈現。"""
+    keys = sorted(days)
+    n = len(keys)
+    if n == 0 or not scale:
+        return ""
+    e = _html.escape
+    scale_min, scale_max = scale
+
+    step, pad_x = 74, 30
+    width = max(360, pad_x * 2 + step * max(n - 1, 0))
+    plot_top, plot_bottom = 34, 118
+    plot_h = plot_bottom - plot_top
+    icon_y, pop_y, day_y = 168, 188, 208
+    height = 224
+
+    def x_at(i: int) -> float:
+        return width / 2 if n <= 1 else pad_x + i * step
+
+    def y_at(v: float) -> float:
+        span = max(scale_max - scale_min, 1e-6)
+        k = (v - scale_min) / span
+        return plot_bottom - k * plot_h
+
+    hi_pts, lo_pts, nodes = [], [], []
+    for i, key in enumerate(keys):
+        d = days[key]
+        x = x_at(i)
+        hv, lv = d.get("max"), d.get("min")
+        if hv is not None:
+            hi_pts.append(f"{x:.1f},{y_at(hv):.1f}")
+        if lv is not None:
+            lo_pts.append(f"{x:.1f},{y_at(lv):.1f}")
+
+    if len(hi_pts) > 1:
+        nodes.append(
+            f"<polyline points='{' '.join(hi_pts)}' fill='none' stroke='#C05A50' "
+            f"stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/>"
+        )
+    if len(lo_pts) > 1:
+        nodes.append(
+            f"<polyline points='{' '.join(lo_pts)}' fill='none' stroke='#6E9FC5' "
+            f"stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/>"
+        )
+
+    for i, key in enumerate(keys):
+        d = days[key]
+        x = x_at(i)
+        dt = d["date"]
+        wx = d.get("day_wx") or d.get("any_wx") or ""
+        pop_txt = f"☔{max(d['pops'])}%" if d.get("pops") else ""
+        hv, lv = d.get("max"), d.get("min")
+        if hv is not None:
+            hy, col = y_at(hv), _temp_color(hv)
+            nodes.append(f"<circle cx='{x:.1f}' cy='{hy:.1f}' r='4' fill='{col}'/>")
+            nodes.append(
+                f"<text x='{x:.1f}' y='{hy - 10:.1f}' text-anchor='middle' "
+                f"font-size='13' font-weight='700' fill='{col}'>{hv:.0f}°</text>"
+            )
+        if lv is not None:
+            ly, col = y_at(lv), _temp_color(lv)
+            nodes.append(f"<circle cx='{x:.1f}' cy='{ly:.1f}' r='4' fill='{col}'/>")
+            nodes.append(
+                f"<text x='{x:.1f}' y='{ly + 18:.1f}' text-anchor='middle' "
+                f"font-size='12' font-weight='600' fill='{col}'>{lv:.0f}°</text>"
+            )
+        nodes.append(f"<text x='{x:.1f}' y='{icon_y}' text-anchor='middle' font-size='20'>{_weather_emoji(wx)}</text>")
+        if pop_txt:
+            nodes.append(
+                f"<text x='{x:.1f}' y='{pop_y}' text-anchor='middle' font-size='11' fill='#5B8DB8'>{e(pop_txt)}</text>"
+            )
+        day_label = f"{dt.month}/{dt.day}（{_WEEKDAY[dt.weekday()]}）"
+        nodes.append(
+            f"<text x='{x:.1f}' y='{day_y}' text-anchor='middle' font-size='12' "
+            f"font-weight='600' fill='#4A2F1A'>{e(day_label)}</text>"
+        )
+
+    svg = (
+        f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' "
+        f"xmlns='http://www.w3.org/2000/svg' role='img' aria-label='一週溫度趨勢圖'>{''.join(nodes)}</svg>"
+    )
+    return f"<div class='wx-week-wrap'>{svg}</div>"
+
+
 def _build_location_card_html(name, county, current, rain, periods, source_bits) -> str:
     e = _html.escape
 
@@ -434,6 +541,22 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits)
         ]
         if current.get("uv_index") is not None:
             stats.append(f"<span>🔆 UV {e(str(current.get('uv_index')))}</span>")
+        if current.get("peak_gust_mps") is not None:
+            stats.append(f"<span>💨 陣風 {e(str(current.get('peak_gust_mps')))} m/s</span>")
+        feels = current.get("feels_like_c")
+        # O-A0003-001 即時觀測本身沒有體感溫度欄位，用氣溫/濕度/風速依 CWA 公式自算
+        feel_html = (
+            f"<div class='wx-now-feel'>{_feel_emoji(feels, feels)} 體感 {e(str(feels))}°C</div>"
+            if feels is not None else ""
+        )
+        hi, lo = current.get("daily_high_c"), current.get("daily_low_c")
+        hi_time, lo_time = _fmt_time(current.get("daily_high_time")), _fmt_time(current.get("daily_low_time"))
+        range_parts = []
+        if hi is not None:
+            range_parts.append(f"<span title='{e(hi_time)} 測得'>↑{e(str(hi))}°</span>")
+        if lo is not None:
+            range_parts.append(f"<span title='{e(lo_time)} 測得'>↓{e(str(lo))}°</span>")
+        range_html = f"<div class='wx-now-range'>🌡️ 今日 {' '.join(range_parts)}</div>" if range_parts else ""
         now_html = f"""
         <div class="wx-now">
           <div class="wx-now-main">
@@ -441,6 +564,8 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits)
             <span class="wx-now-temp">{e(str(current.get('air_temperature_c', '—')))}°</span>
           </div>
           <div class="wx-now-desc">{e(desc)}</div>
+          {feel_html}
+          {range_html}
           <div class="wx-now-stats">{''.join(stats)}</div>
           {rain_chip}
         </div>"""
@@ -513,11 +638,12 @@ has_cwa = bool(get_cwa_api_key())
 is_demo = (st.query_params.get("demo") == "1") or not has_cwa
 
 if is_demo:
-    locations, earthquake, typhoon, alerts = _demo_bundle()
+    locations, earthquake, typhoon, warning_details, alerts = _demo_bundle()
 else:
     locations = [_live_location(n, lat, lon) for n, (lat, lon) in _LOCATION_COORDS.items()]
     earthquake = _live_earthquake()
     typhoon = _live_typhoon()
+    warning_details = _live_warning_details()
     alerts = load_alerts()
 
 header_left, header_right = st.columns([4, 1], vertical_alignment="bottom")
@@ -528,6 +654,7 @@ with header_right:
         _live_location.clear()
         _live_earthquake.clear()
         _live_typhoon.clear()
+        _live_warning_details.clear()
         _load_alerts.clear()
         st.rerun()
 
@@ -555,18 +682,29 @@ if typhoon and typhoon.get("active"):
         icon="⚠️",
     )
 
-for loc in locations:
-    for hazard in loc.get("warnings", []):
-        has_alert = True
-        st.error(
-            f"**{loc['name']}**：{hazard.get('phenomena', '')}{hazard.get('significance', '')}生效中"
-            f"　有效至 {_fmt_time(hazard.get('end_time'))}",
-            icon="🌧️" if "雨" in hazard.get("phenomena", "") else "⚠️",
-        )
+# 全台特報公告（W-C0033-002）：影響到監控地點 → 紅色；其他地區 → 橘色。
+# 橫幅只放簡要（現象＋影響區域＋有效期限），公告全文收 expander 想看再展開。
+_WARN_ICON = [("雨", "🌧️"), ("風", "💨"), ("低溫", "🥶"), ("高溫", "🥵"), ("濃霧", "🌫️")]
+watched_counties = {loc.get("county") for loc in locations if loc.get("county")}
+for wd in warning_details or []:
+    has_alert = True
+    affected = wd.get("affected") or []
+    affected_txt = "、".join(affected) if affected else "詳見內容"
+    is_local = any(c in watched_counties for c in affected)
+    icon = next((emo for kw, emo in _WARN_ICON if kw in wd.get("title", "")), "⚠️")
+    line = (
+        f"**{wd.get('title', '天氣特報')}**　影響：{affected_txt}"
+        f"　:small[:gray[有效至 {_fmt_time(wd.get('end_time'))}]]"
+    )
+    (st.error if is_local else st.warning)(line, icon=icon)
+    if wd.get("content"):
+        with st.expander(f"📄 {wd.get('title', '特報')}內容全文"):
+            st.text(wd["content"])
+            st.caption(f":small[:gray[發布 {_fmt_time(wd.get('issue_time'))}]]")
 
 if not has_alert:
     # 「沒事」是常態，不佔一整條橫幅——例外才浮出
-    st.markdown(":small[:green[✅ 目前無生效中的颱風警報與天氣特報]]")
+    st.markdown(":small[:green[✅ 目前全台無生效中的颱風警報與天氣特報]]")
 
 # ── 我的地點（常駐：現在觀測 + 降雨現況 + 今明36小時預報） ──────────────
 st.subheader("📍 我的地點")
@@ -632,31 +770,13 @@ for loc in locations:
                     d["day_wx"] = wx  # 一天的代表天氣以白天時段為準
 
         wk_scale = _temp_scale(periods)
-        rows_html = []
-        for key in sorted(days):
-            d = days[key]
-            dt = d["date"]
-            wx = d["day_wx"] or d["any_wx"] or "—"
-            pop_txt = f"{max(d['pops'])}%" if d["pops"] else "—"
-            min_txt = f"{d['min']:.0f}°" if d["min"] is not None else "—"
-            max_txt = f"{d['max']:.0f}°" if d["max"] is not None else "—"
-            bar = (
-                _temp_bar_html(d["min"], d["max"], *wk_scale)
-                if wk_scale and d["min"] is not None and d["max"] is not None
-                else "<span></span>"
-            )
-            rows_html.append(
-                f"<div class='wx-wk-row'>"
-                f"<span class='wx-wk-day'>{dt.month}/{dt.day}（{_WEEKDAY[dt.weekday()]}）</span>"
-                f"<span>{_weather_emoji(wx)}</span>"
-                f"<span class='wx-wk-desc'>{_html.escape(wx)}</span>"
-                f"<span class='wx-wk-pop'>☔ {pop_txt}</span>"
-                f"<span class='wx-wk-t'>{min_txt}</span>{bar}<span class='wx-wk-t'>{max_txt}</span>"
-                f"</div>"
-            )
-
-        with st.expander(f"📅 一週預報（{county or loc['name']}）"):
-            st.markdown(f"<div class='wx-wk'>{''.join(rows_html)}</div>", unsafe_allow_html=True)
+        with st.expander(f"📅 一週溫度趨勢（{county or loc['name']}）"):
+            chart = _week_chart_svg(days, wk_scale)
+            if chart:
+                st.markdown(chart, unsafe_allow_html=True)
+                st.caption(":small[:gray[珊瑚色＝高溫　藍色＝低溫；每天一個點，X 軸間隔為天（CWA 預報以12小時為單位，非逐小時）]]")
+            else:
+                st.caption("溫度資料不足，無法繪製趨勢圖。")
 
 # ── 最近地震（一行式，震度圖收進 expander） ─────────────────────────────
 st.subheader("🌐 最近地震")
@@ -685,7 +805,8 @@ else:
         "rain": ":blue-badge[🌧️ 降雨]",
         "forecast": ":gray-badge[☀️ 預報]",
     }
-    with st.container(border=True):
+    # 固定高度、內部捲動：歷史再多也不會把頁面越拉越長
+    with st.container(height=380, border=True):
         for a in alerts:
             badge = _CATEGORY_BADGE.get(a["category"], ":gray-badge[🔔]")
             line = f"{badge}　**{a['title']}**　{a['body']}"
@@ -704,12 +825,12 @@ with st.expander("📋 通知規則說明"):
 | 類別 | 觸發條件 | 去重方式 |
 |---|---|---|
 | 🌐 地震 | 新地震報告，且**所在縣市震度 ≥ 設定門檻**（預設 4級）才推播 | 地震編號 |
-| ⚠️ 天氣特報 | 所在縣市出現**新的**特報（大雨/豪雨/低溫/強風…） | (縣市, 現象, 起始時間)，到期自動重置 |
+| ⚠️ 天氣特報 | 全台發布**新的**特報公告（大雨/豪雨/低溫/強風…），通知只含現象＋影響區域＋期限，公告全文在本頁特報區展開看 | (公告標題, 發布時間)，到期自動重置 |
 | 🌧️ 降雨 | 狀態**轉換**時通知一次：無雨 → 即將降雨（未來1小時預測 ≥ 1.0mm）、→ 降雨中（過去1小時實測 ≥ 0.5mm） | 每個地點各自的狀態機 |
 | ☀️ 預報 | 預報**內容有變化**才通知 | 與上一次快照比對 |
 | 🌀 颱風 | 氣象署發布**新的颱風公告**（含發布與解除） | 公告時戳，保留30天 |
 
 - 收集器由 cron-job.org 定時觸發 GitHub Actions，約 **每 10 分鐘一輪**；門檻值（震度、雨量）在收集器的 `config.yaml` 調整。
-- 通知會即時出現在 Anya **所有頁面**的右下角 toast；本頁「通知歷史」保留最近 20 筆。
+- 通知會即時出現在 Anya **所有頁面**的右下角 toast（不自動消失，按掉才解除）；本頁「通知歷史」顯示最近 20 筆，資料庫保留 30 天後自動清除。
 """
     )
