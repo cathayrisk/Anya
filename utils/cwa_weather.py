@@ -363,6 +363,45 @@ def get_rain(lat: float, lon: float) -> dict:
     }
 
 
+def get_warning_details() -> list:
+    """全台各別特報公告（W-C0033-002）：含公告標題、完整內容文字、影響區域與有效期間。
+    跟 get_warnings(county)（W-C0033-001，只回答某縣市現在有無特報）互補——
+    這裡是「發布尺度」，就算沒影響到查詢縣市的特報也會列出來。無特報時回空 list。"""
+    raw = _rest("W-C0033-002")
+    details = []
+    for record in raw.get("records", {}).get("record", []) or []:
+        ds = record.get("datasetInfo", {}) or {}
+        title = ds.get("datasetDescription", "")
+        if not title:
+            continue
+        valid = ds.get("validTime", {}) or {}
+
+        content = (
+            ((record.get("contents", {}) or {}).get("content", {}) or {}).get("contentText") or ""
+        ).strip()
+
+        affected: list[str] = []
+        hazards = ((record.get("hazardConditions", {}) or {}).get("hazards", {}) or {}).get("hazard", []) or []
+        for hz in hazards:
+            info = hz.get("info", {}) or {}
+            for loc in (info.get("affectedAreas", {}) or {}).get("location", []) or []:
+                name = loc.get("locationName")
+                if name and name not in affected:
+                    affected.append(name)
+
+        details.append(
+            {
+                "title": title,
+                "content": content,
+                "affected": affected,
+                "issue_time": ds.get("issueTime", ""),
+                "start_time": valid.get("startTime", ""),
+                "end_time": valid.get("endTime", ""),
+            }
+        )
+    return details
+
+
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -370,6 +409,16 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
+
+
+def _apparent_temperature(temp_c: float, rh_pct: float, wind_mps: float) -> float:
+    """CWA 官方公開的體感溫度公式（Steadman's Apparent Temperature，與澳洲氣象局
+    同一套，CWA 預報產品 MaxApparentTemperature/MinApparentTemperature 也是用這個
+    算出來的）。O-A0003-001 即時觀測本身沒有體感溫度欄位，用同一公式自己算，
+    才能跟預報卡片的「體感」數字方法一致、可比較。
+    AT = Ta + 0.33e − 0.70×風速 − 4.00，e 為水氣壓（hPa）。"""
+    e = (rh_pct / 100) * 6.105 * math.exp(17.27 * temp_c / (237.7 + temp_c))
+    return temp_c + 0.33 * e - 0.70 * wind_mps - 4.00
 
 
 def get_current_conditions(lat: float, lon: float):
@@ -406,19 +455,42 @@ def get_current_conditions(lat: float, lon: float):
             return v
 
     we = nearest.get("WeatherElement", {})
+    temp = _val(we.get("AirTemperature"))
+    rh = _val(we.get("RelativeHumidity"))
+    wind = _val(we.get("WindSpeed"))
+
+    feels_like_c = None
+    try:
+        if temp is not None and rh is not None and wind is not None:
+            feels_like_c = round(_apparent_temperature(float(temp), float(rh), float(wind)), 1)
+    except (TypeError, ValueError):
+        pass
+
+    daily = we.get("DailyExtreme", {}) or {}
+    daily_high_info = (daily.get("DailyHigh", {}) or {}).get("TemperatureInfo", {}) or {}
+    daily_low_info = (daily.get("DailyLow", {}) or {}).get("TemperatureInfo", {}) or {}
+    gust = we.get("GustInfo", {}) or {}
+
     return {
         "station_name": nearest.get("StationName"),
         "station_distance_km": round(nearest_km, 1),
         "obs_time": nearest.get("ObsTime", {}).get("DateTime"),
         "weather": _val(we.get("Weather")),
-        "air_temperature_c": _val(we.get("AirTemperature")),
-        "relative_humidity_pct": _val(we.get("RelativeHumidity")),
-        "wind_speed_mps": _val(we.get("WindSpeed")),
+        "air_temperature_c": temp,
+        "feels_like_c": feels_like_c,
+        "relative_humidity_pct": rh,
+        "wind_speed_mps": wind,
         "wind_direction_deg": _val(we.get("WindDirection")),
         "air_pressure_hpa": _val(we.get("AirPressure")),
         "uv_index": _val(we.get("UVIndex")),
         "precipitation_now_mm": _val(we.get("Now", {}).get("Precipitation")),
         "visibility": _val(we.get("VisibilityDescription")),
+        "daily_high_c": _val(daily_high_info.get("AirTemperature")),
+        "daily_high_time": (daily_high_info.get("Occurred_at", {}) or {}).get("DateTime"),
+        "daily_low_c": _val(daily_low_info.get("AirTemperature")),
+        "daily_low_time": (daily_low_info.get("Occurred_at", {}) or {}).get("DateTime"),
+        "peak_gust_mps": _val(gust.get("PeakGustSpeed")),
+        "peak_gust_time": (gust.get("Occurred_at", {}) or {}).get("DateTime"),
     }
 
 
