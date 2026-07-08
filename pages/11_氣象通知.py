@@ -337,17 +337,13 @@ def _comfort_emoji(desc: str) -> str:
 
 _WX_CSS = """
 <style>
-/* 超寬螢幕不讓內容無限拉開：整頁內容上限 1280px 置中，所有區塊比例一致。
-   預報卡在無上限的 flex:1 下會被拉到 500px+ 全是空白，這才是排版鬆散的根因。 */
-.stMain .block-container, div[data-testid="stMainBlockContainer"]{
-  max-width:1280px;margin-left:auto;margin-right:auto;}
 .wx-card{border:1px solid #F2D5CF;border-radius:14px;background:linear-gradient(180deg,#FFFFFF 0%,#FFF7F4 100%);
   padding:18px 20px 14px;margin-bottom:14px;}
 .wx-head{display:flex;align-items:baseline;gap:10px;margin-bottom:14px;}
 .wx-name{font-size:1.05rem;font-weight:700;color:#4A2F1A;}
 .wx-county{font-size:.85rem;color:#9A8478;}
 .wx-body{display:flex;gap:16px;flex-wrap:wrap;}
-.wx-now{flex:0 0 320px;display:flex;flex-direction:column;justify-content:center;gap:6px;
+.wx-now{flex:0 0 400px;display:flex;flex-direction:column;justify-content:center;gap:6px;
   padding:14px 18px;border-radius:12px;background:#FFF1EC;}
 .wx-now-main{display:flex;align-items:center;gap:12px;}
 .wx-now-emoji{font-size:2.4rem;line-height:1;}
@@ -355,7 +351,7 @@ _WX_CSS = """
 .wx-now-desc{font-size:1rem;font-weight:600;color:#C05A50;}
 .wx-now-feel{font-size:.8rem;color:#B26A55;}
 .wx-now-range{font-size:.78rem;color:#7A6A5F;display:flex;gap:8px;}
-.wx-now-stats{display:grid;grid-template-columns:repeat(2,auto);column-gap:14px;row-gap:4px;font-size:.82rem;color:#7A6A5F;}
+.wx-now-stats{display:flex;flex-wrap:wrap;column-gap:14px;row-gap:4px;font-size:.82rem;color:#7A6A5F;}
 .wx-now-stats span{white-space:nowrap;}
 .wx-chip{display:inline-block;margin-top:4px;padding:4px 10px;border-radius:99px;font-size:.8rem;font-weight:600;width:fit-content;}
 .wx-chip.rain-on{background:#E3F2FD;color:#1565C0;}
