@@ -26,6 +26,7 @@ import re
 import time
 import json
 import socket
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 from io import BytesIO
@@ -168,6 +169,25 @@ CODING_HINT_RE = re.compile(
 GENERAL_HINT_RE = re.compile(
     r"系統性比較|深入分析|完整報告|全面評估|交叉比對|魔鬼代言人|蘇格拉底|專家團隊"
 )
+# per-skill 確定性 nudge：高精度關鍵詞 → 建議先載入對應 skill（首個命中生效）。
+# 命中同時升級 General（否則落 Fast 無工具，hint 無從生效）。pattern 保持窄以控誤升級。
+SKILL_HINT_RES: dict[str, re.Pattern] = {
+    "market-research": re.compile(r"TAM|SAM|SOM|市場規模|市場調查|市場區隔", re.IGNORECASE),
+    "statistical-analyst": re.compile(r"假設檢定|顯著性|信賴區間|p\s*值|迴歸分析|統計檢定"),
+    "financial-analyst": re.compile(r"DCF|現金流折現|估值|財報比率|CAC|LTV|ARR|MRR", re.IGNORECASE),
+    "universal-scraping-architect": re.compile(r"爬蟲|爬取|反爬|scrap(?:e|ing)", re.IGNORECASE),
+    "data-quality-auditor": re.compile(r"資料品質|缺值|離群值|資料清理"),
+}
+# deep research pipeline Phase 1 的方法論注入來源（與 skills_loaded 取交集）
+METHODOLOGY_SKILLS = ("market-research", "statistical-analyst", "financial-analyst", "product-research")
+
+
+def match_skill_hint(text: str) -> str | None:
+    """回傳第一個命中 hint regex 的 skill 名（無命中回 None）。純函式可測。"""
+    for name, pat in SKILL_HINT_RES.items():
+        if pat.search(text or ""):
+            return name
+    return None
 
 # --- 提問引導（socratic）模式 ---
 # 模式狀態放 harness（gm_mode_sticky session key），不指望弱模型跨回合記得自己在什麼模式。
@@ -608,7 +628,11 @@ def _maybe_unindent_indented_block(text: str) -> str:
 def normalize_markdown_for_streamlit(text: str) -> str:
     if not text:
         return ""
-    t = text.strip("﻿")
+    # NFC 正規化：模型有時吐 Unicode 分解形式（如 ≠ = "="＋U+0338 組合斜線），
+    # 而本地 SF Pro 字型缺組合記號字符 → 瀏覽器顯示 tofu 黑框。NFC 重組回精撰合碼位
+    # （≠ U+2260，字型有），一併修掉其他分解字元；對 CJK 無害（本就是 NFC）。
+    t = unicodedata.normalize("NFC", text)
+    t = t.strip("﻿")
     m = CODE_FENCE_WHOLE_BLOCK_RE.match(t.strip())
     if m:
         t = m.group(1)
@@ -1887,27 +1911,53 @@ def write_todos(todos: list[TodoItem]) -> str:
     return json.dumps({"ok": True, "count": len(cleaned)}, ensure_ascii=False)
 
 
+def split_skill_names(skill_name: str, max_n: int = 3) -> list[str]:
+    """把 skill_name 參數切成名稱清單（支援逗號/頓號/空白分隔，去重、上限 max_n）。純函式可測。"""
+    names: list[str] = []
+    for part in re.split(r"[,、;\s]+", (skill_name or "").strip()):
+        p = part.strip()
+        if p and p not in names:
+            names.append(p)
+    return names[:max_n]
+
+
 @tool
 def load_skill(skill_name: str) -> str:
     """載入指定 skill 的完整內容到你的工作脈絡中。
 
     【何時使用】system prompt 的 skill 索引中有相關技能、且本次任務需要該知識時，先載入再作業。
-    skill_name 必須是索引中列出的名稱。
+    skill_name 必須是索引中列出的名稱；需要多個時用逗號分隔一次載入（最多 3 個），
+    例如 load_skill("python_best_practices, security-checklist")。
     """
     meta = _rt_meta()
     meta["tool_step"] += 1
-    name = (skill_name or "").strip()
-    sk = SKILLS.get(name)
-    if not sk:
-        return json.dumps(
-            {"error": f"找不到 skill「{name}」", "available": list(SKILLS.keys())},
-            ensure_ascii=False,
-        )
-    content = sk.get("content") or load_skill_content(sk)   # 掃描條目惰性讀檔
-    if not content:
-        return json.dumps({"error": f"skill「{name}」內容讀取失敗"}, ensure_ascii=False)
-    _step_done(f"📖 載入 skill：{name}")
-    return f"已載入 skill「{name}」：\n\n{content}"
+    loaded: list = meta.setdefault("skills_loaded", [])   # 本回合已載清單（去重＋#7 歷史 tag 用）
+    names = split_skill_names(skill_name)
+    if not names:
+        return json.dumps({"error": "skill_name 為空"}, ensure_ascii=False)
+    parts: list[str] = []
+    not_found: list[str] = []
+    for name in names:
+        sk = SKILLS.get(name)
+        if not sk:
+            not_found.append(name)
+            continue
+        if name in loaded:
+            # 同回合重複載入：全文還在上方工具結果裡，不再重送（重送會在剩餘每輪重複計費）
+            parts.append(f"skill「{name}」本回合已載入過，內容仍在上方工具結果中，直接沿用即可。")
+            continue
+        content = sk.get("content") or load_skill_content(sk)   # 掃描條目惰性讀檔
+        if not content:
+            not_found.append(name)
+            continue
+        loaded.append(name)
+        _step_done(f"📖 載入 skill：{name}")
+        parts.append(f"已載入 skill「{name}」：\n\n{content}")
+    if not parts:
+        return json.dumps({"error": "找不到指定的 skill", "not_found": not_found}, ensure_ascii=False)
+    if not_found:
+        parts.append(f"（找不到：{'、'.join(not_found)}——名稱需與索引完全一致）")
+    return "\n\n---\n\n".join(parts)
 
 
 # --- 跨 session 長期記憶（Supabase anya_lessons）---
@@ -2188,6 +2238,41 @@ def _dr_toast(msg: str):
 _CP1_REVISE_RE = re.compile(r"###\s*Verdict:\s*REVISE", re.IGNORECASE)
 
 
+def parse_knowledge_gaps(synthesis_md: str, max_n: int = 2) -> list[str]:
+    """從綜整全文寬容解析「知識缺口」條目（31b 輸出格式會漂移，不能只認固定標題）。
+
+    規則：找到「知識缺口」字樣後，收割其後的編號/條列行；碰到下一個標題或連續空行即停。
+    解析不到就回空 list（呼叫端靜默跳過）。純函式可測。
+    """
+    if not synthesis_md:
+        return []
+    idx = synthesis_md.find("知識缺口")
+    if idx < 0:
+        return []
+    gaps: list[str] = []
+    blank_streak = 0
+    for line in synthesis_md[idx:].splitlines()[1:]:
+        s = line.strip()
+        if not s:
+            blank_streak += 1
+            if blank_streak >= 2 and gaps:
+                break
+            continue
+        blank_streak = 0
+        if s.startswith("#") or s.startswith("**") and s.endswith("**"):
+            break   # 下一節開始
+        m = re.match(r"^(?:[-•*]|\d+[.、)])\s*(.+)$", s)
+        if m:
+            gap = m.group(1).strip().rstrip("。")
+            if len(gap) > 5:
+                gaps.append(gap[:120])
+                if len(gaps) >= max_n:
+                    break
+        elif gaps:
+            break   # 條列結束後的一般文字 → 停
+    return gaps
+
+
 def run_deep_research_pipeline(topic: str, focus: str = "") -> dict:
     """固定 5+1 階段 pipeline（主線程序列執行）。回傳 {"ok": bool, "report_md"|"error": str}。
     各階段失敗走降級階梯；state 逐階段存入 gm_dr_state（斷點續跑：同題重跑時跳過已完成階段）。"""
@@ -2213,8 +2298,20 @@ def run_deep_research_pipeline(topic: str, focus: str = "") -> dict:
     # ---- Phase 1：研究問題（FINER）----
     if not state.get("rq_brief"):
         advance_pipeline_todo(0)
+        # 方法論注入（確定性）：lead 本回合載過方法論 skill → 摘要附進定題 payload。
+        # 選中的名稱存 state 保 resume 穩定；不動 focus/topic_hash/訪談閘門。
+        if "methodology_skill" not in state:
+            loaded = _rt_meta().get("skills_loaded") or []
+            state["methodology_skill"] = next((n for n in METHODOLOGY_SKILLS if n in loaded), None)
+            _save()
         try:
             payload = f"研究主題：{topic}" + (f"\n聚焦方向：{focus}" if focus else "")
+            m_name = state.get("methodology_skill")
+            if m_name and m_name in SKILLS:
+                m_body = (SKILLS[m_name].get("content") or load_skill_content(SKILLS[m_name]))[:2000]
+                if m_body:
+                    payload += f"\n\n【方法論要求（{m_name}）——定題與範圍界定必須對齊】\n{m_body}"
+                    _step_done(f"📐 方法論注入：{m_name}")
             state["rq_brief"] = _run_subagent(PERSONA_RESEARCH_QUESTION, payload, llm_brain,
                                               status_label=DR_PHASES[0][1])
             _dr_log("1 研究問題", state["rq_brief"])
@@ -2394,6 +2491,56 @@ def run_deep_research_pipeline(topic: str, focus: str = "") -> dict:
         state["cp2_done"] = True
         _save()
 
+    # ---- Phase 3.5：知識缺口補搜（一次性；成功失敗都設 gapfill_done，防 resume 無限重跑）----
+    if state.get("synthesis_md") and not state.get("gapfill_done"):
+        try:
+            gaps = parse_knowledge_gaps(state["synthesis_md"])
+            if gaps:
+                _status("🕳️ 綜整發現知識缺口，補搜中…",
+                        write="🕳️ 知識缺口：" + "；".join(g[:40] for g in gaps))
+                # 缺口 → 搜尋查詢（26b 機械活；失敗降級直接拿缺口文字當查詢）
+                try:
+                    q_gen = _run_subagent(
+                        PERSONA_BIBLIOGRAPHY,
+                        "把以下研究知識缺口各轉成一條可直接搜尋的網路查詢。"
+                        "只輸出查詢本身（每行一條），不要任何其他文字：\n\n"
+                        + "\n".join(f"- {g}" for g in gaps),
+                        llm_bg, status_label="🕳️ 產生補搜查詢…")
+                    gap_queries = [q.strip().lstrip("-•*1234567890.、) ") for q in q_gen.splitlines() if q.strip()]
+                    gap_queries = [q for q in gap_queries if len(q) > 4][:2] or gaps
+                except Exception:
+                    gap_queries = gaps
+                # 序列搜尋（≤2 條，主線程即可；沿用快取與 grounding→DDG 降級）
+                llm_bound = None
+                if not st.session_state.get("gm_grounding_down"):
+                    llm_bound = get_search_llm().bind_tools([GOOGLE_SEARCH_TOOL])
+                notes = []
+                for q in gap_queries:
+                    cached = _web_cache_get(q)
+                    if cached is not None:
+                        summary, sources = cached
+                    else:
+                        try:
+                            summary, sources, grounded_ok = _search_raw(llm_bound, q)
+                            if llm_bound is not None and not grounded_ok:
+                                st.session_state["gm_grounding_down"] = True
+                            _web_cache_put(q, summary, sources)
+                        except Exception as e:
+                            _step_done(f"⚠️ 補搜失敗（{type(e).__name__}）：{q[:40]}")
+                            continue
+                    _web_log_append(q, sources)
+                    src_lines = "\n".join(f"- {s['title']}: {s['url']}" for s in sources[:3])
+                    notes.append(f"### 缺口補搜：{q}\n{summary}\n來源：\n{src_lines}")
+                    _step_done(f"✅ 缺口補搜：{q[:40]} → {len(sources)} 個來源")
+                if notes:
+                    state["gapfill_notes"] = "\n\n".join(notes)[:2500]
+                    _dr_log("3.5 缺口補搜", state["gapfill_notes"])
+                    _dr_toast("🕳️ 知識缺口補搜完成")
+        except Exception as e:
+            state["degraded"].append(f"缺口補搜跳過（{type(e).__name__}）")
+        state["gapfill_done"] = True
+        _save()
+
     # ---- Phase 4：撰寫簡報（flash，真串流到主 placeholder）----
     advance_pipeline_todo(6)
     degraded_note = ""
@@ -2409,10 +2556,17 @@ def run_deep_research_pipeline(topic: str, focus: str = "") -> dict:
             "\n\n【魔鬼代言人對綜整的重大質疑（撰寫時必須處理：修正論述或明確列入研究限制）】\n"
             + state["cp2_findings"]
         )
+    gapfill_note = ""
+    if state.get("gapfill_notes"):
+        gapfill_note = (
+            "\n\n【知識缺口補充搜尋摘要（未經來源分級，僅供補充；引用時須註明初步性質）】\n"
+            + state["gapfill_notes"][:2500]
+        )
     report_input = (
         f"研究問題：\n{state['rq_brief'][:1500]}\n\n"
         + (f"綜整分析：\n{state['synthesis_md'][:7000]}" if state.get("synthesis_md")
            else f"標註書目（綜整階段缺席，請直接由此編譯）：\n{state['bibliography_md'][:7000]}")
+        + gapfill_note
         + cp2_note
         + degraded_note
     )
@@ -2904,12 +3058,34 @@ def _build_general_instructions(socratic: bool = False) -> str:
         )
     skills_index = ""
     if SKILLS:
-        lines = "\n".join(f"- {name}：{sk['description']}" for name, sk in SKILLS.items())
+        # 分類只影響索引排版（幫 31b 選中），不動 entry schema；未歸類自動落「其他」
+        groups: dict[str, list[str]] = {
+            "程式碼品質": ["python_best_practices", "security-checklist", "sql-and-database",
+                          "karpathy-coder"],
+            "研究與分析方法": ["market-research", "product-research", "statistical-analyst",
+                              "financial-analyst", "data-quality-auditor", "deep_research_process"],
+            "寫作與文件": ["md-document", "landing", "caveman", "roast", "reflect"],
+            "資料擷取": ["universal-scraping-architect"],
+        }
+        grouped = {n for names in groups.values() for n in names}
+        others = [n for n in SKILLS if n not in grouped]
+        widget_names = [n for n in others if n.startswith("widget_")]
+        rest = [n for n in others if not n.startswith("widget_")]
+        if widget_names:
+            groups["widget 模板"] = widget_names
+        if rest:
+            groups["其他"] = rest
+        sections = []
+        for cat, names in groups.items():
+            lines = "\n".join(f"- {n}：{SKILLS[n]['description']}" for n in names if n in SKILLS)
+            if lines:
+                sections.append(f"◆ {cat}\n{lines}")
         skills_index = (
             "\n\n"
             "【可載入的 skills（漸進式知識）】\n"
-            f"{lines}\n"
-            "需要上述知識時，先呼叫 load_skill(skill_name) 載入完整內容再作業；不需要就不要載。\n"
+            + "\n".join(sections) + "\n"
+            "需要上述知識時，先呼叫 load_skill(skill_name) 載入完整內容再作業（多個用逗號分隔一次載入）；"
+            "不需要就不要載。\n"
         )
     DEEP_RESEARCH_RULES = ""
     if HAS_PERSONAS:
@@ -2922,6 +3098,9 @@ def _build_general_instructions(socratic: bool = False) -> str:
             "- 若是你自己判斷需要（使用者沒明講）：先用一句話確認「這需要約 10 分鐘的深度研究，要進行嗎？」，"
             "等使用者同意後才呼叫。\n"
             "- 每回合最多一次；呼叫前不必自己 write_todos——pipeline 會自動建立進度清單。\n"
+            "- 研究主題屬市場/統計/財務/產品領域時，呼叫 deep_research 前先 load_skill 對應方法論"
+            "（market-research / statistical-analyst / financial-analyst / product-research），"
+            "研究流程會自動對齊該方法論。\n"
             "- 若工具回傳 needs_clarification：照其指示【一次問完】訪談問題後結束回合等使用者回覆；"
             "不要自問自答、不要跳過訪談、不要在同一回合重呼叫。下一回合把回答整理進 focus 再呼叫。\n"
         )
@@ -3318,6 +3497,7 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
                      renderer: "ShimmerStreamRenderer", placeholder,
                      todo_ph=None, deep_research_requested: bool = False,
                      widget_area=None, widget_requested: bool = False,
+                     suggested_skill: str | None = None,
                      socratic: bool = False) -> tuple[str, dict]:
     """General：手動 tool loop + 真串流。回傳 (ai_text, meta)。"""
     rt = st.session_state["_gm_rt"]
@@ -3383,9 +3563,17 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
                 "\n\n【本回合注意】使用者明確要求互動元件。請先用 load_skill 載入最符合需求的"
                 " widget_* 模板，替換資料區後呼叫 create_widget，不需要再向使用者確認。"
             )
+    if suggested_skill and not widget_requested and suggested_skill in SKILLS:
+        # widget 命中時讓位（兩個【本回合注意】會互搶弱模型的注意力）
+        instructions += (
+            f"\n\n【本回合注意】訊息內容與「{suggested_skill}」skill 高度相關，"
+            f"建議先 load_skill(\"{suggested_skill}\") 載入方法論再作業。"
+        )
     instructions += (
         "\n\n## 程式碼任務規範（硬性）\n"
-        "- 撰寫 Python 前先 load_skill(\"python_best_practices\") 對齊品質規範。\n"
+        "- 撰寫 Python 前先 load_skill(\"python_best_practices\") 對齊品質規範；"
+        "涉及 secrets/資料庫/檔案 IO/網路請求/使用者輸入時，一次載入"
+        " load_skill(\"python_best_practices, security-checklist\")。\n"
         "- 你交付的 Python 程式碼【必須】先附最小測試（assert）並用 run_python 實際執行驗證；"
         "失敗→修正→重驗（最多 2 輪），通過才輸出最終答案，並註明「✅ 已實測通過」。\n"
         "- VBA 無法執行：完成後改用 consult_expert(role=\"coding_expert\") 做靜態複審，"
@@ -3614,8 +3802,9 @@ if prompt or retry_payload:
         escalate_reason = "docstore_indexed_prefer_general"
     elif (DEEP_RESEARCH_HINT_RE.search(user_text or "") or GENERAL_HINT_RE.search(user_text or "")
           or CODING_HINT_RE.search(user_text or "")
-          or (WIDGET_HINT_RE and WIDGET_HINT_RE.search(user_text or ""))):
-        # 明顯需要深思模式的關鍵詞（含寫程式/互動元件請求）：直送 General，省掉一次 Fast 升級呼叫
+          or (WIDGET_HINT_RE and WIDGET_HINT_RE.search(user_text or ""))
+          or match_skill_hint(user_text or "")):
+        # 明顯需要深思模式的關鍵詞（含寫程式/互動元件/skill hint 命中）：直送 General，省掉一次 Fast 升級呼叫
         mode = "general"
         escalate_reason = "keyword_hint"
     else:
@@ -3751,6 +3940,7 @@ if prompt or retry_payload:
                         ),
                         widget_area=widget_area,
                         widget_requested=bool(WIDGET_HINT_RE and WIDGET_HINT_RE.search(user_text or "")),
+                        suggested_skill=match_skill_hint(user_text or ""),
                         socratic=socratic_active,
                     )
 
@@ -3805,6 +3995,9 @@ if prompt or retry_payload:
                         _tool_tags.append(f"doc_search×{meta['doc_calls']}")
                     if meta.get("web_calls", 0) > 0:
                         _tool_tags.append(f"web_search×{meta['web_calls']}")
+                    if meta.get("skills_loaded"):
+                        # 記載過的 skill 名（內容已不在脈絡中；下回合延續任務時模型可據此重載）
+                        _tool_tags.append("skills:" + "+".join(meta["skills_loaded"]))
                     _stored_text = final_text
                     # 深度研究報告存歷史時截斷：避免之後每一輪 31b 呼叫都全額重付報告 tokens
                     # （完整原文可經 get_research_artifact 取回）
