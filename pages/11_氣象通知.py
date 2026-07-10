@@ -345,58 +345,126 @@ def _comfort_emoji(desc: str) -> str:
     return "😐"
 
 
+# 設計原則:警報層用「嚴重度系統」跳出全站暖色環境(危險/警戒/注意各有明文標籤+
+# 圖示+成對色,不只靠顏色);天氣卡表面中性化、暖色只留在 accent 與溫度帶;
+# 內文對比一律 ≥4.5:1(舊版 #B0A399/#7A6A5F 在暖白底上不及格)。
 _WX_CSS = """
 <style>
-.wx-card{border:1px solid #F2D5CF;border-radius:14px;background:linear-gradient(180deg,#FFFFFF 0%,#FFF7F4 100%);
+.wx-card{border:1px solid #E4E7EC;border-radius:14px;background:#FFFFFF;
   padding:18px 20px 14px;margin-bottom:14px;}
 .wx-head{display:flex;align-items:baseline;gap:10px;margin-bottom:14px;}
-.wx-name{font-size:1.05rem;font-weight:700;color:#4A2F1A;}
-.wx-county{font-size:.85rem;color:#9A8478;}
+.wx-name{font-size:1.05rem;font-weight:700;color:#172033;}
+.wx-county{font-size:.85rem;color:#526070;}
 .wx-body{display:flex;gap:16px;flex-wrap:wrap;}
 .wx-now{flex:0 0 400px;display:flex;flex-direction:column;justify-content:center;gap:6px;
-  padding:14px 18px;border-radius:12px;background:#FFF1EC;}
+  padding:14px 18px;border-radius:12px;background:#F6F7F9;}
 .wx-now-main{display:flex;align-items:center;gap:12px;}
 .wx-now-emoji{font-size:2.4rem;line-height:1;}
-.wx-now-temp{font-size:2.5rem;font-weight:700;color:#4A2F1A;line-height:1;}
-.wx-now-desc{font-size:1rem;font-weight:600;color:#C05A50;}
-.wx-now-feel{font-size:.8rem;color:#B26A55;}
-.wx-now-range{font-size:.78rem;color:#7A6A5F;display:flex;gap:8px;}
-.wx-now-stats{display:flex;flex-wrap:wrap;column-gap:14px;row-gap:4px;font-size:.82rem;color:#7A6A5F;}
+.wx-now-temp{font-size:2.5rem;font-weight:700;color:#172033;line-height:1;}
+.wx-now-desc{font-size:1rem;font-weight:600;color:#B0453B;}
+.wx-now-feel{font-size:.8rem;color:#475467;}
+.wx-now-range{font-size:.78rem;color:#475467;display:flex;gap:8px;}
+.wx-now-stats{display:flex;flex-wrap:wrap;column-gap:14px;row-gap:4px;font-size:.82rem;color:#475467;}
 .wx-now-stats span{white-space:nowrap;}
 .wx-chip{display:inline-block;margin-top:4px;padding:4px 10px;border-radius:99px;font-size:.8rem;font-weight:600;width:fit-content;}
-.wx-chip.rain-on{background:#E3F2FD;color:#1565C0;}
-.wx-chip.rain-soon{background:#FFF3E0;color:#B26A00;}
-.wx-chip.rain-off{background:#F1EDEA;color:#8A7A6E;}
+.wx-chip.rain-on{background:#E3F2FD;color:#1258A8;}
+.wx-chip.rain-soon{background:#FFF3E0;color:#8F5300;}
+.wx-chip.rain-off{background:#EEF0F3;color:#526070;}
 .wx-periods{flex:1;min-width:220px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
-.wx-period{border:1px solid #F2D5CF;border-radius:12px;background:#FFFFFF;padding:12px 14px;
+.wx-period{border:1px solid #E4E7EC;border-radius:12px;background:#FFFFFF;padding:12px 14px;
   display:flex;flex-direction:column;gap:5px;}
 .wx-p-head{display:flex;justify-content:space-between;align-items:baseline;gap:6px;}
-.wx-p-label{font-size:.85rem;font-weight:700;color:#4A2F1A;}
-.wx-p-pop{font-size:.78rem;color:#5B8DB8;white-space:nowrap;}
-.wx-p-hours{font-size:.72rem;color:#B0A399;}
-.wx-p-wx{font-size:.98rem;font-weight:600;color:#C05A50;display:flex;align-items:center;gap:6px;}
-.wx-p-temp{font-size:.82rem;color:#7A6A5F;}
-.wx-p-feel{font-size:.78rem;color:#B26A55;}
-.wx-p-comfort{font-size:.76rem;color:#8A7A6E;}
-.wx-src{margin-top:12px;font-size:.72rem;color:#B0A399;}
-.wx-t-row{display:flex;align-items:center;gap:7px;font-size:.8rem;color:#7A6A5F;}
+.wx-p-label{font-size:.85rem;font-weight:700;color:#172033;}
+.wx-p-pop{font-size:.78rem;color:#33658E;white-space:nowrap;}
+.wx-p-hours{font-size:.72rem;color:#667085;}
+.wx-p-wx{font-size:.98rem;font-weight:600;color:#B0453B;display:flex;align-items:center;gap:6px;}
+.wx-p-temp{font-size:.82rem;color:#475467;}
+.wx-p-feel{font-size:.78rem;color:#475467;}
+.wx-p-comfort{font-size:.76rem;color:#526070;}
+.wx-src{margin-top:12px;font-size:.74rem;color:#667085;}
+.wx-t-row{display:flex;align-items:center;gap:7px;font-size:.8rem;color:#475467;}
 .wx-t-row .t{font-weight:600;}
-.wx-t-track{flex:1;height:6px;border-radius:99px;background:#F1EDEA;position:relative;min-width:50px;}
+.wx-t-track{flex:1;height:6px;border-radius:99px;background:#EEF0F3;position:relative;min-width:50px;}
 .wx-t-fill{position:absolute;top:0;height:100%;border-radius:99px;}
 .wx-wk{display:flex;flex-direction:column;gap:2px;}
 .wx-wk-row{display:grid;grid-template-columns:104px 26px minmax(70px,1fr) 52px 34px minmax(80px,1.4fr) 34px;
-  align-items:center;gap:8px;padding:7px 10px;border-radius:10px;font-size:.86rem;color:#4A2F1A;}
-.wx-wk-row:nth-child(even){background:#FDF0ED;}
+  align-items:center;gap:8px;padding:7px 10px;border-radius:10px;font-size:.86rem;color:#172033;}
+.wx-wk-row:nth-child(even){background:#F6F7F9;}
 .wx-wk-day{font-weight:600;}
-.wx-wk-desc{color:#7A6A5F;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.wx-wk-pop{color:#5B8DB8;font-size:.8rem;text-align:right;white-space:nowrap;}
-.wx-wk-t{color:#7A6A5F;font-weight:600;text-align:right;}
+.wx-wk-desc{color:#475467;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.wx-wk-pop{color:#33658E;font-size:.8rem;text-align:right;white-space:nowrap;}
+.wx-wk-t{color:#475467;font-weight:600;text-align:right;}
 @media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:1fr;}
   .wx-wk-row{grid-template-columns:88px 24px 46px 30px 1fr 30px;}.wx-wk-desc{display:none;}}
+/* ── 警報嚴重度系統:明文等級+圖示+成對色,不只靠顏色 ── */
+.al-banner{display:flex;gap:12px;align-items:flex-start;border:1px solid;border-radius:12px;
+  padding:12px 16px;margin-bottom:8px;}
+.al-danger{background:#FFF1F0;border-color:#F1AEA7;}
+.al-watch{background:#FFFAEB;border-color:#F0D28E;}
+.al-notice{background:#EFF8FF;border-color:#B5D3F5;}
+.al-icon{font-size:1.35rem;line-height:1.25;}
+.al-main{flex:1;display:flex;flex-direction:column;gap:3px;min-width:0;}
+.al-row1{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.al-chip{font-size:.75rem;font-weight:700;padding:2px 10px;border-radius:99px;color:#FFFFFF;white-space:nowrap;}
+.al-danger .al-chip{background:#B42318;}
+.al-watch .al-chip{background:#B54708;}
+.al-notice .al-chip{background:#175CD3;}
+.al-title{font-weight:700;color:#172033;font-size:.98rem;}
+.al-local{font-size:.75rem;font-weight:700;color:#B42318;background:#FFFFFF;border:1px solid #F1AEA7;
+  padding:1px 8px;border-radius:99px;white-space:nowrap;}
+.al-meta{font-size:.82rem;color:#475467;}
+.al-meta b{color:#172033;}
+/* 在地決策列:此刻、此地、有沒有事 */
+.al-strip{display:flex;align-items:center;gap:10px;border:1px solid;border-radius:12px;
+  padding:12px 16px;margin-bottom:12px;font-size:.95rem;}
+.al-strip.ok{background:#ECFDF3;border-color:#A6E4C0;color:#054F31;}
+.al-strip.hit{background:#FFF1F0;border-color:#F1AEA7;color:#7A1710;}
+.al-strip b{font-size:1.02rem;}
 </style>
 """
 
 _RAIN_CHIP_CLASS = {"raining": "rain-on", "soon_rain": "rain-soon", "dry": "rain-off"}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 警報嚴重度元件(等級=本頁自訂的相關性×災種映射,非 CWA 官方分級)
+# ──────────────────────────────────────────────────────────────────────────
+def _remaining_label(end_str) -> str:
+    """有效期限剩不到 3 小時 → 顯示倒數,時間成為一級資訊。"""
+    try:
+        end = datetime.fromisoformat(str(end_str))
+    except (TypeError, ValueError):
+        return ""
+    now = datetime.now(_TAIPEI) if end.tzinfo else datetime.now()
+    secs = (end - now).total_seconds()
+    if secs <= 0:
+        return ""
+    if secs <= 3 * 3600:
+        return f"(剩約 {secs / 3600:.0f} 小時)" if secs >= 3600 else f"(剩約 {secs / 60:.0f} 分)"
+    return ""
+
+
+def _affected_summary(affected: list, watched: set) -> str:
+    """地名牆 → 摘要:命中的監控縣市排最前,其餘收成「等 N 地」。"""
+    if not affected:
+        return "詳見內容全文"
+    hits = [c for c in affected if c in watched]
+    lead = hits[0] if hits else affected[0]
+    return lead if len(affected) == 1 else f"{lead} 等 {len(affected)} 地"
+
+
+def _alert_banner_html(sev: str, icon: str, title: str, affected_txt: str, time_txt: str, local: bool) -> str:
+    """嚴重度橫幅:明文等級 chip + 圖示 + 在地標記,不只靠顏色編碼。"""
+    e = _html.escape
+    label = {"danger": "危險", "watch": "警戒", "notice": "注意"}[sev]
+    local_tag = "<span class='al-local'>📍 影響你的地點</span>" if local else ""
+    meta_bits = [b for b in (affected_txt, time_txt) if b]
+    meta = f"<div class='al-meta'>{'　'.join(meta_bits)}</div>" if meta_bits else ""
+    return (
+        f"<div class='al-banner al-{sev}'><span class='al-icon'>{icon}</span>"
+        f"<div class='al-main'><div class='al-row1'><span class='al-chip'>{label}</span>"
+        f"<span class='al-title'>{e(title)}</span>{local_tag}</div>{meta}</div></div>"
+    )
 
 # 溫度 → 端點顏色（冷藍 → 金 → 暖橘 → 珊瑚紅），溫度帶兩端各取自己溫度的顏色
 _TEMP_STOPS = [(12, (110, 159, 197)), (22, (200, 164, 58)), (30, (224, 138, 99)), (36, (192, 90, 80))]
@@ -579,11 +647,12 @@ else:
     warning_details = _live_warning_details()
     alerts = load_alerts()
 
-header_left, header_right = st.columns([4, 1], vertical_alignment="bottom")
+header_left, header_right = st.columns([5, 1], vertical_alignment="bottom")
 with header_left:
     st.title("🌦️ 氣象通知")
 with header_right:
-    if st.button("🔄 重新整理", width="stretch"):
+    # 次要操作不佔滿欄寬——過寬的單一按鈕會搶走警示層的視覺權重
+    if st.button("🔄 重新整理", width="content"):
         _live_location.clear()
         _live_earthquake.clear()
         _live_typhoon.clear()
@@ -602,60 +671,105 @@ if is_demo:
         st.warning("目前顯示**示範資料**（`?demo=1`）。移除網址參數即可看即時資料。", icon="🧪")
 else:
     newest = max((l.get("data_time") or "" for l in locations), default="")
-    st.caption(f":green-badge[即時 CWA 資料]　降雨網格時間：{_fmt_time(newest)}（頁面每次載入即時查詢）")
+    # 資料連線狀態用中性灰——綠色保留給「安全」語意，避免在警報上方形成假安全訊號
+    st.caption(f":gray-badge[即時 CWA 資料]　降雨網格時間：{_fmt_time(newest)}（頁面每次載入即時查詢）")
 
-# ── 警示橫幅：只在有事時出現 ────────────────────────────────────────────
-has_alert = False
+# ── 警示層：在地決策列 + 嚴重度橫幅（例外才浮出；等級=相關性×災種，非官方分級） ──
+st.markdown(_WX_CSS, unsafe_allow_html=True)
 
-if typhoon and typhoon.get("active"):
-    has_alert = True
-    st.error(
-        f"🌀 **{typhoon.get('headline', '颱風警報')}** 生效中"
-        f"　:small[:gray[公告 {_fmt_time(typhoon.get('effective'))}]]",
-        icon="⚠️",
-    )
-    # 公告段落（颱風動態/警戒區域…）收 expander，跟特報全文同一套呈現方式
-    if typhoon.get("description") or typhoon.get("affected_areas"):
-        with st.expander("📄 颱風警報內容全文"):
-            for sec in typhoon.get("description") or []:
-                if sec.get("title"):
-                    st.markdown(f"**{sec['title']}**")
-                if sec.get("value"):
-                    st.text(sec["value"])
-            areas = typhoon.get("affected_areas") or []
-            if areas:
-                st.markdown(f"**警戒區域**　{'、'.join(a for a in areas if a)}")
-
-# 全台特報公告（W-C0033-002）：影響到監控地點 → 紅色；其他地區 → 橘色。
-# 橫幅只放簡要（現象＋影響區域＋有效期限），公告全文收 expander 想看再展開。
 _WARN_ICON = [("雨", "🌧️"), ("風", "💨"), ("低溫", "🥶"), ("高溫", "🥵"), ("濃霧", "🌫️")]
 watched_counties = {loc.get("county") for loc in locations if loc.get("county")}
-for wd in warning_details or []:
-    has_alert = True
-    affected = wd.get("affected") or []
-    affected_txt = "、".join(affected) if affected else "詳見內容"
-    is_local = any(c in watched_counties for c in affected)
-    icon = next((emo for kw, emo in _WARN_ICON if kw in wd.get("title", "")), "⚠️")
-    line = (
-        f"**{wd.get('title', '天氣特報')}**　影響：{affected_txt}"
-        f"　:small[:gray[有效至 {_fmt_time(wd.get('end_time'))}]]"
+watched_label = "、".join(sorted(watched_counties)) or "我的地點"
+
+typhoon_active = bool(typhoon and typhoon.get("active"))
+# 同一颱風常同時出現在颱風公報與 W-C0033 特報清單 → 只呈現一次，特報版併入颱風區塊
+typhoon_dups = [wd for wd in (warning_details or []) if typhoon_active and "颱風" in (wd.get("title") or "")]
+other_details = [wd for wd in (warning_details or []) if wd not in typhoon_dups]
+
+typhoon_affected = list((typhoon or {}).get("affected_areas") or [])
+for wd in typhoon_dups:
+    for c in wd.get("affected") or []:
+        if c not in typhoon_affected:
+            typhoon_affected.append(c)
+typhoon_local = any(c in watched_counties for c in typhoon_affected)
+
+local_warns = [wd for wd in other_details if any(c in watched_counties for c in wd.get("affected") or [])]
+other_warns = [wd for wd in other_details if wd not in local_warns]
+
+# 在地決策列：先回答「此刻、此地、有沒有事」，再往下看是什麼事
+n_local = len(local_warns) + (1 if (typhoon_active and typhoon_local) else 0)
+if n_local:
+    st.markdown(
+        f"<div class='al-strip hit'>📍 <b>{_html.escape(watched_label)}</b>"
+        f"<span>{n_local} 則警報影響中，詳見下方</span></div>",
+        unsafe_allow_html=True,
     )
-    (st.error if is_local else st.warning)(line, icon=icon)
+else:
+    st.markdown(
+        f"<div class='al-strip ok'>📍 <b>{_html.escape(watched_label)}</b>"
+        f"<span>目前無生效中的警報特報</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_warning_banner(wd: dict, sev: str) -> None:
+    icon = next((emo for kw, emo in _WARN_ICON if kw in wd.get("title", "")), "⚠️")
+    time_txt = f"有效至 <b>{_fmt_time(wd.get('end_time'))}</b> {_remaining_label(wd.get('end_time'))}"
+    st.markdown(
+        _alert_banner_html(
+            sev, icon, wd.get("title", "天氣特報"),
+            f"影響：{_affected_summary(wd.get('affected') or [], watched_counties)}",
+            time_txt, sev == "watch",
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+if typhoon_active:
+    st.markdown(
+        _alert_banner_html(
+            "danger", "🌀", typhoon.get("headline", "颱風警報"),
+            f"影響：{_affected_summary(typhoon_affected, watched_counties)}",
+            f"公告 <b>{_fmt_time(typhoon.get('effective'))}</b>", typhoon_local,
+        ),
+        unsafe_allow_html=True,
+    )
+    with st.expander("📄 颱風警報內容全文與完整影響範圍"):
+        for sec in typhoon.get("description") or []:
+            if sec.get("title"):
+                st.markdown(f"**{sec['title']}**")
+            if sec.get("value"):
+                st.text(sec["value"])
+        if typhoon_affected:
+            st.markdown(f"**警戒區域**　{'、'.join(a for a in typhoon_affected if a)}")
+        for wd in typhoon_dups:
+            if wd.get("content"):
+                st.markdown(f"**{wd.get('title', '特報')}**")
+                st.text(wd["content"])
+
+for wd in local_warns:
+    _render_warning_banner(wd, "watch")
     if wd.get("content"):
-        with st.expander(f"📄 {wd.get('title', '特報')}內容全文"):
+        with st.expander(f"📄 {wd.get('title', '特報')}內容全文與完整影響範圍"):
             st.text(wd["content"])
+            if wd.get("affected"):
+                st.markdown(f"**影響範圍**　{'、'.join(wd['affected'])}")
             st.caption(f":small[:gray[發布 {_fmt_time(wd.get('issue_time'))}]]")
 
-if not has_alert:
-    # 「沒事」是常態，不佔一整條橫幅——例外才浮出
-    st.markdown(":small[:green[✅ 目前全台無生效中的颱風警報與天氣特報]]")
+# 沒打到監控地點的特報整批收合，不佔首屏
+if other_warns:
+    with st.expander(f"🗺️ 其他地區特報 {len(other_warns)} 則（未影響你的地點）"):
+        for wd in other_warns:
+            _render_warning_banner(wd, "notice")
+            if wd.get("content"):
+                st.text(wd["content"])
+            if wd.get("affected"):
+                st.caption(f"影響範圍：{'、'.join(wd['affected'])}")
 
 # ── 我的地點（常駐：現在觀測 + 降雨現況 + 今明36小時預報） ──────────────
 st.subheader("📍 我的地點")
 if not locations:
     st.caption("沒有設定監控地點。")
-else:
-    st.markdown(_WX_CSS, unsafe_allow_html=True)
 
 for loc in locations:
     current = loc.get("current")
