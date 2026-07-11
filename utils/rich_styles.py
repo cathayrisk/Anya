@@ -26,15 +26,22 @@ from urllib.parse import urlparse
 import markdown as _md_lib
 import streamlit as st
 
-# ── Anya Forger 色彩常數
-# 取自 Spy x Family Anya Forger 海報
-_CORAL   = "#C05A50"   # 珊瑚深紅（海報背景加深）
-_GOLD    = "#C8A43A"   # 金邊黃（制服金邊）
-_BROWN   = "#4A2F1A"   # 深褐色（制服底色）
-_LIGHT   = "#FFF5F2"   # 淡珊瑚（背景色調）
-_STRIPE  = "#FDF0ED"   # 斑馬紋偶數列
-_BORDER  = "#F2D5CF"   # 表格分隔線
-_CODE_BG = "#EDE8E6"   # 行內程式碼底色（淡暖灰，不搶眼）
+from utils import theme_tokens as tt
+
+# ── Anya Forger 色彩常數（單一事實來源見 utils/theme_tokens.py，這裡只是別名）──
+# 版面採「粉框＋紙頁」：app 畫框是海報鮭魚粉（見 .streamlit/config.toml），
+# 但長文閱讀不能發生在飽和粉底上（視覺疲勞）——主內容區墊一張奶油紙面(_PAPER)，
+# 所有 markdown 都在紙上，粉紅以畫框形式包圍內容。以下對比值皆以紙面為基準實測。
+_PAPER   = tt.PAPER
+_CORAL   = tt.CORAL_DECORATIVE  # 裝飾用；當文字用要換 _CORAL_TEXT
+_CORAL_TEXT = tt.CORAL_TEXT     # 珊瑚色系的「文字安全版」（紙面上 5.78:1）
+_GOLD    = tt.GOLD              # 僅限深褐/淺色面上，粉底上幾乎隱形(1.0)
+_BROWN   = tt.BROWN
+_MUTED   = tt.MUTED             # 紙面上 6.38:1
+_LIGHT   = tt.LIGHT
+_STRIPE  = tt.STRIPE
+_BORDER  = tt.BORDER
+_CODE_BG = tt.CODE_BG
 
 # ── CSS（只套用在 .stMarkdown 範圍，不影響 widget）
 _RICH_CSS = f"""
@@ -44,6 +51,29 @@ _RICH_CSS = f"""
    參考：GitHub Markdown CSS (sindresorhus.com/github-markdown-css)
    色調：珊瑚粉 / 金邊黃 / 深褐色（Spy x Family Anya 配色）
    ════════════════════════════════════════════════════════ */
+
+/* ════════════════════════════════════════════════════════
+   粉框＋紙頁：主內容區墊一張奶油紙面，長文都在紙上讀，
+   海報鮭魚粉畫布以「畫框」形式包圍內容（閱讀舒適 > 全面浸染）。
+   ════════════════════════════════════════════════════════ */
+div[data-testid="stMainBlockContainer"],
+.stMain .block-container {{
+    background: {_PAPER};
+    border-radius: 18px;
+    margin-top: 4.2rem;
+    margin-bottom: 2rem;
+    padding: 2.2rem 2.6rem 2.6rem;
+}}
+/* 窄螢幕：紙頁內距/圓角/邊距縮小，避免手機上兩側被吃掉一大截可用寬度 */
+@media (max-width: 640px) {{
+    div[data-testid="stMainBlockContainer"],
+    .stMain .block-container {{
+        border-radius: 12px;
+        margin-top: 1.6rem;
+        margin-bottom: 1rem;
+        padding: 1.2rem 1rem 1.4rem;
+    }}
+}}
 
 /* ── 全域：字型 + 文字換行 ── */
 .stMarkdown {{
@@ -74,7 +104,7 @@ _RICH_CSS = f"""
 .stMarkdown h1 {{
     font-size: 1.9em;
     font-weight: 700;
-    color: {_CORAL};
+    color: {_CORAL_TEXT};
     border-bottom: 2px solid {_BORDER};
     padding-bottom: .25em;
     margin-top: 1em;
@@ -83,7 +113,7 @@ _RICH_CSS = f"""
 .stMarkdown h2 {{
     font-size: 1.5em;
     font-weight: 700;
-    color: {_CORAL};
+    color: {_CORAL_TEXT};
     border-bottom: 1px solid {_BORDER};
     padding-bottom: .2em;
     margin-top: 0.9em;
@@ -114,7 +144,7 @@ _RICH_CSS = f"""
 .stMarkdown h6 {{
     font-size: 0.87em;
     font-weight: 600;
-    color: #B07060;
+    color: #8A4A3C;
     margin-top: .5em;
     margin-bottom: 0.15em;
 }}
@@ -145,33 +175,32 @@ _RICH_CSS = f"""
 .stMarkdown strong em,
 .stMarkdown em strong {{ font-weight: 700; font-style: italic; }}
 
-/* 刪除線 — 灰色，暗示「已廢棄」 */
+/* 刪除線 — 暗示「已廢棄」（畫布粉底上仍可讀的深度） */
 .stMarkdown del {{
-    color: #999;
+    color: {_MUTED};
     text-decoration: line-through;
 }}
 
 /* ════════════════════
-   連結
+   連結（會直接落在粉底畫布上 → 深褐紅系）
    ════════════════════ */
 .stMarkdown a {{
-    color: {_CORAL};
+    color: {_CORAL_TEXT};
     text-decoration: none;
     border-bottom: 1px solid transparent;
     transition: border-color 0.15s;
 }}
 .stMarkdown a:hover {{
-    border-bottom-color: {_CORAL};
+    border-bottom-color: {_CORAL_TEXT};
 }}
 
 /* ════════════════════
-   水平分隔線
+   水平分隔線（畫布上 → 褐色 hairline，粉底上看得見）
    ════════════════════ */
 .stMarkdown hr {{
     border: none;
     border-top: 2px solid {_BORDER};
     margin: 1.6em 0;
-    opacity: 0.8;
 }}
 
 /* ════════════════════
@@ -219,9 +248,9 @@ _RICH_CSS = f"""
 .stMarkdown ol                   {{ list-style-type: decimal; }}
 .stMarkdown ol ol                {{ list-style-type: lower-alpha; }}
 .stMarkdown ol ol ol             {{ list-style-type: lower-roman; }}
-/* 清單符號顏色 */
-.stMarkdown ul li::marker {{ color: {_CORAL}; }}
-.stMarkdown ol li::marker {{ color: {_CORAL}; font-weight: 700; }}
+/* 清單符號顏色（落在畫布上 → 用連結深褐紅，粉底上可見） */
+.stMarkdown ul li::marker {{ color: {_CORAL_TEXT}; }}
+.stMarkdown ol li::marker {{ color: {_CORAL_TEXT}; font-weight: 700; }}
 
 /* Task list（GFM checkbox）*/
 .stMarkdown .task-list-item {{
@@ -239,10 +268,10 @@ _RICH_CSS = f"""
    Blockquote
    ════════════════════ */
 .stMarkdown blockquote {{
-    border-left: 4px solid {_CORAL};
+    border: 1px solid #F2D5CF;
     background: #FDECEA;
     padding: .65em 1.2em;
-    border-radius: 0 8px 8px 0;
+    border-radius: 8px;
     margin: .7em 0 .4em 0;
     color: {_BROWN};
 }}
@@ -251,9 +280,9 @@ _RICH_CSS = f"""
     padding: 0;
     line-height: 1.75;
 }}
-/* 巢狀 blockquote — 金色邊框，略深底色，區分層級 */
+/* 巢狀 blockquote — 略深底色＋自己的邊框區分層級（不用側邊條紋） */
 .stMarkdown blockquote blockquote {{
-    border-left: 3px solid {_GOLD};
+    border-color: #E8C4A8;
     background: #FAE4E1;
     margin: .45em 0;
 }}
@@ -287,6 +316,7 @@ _RICH_CSS = f"""
     padding: 8px 14px;
     border-top: 1px solid {_BORDER};
     vertical-align: top;
+    background: #FFFDFB;   /* 表格自帶淺底：畫布是飽和粉紅，不能讓奇數列透出粉底 */
 }}
 .stMarkdown tr:nth-child(even) td {{
     background: {_STRIPE};
@@ -355,7 +385,7 @@ _RICH_CSS = f"""
 .stMarkdown summary {{
     cursor: pointer;
     font-weight: 600;
-    color: {_CORAL};
+    color: #A8433A;   /* details 淺底(#FFF5F2)上的珊瑚：加深一階過 4.5:1 */
     user-select: none;
     outline: none;
     list-style: none;
@@ -382,7 +412,7 @@ _RICH_CSS = f"""
 }}
 .stMarkdown dt {{
     font-weight: 700;
-    color: {_CORAL};
+    color: {_CORAL_TEXT};
     margin-top: 0.6em;
 }}
 .stMarkdown dd {{
@@ -399,11 +429,11 @@ _RICH_CSS = f"""
     margin-top: 1.5em;
     padding-top: 0.8em;
     font-size: 0.88em;
-    color: #666;
+    color: {_MUTED};
 }}
 .stMarkdown .footnote-ref a,
 .stMarkdown .footnotes a {{
-    color: {_CORAL};
+    color: {_CORAL_TEXT};
     font-size: 0.85em;
     vertical-align: super;
 }}
@@ -515,29 +545,30 @@ def copy_html_button(text: str, key: str = "copy") -> None:
     html = _md_lib.markdown(text, extensions=["tables", "extra"])
 
     # 2. 補 inline style — Word 只讀 inline style，不讀 CSS class
+    #    Word 文件是白底，用文字安全版珊瑚色（tt.CORAL_TEXT）而非裝飾版，避免對比不足。
     html = (
         html
-        .replace("<h1>", '<h1 style="color:#C05A50;font-size:20pt;font-weight:bold;margin-top:1em;border-bottom:2px solid #F2D5CF;padding-bottom:.2em;">')
-        .replace("<h2>", '<h2 style="color:#C05A50;font-size:16pt;font-weight:bold;margin-top:.8em;border-bottom:1px solid #F2D5CF;padding-bottom:.15em;">')
-        .replace("<h3>", '<h3 style="color:#7A4030;font-size:13pt;font-weight:bold;margin-top:.6em;">')
-        .replace("<h4>", '<h4 style="color:#7A4030;font-size:12pt;font-weight:bold;">')
-        .replace("<h5>", '<h5 style="color:#9A5040;font-size:11pt;font-weight:bold;">')
-        .replace("<h6>", '<h6 style="color:#B07060;font-size:10pt;font-weight:bold;">')
-        .replace("<th>", '<th style="background:#4A2F1A;color:#C8A43A;padding:6px 10px;text-align:left;font-weight:600;">')
-        .replace("<td>", '<td style="padding:6px 10px;border-top:1px solid #F2D5CF;vertical-align:top;">')
-        .replace("<table>", '<table style="border-collapse:collapse;width:100%;border:1px solid #F2D5CF;border-radius:8px;">')
-        .replace("<blockquote>", '<blockquote style="border-left:4px solid #C8A43A;padding:.5em 1em;background:#FFF5F2;color:#4A2F1A;margin:.5em 0;border-radius:0 6px 6px 0;">')
-        .replace("<hr>", '<hr style="border:none;border-top:2px solid #F2D5CF;margin:1.2em 0;">')
-        .replace("<del>", '<del style="color:#999;">')
-        .replace("<kbd>", '<kbd style="background:#F0EBE8;border:1px solid #F2D5CF;border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.85em;">')
+        .replace("<h1>", f'<h1 style="color:{tt.CORAL_TEXT};font-size:20pt;font-weight:bold;margin-top:1em;border-bottom:2px solid {tt.BORDER};padding-bottom:.2em;">')
+        .replace("<h2>", f'<h2 style="color:{tt.CORAL_TEXT};font-size:16pt;font-weight:bold;margin-top:.8em;border-bottom:1px solid {tt.BORDER};padding-bottom:.15em;">')
+        .replace("<h3>", f'<h3 style="color:{tt.H3_BROWN};font-size:13pt;font-weight:bold;margin-top:.6em;">')
+        .replace("<h4>", f'<h4 style="color:{tt.H3_BROWN};font-size:12pt;font-weight:bold;">')
+        .replace("<h5>", f'<h5 style="color:{tt.H5_BROWN};font-size:11pt;font-weight:bold;">')
+        .replace("<h6>", f'<h6 style="color:{tt.H6_BROWN};font-size:10pt;font-weight:bold;">')
+        .replace("<th>", f'<th style="background:{tt.BROWN};color:{tt.GOLD};padding:6px 10px;text-align:left;font-weight:600;">')
+        .replace("<td>", f'<td style="padding:6px 10px;border-top:1px solid {tt.BORDER};vertical-align:top;">')
+        .replace("<table>", f'<table style="border-collapse:collapse;width:100%;border:1px solid {tt.BORDER};border-radius:8px;">')
+        .replace("<blockquote>", f'<blockquote style="border:1px solid {tt.BORDER};padding:.5em 1em;background:{tt.LIGHT};color:{tt.BROWN};margin:.5em 0;border-radius:6px;">')
+        .replace("<hr>", f'<hr style="border:none;border-top:2px solid {tt.BORDER};margin:1.2em 0;">')
+        .replace("<del>", f'<del style="color:{tt.MUTED};">')
+        .replace("<kbd>", f'<kbd style="background:#F0EBE8;border:1px solid {tt.BORDER};border-radius:4px;padding:1px 5px;font-family:monospace;font-size:.85em;">')
     )
 
     # 3. 用 st.html() 注入 JS 按鈕（在主 DOM，無 same-origin iframe 限制）
     escaped = html.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
     st.html(f"""
     <button id="cpbtn-{key}"
-        style="font-size:13px;padding:4px 14px;border:1px solid #C05A50;border-radius:6px;
-               background:#fff;color:#C05A50;cursor:pointer;margin-top:8px;"
+        style="font-size:14px;padding:11px 20px;min-height:44px;border:1px solid {tt.CORAL_TEXT};border-radius:6px;
+               background:#fff;color:{tt.CORAL_TEXT};cursor:pointer;margin-top:8px;"
         onclick="
             navigator.clipboard.write([
                 new ClipboardItem({{'text/html': new Blob([`{escaped}`], {{type:'text/html'}})}})
