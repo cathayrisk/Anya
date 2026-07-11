@@ -29,10 +29,8 @@ import streamlit as st
 from utils import theme_tokens as tt
 
 # ── Anya Forger 色彩常數（單一事實來源見 utils/theme_tokens.py，這裡只是別名）──
-# 版面採「粉框＋紙頁」：app 畫框是海報鮭魚粉（見 .streamlit/config.toml），
-# 但長文閱讀不能發生在飽和粉底上（視覺疲勞）——主內容區墊一張奶油紙面(_PAPER)，
-# 所有 markdown 都在紙上，粉紅以畫框形式包圍內容。以下對比值皆以紙面為基準實測。
-_PAPER   = tt.PAPER
+# 全站底色是淡粉近白（見 .streamlit/config.toml backgroundColor），
+# 以下對比值皆以該底色為基準實測。
 _CORAL   = tt.CORAL_DECORATIVE  # 裝飾用；當文字用要換 _CORAL_TEXT
 _CORAL_TEXT = tt.CORAL_TEXT     # 珊瑚色系的「文字安全版」（紙面上 5.78:1）
 _GOLD    = tt.GOLD              # 僅限深褐/淺色面上，粉底上幾乎隱形(1.0)
@@ -51,29 +49,6 @@ _RICH_CSS = f"""
    參考：GitHub Markdown CSS (sindresorhus.com/github-markdown-css)
    色調：珊瑚粉 / 金邊黃 / 深褐色（Spy x Family Anya 配色）
    ════════════════════════════════════════════════════════ */
-
-/* ════════════════════════════════════════════════════════
-   粉框＋紙頁：主內容區墊一張奶油紙面，長文都在紙上讀，
-   海報鮭魚粉畫布以「畫框」形式包圍內容（閱讀舒適 > 全面浸染）。
-   ════════════════════════════════════════════════════════ */
-div[data-testid="stMainBlockContainer"],
-.stMain .block-container {{
-    background: {_PAPER};
-    border-radius: 18px;
-    margin-top: 4.2rem;
-    margin-bottom: 2rem;
-    padding: 2.2rem 2.6rem 2.6rem;
-}}
-/* 窄螢幕：紙頁內距/圓角/邊距縮小，避免手機上兩側被吃掉一大截可用寬度 */
-@media (max-width: 640px) {{
-    div[data-testid="stMainBlockContainer"],
-    .stMain .block-container {{
-        border-radius: 12px;
-        margin-top: 1.6rem;
-        margin-bottom: 1rem;
-        padding: 1.2rem 1rem 1.4rem;
-    }}
-}}
 
 /* ── 全域：字型 + 文字換行 ── */
 .stMarkdown {{
@@ -316,7 +291,7 @@ div[data-testid="stMainBlockContainer"],
     padding: 8px 14px;
     border-top: 1px solid {_BORDER};
     vertical-align: top;
-    background: #FFFDFB;   /* 表格自帶淺底：畫布是飽和粉紅，不能讓奇數列透出粉底 */
+    background: #FFFDFB;   /* 表格自帶淺底，奇數列不透出頁面底色 */
 }}
 .stMarkdown tr:nth-child(even) td {{
     background: {_STRIPE};
