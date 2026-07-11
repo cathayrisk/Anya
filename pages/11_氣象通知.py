@@ -35,6 +35,7 @@ from utils.cwa_weather import (
     get_cwa_api_key,
     get_earthquake_impl,
     get_forecast_periods,
+    get_health_indices,
     get_rain,
     get_typhoon_impl,
     get_warning_details,
@@ -80,7 +81,7 @@ def _live_location(name: str, lat: float, lon: float) -> dict:
     out = {
         "name": name, "county": county, "current": None, "periods": [],
         "rain": {"observed_mm": 0.0, "forecast_mm": 0.0, "state": "dry"},
-        "warnings": [], "data_time": None,
+        "warnings": [], "data_time": None, "health": {"primary": None, "extra": []},
     }
     try:
         out["current"] = get_current_conditions(lat, lon)
@@ -105,6 +106,10 @@ def _live_location(name: str, lat: float, lon: float) -> dict:
         out["warnings"] = get_warnings(county)
     except Exception:
         pass
+    try:
+        out["health"] = get_health_indices(lat, lon)
+    except Exception:
+        out["health"] = {"primary": None, "extra": []}
     return out
 
 
@@ -217,6 +222,14 @@ def _demo_bundle():
         "warnings": [{"phenomena": "大雨", "significance": "特報",
                       "start_time": ago(hours=2), "end_time": ago(hours=-4)}],
         "data_time": ago(minutes=8),
+        "health": {
+            "primary": {"kind": "heat", "label": "熱傷害", "emoji": "🥵",
+                        "index": 30, "warning": "", "peak_index_24h": 35,
+                        "peak_warning_24h": "警戒", "peak_time_24h": ago(hours=-18)},
+            "extra": [{"kind": "tempdiff", "label": "溫差提醒", "emoji": "🌡️",
+                       "index": 8, "warning": "注意", "peak_index_24h": 9,
+                       "peak_warning_24h": "注意", "peak_time_24h": ago(hours=-6)}],
+        },
     }]
     earthquake = {
         "location": "花蓮縣政府南南西方 41.0 公里 (位於花蓮縣豐濱鄉)",
@@ -370,6 +383,12 @@ _WX_CSS = """
 .wx-chip.rain-on{background:#E3F2FD;color:#1258A8;}
 .wx-chip.rain-soon{background:#FFF3E0;color:#8F5300;}
 .wx-chip.rain-off{background:#EEF0F3;color:#526070;}
+.wx-health{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px;}
+.wx-chip.hz-danger{background:#FDECEA;color:#B42318;}
+.wx-chip.hz-warn{background:#FFF3E0;color:#8F5300;}
+.wx-chip.hz-caution{background:#FEF7E6;color:#8A6D00;}
+.wx-chip.hz-safe{background:#EEF0F3;color:#526070;}
+.wx-chip .hz-soon{font-weight:400;opacity:.85;}
 .wx-periods{flex:1;min-width:220px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
 .wx-period{border:1px solid #E4E7EC;border-radius:12px;background:#FFFFFF;padding:12px 14px;
   display:flex;flex-direction:column;gap:5px;}
@@ -515,8 +534,53 @@ def _temp_bar_html(min_t, max_t, scale_min: float, scale_max: float) -> str:
     )
 
 
-def _build_location_card_html(name, county, current, rain, periods, source_bits) -> str:
+def _health_severity_class(warning: str) -> str:
+    """官方警示文字 → chip 嚴重度樣式。健康指數的數字大小不代表嚴重度（冷傷害
+    指數越高反而越安全），一律以 CWA 給的警示文字判斷，不自己編級距。"""
+    w = warning or ""
+    if "危險" in w:
+        return "hz-danger"
+    if "警戒" in w:
+        return "hz-warn"
+    if "注意" in w:
+        return "hz-caution"
+    return "hz-safe"
+
+
+def _health_chip_html(h: dict) -> str:
+    """單一健康指數 chip：現在有警示→亮色顯示等級；現在沒事但24h內會升→標註稍後等級；
+    完全沒事→中性色只帶指數值。"""
     e = _html.escape
+    emoji, label = h.get("emoji", "🩺"), h.get("label", "健康指數")
+    warning = h.get("warning") or ""
+    peak = h.get("peak_warning_24h") or ""
+    if warning:
+        return f"<span class='wx-chip {_health_severity_class(warning)}'>{emoji} {e(label)}：{e(warning)}</span>"
+    if peak:
+        return (
+            f"<span class='wx-chip {_health_severity_class(peak)}'>{emoji} {e(label)} 目前安全"
+            f"<span class='hz-soon'>・稍後達{e(peak)}</span></span>"
+        )
+    idx = h.get("index")
+    idx_txt = f" 指數 {e(str(idx))}" if idx is not None else ""
+    return f"<span class='wx-chip hz-safe'>{emoji} {e(label)}{idx_txt}・無警示</span>"
+
+
+def _health_chips_html(health: dict) -> str:
+    if not health:
+        return ""
+    chips = []
+    if health.get("primary"):
+        chips.append(_health_chip_html(health["primary"]))
+    for h in health.get("extra") or []:
+        chips.append(_health_chip_html(h))
+    return f"<div class='wx-health'>{''.join(chips)}</div>" if chips else ""
+
+
+def _build_location_card_html(name, county, current, rain, periods, source_bits, health=None) -> str:
+    e = _html.escape
+
+    health_html = _health_chips_html(health or {})
 
     rain_state = rain.get("state", "dry")
     # 乾的時候不列一串 0.0mm——數字只在真的有雨量意義時才出現
@@ -569,6 +633,7 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits)
           {range_html}
           <div class="wx-now-stats">{''.join(stats)}</div>
           {rain_chip}
+          {health_html}
         </div>"""
     else:
         now_html = f"""
@@ -577,6 +642,7 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits)
           <div class="wx-now-main"><span class="wx-now-temp">{e(str(rain.get('observed_mm', 0)))}</span>
             <span class="wx-now-desc">mm</span></div>
           {rain_chip}
+          {health_html}
         </div>"""
 
     # 同一張卡的三個時段共用刻度，溫度帶位置/長度可直接互相比較
@@ -788,7 +854,7 @@ for loc in locations:
     source_bits.append("預報：CWA 一週鄉鎮天氣預報")
 
     st.markdown(
-        _build_location_card_html(loc["name"], county, current, rain, periods, source_bits),
+        _build_location_card_html(loc["name"], county, current, rain, periods, source_bits, loc.get("health")),
         unsafe_allow_html=True,
     )
 
