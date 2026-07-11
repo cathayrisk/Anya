@@ -1,24 +1,23 @@
 # ══════════════════════════════════════════════════════════════════
-# Anya Forger 海報主題（SPY×FAMILY 官方海報配色，drenched 策略）：
-# 鮭魚粉整面當畫布、奶油白當表面（領子）、深制服褐當墨色、金邊只放在淺色面上。
-# 所有文字/背景組合都用 WCAG 公式驗證過：墨色 on 粉底 6.68:1、on 奶油 12.9:1。
-# 注意：金色(#C8A43A)在粉底上對比僅 1.0 幾乎隱形，金邊裝飾只能用在卡片/深色面。
+# Anya Forger 主題：淡粉底 + 珊瑚/褐色文字階層（原版配色）。
+# 曾嘗試把海報鮭魚粉(#EF8E7F)整面當畫布（drenched 策略），
+# 實際使用回饋是難以閱讀，已還原成淡粉近白底。
 # ══════════════════════════════════════════════════════════════════
 [theme]
 base = "light"
-primaryColor = "#AD4746"          # 按鈕/互動主色（白字 on 此底 5.58:1 ✓）
-backgroundColor = "#EF8E7F"       # 海報鮭魚粉：畫布本身就是粉紅，不是淡淡暈染
-secondaryBackgroundColor = "#FFF7F0"  # 奶油白（領子）：側欄、輸入框、卡片面
-textColor = "#2E1F16"             # 制服深褐（比舊 #4B3832 更深：粉底上 6.68:1）
-# 連結色：要能在「粉底畫布」上直接可讀（#5E241D on 粉底 5.07:1）
-linkColor = "#5E241D"
+primaryColor = "#AD4746"
+backgroundColor = "#FFF6F7"
+secondaryBackgroundColor = "#FFDFE0"
+textColor = "#4B3832"
+# 連結色與實際生效值對齊（rich_styles 的珊瑚色系；加深一階使對比 ≥4.5:1）
+linkColor = "#A84A40"
 # 與 rich_styles 實際生效的行內程式碼底色對齊（原 #FFF2CC 從未生效）
 codeBackgroundColor = "#EDE8E6"
 font = "SF Pro Rounded"
 codeFont = "monospace"
 headingFont = "SF Pro Rounded"
 baseRadius = "10px"
-borderColor = "#D2AE9E"           # 暖棕邊框：在奶油面上做 widget 描邊
+borderColor = "#E8D5D3"   # 帶品牌色相的暖灰（原純灰 #D3D3D3 在粉底上偏冷）
 showWidgetBorder = true
 baseFontSize = 16
 showSidebarBorder = true
