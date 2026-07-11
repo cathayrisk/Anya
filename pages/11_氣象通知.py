@@ -372,20 +372,17 @@ _WX_CSS_TEMPLATE = """
 .wx-head{display:flex;align-items:baseline;gap:10px;margin-bottom:14px;}
 .wx-name{font-size:1.05rem;font-weight:700;color:%(brown)s;}
 .wx-county{font-size:.85rem;color:%(muted)s;}
-.wx-body{display:flex;flex-direction:column;gap:14px;}
-.wx-now{display:flex;flex-wrap:wrap;align-items:center;gap:22px;
-  padding:18px 24px;border-radius:12px;background:%(bg_panel)s;}
-.wx-now-primary{display:flex;align-items:center;gap:14px;}
-.wx-now-emoji{font-size:2.6rem;line-height:1;}
-.wx-now-temp{font-size:2.7rem;font-weight:700;color:%(brown)s;line-height:1;}
-.wx-now-desc-wrap{display:flex;flex-direction:column;gap:2px;}
-.wx-now-desc{font-size:1.05rem;font-weight:600;color:%(coral_text)s;}
+.wx-body{display:flex;gap:16px;flex-wrap:wrap;}
+.wx-now{flex:0 0 400px;display:flex;flex-direction:column;justify-content:center;gap:6px;
+  padding:14px 18px;border-radius:12px;background:%(bg_panel)s;}
+.wx-now-main{display:flex;align-items:center;gap:12px;}
+.wx-now-emoji{font-size:2.4rem;line-height:1;}
+.wx-now-temp{font-size:2.5rem;font-weight:700;color:%(brown)s;line-height:1;}
+.wx-now-desc{font-size:1rem;font-weight:600;color:%(coral_text)s;}
 .wx-now-feel{font-size:.8rem;color:%(muted)s;}
-.wx-now-mid{flex:1;min-width:200px;display:flex;flex-direction:column;gap:6px;}
-.wx-now-range{font-size:.8rem;color:%(muted)s;display:flex;gap:8px;}
-.wx-now-stats{display:flex;flex-wrap:wrap;column-gap:14px;row-gap:4px;font-size:.84rem;color:%(muted)s;}
+.wx-now-range{font-size:.78rem;color:%(muted)s;display:flex;gap:8px;}
+.wx-now-stats{display:flex;flex-wrap:wrap;column-gap:14px;row-gap:4px;font-size:.82rem;color:%(muted)s;}
 .wx-now-stats span{white-space:nowrap;}
-.wx-now-side{display:flex;flex-direction:column;gap:6px;align-items:flex-start;min-width:160px;}
 .wx-chip{display:inline-block;margin-top:4px;padding:4px 10px;border-radius:99px;font-size:.8rem;font-weight:600;width:fit-content;}
 .wx-chip.rain-on{background:%(rain_blue_bg)s;color:%(rain_blue)s;}
 .wx-chip.rain-soon{background:%(warn_amber_bg)s;color:%(warn_amber)s;}
@@ -409,7 +406,7 @@ _WX_CSS_TEMPLATE = """
 .wx-badge.outline-warn{background:transparent;border:1px solid %(outline_warn)s;color:%(warn_amber)s;}
 .wx-badge.outline-caution{background:transparent;border:1px solid %(outline_caution)s;color:%(caution)s;}
 .wx-badge.outline-safe{background:transparent;border:1px solid %(outline_safe)s;color:%(muted)s;}
-.wx-periods{width:100%%;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+.wx-periods{flex:1;min-width:220px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
 .wx-period{border:1px solid %(border)s;border-radius:12px;background:#FFFFFF;padding:12px 14px;
   display:flex;flex-direction:column;gap:5px;}
 .wx-p-head{display:flex;justify-content:space-between;align-items:baseline;gap:6px;}
@@ -433,8 +430,7 @@ _WX_CSS_TEMPLATE = """
 .wx-wk-desc{color:%(muted)s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .wx-wk-pop{color:%(info_blue)s;font-size:.8rem;text-align:right;white-space:nowrap;}
 .wx-wk-t{color:%(muted)s;font-weight:600;text-align:right;}
-@media (max-width:720px){.wx-now{flex-direction:column;align-items:flex-start;gap:12px;}
-  .wx-periods{grid-template-columns:1fr;}
+@media (max-width:720px){.wx-now{flex:1 1 100%%;}.wx-periods{grid-template-columns:1fr;}
   .wx-wk-row{grid-template-columns:88px 24px 46px 30px 1fr 30px;}.wx-wk-desc{display:none;}}
 /* ── 警報嚴重度系統:明文等級+圖示+成對色,不只靠顏色 ── */
 .al-banner{display:flex;gap:12px;align-items:flex-start;border:1px solid;border-radius:12px;
@@ -735,37 +731,25 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits,
         range_html = f"<div class='wx-now-range'>🌡️ 今日 {' '.join(range_parts)}</div>" if range_parts else ""
         now_html = f"""
         <div class="wx-now">
-          <div class="wx-now-primary">
+          <div class="wx-now-main">
             <span class="wx-now-emoji">{_weather_emoji(desc)}</span>
             <span class="wx-now-temp">{e(str(current.get('air_temperature_c', '—')))}°</span>
-            <div class="wx-now-desc-wrap">
-              <div class="wx-now-desc">{e(desc)}</div>
-              {feel_html}
-            </div>
           </div>
-          <div class="wx-now-mid">
-            {range_html}
-            <div class="wx-now-stats">{''.join(stats)}</div>
-          </div>
-          <div class="wx-now-side">
-            {health_html}
-            {rain_chip}
-          </div>
+          <div class="wx-now-desc">{e(desc)}</div>
+          {feel_html}
+          {range_html}
+          <div class="wx-now-stats">{''.join(stats)}</div>
+          {health_html}
+          {rain_chip}
         </div>"""
     else:
         now_html = f"""
         <div class="wx-now">
-          <div class="wx-now-primary">
-            <div class="wx-now-desc-wrap"><div class="wx-now-desc">降雨現況</div></div>
-          </div>
-          <div class="wx-now-mid">
-            <span class="wx-now-temp">{e(str(rain.get('observed_mm', 0)))}</span>
-            <span class="wx-now-desc">mm</span>
-          </div>
-          <div class="wx-now-side">
-            {health_html}
-            {rain_chip}
-          </div>
+          <div class="wx-now-desc">降雨現況</div>
+          <div class="wx-now-main"><span class="wx-now-temp">{e(str(rain.get('observed_mm', 0)))}</span>
+            <span class="wx-now-desc">mm</span></div>
+          {health_html}
+          {rain_chip}
         </div>"""
 
     # 同一張卡的三個時段共用刻度，溫度帶位置/長度可直接互相比較
@@ -1047,45 +1031,42 @@ for loc in locations:
             unsafe_allow_html=True,
         )
 
-# ── 最近地震 + 通知歷史（併成雙欄，減少常駐版面高度） ────────────────────
-col_eq, col_hist = st.columns(2)
+# ── 最近地震（一行式，震度圖收進 expander） ─────────────────────────────
+st.subheader("🌐 最近地震")
+if earthquake:
+    st.markdown(
+        f"{_fmt_time(earthquake.get('origin_time'))}　**{earthquake.get('location', '未知位置')}**　"
+        f"規模 **{earthquake.get('magnitude', '—')}**　深度 {earthquake.get('depth', '—')} km"
+    )
+    if earthquake.get("report_image_uri"):
+        with st.expander("查看震度分布圖"):
+            st.image(earthquake["report_image_uri"], caption="CWA 震度分布圖", width="stretch")
+else:
+    st.caption("目前沒有地震資料。")
 
-with col_eq:
-    st.subheader("🌐 最近地震")
-    if earthquake:
-        st.markdown(
-            f"{_fmt_time(earthquake.get('origin_time'))}　**{earthquake.get('location', '未知位置')}**　"
-            f"規模 **{earthquake.get('magnitude', '—')}**　深度 {earthquake.get('depth', '—')} km"
-        )
-        if earthquake.get("report_image_uri"):
-            with st.expander("查看震度分布圖"):
-                st.image(earthquake["report_image_uri"], caption="CWA 震度分布圖", width="stretch")
-    else:
-        st.caption("目前沒有地震資料。")
-
-with col_hist:
-    st.subheader("🔔 通知歷史")
-    if alerts is None:
-        st.caption("通知歷史來自收集器寫入 Supabase 的推播事件流；本機未設定 Supabase，暫不顯示。")
-    elif not alerts:
-        st.caption("還沒有任何通知紀錄。")
-    else:
-        _CATEGORY_BADGE = {
-            "earthquake": ":red-badge[🌐 地震]",
-            "typhoon": ":orange-badge[🌀 颱風]",
-            "warning": ":orange-badge[⚠️ 特報]",
-            "rain": ":blue-badge[🌧️ 降雨]",
-            "forecast": ":gray-badge[☀️ 預報]",
-        }
-        # 固定高度、內部捲動：歷史再多也不會把頁面越拉越長
-        with st.container(height=320, border=True):
-            for a in alerts:
-                badge = _CATEGORY_BADGE.get(a["category"], ":gray-badge[🔔]")
-                line = f"{badge}　**{a['title']}**"
-                if a.get("extra_url"):
-                    line += f"　[圖]({a['extra_url']})"
-                st.markdown(line)
-                st.caption(f":small[:gray[{a['body']}　{_fmt_time(a.get('ts'))}]]")
+# ── 通知歷史（來自 Supabase 收集器；本機未設定 Supabase 時不顯示） ──────
+st.subheader("🔔 通知歷史")
+if alerts is None:
+    st.caption("通知歷史來自收集器寫入 Supabase 的推播事件流；本機未設定 Supabase，暫不顯示。")
+elif not alerts:
+    st.caption("還沒有任何通知紀錄。")
+else:
+    _CATEGORY_BADGE = {
+        "earthquake": ":red-badge[🌐 地震]",
+        "typhoon": ":orange-badge[🌀 颱風]",
+        "warning": ":orange-badge[⚠️ 特報]",
+        "rain": ":blue-badge[🌧️ 降雨]",
+        "forecast": ":gray-badge[☀️ 預報]",
+    }
+    # 固定高度、內部捲動：歷史再多也不會把頁面越拉越長
+    with st.container(height=380, border=True):
+        for a in alerts:
+            badge = _CATEGORY_BADGE.get(a["category"], ":gray-badge[🔔]")
+            line = f"{badge}　**{a['title']}**　{a['body']}"
+            if a.get("extra_url"):
+                line += f"　[圖]({a['extra_url']})"
+            st.markdown(line)
+            st.caption(f":small[:gray[{_fmt_time(a.get('ts'))}]]")
 
 # ── 通知規則 ────────────────────────────────────────────────────────────
 with st.expander("📋 通知規則說明"):
