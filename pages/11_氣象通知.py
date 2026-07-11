@@ -42,6 +42,7 @@ from utils.cwa_weather import (
     get_warnings,
 )
 from utils.rich_styles import inject_rich_styles
+from utils import theme_tokens as tt
 from utils.weather_toast import (
     _get_weather_supabase_client,
     get_secret_safe,
@@ -228,7 +229,7 @@ def _demo_bundle():
                         "peak_warning_24h": "警戒", "peak_time_24h": ago(hours=-18)},
             "extra": [{"kind": "tempdiff", "label": "溫差提醒", "emoji": "🌡️",
                        "index": 8, "warning": "注意", "peak_index_24h": 9,
-                       "peak_warning_24h": "注意", "peak_time_24h": ago(hours=-6)}],
+                       "peak_warning_24h": "警戒", "peak_time_24h": ago(hours=-6)}],
         },
     }]
     earthquake = {
@@ -358,89 +359,142 @@ def _comfort_emoji(desc: str) -> str:
     return "😐"
 
 
-# 設計原則:警報層用「嚴重度系統」跳出全站暖色環境(危險/警戒/注意各有明文標籤+
-# 圖示+成對色,不只靠顏色);天氣卡表面中性化、暖色只留在 accent 與溫度帶;
-# 內文對比一律 ≥4.5:1(舊版 #B0A399/#7A6A5F 在暖白底上不及格)。
-_WX_CSS = """
+# 設計原則:警報層(danger/watch/notice)沿用消防/交通號誌等級的紅/橘/藍語意色,
+# 不強行套品牌珊瑚色,安全警示的辨識度優先;其餘卡片表面回到全站珊瑚粉/金邊/深褐
+# 主題,與 Anya Forger 人格化風格一致;內文對比一律 ≥4.5:1。
+# 顏色一律引用 utils/theme_tokens.py（單一事實來源），不在這裡重複硬編碼 hex——
+# 用 %()s 而非 f-string，避免跟 CSS 本身滿版的 { } 起衝突。
+_WX_CSS_TEMPLATE = """
 <style>
-.wx-card{border:1px solid #E4E7EC;border-radius:14px;background:#FFFFFF;
+/* 版面是「粉框＋紙頁」（rich_styles 把主內容區墊成奶油紙面）：
+   卡片坐在紙面上，用淡珊瑚描邊分離；海報鮭魚粉只出現在內容區外的畫框。 */
+.wx-card{border:1px solid %(border)s;border-radius:14px;background:linear-gradient(180deg,#FFFFFF 0%%,%(bg_card_end)s 100%%);
   padding:18px 20px 14px;margin-bottom:14px;}
 .wx-head{display:flex;align-items:baseline;gap:10px;margin-bottom:14px;}
-.wx-name{font-size:1.05rem;font-weight:700;color:#172033;}
-.wx-county{font-size:.85rem;color:#526070;}
+.wx-name{font-size:1.05rem;font-weight:700;color:%(brown)s;}
+.wx-county{font-size:.85rem;color:%(muted)s;}
 .wx-body{display:flex;gap:16px;flex-wrap:wrap;}
 .wx-now{flex:0 0 400px;display:flex;flex-direction:column;justify-content:center;gap:6px;
-  padding:14px 18px;border-radius:12px;background:#F6F7F9;}
+  padding:14px 18px;border-radius:12px;background:%(bg_panel)s;}
 .wx-now-main{display:flex;align-items:center;gap:12px;}
 .wx-now-emoji{font-size:2.4rem;line-height:1;}
-.wx-now-temp{font-size:2.5rem;font-weight:700;color:#172033;line-height:1;}
-.wx-now-desc{font-size:1rem;font-weight:600;color:#B0453B;}
-.wx-now-feel{font-size:.8rem;color:#475467;}
-.wx-now-range{font-size:.78rem;color:#475467;display:flex;gap:8px;}
-.wx-now-stats{display:flex;flex-wrap:wrap;column-gap:14px;row-gap:4px;font-size:.82rem;color:#475467;}
+.wx-now-temp{font-size:2.5rem;font-weight:700;color:%(brown)s;line-height:1;}
+.wx-now-desc{font-size:1rem;font-weight:600;color:%(coral_text)s;}
+.wx-now-feel{font-size:.8rem;color:%(muted)s;}
+.wx-now-range{font-size:.78rem;color:%(muted)s;display:flex;gap:8px;}
+.wx-now-stats{display:flex;flex-wrap:wrap;column-gap:14px;row-gap:4px;font-size:.82rem;color:%(muted)s;}
 .wx-now-stats span{white-space:nowrap;}
 .wx-chip{display:inline-block;margin-top:4px;padding:4px 10px;border-radius:99px;font-size:.8rem;font-weight:600;width:fit-content;}
-.wx-chip.rain-on{background:#E3F2FD;color:#1258A8;}
-.wx-chip.rain-soon{background:#FFF3E0;color:#8F5300;}
-.wx-chip.rain-off{background:#EEF0F3;color:#526070;}
-.wx-health{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px;}
-.wx-chip.hz-danger{background:#FDECEA;color:#B42318;}
-.wx-chip.hz-warn{background:#FFF3E0;color:#8F5300;}
-.wx-chip.hz-caution{background:#FEF7E6;color:#8A6D00;}
-.wx-chip.hz-safe{background:#EEF0F3;color:#526070;}
-.wx-chip .hz-soon{font-weight:400;opacity:.85;}
+.wx-chip.rain-on{background:%(rain_blue_bg)s;color:%(rain_blue)s;}
+.wx-chip.rain-soon{background:%(warn_amber_bg)s;color:%(warn_amber)s;}
+.wx-chip.rain-off{background:%(neutral_chip_bg)s;color:%(muted)s;}
+/* 健康警示：固定一個位置(stats排之後、降雨chip之前)，狀態改變只換樣式深淺，不搬家 */
+.wx-health-slot{display:flex;flex-direction:column;gap:3px;margin-top:2px;}
+.wx-health-calm{font-size:.78rem;color:%(muted)s;}
+.wx-health-section-label{font-size:.7rem;font-weight:700;color:%(muted)s;letter-spacing:.03em;margin-top:2px;}
+.wx-health-row{display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:4px 8px;border-radius:8px;font-size:.8rem;}
+.wx-health-row.active{background:%(health_active_bg)s;}
+.wx-health-row .label{display:flex;align-items:center;gap:5px;font-weight:600;color:%(brown)s;white-space:nowrap;}
+.wx-health-row .meta{font-size:.74rem;color:%(muted)s;white-space:nowrap;}
+.wx-health-escalate{font-size:.7rem;color:%(warn_amber)s;padding:0 8px 2px;}
+.wx-badge{font-size:.72rem;font-weight:700;padding:2px 8px;border-radius:99px;white-space:nowrap;}
+.wx-badge.fill-danger{background:%(danger_bg)s;color:%(danger)s;}
+.wx-badge.fill-warn{background:%(warn_amber_bg)s;color:%(warn_amber)s;}
+.wx-badge.fill-caution{background:%(caution_bg)s;color:%(caution)s;}
+.wx-badge.fill-safe{background:%(neutral_chip_bg)s;color:%(muted)s;}
+.wx-badge.outline-danger{background:transparent;border:1px solid %(outline_danger)s;color:%(danger)s;}
+.wx-badge.outline-warn{background:transparent;border:1px solid %(outline_warn)s;color:%(warn_amber)s;}
+.wx-badge.outline-caution{background:transparent;border:1px solid %(outline_caution)s;color:%(caution)s;}
+.wx-badge.outline-safe{background:transparent;border:1px solid %(outline_safe)s;color:%(muted)s;}
 .wx-periods{flex:1;min-width:220px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
-.wx-period{border:1px solid #E4E7EC;border-radius:12px;background:#FFFFFF;padding:12px 14px;
+.wx-period{border:1px solid %(border)s;border-radius:12px;background:#FFFFFF;padding:12px 14px;
   display:flex;flex-direction:column;gap:5px;}
 .wx-p-head{display:flex;justify-content:space-between;align-items:baseline;gap:6px;}
-.wx-p-label{font-size:.85rem;font-weight:700;color:#172033;}
-.wx-p-pop{font-size:.78rem;color:#33658E;white-space:nowrap;}
-.wx-p-hours{font-size:.72rem;color:#667085;}
-.wx-p-wx{font-size:.98rem;font-weight:600;color:#B0453B;display:flex;align-items:center;gap:6px;}
-.wx-p-temp{font-size:.82rem;color:#475467;}
-.wx-p-feel{font-size:.78rem;color:#475467;}
-.wx-p-comfort{font-size:.76rem;color:#526070;}
-.wx-src{margin-top:12px;font-size:.74rem;color:#667085;}
-.wx-t-row{display:flex;align-items:center;gap:7px;font-size:.8rem;color:#475467;}
+.wx-p-label{font-size:.85rem;font-weight:700;color:%(brown)s;}
+.wx-p-pop{font-size:.78rem;color:%(info_blue)s;white-space:nowrap;}
+.wx-p-hours{font-size:.72rem;color:%(muted)s;}
+.wx-p-wx{font-size:.98rem;font-weight:600;color:%(coral_text)s;display:flex;align-items:center;gap:6px;}
+.wx-p-temp{font-size:.82rem;color:%(muted)s;}
+.wx-p-feel{font-size:.78rem;color:%(muted)s;}
+.wx-p-comfort{font-size:.76rem;color:%(muted)s;}
+.wx-src{margin-top:12px;font-size:.74rem;color:%(muted)s;}
+.wx-t-row{display:flex;align-items:center;gap:7px;font-size:.8rem;color:%(muted)s;}
 .wx-t-row .t{font-weight:600;}
-.wx-t-track{flex:1;height:6px;border-radius:99px;background:#EEF0F3;position:relative;min-width:50px;}
-.wx-t-fill{position:absolute;top:0;height:100%;border-radius:99px;}
+.wx-t-track{flex:1;height:6px;border-radius:99px;background:%(neutral_chip_bg)s;position:relative;min-width:50px;}
+.wx-t-fill{position:absolute;top:0;height:100%%;border-radius:99px;}
 .wx-wk{display:flex;flex-direction:column;gap:2px;}
 .wx-wk-row{display:grid;grid-template-columns:104px 26px minmax(70px,1fr) 52px 34px minmax(80px,1.4fr) 34px;
-  align-items:center;gap:8px;padding:7px 10px;border-radius:10px;font-size:.86rem;color:#172033;}
-.wx-wk-row:nth-child(even){background:#F6F7F9;}
+  align-items:center;gap:8px;padding:7px 10px;border-radius:10px;font-size:.86rem;color:%(brown)s;}
+.wx-wk-row:nth-child(even){background:%(stripe)s;}
 .wx-wk-day{font-weight:600;}
-.wx-wk-desc{color:#475467;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.wx-wk-pop{color:#33658E;font-size:.8rem;text-align:right;white-space:nowrap;}
-.wx-wk-t{color:#475467;font-weight:600;text-align:right;}
-@media (max-width:720px){.wx-now{flex:1 1 100%;}.wx-periods{grid-template-columns:1fr;}
+.wx-wk-desc{color:%(muted)s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.wx-wk-pop{color:%(info_blue)s;font-size:.8rem;text-align:right;white-space:nowrap;}
+.wx-wk-t{color:%(muted)s;font-weight:600;text-align:right;}
+@media (max-width:720px){.wx-now{flex:1 1 100%%;}.wx-periods{grid-template-columns:1fr;}
   .wx-wk-row{grid-template-columns:88px 24px 46px 30px 1fr 30px;}.wx-wk-desc{display:none;}}
 /* ── 警報嚴重度系統:明文等級+圖示+成對色,不只靠顏色 ── */
 .al-banner{display:flex;gap:12px;align-items:flex-start;border:1px solid;border-radius:12px;
   padding:12px 16px;margin-bottom:8px;}
-.al-danger{background:#FFF1F0;border-color:#F1AEA7;}
-.al-watch{background:#FFFAEB;border-color:#F0D28E;}
-.al-notice{background:#EFF8FF;border-color:#B5D3F5;}
+.al-danger{background:%(alert_danger_bg)s;border-color:%(alert_danger_border)s;}
+.al-watch{background:%(alert_watch_bg)s;border-color:%(alert_watch_border)s;}
+.al-notice{background:%(alert_notice_bg)s;border-color:%(alert_notice_border)s;}
 .al-icon{font-size:1.35rem;line-height:1.25;}
 .al-main{flex:1;display:flex;flex-direction:column;gap:3px;min-width:0;}
 .al-row1{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .al-chip{font-size:.75rem;font-weight:700;padding:2px 10px;border-radius:99px;color:#FFFFFF;white-space:nowrap;}
-.al-danger .al-chip{background:#B42318;}
-.al-watch .al-chip{background:#B54708;}
-.al-notice .al-chip{background:#175CD3;}
-.al-title{font-weight:700;color:#172033;font-size:.98rem;}
-.al-local{font-size:.75rem;font-weight:700;color:#B42318;background:#FFFFFF;border:1px solid #F1AEA7;
+.al-danger .al-chip{background:%(danger)s;}
+.al-watch .al-chip{background:%(alert_watch_chip)s;}
+.al-notice .al-chip{background:%(alert_notice_chip)s;}
+.al-title{font-weight:700;color:%(brown)s;font-size:.98rem;}
+.al-local{font-size:.75rem;font-weight:700;color:%(danger)s;background:#FFFFFF;border:1px solid %(alert_danger_border)s;
   padding:1px 8px;border-radius:99px;white-space:nowrap;}
-.al-meta{font-size:.82rem;color:#475467;}
-.al-meta b{color:#172033;}
+.al-meta{font-size:.82rem;color:%(muted)s;}
+.al-meta b{color:%(brown)s;}
 /* 在地決策列:此刻、此地、有沒有事 */
 .al-strip{display:flex;align-items:center;gap:10px;border:1px solid;border-radius:12px;
   padding:12px 16px;margin-bottom:12px;font-size:.95rem;}
-.al-strip.ok{background:#ECFDF3;border-color:#A6E4C0;color:#054F31;}
-.al-strip.hit{background:#FFF1F0;border-color:#F1AEA7;color:#7A1710;}
+.al-strip.ok{background:%(success_bg)s;border-color:%(alert_success_border)s;color:%(success)s;}
+.al-strip.hit{background:%(alert_danger_bg)s;border-color:%(alert_danger_border)s;color:%(alert_strip_hit_text)s;}
 .al-strip b{font-size:1.02rem;}
 </style>
-"""
+""" % {
+    "border": tt.BORDER,
+    "bg_card_end": tt.BG_CARD_END,
+    "brown": tt.BROWN,
+    "muted": tt.MUTED,
+    "bg_panel": tt.BG_PANEL,
+    "coral_text": tt.CORAL_TEXT,
+    "rain_blue_bg": tt.RAIN_BLUE_BG,
+    "rain_blue": tt.RAIN_BLUE,
+    "warn_amber_bg": tt.WARN_AMBER_BG,
+    "warn_amber": tt.WARN_AMBER,
+    "neutral_chip_bg": tt.NEUTRAL_CHIP_BG,
+    "health_active_bg": tt.HEALTH_ACTIVE_BG,
+    "danger_bg": tt.DANGER_RED_BG,
+    "danger": tt.DANGER_RED,
+    "caution_bg": tt.CAUTION_GOLD_BG,
+    "caution": tt.CAUTION_GOLD,
+    "outline_danger": tt.OUTLINE_DANGER_BORDER,
+    "outline_warn": tt.OUTLINE_WARN_BORDER,
+    "outline_caution": tt.OUTLINE_CAUTION_BORDER,
+    "outline_safe": tt.OUTLINE_SAFE_BORDER,
+    "info_blue": tt.INFO_BLUE,
+    "stripe": tt.STRIPE,
+    "alert_danger_bg": tt.ALERT_DANGER_BG,
+    "alert_danger_border": tt.ALERT_DANGER_BORDER,
+    "alert_watch_bg": tt.ALERT_WATCH_BG,
+    "alert_watch_border": tt.ALERT_WATCH_BORDER,
+    "alert_watch_chip": tt.ALERT_WATCH_CHIP,
+    "alert_notice_bg": tt.ALERT_NOTICE_BG,
+    "alert_notice_border": tt.ALERT_NOTICE_BORDER,
+    "alert_notice_chip": tt.ALERT_NOTICE_CHIP,
+    "success_bg": tt.SUCCESS_GREEN_BG,
+    "success": tt.SUCCESS_GREEN,
+    "alert_success_border": tt.ALERT_SUCCESS_BORDER,
+    "alert_strip_hit_text": tt.ALERT_STRIP_HIT_TEXT,
+}
+_WX_CSS = _WX_CSS_TEMPLATE
 
 _RAIN_CHIP_CLASS = {"raining": "rain-on", "soon_rain": "rain-soon", "dry": "rain-off"}
 
@@ -486,7 +540,7 @@ def _alert_banner_html(sev: str, icon: str, title: str, affected_txt: str, time_
     )
 
 # 溫度 → 端點顏色（冷藍 → 金 → 暖橘 → 珊瑚紅），溫度帶兩端各取自己溫度的顏色
-_TEMP_STOPS = [(12, (110, 159, 197)), (22, (200, 164, 58)), (30, (224, 138, 99)), (36, (192, 90, 80))]
+_TEMP_STOPS = tt.TEMP_GRADIENT_STOPS
 
 
 def _temp_color(t: float) -> str:
@@ -534,53 +588,107 @@ def _temp_bar_html(min_t, max_t, scale_min: float, scale_max: float) -> str:
     )
 
 
+_SEVERITY_RANK = {"": 0, "注意": 1, "警戒": 2, "危險": 3}
+
+
+def _severity_rank(warning: str) -> int:
+    # 未知字串（CWA 未來若換新詞）保守當作至少「注意」等級，不要低估
+    return _SEVERITY_RANK.get(warning or "", 1)
+
+
 def _health_severity_class(warning: str) -> str:
-    """官方警示文字 → chip 嚴重度樣式。健康指數的數字大小不代表嚴重度（冷傷害
+    """官方警示文字 → 嚴重度樣式代碼。健康指數的數字大小不代表嚴重度（冷傷害
     指數越高反而越安全），一律以 CWA 給的警示文字判斷，不自己編級距。"""
     w = warning or ""
     if "危險" in w:
-        return "hz-danger"
+        return "danger"
     if "警戒" in w:
-        return "hz-warn"
+        return "warn"
     if "注意" in w:
-        return "hz-caution"
-    return "hz-safe"
+        return "caution"
+    return "safe"
 
 
-def _health_chip_html(h: dict) -> str:
-    """單一健康指數 chip：現在有警示→亮色顯示等級；現在沒事但24h內會升→標註稍後等級；
-    完全沒事→中性色只帶指數值。"""
+def _health_relative_day(dt: datetime, now: datetime) -> str:
+    delta = (dt.date() - now.date()).days
+    if delta == 0:
+        return "今天"
+    if delta == 1:
+        return "明天"
+    return f"{dt.month}/{dt.day}"
+
+
+def _health_peak_when(h: dict, now: datetime) -> str:
+    """peak_time_24h 是『預測最嚴重的那個時間點』，不是警示開始生效的時刻，
+    用詞避免『起』這種暗示持續生效的字眼。"""
+    try:
+        dt = datetime.fromisoformat(h.get("peak_time_24h"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_TAIPEI)
+        return f"{_health_relative_day(dt, now)} {dt.strftime('%H:%M')}"
+    except (TypeError, ValueError):
+        return "稍後"
+
+
+def _health_row_html(h: dict, now: datetime) -> str:
+    """單一指數一列：現在生效中→實心 badge（若預測會再惡化，底下多一行升級提示，
+    不會因為現在只是『注意』就丟失『稍後會到危險』這個資訊）；現在安全但24h內會
+    達標→outline badge 標時間。固定放在同一個位置，只有樣式深淺隨急迫程度變化。"""
     e = _html.escape
     emoji, label = h.get("emoji", "🩺"), h.get("label", "健康指數")
-    warning = h.get("warning") or ""
-    peak = h.get("peak_warning_24h") or ""
+    warning, peak = h.get("warning") or "", h.get("peak_warning_24h") or ""
+
     if warning:
-        return f"<span class='wx-chip {_health_severity_class(warning)}'>{emoji} {e(label)}：{e(warning)}</span>"
-    if peak:
-        return (
-            f"<span class='wx-chip {_health_severity_class(peak)}'>{emoji} {e(label)} 目前安全"
-            f"<span class='hz-soon'>・稍後達{e(peak)}</span></span>"
+        sev = _health_severity_class(warning)
+        row = (
+            f"<div class='wx-health-row active'><span class='label'>{emoji} {e(label)}</span>"
+            f"<span class='wx-badge fill-{sev}'>{e(warning)}中</span></div>"
         )
-    idx = h.get("index")
-    idx_txt = f" 指數 {e(str(idx))}" if idx is not None else ""
-    return f"<span class='wx-chip hz-safe'>{emoji} {e(label)}{idx_txt}・無警示</span>"
+        if peak and _severity_rank(peak) > _severity_rank(warning):
+            row += f"<div class='wx-health-escalate'>{e(_health_peak_when(h, now))} 預計升至{e(peak)}</div>"
+        return row
+
+    if peak:
+        sev = _health_severity_class(peak)
+        return (
+            f"<div class='wx-health-row'><span class='label'>{emoji} {e(label)}</span>"
+            f"<span class='meta'>{e(_health_peak_when(h, now))} 預計達</span>"
+            f"<span class='wx-badge outline-{sev}'>{e(peak)}</span></div>"
+        )
+    return ""
 
 
-def _health_chips_html(health: dict) -> str:
+def _health_slot_html(health: dict) -> str:
+    """固定位置的健康警示區塊：一定會顯示東西（沒事時是一行安靜確認，不是完全消失
+    ——沉默無法區分『查過沒事』跟『這功能沒在運作』）。多項時分組列出，不擠成一句
+    長文或一排 pill 雲。"""
     if not health:
         return ""
-    chips = []
-    if health.get("primary"):
-        chips.append(_health_chip_html(health["primary"]))
-    for h in health.get("extra") or []:
-        chips.append(_health_chip_html(h))
-    return f"<div class='wx-health'>{''.join(chips)}</div>" if chips else ""
+    items = [h for h in [health.get("primary"), *(health.get("extra") or [])] if h]
+    if not items:
+        return ""
+    now = datetime.now(_TAIPEI)
+
+    active = [h for h in items if h.get("warning")]
+    upcoming = [h for h in items if not h.get("warning") and h.get("peak_warning_24h")]
+
+    if not active and not upcoming:
+        return "<div class='wx-health-slot'><div class='wx-health-calm'>✓ CWA 健康警示｜24小時內無警示</div></div>"
+
+    rows = []
+    if active:
+        rows.append(f"<div class='wx-health-section-label'>健康警示・現在（{len(active)}項）</div>" if len(active) > 1 else "")
+        rows.extend(_health_row_html(h, now) for h in active)
+    if upcoming:
+        rows.append("<div class='wx-health-section-label'>健康提醒・未來24小時</div>")
+        rows.extend(_health_row_html(h, now) for h in upcoming)
+    return f"<div class='wx-health-slot'>{''.join(rows)}</div>"
 
 
 def _build_location_card_html(name, county, current, rain, periods, source_bits, health=None) -> str:
     e = _html.escape
 
-    health_html = _health_chips_html(health or {})
+    health_html = _health_slot_html(health or {})
 
     rain_state = rain.get("state", "dry")
     # 乾的時候不列一串 0.0mm——數字只在真的有雨量意義時才出現
@@ -632,8 +740,8 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits,
           {feel_html}
           {range_html}
           <div class="wx-now-stats">{''.join(stats)}</div>
-          {rain_chip}
           {health_html}
+          {rain_chip}
         </div>"""
     else:
         now_html = f"""
@@ -641,8 +749,8 @@ def _build_location_card_html(name, county, current, rain, periods, source_bits,
           <div class="wx-now-desc">降雨現況</div>
           <div class="wx-now-main"><span class="wx-now-temp">{e(str(rain.get('observed_mm', 0)))}</span>
             <span class="wx-now-desc">mm</span></div>
-          {rain_chip}
           {health_html}
+          {rain_chip}
         </div>"""
 
     # 同一張卡的三個時段共用刻度，溫度帶位置/長度可直接互相比較
