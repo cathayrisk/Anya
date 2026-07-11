@@ -19,6 +19,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
@@ -400,6 +401,130 @@ def get_warning_details() -> list:
             }
         )
     return details
+
+
+# 健康氣象傷害指數：三個資料集（熱/冷/溫差）結構完全相同——鄉鎮級、逐3小時，
+# 每個時間點 WeatherElements 裡有一個數值指數 + 一個警示文字（達標才有值）。
+_HEALTH_TZ = ZoneInfo("Asia/Taipei")
+_HEALTH_INDEX = {
+    "heat": {"rid": "M-A0085-001", "index_key": "HeatInjuryIndex",
+             "warn_key": "HeatInjuryWarning", "label": "熱傷害", "emoji": "🥵"},
+    "cold": {"rid": "F-A0085-003", "index_key": "ColdInjuryIndex",
+             "warn_key": "ColdInjuryWarning", "label": "冷傷害", "emoji": "🥶"},
+    "tempdiff": {"rid": "F-A0085-005", "index_key": "TemperatureDifferenceIndex",
+                 "warn_key": "TemperatureDifferenceWarning", "label": "溫差提醒", "emoji": "🌡️"},
+}
+
+
+def _nearest_township(raw: dict, lat: float, lon: float) -> Optional[dict]:
+    """健康指數資料是全台鄉鎮，用座標找最近的鄉鎮（同 get_current_conditions 的最近測站邏輯）。"""
+    best, best_km = None, float("inf")
+    for grp in raw.get("records", {}).get("Locations", []) or []:
+        for town in grp.get("Location", []) or []:
+            try:
+                tlat, tlon = float(town["Latitude"]), float(town["Longitude"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            km = _haversine_km(lat, lon, tlat, tlon)
+            if km < best_km:
+                best_km, best = km, town
+    return best
+
+
+def _health_time_entries(town: dict) -> list:
+    """鄉鎮的 Time[] → [(datetime, WeatherElements)]，依時間排序。IssueTime 有的帶時區、
+    有的是 naive 台北時間，統一補上台北時區再比較。"""
+    entries = []
+    for t in town.get("Time", []) or []:
+        it = t.get("IssueTime")
+        try:
+            dt = datetime.fromisoformat(it)
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_HEALTH_TZ)
+        entries.append((dt, t.get("WeatherElements", {}) or {}))
+    entries.sort(key=lambda x: x[0])
+    return entries
+
+
+def get_health_index(lat: float, lon: float, kind: str) -> Optional[dict]:
+    """單一健康傷害指數（kind: 'heat'/'cold'/'tempdiff'）在座標最近鄉鎮的
+    「目前時段值」與「未來24小時內的最高值/是否出現警示」。查無資料回 None。"""
+    cfg = _HEALTH_INDEX.get(kind)
+    if cfg is None:
+        return None
+    try:
+        raw = _rest(cfg["rid"])
+    except Exception:
+        return None
+    town = _nearest_township(raw, lat, lon)
+    if not town:
+        return None
+    entries = _health_time_entries(town)
+    if not entries:
+        return None
+
+    now = datetime.now(_HEALTH_TZ)
+    idx_key, warn_key = cfg["index_key"], cfg["warn_key"]
+
+    # 目前時段 = 最後一個 IssueTime <= now，都在未來則取最早一筆
+    current = None
+    for dt, we in entries:
+        if dt <= now:
+            current = (dt, we)
+        elif current is None:
+            current = (dt, we)
+            break
+        else:
+            break
+    if current is None:
+        current = entries[0]
+    cur_dt, cur_we = current
+
+    # 未來24小時內（含目前）的最高指數與是否出現警示——回答「今天稍後會不會更嚴重」
+    horizon = now.timestamp() + 24 * 3600
+    peak_index, peak_warning, peak_time = cur_we.get(idx_key), "", None
+    for dt, we in entries:
+        if dt < cur_dt or dt.timestamp() > horizon:
+            continue
+        v = we.get(idx_key)
+        try:
+            if peak_index is None or (v is not None and float(v) > float(peak_index)):
+                peak_index, peak_time = v, dt.isoformat()
+        except (TypeError, ValueError):
+            pass
+        w = (we.get(warn_key) or "").strip()
+        if w and not peak_warning:
+            peak_warning = w
+
+    return {
+        "kind": kind, "label": cfg["label"], "emoji": cfg["emoji"],
+        "town": town.get("TownName"),
+        "index": cur_we.get(idx_key),
+        "warning": (cur_we.get(warn_key) or "").strip(),
+        "time": cur_dt.isoformat(),
+        "peak_index_24h": peak_index,
+        "peak_warning_24h": peak_warning,
+        "peak_time_24h": peak_time,
+    }
+
+
+def get_health_indices(lat: float, lon: float) -> dict:
+    """依當季挑主指數（暖季→熱傷害、冷季→冷傷害），另外任何指數有生效警示就一併帶出。
+    回傳 {'primary': {...}|None, 'extra': [{...}, ...]}，供儀表板決定顯示哪些 chip。"""
+    month = datetime.now(_HEALTH_TZ).month
+    primary_kind = "heat" if 5 <= month <= 10 else "cold"
+    secondary_kind = "cold" if primary_kind == "heat" else "heat"
+
+    primary = get_health_index(lat, lon, primary_kind)
+    extra = []
+    # 反季節的傷害指數、以及溫差提醒——只有「出現警示」時才浮出，平時不佔版面
+    for kind in (secondary_kind, "tempdiff"):
+        h = get_health_index(lat, lon, kind)
+        if h and (h.get("warning") or h.get("peak_warning_24h")):
+            extra.append(h)
+    return {"primary": primary, "extra": extra}
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
