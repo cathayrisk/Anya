@@ -36,7 +36,9 @@ from utils.cwa_weather import (
     get_earthquake_impl,
     get_forecast_periods,
     get_health_indices,
+    get_radar_image,
     get_rain,
+    get_reflectivity,
     get_typhoon_impl,
     get_warning_details,
     get_warnings,
@@ -83,6 +85,7 @@ def _live_location(name: str, lat: float, lon: float) -> dict:
         "name": name, "county": county, "current": None, "periods": [],
         "rain": {"observed_mm": 0.0, "forecast_mm": 0.0, "state": "dry"},
         "warnings": [], "data_time": None, "health": {"primary": None, "extra": []},
+        "reflectivity": None,
     }
     try:
         out["current"] = get_current_conditions(lat, lon)
@@ -111,7 +114,19 @@ def _live_location(name: str, lat: float, lon: float) -> dict:
         out["health"] = get_health_indices(lat, lon)
     except Exception:
         out["health"] = {"primary": None, "extra": []}
+    try:
+        out["reflectivity"] = get_reflectivity(lat, lon)
+    except Exception:
+        out["reflectivity"] = None
     return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _live_radar_image():
+    try:
+        return get_radar_image()
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -223,6 +238,7 @@ def _demo_bundle():
         "warnings": [{"phenomena": "大雨", "significance": "特報",
                       "start_time": ago(hours=2), "end_time": ago(hours=-4)}],
         "data_time": ago(minutes=8),
+        "reflectivity": {"dbz": 42.0, "label": "中到大雨"},
         "health": {
             "primary": {"kind": "heat", "label": "熱傷害", "emoji": "🥵",
                         "index": 30, "warning": "", "peak_index_24h": 35,
@@ -264,7 +280,11 @@ def _demo_bundle():
         {"id": 1, "ts": ago(hours=5), "category": "typhoon",
          "title": "颱風公告 - 海上颱風警報", "body": "第7號颱風海上警報發布，暴風圈朝台灣東部海面接近，請注意後續動態。", "extra_url": None},
     ]
-    return locations, earthquake, typhoon, warning_details, alerts
+    radar_image = {
+        "image_url": "https://cwaopendata.s3.ap-northeast-1.amazonaws.com/Observation/O-A0084-001.png",
+        "data_time": ago(minutes=3),
+    }
+    return locations, earthquake, typhoon, warning_details, alerts, radar_image
 
 
 _TAIPEI = ZoneInfo("Asia/Taipei")
@@ -684,26 +704,39 @@ def _health_slot_html(health: dict) -> str:
     return f"<div class='wx-health-slot'>{''.join(rows)}</div>"
 
 
-def _build_location_card_html(name, county, current, rain, periods, source_bits, health=None) -> str:
+def _build_location_card_html(name, county, current, rain, periods, source_bits, health=None, reflectivity=None) -> str:
     e = _html.escape
 
     health_html = _health_slot_html(health or {})
 
+    dbz = (reflectivity or {}).get("dbz")
+    dbz_label = (reflectivity or {}).get("label")
+    dbz_txt = f"{e(str(dbz))}dBZ（{e(dbz_label)}）" if dbz is not None and dbz_label else ""
+
     rain_state = rain.get("state", "dry")
     # 乾的時候不列一串 0.0mm——數字只在真的有雨量意義時才出現
     if rain_state == "raining":
+        chip_label, chip_class = RAIN_STATE_LABEL["raining"], _RAIN_CHIP_CLASS["raining"]
         rain_amounts = (
             f"　{e(str(rain.get('observed_mm', 0)))} mm"
             f"・未來1hr {e(str(rain.get('forecast_mm', 0)))} mm"
         )
+        if dbz_txt:
+            rain_amounts += f"・回波 {dbz_txt}"
     elif rain_state == "soon_rain":
+        chip_label, chip_class = RAIN_STATE_LABEL["soon_rain"], _RAIN_CHIP_CLASS["soon_rain"]
         rain_amounts = f"　未來1hr 約 {e(str(rain.get('forecast_mm', 0)))} mm"
+        if dbz_txt:
+            rain_amounts += f"・回波 {dbz_txt}"
+    elif dbz_txt:
+        # 地面雨量計還沒測到雨，但空中已有回波——比降雨數字早一步的示警，
+        # chip 從「無降雨」升級，不是新增一個獨立區塊（同一資訊概念固定位置）。
+        chip_label, chip_class = "🌩️ 回波接近", "rain-soon"
+        rain_amounts = f"　{dbz_txt}"
     else:
+        chip_label, chip_class = RAIN_STATE_LABEL["dry"], _RAIN_CHIP_CLASS["dry"]
         rain_amounts = ""
-    rain_chip = (
-        f"<span class='wx-chip {_RAIN_CHIP_CLASS.get(rain_state, 'rain-off')}'>"
-        f"{e(RAIN_STATE_LABEL.get(rain_state, '降雨'))}{rain_amounts}</span>"
-    )
+    rain_chip = f"<span class='wx-chip {chip_class}'>{e(chip_label)}{rain_amounts}</span>"
 
     if current:
         desc = current.get("weather") or "—"
@@ -812,13 +845,14 @@ has_cwa = bool(get_cwa_api_key())
 is_demo = (st.query_params.get("demo") == "1") or not has_cwa
 
 if is_demo:
-    locations, earthquake, typhoon, warning_details, alerts = _demo_bundle()
+    locations, earthquake, typhoon, warning_details, alerts, radar_image = _demo_bundle()
 else:
     locations = [_live_location(n, lat, lon) for n, (lat, lon) in _LOCATION_COORDS.items()]
     earthquake = _live_earthquake()
     typhoon = _live_typhoon()
     warning_details = _live_warning_details()
     alerts = load_alerts()
+    radar_image = _live_radar_image()
 
 header_left, header_right = st.columns([5, 1], vertical_alignment="bottom")
 with header_left:
@@ -831,6 +865,7 @@ with header_right:
         _live_typhoon.clear()
         _live_warning_details.clear()
         _load_alerts.clear()
+        _live_radar_image.clear()
         st.rerun()
 
 if is_demo:
@@ -961,9 +996,16 @@ for loc in locations:
     source_bits.append("預報：CWA 一週鄉鎮天氣預報")
 
     st.markdown(
-        _build_location_card_html(loc["name"], county, current, rain, periods, source_bits, loc.get("health")),
+        _build_location_card_html(
+            loc["name"], county, current, rain, periods, source_bits,
+            loc.get("health"), loc.get("reflectivity"),
+        ),
         unsafe_allow_html=True,
     )
+
+    if radar_image and radar_image.get("image_url"):
+        with st.expander(f"🛰️ 雷達回波圖（樹林）　{_fmt_time(radar_image.get('data_time'))}"):
+            st.image(radar_image["image_url"], caption="CWA 樹林雷達回波圖（半徑150km）", width="stretch")
 
     # 卡片只放最近 3 個時段；一週預報（一天一列，白天/晚上合併）收進 expander
     if len(periods) > 3:
