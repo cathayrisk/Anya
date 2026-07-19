@@ -1154,14 +1154,36 @@ def _sleep_with_heartbeat(delay: float) -> None:
             _status("⏳ 免費層限流中，安妮亞等一下下再試…")
 
 
+_RETRY_DELAY_RES = (
+    re.compile(r"retry in ([0-9.]+)\s*s", re.IGNORECASE),      # "Please retry in 26.371882092s."
+    re.compile(r"retry_delay[^0-9]*([0-9]+)"),                  # proto: retry_delay { seconds: 26 }
+)
+
+def parse_retry_delay(msg: str) -> float | None:
+    """從 Google 429 錯誤訊息解析官方建議的重試等待秒數（找不到回 None）。純函式可測。"""
+    for pat in _RETRY_DELAY_RES:
+        m = pat.search(msg or "")
+        if m:
+            try:
+                return min(float(m.group(1)) + 1.0, 70.0)   # +1s 緩衝；上限 70s 防伺服器亂報
+            except ValueError:
+                continue
+    return None
+
+
 def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS):
     """暫時性錯誤時指數退避重試：429/quota（免費額度）＋ 503 UNAVAILABLE（flash 高峰）
     ＋ 500 INTERNAL（Google 端暫時性，gemma 池實測常見）。其他錯誤直接拋出。
+    配額類錯誤（429/quota——RPM/TPM 都是「分鐘窗」）短階梯根本等不完，會白白燒光重試次數：
+    優先採用 Google 錯誤訊息自帶的建議秒數，沒有就把該段升級成長階梯對應值。
+    長等待期間由 _sleep_with_heartbeat 切段送心跳，不會觸發代理閒置逾時斷線。
     注意：呼叫端的串流 _consume 都以 renderer.reset() 開頭，重試在視覺上是乾淨重播。"""
     last_exc = None
+    delay_override: float | None = None
     for attempt, delay in enumerate((0,) + delays):
-        if delay:
-            _sleep_with_heartbeat(delay)
+        if delay or delay_override:
+            _sleep_with_heartbeat(delay_override if delay_override is not None else delay)
+        delay_override = None
         try:
             return fn()
         except Exception as e:
@@ -1169,12 +1191,15 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS):
             if name in ("StopException", "RerunException"):  # streamlit 控制流例外不可吞
                 raise
             msg = str(e)
-            retriable = (
+            is_quota = (
                 "429" in msg
                 or "ResourceExhausted" in name
                 or "rate" in msg.lower()
                 or "quota" in msg.lower()
                 or "exhausted" in msg.lower()
+            )
+            retriable = (
+                is_quota
                 or "503" in msg
                 or "UNAVAILABLE" in msg
                 or "ServiceUnavailable" in name
@@ -1185,6 +1210,14 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS):
             last_exc = e
             if not retriable:
                 raise
+            if is_quota:
+                # 官方建議秒數優先；沒有就把下一段升到長階梯同位值（分鐘窗要等得夠久才有意義）
+                delay_override = parse_retry_delay(msg)
+                if delay_override is None and attempt < len(BACKOFF_DELAYS_LONG):
+                    delay_override = float(max(
+                        delays[attempt] if attempt < len(delays) else 0,
+                        BACKOFF_DELAYS_LONG[attempt],
+                    ))
     raise last_exc
 
 def invoke_with_backoff_long(fn):
