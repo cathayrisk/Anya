@@ -393,7 +393,7 @@ _WX_CSS_TEMPLATE = """
 .wx-name{font-size:1.05rem;font-weight:700;color:%(brown)s;}
 .wx-county{font-size:.85rem;color:%(muted)s;}
 .wx-body{display:flex;gap:16px;flex-wrap:wrap;}
-.wx-now{flex:0 0 400px;display:flex;flex-direction:column;justify-content:center;gap:6px;
+.wx-now{flex:0 0 460px;display:flex;flex-direction:column;justify-content:center;gap:6px;
   padding:14px 18px;border-radius:12px;background:%(bg_panel)s;}
 .wx-now-main{display:flex;align-items:center;gap:12px;}
 .wx-now-emoji{font-size:2.4rem;line-height:1;}
@@ -452,6 +452,8 @@ _WX_CSS_TEMPLATE = """
 .wx-wk-t{color:%(muted)s;font-weight:600;text-align:right;}
 @media (max-width:720px){.wx-now{flex:1 1 100%%;}.wx-periods{grid-template-columns:1fr;}
   .wx-wk-row{grid-template-columns:88px 24px 46px 30px 1fr 30px;}.wx-wk-desc{display:none;}}
+/* 樹林雷達回波圖縮小顯示，避免原圖(3600x3600)撐滿整個展開區 */
+.st-key-wx_radar_img img{width:85%% !important;height:auto !important;margin:0 auto;display:block;}
 /* ── 警報嚴重度系統:明文等級+圖示+成對色,不只靠顏色 ── */
 .al-banner{display:flex;gap:12px;align-items:flex-start;border:1px solid;border-radius:12px;
   padding:12px 16px;margin-bottom:8px;}
@@ -1005,7 +1007,8 @@ for loc in locations:
 
     if radar_image and radar_image.get("image_url"):
         with st.expander(f"🛰️ 雷達回波圖（樹林）　{_fmt_time(radar_image.get('data_time'))}"):
-            st.image(radar_image["image_url"], caption="CWA 樹林雷達回波圖（半徑150km）", width="stretch")
+            with st.container(key="wx_radar_img"):
+                st.image(radar_image["image_url"], caption="CWA 樹林雷達回波圖（半徑150km）", width="stretch")
 
     # 卡片只放最近 3 個時段；一週預報（一天一列，白天/晚上合併）收進 expander
     if len(periods) > 3:
