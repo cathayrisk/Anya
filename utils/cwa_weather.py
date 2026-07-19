@@ -364,6 +364,54 @@ def get_rain(lat: float, lon: float) -> dict:
     }
 
 
+def _reflectivity_label(dbz: float) -> Optional[str]:
+    """dBZ → 強度描述（氣象業界常用門檻，非CWA官方分級，比照特報橫幅「相關性×災種」
+    自訂等級的做法）。<20 視為無明顯回波，回傳 None 讓呼叫端保持安靜。"""
+    if dbz < 20:
+        return None
+    if dbz < 35:
+        return "一般降雨"
+    if dbz < 45:
+        return "中到大雨"
+    if dbz < 55:
+        return "豪雨等級"
+    return "對流旺盛"
+
+
+def get_reflectivity(lat: float, lon: float) -> Optional[dict]:
+    """整合回波圖（O-A0059-001）：全台 dBZ 網格，跟降雨網格共用同一套 GridDataset
+    取樣機制（已用樹林站實測值 47.8dBZ／觀測降雨1.75mm 交叉驗證過對應關係正確）。
+    回波比地面雨量計早一步：空中已有回波、地面雨量還沒累積出來時能提早示警。
+    只給儀表板用（單次約9MB，比降雨網格重很多），不接進 get_rain()／聊天工具，
+    避免每次問天氣都多付這筆網路成本。"""
+    try:
+        dbz = _grid("O-A0059-001").value_at(lat, lon)
+    except Exception:
+        return None
+    if dbz is None:
+        return None
+    return {"dbz": round(dbz, 1), "label": _reflectivity_label(dbz)}
+
+
+def get_radar_image() -> Optional[dict]:
+    """樹林雷達回波圖（O-A0084-001）：CWA 已經畫好的 PNG（半徑150km，涵蓋台北盆地），
+    直接回傳圖片網址供 st.image 顯示，不需要自己畫。"""
+    api_key = get_cwa_api_key()
+    if not api_key:
+        return None
+    try:
+        resp = requests.get(
+            f"{FILE_BASE}/O-A0084-001",
+            params={"Authorization": api_key, "format": "JSON"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        dataset = resp.json()["cwaopendata"]["dataset"]
+        return {"image_url": dataset["resource"]["ProductURL"], "data_time": dataset.get("DateTime")}
+    except Exception:
+        return None
+
+
 def get_warning_details() -> list:
     """全台各別特報公告（W-C0033-002）：含公告標題、完整內容文字、影響區域與有效期間。
     跟 get_warnings(county)（W-C0033-001，只回答某縣市現在有無特報）互補——
