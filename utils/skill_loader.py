@@ -17,23 +17,34 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ===== Skill 白名單：{SKILL.md frontmatter name: 中文索引描述} =====
 # 名稱必須和 SKILL.md frontmatter 的 name 完全一致（掃描時以此配對）。
+# ⚠️ 加新條目前務必確認兩件事（2026-08-26 盤點的教訓）：
+#   1. skills/ 底下真的有那個 SKILL.md，且 frontmatter name 完全一致
+#      （舊版白名單有 7 個條目的檔案根本不存在，等於永遠載不到）
+#   2. 該 SKILL.md 引用的 references/ 檔案也都在
+#      （supabase-postgres-best-practices 只有索引、3 個引用檔全缺 → 刻意不收）
+# 盤點腳本：見 git 記錄或用 discover_skills() 比對本表。
 SKILL_WHITELIST: dict[str, str] = {
-    "caveman": "極簡回覆模式——砍掉贅字客套、保留完整技術正確性（使用者要求「簡短點」「省 token」時）",
-    "reflect": "對話中途退一步重估——方向/假設/偏誤五維檢查（使用者說「等等」「我們是不是想偏了」時）",
-    "roast": "誠實吐槽模式——直白指出計畫/程式碼/文案的問題，不留情面（使用者要求誠實評價時）",
+    # ── 研究與分析方法 ──
     "market-research": "市場研究方法論——TAM/SAM/SOM 雙向估算、問卷樣本數、市場區隔評分",
-    "product-research": "產品研究方法論——用戶訪談設計、假設驗證、機會評估",
     "statistical-analyst": "統計分析——假設檢定、信賴區間、迴歸、效果量的正確用法與陷阱",
     "financial-analyst": "財務分析——DCF 估值、財報比率、預算預測、SaaS 指標（ARR/CAC/LTV）",
     "data-quality-auditor": "資料品質稽核——缺值/重複/離群/型別不一致的系統性檢查清單",
-    "universal-scraping-architect": "網頁爬取架構——反爬因應、選擇器策略、結構變動的穩健設計",
-    "karpathy-coder": "Karpathy 風格寫碼紀律——最小可行改動、先讀後寫、避免過度工程",
-    "md-document": "Markdown 轉精美 HTML 文件——排版/目錄/樣式模板",
-    "landing": "Landing page HTML 產生器——4 種設計風格可選",
-    # 原有本地 skills（python_best_practices 已由寫死條目涵蓋；
-    # supabase-postgres-best-practices 是目錄型、規則本文缺檔，刻意不收）
+    "business-investment-advisor": "投資與資本支出評估——ROI/IRR/NPV/回收期、該不該買設備或投新事業",
+    "andreessen": "市場優先的直白壓力測試——用 Andreessen 框架挑戰點子、產品與押注，不留情面",
+    # ── 程式碼與資料庫 ──
     "security-checklist": "程式碼安全檢查——涉及 secrets/資料庫/檔案 IO/網路請求/使用者輸入時必查",
     "sql-and-database": "SQL 與資料庫實務——SQLAlchemy/原生 SQL/交易/連線管理/migration",
+    "developing-with-streamlit": "Streamlit 開發——快取/版面/session_state/效能，會再路由到 14 個子技能",
+    # ── 文件與交付 ──
+    "md-document": "Markdown 轉精美 HTML 文件——排版/目錄/樣式模板",
+    "md-slides": "Markdown 轉 HTML 簡報——鍵盤操作、講者備忘稿、單檔輸出",
+    "md-review": "程式碼審查轉雙欄 HTML——左側 diff、右側依嚴重度分級的審查卡",
+    "design-system": "品牌識別與輸出樣式——配色/字型/設計風格，供 md-document 等產出沿用",
+    "contract-and-proposal-writer": "合約與提案文件——SOW/NDA/MSA/報價，含各法域差異",
+    # ── 產品與流程 ──
+    "agile-product-owner": "敏捷產品管理——user story、驗收條件、sprint 規劃與點數估算",
+    "process-mapper": "端到端流程盤點——BPMN 式流程圖、各階段週期時間、瓶頸定位",
+    "knowledge-ops": "SOP 與 runbook——撰寫、5W2H 完整性檢查、內部知識庫健檢",
 }
 
 # ===== Agent 白名單：{consult_expert role key: 條目設定} =====
