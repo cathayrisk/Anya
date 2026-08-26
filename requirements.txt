@@ -12,6 +12,7 @@ openai-agents
 deepagents
 #gpt-researcher>=0.10.0,<0.15.0
 langsmith
+langchain-google-genai
 
 # Document processing
 faiss-cpu
