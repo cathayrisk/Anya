@@ -57,3 +57,4 @@ enableStaticServing = true
 # 參考：https://docs.streamlit.io/develop/api-reference/configuration/config.toml
 #      https://github.com/streamlit/streamlit/issues/8660（Streamlit 曾有 ping frame 未確實送出的已知問題）
 websocketPingInterval = 30
+disconnectedSessionTTL = 1800
