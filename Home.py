@@ -163,6 +163,9 @@ ESCALATE_SENTINEL = "[[ESCALATE]]"
 MAX_TOOL_ROUNDS = 8                    # 手動 tool loop 上限（每輪 = 一次 LLM 呼叫 + 執行其 tool calls）
 MAX_WEB_CALLS_PER_RUN = 10             # web_search tool 每回合上限（免費額度保護）
 API_MAX_RETRIES = 4                    # ChatGoogleGenerativeAI 內建重試
+# 單次 LLM 呼叫上限。沒有這個，模型只要不吐字就是「無限期卡住」，使用者只看得到
+# 骨架條一直轉，也沒有任何機制能把它救回來。逾時會被當成可重試 → 自動換下一個模型。
+LLM_TIMEOUT_SECS = 90
 BACKOFF_DELAYS = (2, 4, 8)             # 外層 429 指數退避（秒）
 BACKOFF_DELAYS_LONG = (15, 30, 60)     # deep research pipeline 用（TPM 是分鐘窗，短退避沒用）
 BACKOFF_HEARTBEAT_SECS = 8             # 長退避 sleep 每隔這麼久送一次 UI delta，避免代理判定連線閒置逾時
@@ -216,31 +219,37 @@ def match_skill_hint(text: str) -> str | None:
 # 為什麼要兩張表：SKILL_HINT_RES 命中會「強制升級 General」（見上方註解），放寬會讓更多
 # 對話跳到 31b、加劇免費層限流。這張表只用於「答完之後回顧」，沒有任何成本副作用，
 # 因此可以放寬到涵蓋全部白名單 skill。改這裡不會影響模型路由。
+# 條目必須與 SKILL_WHITELIST 對得上，否則永遠不會觸發（suggest_unused_skills 會過濾
+# 掉不在 SKILLS 裡的名稱）。加新 skill 時記得兩邊一起加。
 SKILL_SUGGEST_RES: dict[str, re.Pattern] = {
     "market-research": re.compile(r"TAM|SAM|SOM|市場規模|市場調查|市場區隔|競品|目標客群", re.I),
-    "product-research": re.compile(r"用戶訪談|使用者訪談|假設驗證|機會評估|產品需求|PMF|痛點"),
     "statistical-analyst": re.compile(r"假設檢定|顯著|信賴區間|p值|p 值|迴歸|樣本數|相關性|統計"),
     "financial-analyst": re.compile(r"DCF|估值|財報|現金流|CAC|LTV|ARR|MRR|毛利|損益|投報", re.I),
     "data-quality-auditor": re.compile(r"資料品質|缺值|遺漏值|離群|重複值|資料清理|髒資料"),
-    "universal-scraping-architect": re.compile(r"爬蟲|爬取|抓網頁|反爬|scrap", re.I),
-    "karpathy-coder": re.compile(r"重構|過度工程|最小改動|程式碼太|技術債"),
+    "business-investment-advisor": re.compile(r"ROI|IRR|NPV|回收期|投資報酬|資本支出|值不值得投|該不該買", re.I),
+    "andreessen": re.compile(r"壓力測試|挑戰這個|市場夠不夠|創業|商業模式|這個點子"),
     "security-checklist": re.compile(r"資安|安全性|secret|金鑰|注入|injection|權限|加密|漏洞", re.I),
     "sql-and-database": re.compile(r"SQL|資料庫|查詢語法|migration|索引|交易|SQLAlchemy", re.I),
+    "developing-with-streamlit": re.compile(r"streamlit|session_state|cache_data|st\.cache|重跑|rerun", re.I),
     "python_best_practices": re.compile(r"python|type hint|pytest|型別註記|單元測試", re.I),
     "md-document": re.compile(r"轉成HTML|轉成 HTML|排版|做成文件|報告格式|目錄", re.I),
-    "landing": re.compile(r"landing|落地頁|官網|產品首頁|行銷頁", re.I),
-    "caveman": re.compile(r"太長|簡短|精簡|廢話|講重點"),
-    "reflect": re.compile(r"想偏|重新評估|退一步|方向對嗎|是不是搞錯"),
-    "roast": re.compile(r"誠實|吐槽|直說|真的可行嗎|幫我挑毛病"),
+    "md-slides": re.compile(r"簡報|投影片|slides|deck|做成 PPT", re.I),
+    "md-review": re.compile(r"code review|程式碼審查|PR 審查|審查意見|review 這段", re.I),
+    "design-system": re.compile(r"品牌|配色|設計系統|視覺規範|字型搭配"),
+    "contract-and-proposal-writer": re.compile(r"合約|提案書|報價單|SOW|NDA|MSA", re.I),
+    "agile-product-owner": re.compile(r"user story|使用者故事|驗收條件|sprint|backlog|產品需求", re.I),
+    "process-mapper": re.compile(r"流程盤點|流程圖|端到端流程|瓶頸|週期時間|SOP 流程"),
+    "knowledge-ops": re.compile(r"SOP|runbook|作業手冊|知識庫|操作手冊", re.I),
 }
 
 # 手寫的常見組合流程：命中其中一步時，順帶告訴使用者它的上下游搭配長什麼樣。
 SKILL_FLOWS: list[tuple[str, list[str]]] = [
     ("市場機會評估", ["market-research", "statistical-analyst", "financial-analyst"]),
-    ("從爬取到洞察", ["universal-scraping-architect", "data-quality-auditor", "statistical-analyst"]),
+    ("投資決策", ["market-research", "financial-analyst", "business-investment-advisor"]),
     ("資料分析前置", ["data-quality-auditor", "statistical-analyst"]),
-    ("上線前程式碼健檢", ["security-checklist", "python_best_practices", "karpathy-coder"]),
-    ("產品決策", ["product-research", "statistical-analyst"]),
+    ("上線前程式碼健檢", ["security-checklist", "python_best_practices", "sql-and-database"]),
+    ("產品規劃", ["agile-product-owner", "process-mapper"]),
+    ("研究成果交付", ["md-document", "md-slides", "design-system"]),
 ]
 
 
@@ -799,6 +808,31 @@ def _maybe_unindent_indented_block(text: str) -> str:
             new_lines.append(ln)
     return "\n".join(new_lines)
 
+# Streamlit 合法顏色名（與 Home.py 提示詞第「字色限…」條一致）。
+_ST_COLORS = "blue|green|orange|red|violet|gray|grey|rainbow|primary"
+# 模型常漏掉指令開頭的 ":"（實測看過 orange[重點]、orange-background[警告]）。
+# 前方不可是 ":"（已經正確）、英數或 "-"（避免誤傷 deep-orange[0] 這類字串）。
+_MISSING_COLON_RE = re.compile(
+    r"(?<![:\w-])(" + _ST_COLORS + r")(-badge|-background)?\[",
+)
+
+
+def _repair_color_directives(text: str) -> str:
+    """把漏冒號的顏色指令補回去；程式碼區塊／行內程式碼內一律不動。純函式可測。"""
+    if not text:
+        return text
+    stash: list = []
+
+    def _hold(m):
+        stash.append(m.group(0))
+        return "\x00c%d\x00" % (len(stash) - 1)
+
+    t = re.sub(r"```.*?```", _hold, text, flags=re.S)
+    t = re.sub(r"`[^`]*`", _hold, t)
+    t = _MISSING_COLON_RE.sub(lambda m: ":" + m.group(0), t)
+    return re.sub(r"\x00c(\d+)\x00", lambda m: stash[int(m.group(1))], t)
+
+
 def normalize_markdown_for_streamlit(text: str) -> str:
     if not text:
         return ""
@@ -813,6 +847,7 @@ def normalize_markdown_for_streamlit(text: str) -> str:
     t = _strip_unbalanced_code_fences(t)
     t = _maybe_unindent_indented_block(t)
     t = re.sub(r"\\([*_`])", r"\1", t)
+    t = _repair_color_directives(t)
     return t
 
 def _emphasis_to_html(t: str) -> str:
@@ -1371,8 +1406,17 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
                 or "quota" in msg.lower()
                 or "exhausted" in msg.lower()
             )
+            # 逾時／連線中斷：卡住的模型不值得再等，直接換下一個
+            is_stuck = (
+                "timeout" in msg.lower()
+                or "timed out" in msg.lower()
+                or "deadline" in msg.lower()
+                or "DeadlineExceeded" in name
+                or name in ("TimeoutError", "ReadTimeout", "ConnectTimeout")
+            )
             retriable = (
                 is_quota
+                or is_stuck
                 or "503" in msg
                 or "UNAVAILABLE" in msg
                 or "ServiceUnavailable" in name
@@ -1395,9 +1439,11 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
             if not retriable:
                 raise
 
-            # 配額錯誤且還有備援模型 → 直接換模型重試（不同配額池，不必等退避）
-            if is_quota and purpose and downgrade_model(purpose):
-                _status(f"⏳ 主模型限流，改用備援模型（{current_model_name(purpose)}）…")
+            # 配額錯誤或卡住，且還有備援模型 → 直接換模型重試
+            #（配額：不同池不必等退避；卡住：再等也是白等）
+            if (is_quota or is_stuck) and purpose and downgrade_model(purpose):
+                _reason = "限流" if is_quota else "沒有回應"
+                _status(f"⏳ 主模型{_reason}，改用備援模型（{current_model_name(purpose)}）…")
                 delay_override = 0.0
                 continue
 
@@ -1419,11 +1465,24 @@ def invoke_with_backoff_long(fn):
 # §H LLM 初始化
 # =============================================================================
 def _make_llm(model: str, **kw) -> ChatGoogleGenerativeAI:
-    try:
-        return ChatGoogleGenerativeAI(model=model, max_retries=API_MAX_RETRIES, **kw)
-    except Exception:
-        # thinking 參數不被支援時退回無參數版本
-        return ChatGoogleGenerativeAI(model=model, max_retries=API_MAX_RETRIES)
+    """逐項降級建構：完整參數 → 拿掉 thinking_level → 拿掉 timeout → 全裸。
+
+    原本是「一有例外就退回無參數版」，那會把 timeout 也一起丟掉——
+    偏偏 timeout 正是防止卡死的那道保險，不能因為 thinking_level 不被支援就連坐。"""
+    kw.setdefault("timeout", LLM_TIMEOUT_SECS)
+    variants = [
+        kw,
+        {k: v for k, v in kw.items() if k != "thinking_level"},
+        {k: v for k, v in kw.items() if k != "timeout"},
+        {},
+    ]
+    last = None
+    for extra in variants:
+        try:
+            return ChatGoogleGenerativeAI(model=model, max_retries=API_MAX_RETRIES, **extra)
+        except Exception as e:
+            last = e
+    raise last
 
 # ── 備援鏈狀態：哪個用途目前降到第幾格 ─────────────────────────────────
 def _model_tiers() -> dict:
@@ -1474,6 +1533,18 @@ def is_downgraded(purpose: str) -> bool:
     return current_model_name(purpose) != _chain_for(purpose)[0]
 
 
+def _thinking_for(model: str, requested: str) -> str:
+    """thinking_level 只給 Gemma 主腦；備援到 Gemini flash 家族時一律不帶。
+
+    原因：本專案的串流 UI（extract_thinking_from_content）是照 Gemma 的
+    thinking 區塊格式寫的。Gemini 家族加上 thinking_level="high" 之後會先進行
+    長時間推理，而那段推理不會以相同格式串回來 → 畫面只剩骨架條、零進度，
+    使用者看到的就是「卡住」。純函式可測。"""
+    if not requested:
+        return ""
+    return requested if model.startswith("gemma") else ""
+
+
 @st.cache_resource(show_spinner=False)
 def _llm_by_name(model: str, thinking: str = "") -> ChatGoogleGenerativeAI:
     return _make_llm(model, thinking_level=thinking) if thinking else _make_llm(model)
@@ -1482,7 +1553,8 @@ def _llm_by_name(model: str, thinking: str = "") -> ChatGoogleGenerativeAI:
 def llm_for(purpose: str, thinking: str = "") -> ChatGoogleGenerativeAI:
     """依用途取得「目前該用的」模型。務必在重試閉包『內部』呼叫，
     否則降級後拿到的還是舊模型（這是整套機制唯一的使用陷阱）。"""
-    return _llm_by_name(current_model_name(purpose), thinking)
+    model = current_model_name(purpose)
+    return _llm_by_name(model, _thinking_for(model, thinking))
 
 
 @st.cache_resource(show_spinner=False)
@@ -3364,11 +3436,13 @@ def _build_general_instructions(socratic: bool = False) -> str:
         # 分類只影響索引排版（幫 31b 選中），不動 entry schema；未歸類自動落「其他」
         groups: dict[str, list[str]] = {
             "程式碼品質": ["python_best_practices", "security-checklist", "sql-and-database",
-                          "karpathy-coder"],
-            "研究與分析方法": ["market-research", "product-research", "statistical-analyst",
-                              "financial-analyst", "data-quality-auditor", "deep_research_process"],
-            "寫作與文件": ["md-document", "landing", "caveman", "roast", "reflect"],
-            "資料擷取": ["universal-scraping-architect"],
+                          "developing-with-streamlit"],
+            "研究與分析方法": ["market-research", "statistical-analyst", "financial-analyst",
+                              "data-quality-auditor", "business-investment-advisor",
+                              "andreessen", "deep_research_process"],
+            "寫作與文件": ["md-document", "md-slides", "md-review", "design-system",
+                          "contract-and-proposal-writer"],
+            "產品與流程": ["agile-product-owner", "process-mapper", "knowledge-ops"],
         }
         grouped = {n for names in groups.values() for n in names}
         others = [n for n in SKILLS if n not in grouped]
@@ -3727,8 +3801,11 @@ def _render_skill_suggestion(msg: dict, idx: int) -> None:
     chips = " ".join(f":violet-badge[{_skill_label(n)}]" for n in names)
     line = f":small[:gray[🧩 這類問題也可以搭配]] {chips}"
     if sug.get("flow_name"):
-        steps = " → ".join(_skill_label(x) for x in (sug.get("flow_steps") or []))
-        line += f" :small[:gray[｜常見流程「{sug['flow_name']}」：{steps}]]"
+        # 只顯示目前真的載得到的步驟，避免流程裡出現一個使用者根本用不到的名字
+        _steps = [x for x in (sug.get("flow_steps") or []) if x in SKILLS]
+        if _steps:
+            steps = " → ".join(_skill_label(x) for x in _steps)
+            line += f" :small[:gray[｜常見流程「{sug['flow_name']}」：{steps}]]"
     st.markdown(line)
 
     if sug.get("composed"):
