@@ -424,10 +424,24 @@ _SKELETON_CSS = (
     "background:linear-gradient(90deg,#efe7e3 0%,#faf4f1 50%,#efe7e3 100%);"
     "background-size:220% 100%;animation:rjShine 1.15s linear infinite;}"
     "@keyframes rjShine{0%{background-position:120% 0;}100%{background-position:-120% 0;}}"
+    # word-break:break-all 會把英文單字從中間劈開（模型用英文推理，整段都是英文）
+    # → 改 overflow-wrap:anywhere：優先在詞邊界換行，真的塞不下才硬斷
     ".rj-think{color:#a89b96;font-size:0.86em;line-height:1.55;padding:0 2px 8px 2px;"
-    "font-style:italic;word-break:break-all;animation:rjThinkIn .3s ease;}"
+    "font-style:italic;word-break:normal;overflow-wrap:anywhere;animation:rjThinkIn .3s ease;}"
     "@keyframes rjThinkIn{from{opacity:0;}to{opacity:1;}}"
-    "@media (prefers-reduced-motion:reduce){.rjsk .b{animation:none;}}"
+    # 思考階段膠囊：已過的階段淡置、當前階段鑲金邊並呼吸
+    ".rj-stages{display:flex;flex-wrap:wrap;gap:5px;padding:0 2px 6px 2px;}"
+    ".rj-stage{font-size:0.76em;line-height:1;padding:3px 8px;border-radius:999px;"
+    "border:1px solid #e8d5d3;background:#fffaf9;color:#b3a49e;white-space:nowrap;"
+    "animation:rjStageIn .25s ease both;}"
+    "@keyframes rjStageIn{from{opacity:0;transform:translateY(3px);}to{opacity:1;transform:none;}}"
+    ".rj-stage.rj-more{padding:3px 6px;color:#c9bcb6;letter-spacing:1px;}"
+    ".rj-stage.live{color:#8c6a3f;border-color:#e8c878;background:#fffdf6;"
+    "animation:rjStageIn .25s ease both,rjStagePulse 1.5s ease-in-out .25s infinite;}"
+    "@keyframes rjStagePulse{0%,100%{box-shadow:0 0 0 0 rgba(232,200,120,0);}"
+    "50%{box-shadow:0 0 0 3px rgba(232,200,120,.30);}}"
+    "@media (prefers-reduced-motion:reduce){.rjsk .b{animation:none;}"
+    ".rj-stage,.rj-stage.live{animation:none;}}"
     "</style>"
 )
 _SKELETON_BARS = (
@@ -481,9 +495,59 @@ class ShimmerStreamRenderer:
         self.last_draw = 0.0
         self.think_buf = ""
         self.last_think_draw = 0.0
+        self.think_stages: list[tuple[str, str]] = []   # [(icon, label)] 已走過的推理階段
+        self._think_scanned = 0                          # 已掃描到的 think_buf 位移
+        self._think_trimmed = False                      # 階段數爆表、最早幾段已被裁掉
+
+    # 推理階段偵測。模型（Gemma）用英文思考，靠英文轉折詞判斷它走到哪一步；
+    # 刻意不翻譯思考內容本身——那是模型真實的思維鏈，翻了反而失真。
+    _THINK_STAGES = [
+        ("🎯", "理解問題", re.compile(r"\b(?:first|the user (?:is|wants|asks|needs)|i need to|let me start|okay,? so)\b", re.I)),
+        ("🔍", "查證",     re.compile(r"\b(?:let me check|i should (?:check|verify|search)|search(?:ing)? for|look(?:ing)? up|according to)\b", re.I)),
+        ("⚖️", "權衡",     re.compile(r"\b(?:however|although|on the other hand|alternatively|trade-?offs?)\b", re.I)),
+        ("🔁", "修正",     re.compile(r"\b(?:actually|wait|let me reconsider|on second thought)\b", re.I)),
+        ("✅", "收斂",     re.compile(r"\b(?:therefore|thus|hence|in conclusion|finally|to summari[sz]e|so the answer)\b", re.I)),
+    ]
+    _THINK_MAX_STAGES = 8      # 超過就丟掉最舊的，避免膠囊列爆版（會補一個 ⋯ 表示前面還有）
+    _THINK_SCAN_OVERLAP = 24   # 回頭重疊掃描，避免轉折詞剛好被切在兩個 chunk 中間而漏掉
+
+    def _scan_think_stages(self) -> None:
+        start = max(0, self._think_scanned - self._THINK_SCAN_OVERLAP)
+        chunk = self.think_buf[start:]
+        if not chunk:
+            return
+        self._think_scanned = len(self.think_buf)
+        hits = []
+        for icon, label, pat in self._THINK_STAGES:
+            m = pat.search(chunk)
+            if m:
+                hits.append((m.start(), icon, label))
+        for _pos, icon, label in sorted(hits):
+            # 同一階段連續重複不重覆推入（來回震盪才有意義，連擊沒有）
+            if self.think_stages and self.think_stages[-1][1] == label:
+                continue
+            self.think_stages.append((icon, label))
+        if len(self.think_stages) > self._THINK_MAX_STAGES:
+            del self.think_stages[:-self._THINK_MAX_STAGES]
+            self._think_trimmed = True   # 記住前面有被裁掉，顯示時補 ⋯
+
+    def _think_stages_html(self) -> str:
+        if not self.think_stages:
+            return ""
+        last = len(self.think_stages) - 1
+        # 注意：這裡刻意不用巢狀同款引號的 f-string（PEP 701 需要 Python 3.12），
+        # devcontainer 跑的是 3.11，寫成那樣會在部署環境直接 SyntaxError。
+        chips = []
+        if self._think_trimmed:
+            # 明示「前面還有更早的階段」，避免使用者以為思考是從中途開始的
+            chips.append("<span class='rj-stage rj-more'>⋯</span>")
+        for i, (icon, label) in enumerate(self.think_stages):
+            cls = "rj-stage live" if i == last else "rj-stage"
+            chips.append(f"<span class='{cls}'>{icon} {_esc_html(label)}</span>")
+        return "<div class='rj-stages'>" + "".join(chips) + "</div>"
 
     def feed_thinking(self, delta: str):
-        """思考期即時顯示：骨架條下方以灰色小字串流思考片段（正式文字開始後不再顯示）。"""
+        """思考期即時顯示：階段膠囊 + 灰色小字串流思考片段（正式文字開始後不再顯示）。"""
         if not delta or self.buf:
             return
         self.think_buf += delta
@@ -491,10 +555,18 @@ class ShimmerStreamRenderer:
         if now - self.last_think_draw < 0.15:
             return
         self.last_think_draw = now
-        tail = re.sub(r"\s+", " ", self.think_buf)[-180:]
-        # 思考片段放在骨架條「上方」
+        self._scan_think_stages()
+        tail = re.sub(r"\s+", " ", self.think_buf)
+        if len(tail) > 180:
+            # 原本直接 [-180:] 會切在單字中間（出現 ation="台北市" 這種殘句）。
+            # 改成往右退到最近的詞邊界，並用「…」明示這是接續片段。
+            tail = tail[-180:]
+            sp = tail.find(" ")
+            tail = "… " + (tail[sp + 1:] if 0 <= sp <= 48 else tail)
+        # 階段膠囊 + 思考片段放在骨架條「上方」
         self.ph.markdown(
-            _SKELETON_CSS + f"<div class='rj-think'>💭 {_esc_html(tail)}</div>" + _SKELETON_BARS,
+            _SKELETON_CSS + self._think_stages_html()
+            + f"<div class='rj-think'>💭 {_esc_html(tail)}</div>" + _SKELETON_BARS,
             unsafe_allow_html=True,
         )
 
@@ -571,8 +643,13 @@ class ShimmerStreamRenderer:
             f".st-key-{scope_key}{{position:relative;overflow:hidden;}}"
             f".st-key-{scope_key} .rj-old{{position:absolute;top:0;left:0;width:100%;"
             "pointer-events:none;color:#2a241f;opacity:0;"  # 基底透明：動畫沒跑也不會殘留
+            # user-select:none：這層只是淡出殘影，不該被 Ctrl+A／拖曳選取一起複製走。
+            # 放在基底規則而非動畫終點 → 就算動畫被背景分頁節流而沒跑完也一樣有效。
+            "user-select:none;-webkit-user-select:none;"
             "animation:rjXOut .55s ease both;}"
-            "@keyframes rjXOut{from{opacity:1;}to{opacity:0;}}"
+            # visibility 依 CSS 規範：端點含 visible 時，整段動畫維持 visible，
+            # 只在 t=1 才翻成 hidden → 淡出過程不受影響，結束後才真正退出可及性樹。
+            "@keyframes rjXOut{from{opacity:1;visibility:visible;}to{opacity:0;visibility:hidden;}}"
             f".st-key-{scope_key}-new{{animation:rjXIn .55s ease both;}}"
             "@keyframes rjXIn{from{opacity:0;}to{opacity:1;}}"
             "@media (prefers-reduced-motion:reduce){"
@@ -581,7 +658,8 @@ class ShimmerStreamRenderer:
             "</style>"
         )
         cont = self.ph.container(key=scope_key)
-        cont.markdown(xfade_css + (f"<div class='rj-old'>{old_plain_html}</div>" if old_plain_html else ""),
+        cont.markdown(xfade_css + (f"<div class='rj-old' aria-hidden='true'>{old_plain_html}</div>"
+                                   if old_plain_html else ""),
                       unsafe_allow_html=True)
         new_cont = cont.container(key=f"{scope_key}-new")
         new_cont.markdown(_emphasis_to_html(normalize_markdown_for_streamlit(final_markdown)), unsafe_allow_html=True)
@@ -3439,6 +3517,11 @@ for msg in st.session_state.get("gm_chat_history", []):
         if msg.get("text"):
             _display_text = _RE_HTML_COMMENT.sub("", msg["text"]).strip()
             st.markdown(_emphasis_to_html(normalize_markdown_for_streamlit(_display_text)), unsafe_allow_html=True)
+        if msg.get("pending_retry"):
+            st.markdown(
+                ":orange-badge[⏳ 尚未送達] "
+                ":small[:gray[被免費層限流擋下來了，你的字還在。用下方的重試按鈕重送即可。]]"
+            )
         if msg.get("images"):
             for fn, thumb, _orig in msg["images"]:
                 st.image(thumb, caption=fn, width=220)
@@ -3784,10 +3867,20 @@ if prompt or retry_payload:
         user_text = (retry_payload.get("text") or "").strip()
         images_for_history = list(retry_payload.get("images") or [])
         files = []
+        # 待重試的那則提問還留在歷史裡（純顯示用）。這裡先移除，讓底下的流程以正常回合
+        # 重新寫入；不移除的話 build_lc_messages 會把同一句話餵給模型兩次。
+        _h = st.session_state.get("gm_chat_history") or []
+        if _h and _h[-1].get("role") == "user" and _h[-1].get("pending_retry"):
+            _h.pop()
     else:
         user_text = (prompt.text or "").strip()
         images_for_history = []
         files = getattr(prompt, "files", []) or []
+        # 使用者選擇問別的而不是重試 → 放棄重試通道並清掉標記。
+        # 舊提問本身留在歷史（它確實問過，只是沒被回答），只是不再顯示「待重試」。
+        st.session_state.pop("gm_retry_payload", None)
+        for _m in st.session_state.get("gm_chat_history") or []:
+            _m.pop("pending_retry", None)
     total_payload_bytes = 0
 
     for f in files:
@@ -4111,10 +4204,12 @@ if prompt or retry_payload:
                 raise
             msg = str(e)
             if "429" in msg or "quota" in msg.lower() or "exhausted" in msg.lower() or "ResourceExhausted" in type(e).__name__:
-                # 把剛送出的提問退回（從歷史移除）並暫存 → 使用者可一鍵重試，不用重打
+                # 提問「留在畫面上」並標記待重試 → 使用者看得到自己打的字，不用重打。
+                # （原本是從歷史 pop 掉，體感就是「我送出的訊息不見了」；重試時會在
+                #   retry_payload 分支先移除這則，避免同一句話被送進模型兩次。）
                 hist = st.session_state.get("gm_chat_history") or []
                 if hist and hist[-1].get("role") == "user":
-                    hist.pop()
+                    hist[-1]["pending_retry"] = True
                 st.session_state["gm_retry_payload"] = {"text": user_text, "images": images_for_history}
                 if DEV_MODE:
                     st.exception(e)  # dev 模式保留現場，不自動 rerun
