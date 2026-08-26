@@ -132,6 +132,28 @@ GENERAL_MODEL = "gemma-4-31b-it"           # 主腦：General mode / pipeline �
 PREMIUM_MODEL = "gemini-3-flash-preview"   # 稀缺精銳：免費層實測「每天只有 20 次」→ 只用在 CP1/CP2 審查，用盡自動退 31b
 BACKGROUND_MODEL = "gemma-4-26b-a4b-it"    # 背景雜活：歷史摘要 / 查詢生成 / 文獻標註（獨立配額池，使用者看不到輸出）
 GEMINI_EMBED_MODEL = "gemini-embedding-001"
+
+# ── 模型備援鏈：撞配額(429)時往後退一格，冷卻後自動升回第一格 ──────────────
+# ⚠️ 成立前提：Google 免費層配額是「每個模型獨立計算」。若你的方案是專案層級共用配額，
+#    換模型不會有幫助（驗證法：撞 429 時看歷史摘要（走 26b 背景池）是否仍正常運作）。
+# ⚠️ 只填實測可用的模型 ID。不存在的 ID 會在第一次失敗後被標記並永久跳過（見
+#    _mark_model_dead），但仍會浪費一次呼叫。用 tools/list-google-models.py 可列出
+#    你的金鑰實際支援哪些模型，再回來擴充這張表。
+# 依 https://ai.google.dev/gemini-api/docs/pricing 的免費層清單挑選。
+# ⚠️ 「免費」不等於「配額大」：同一頁把 gemini-3-flash-preview 也標為免費，
+#    但本專案實測它每天只有 20 次 → 稀缺模型不可放進高頻用途（見 PREMIUM_MODEL）。
+#    每個模型有各自的 RPM/RPD，換模型能繞開的是「單一模型的分鐘窗」。
+MODEL_CHAINS: dict[str, tuple[str, ...]] = {
+    # Gemma 主腦優先（風格與工具行為一致），撐不住才跨到 Gemini flash 家族。
+    "general":  (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash", "gemini-3.6-flash"),
+    # socratic 刻意只用「大模型」：SOCRATIC_OVERLAY 的硬性禁止清單（只問不答）
+    # 需要夠強的模型才撐得住，本專案實測 flash-lite 會漏答案 → 全鏈不含任何 lite 變體。
+    "socratic": (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash"),
+    "research": (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash"),
+    # Fast 要的是「快」→ 優先在 lite 變體之間輪替，真的都掛了才用完整版 flash。
+    "fast":     (FAST_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash-lite"),
+}
+MODEL_COOLDOWN_SECS = 180      # 降級後多久嘗試升回主力模型
 GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 TRIM_LAST_N_USER_TURNS = 18
@@ -189,6 +211,79 @@ def match_skill_hint(text: str) -> str | None:
         if pat.search(text or ""):
             return name
     return None
+
+# ── 回合結束後的 skill 建議（刻意與上面的 SKILL_HINT_RES 分開）─────────────────
+# 為什麼要兩張表：SKILL_HINT_RES 命中會「強制升級 General」（見上方註解），放寬會讓更多
+# 對話跳到 31b、加劇免費層限流。這張表只用於「答完之後回顧」，沒有任何成本副作用，
+# 因此可以放寬到涵蓋全部白名單 skill。改這裡不會影響模型路由。
+SKILL_SUGGEST_RES: dict[str, re.Pattern] = {
+    "market-research": re.compile(r"TAM|SAM|SOM|市場規模|市場調查|市場區隔|競品|目標客群", re.I),
+    "product-research": re.compile(r"用戶訪談|使用者訪談|假設驗證|機會評估|產品需求|PMF|痛點"),
+    "statistical-analyst": re.compile(r"假設檢定|顯著|信賴區間|p值|p 值|迴歸|樣本數|相關性|統計"),
+    "financial-analyst": re.compile(r"DCF|估值|財報|現金流|CAC|LTV|ARR|MRR|毛利|損益|投報", re.I),
+    "data-quality-auditor": re.compile(r"資料品質|缺值|遺漏值|離群|重複值|資料清理|髒資料"),
+    "universal-scraping-architect": re.compile(r"爬蟲|爬取|抓網頁|反爬|scrap", re.I),
+    "karpathy-coder": re.compile(r"重構|過度工程|最小改動|程式碼太|技術債"),
+    "security-checklist": re.compile(r"資安|安全性|secret|金鑰|注入|injection|權限|加密|漏洞", re.I),
+    "sql-and-database": re.compile(r"SQL|資料庫|查詢語法|migration|索引|交易|SQLAlchemy", re.I),
+    "python_best_practices": re.compile(r"python|type hint|pytest|型別註記|單元測試", re.I),
+    "md-document": re.compile(r"轉成HTML|轉成 HTML|排版|做成文件|報告格式|目錄", re.I),
+    "landing": re.compile(r"landing|落地頁|官網|產品首頁|行銷頁", re.I),
+    "caveman": re.compile(r"太長|簡短|精簡|廢話|講重點"),
+    "reflect": re.compile(r"想偏|重新評估|退一步|方向對嗎|是不是搞錯"),
+    "roast": re.compile(r"誠實|吐槽|直說|真的可行嗎|幫我挑毛病"),
+}
+
+# 手寫的常見組合流程：命中其中一步時，順帶告訴使用者它的上下游搭配長什麼樣。
+SKILL_FLOWS: list[tuple[str, list[str]]] = [
+    ("市場機會評估", ["market-research", "statistical-analyst", "financial-analyst"]),
+    ("從爬取到洞察", ["universal-scraping-architect", "data-quality-auditor", "statistical-analyst"]),
+    ("資料分析前置", ["data-quality-auditor", "statistical-analyst"]),
+    ("上線前程式碼健檢", ["security-checklist", "python_best_practices", "karpathy-coder"]),
+    ("產品決策", ["product-research", "statistical-analyst"]),
+]
+
+
+def suggest_unused_skills(text: str, used: list | None = None,
+                          available: dict | None = None, max_n: int = 2) -> list[str]:
+    """回傳「內容命中、但本回合沒載入」的 skill 名。純函式（零 LLM 呼叫）可測。
+
+    used       — 本回合已載入的 skill（meta["skills_loaded"]）
+    available  — 目前實際可用的 skill 索引（預設用全域 SKILLS）
+    """
+    pool = SKILLS if available is None else available
+    used_set = set(used or [])
+    out: list[str] = []
+    for name, pat in SKILL_SUGGEST_RES.items():
+        if name in used_set or name not in pool:
+            continue
+        if pat.search(text or ""):
+            out.append(name)
+            if len(out) >= max_n:
+                break
+    return out
+
+
+def match_skill_flow(names: list[str]) -> tuple[str, list[str]] | None:
+    """建議的 skill 若落在某條常見流程上，回傳 (流程名, 完整步驟)。純函式可測。"""
+    for flow_name, steps in SKILL_FLOWS:
+        if any(n in steps for n in names):
+            return flow_name, steps
+    return None
+
+
+def build_skill_suggestion(text: str, used: list | None = None) -> dict | None:
+    """組出要存進歷史訊息的建議物件；沒有可建議的就回 None（→ 不渲染任何東西）。"""
+    names = suggest_unused_skills(text, used)
+    if not names:
+        return None
+    flow = match_skill_flow(names)
+    return {
+        "skills": names,
+        "flow_name": flow[0] if flow else None,
+        "flow_steps": flow[1] if flow else None,
+        "composed": None,   # 按下按鈕後才由 BACKGROUND_MODEL 生成
+    }
 
 # --- 提問引導（socratic）模式 ---
 # 模式狀態放 harness（gm_mode_sticky session key），不指望弱模型跨回合記得自己在什麼模式。
@@ -1249,7 +1344,7 @@ def parse_retry_delay(msg: str) -> float | None:
     return None
 
 
-def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS):
+def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
     """暫時性錯誤時指數退避重試：429/quota（免費額度）＋ 503 UNAVAILABLE（flash 高峰）
     ＋ 500 INTERNAL（Google 端暫時性，gemma 池實測常見）。其他錯誤直接拋出。
     配額類錯誤（429/quota——RPM/TPM 都是「分鐘窗」）短階梯根本等不完，會白白燒光重試次數：
@@ -1286,8 +1381,26 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS):
                 or "InternalServerError" in name
             )
             last_exc = e
+
+            # 模型 ID 不存在／不支援 → 標記後立刻換下一格，不浪費退避次數
+            if purpose and ("404" in msg or "NOT_FOUND" in msg
+                            or "not found" in msg.lower()
+                            or "is not supported" in msg.lower()):
+                _mark_model_dead(current_model_name(purpose))
+                if downgrade_model(purpose):
+                    delay_override = 0.0
+                    continue
+                raise
+
             if not retriable:
                 raise
+
+            # 配額錯誤且還有備援模型 → 直接換模型重試（不同配額池，不必等退避）
+            if is_quota and purpose and downgrade_model(purpose):
+                _status(f"⏳ 主模型限流，改用備援模型（{current_model_name(purpose)}）…")
+                delay_override = 0.0
+                continue
+
             if is_quota:
                 # 官方建議秒數優先；沒有就把下一段升到長階梯同位值（分鐘窗要等得夠久才有意義）
                 delay_override = parse_retry_delay(msg)
@@ -1311,6 +1424,66 @@ def _make_llm(model: str, **kw) -> ChatGoogleGenerativeAI:
     except Exception:
         # thinking 參數不被支援時退回無參數版本
         return ChatGoogleGenerativeAI(model=model, max_retries=API_MAX_RETRIES)
+
+# ── 備援鏈狀態：哪個用途目前降到第幾格 ─────────────────────────────────
+def _model_tiers() -> dict:
+    return st.session_state.setdefault("gm_model_tier", {})    # purpose -> (tier, 降級時刻)
+
+
+def _dead_models() -> set:
+    return st.session_state.setdefault("gm_model_dead", set())  # 確認不可用的模型 ID
+
+
+def _chain_for(purpose: str) -> tuple:
+    return MODEL_CHAINS.get(purpose) or (GENERAL_MODEL,)
+
+
+def current_model_name(purpose: str) -> str:
+    """本回合該用哪個模型：含冷卻自動升回、跳過已知不可用的。純讀取不改狀態（冷卻除外）。"""
+    chain = _chain_for(purpose)
+    tiers = _model_tiers()
+    tier, ts = tiers.get(purpose, (0, 0.0))
+    if tier and (time.time() - ts) > MODEL_COOLDOWN_SECS:
+        tier = 0                       # 冷卻結束：試著升回主力模型
+        tiers[purpose] = (0, 0.0)
+    dead = _dead_models()
+    for i in range(tier, len(chain)):
+        if chain[i] not in dead:
+            return chain[i]
+    return chain[-1]
+
+
+def downgrade_model(purpose: str) -> bool:
+    """往後退一格。回傳 True 表示真的換到了另一個模型（False = 已經到底）。"""
+    chain = _chain_for(purpose)
+    tiers = _model_tiers()
+    tier = tiers.get(purpose, (0, 0.0))[0]
+    if tier + 1 >= len(chain):
+        return False
+    tiers[purpose] = (tier + 1, time.time())
+    return True
+
+
+def _mark_model_dead(model: str) -> None:
+    """模型 ID 不存在／不支援 → 記下來，本 session 不再嘗試（避免每回合都浪費一次呼叫）。"""
+    _dead_models().add(model)
+
+
+def is_downgraded(purpose: str) -> bool:
+    """目前是否跑在備援模型上（給 UI 徽章用）。"""
+    return current_model_name(purpose) != _chain_for(purpose)[0]
+
+
+@st.cache_resource(show_spinner=False)
+def _llm_by_name(model: str, thinking: str = "") -> ChatGoogleGenerativeAI:
+    return _make_llm(model, thinking_level=thinking) if thinking else _make_llm(model)
+
+
+def llm_for(purpose: str, thinking: str = "") -> ChatGoogleGenerativeAI:
+    """依用途取得「目前該用的」模型。務必在重試閉包『內部』呼叫，
+    否則降級後拿到的還是舊模型（這是整套機制唯一的使用陷阱）。"""
+    return _llm_by_name(current_model_name(purpose), thinking)
+
 
 @st.cache_resource(show_spinner=False)
 def get_fast_llm() -> ChatGoogleGenerativeAI:
@@ -2414,7 +2587,9 @@ def run_deep_research_pipeline(topic: str, focus: str = "") -> dict:
         state = {"topic_hash": thash, "topic": topic, "focus": focus, "degraded": []}
     st.session_state["gm_dr_state"] = state
 
-    llm_brain = get_general_llm()   # gemma-4-31b：定題、來源分級、綜整、報告（CP1/CP2 走 premium wrapper）
+    # research 用途的備援鏈；pipeline 內模型只解析一次（各階段共用同一顆），
+    # 所以它承接的是「本回合開始前已發生的降級」，不會在 pipeline 中途換模型。
+    llm_brain = llm_for("research", thinking="high")   # 預設 gemma-4-31b：定題、來源分級、綜整、報告
     llm_bg = get_background_llm()   # gemma-4-26b：查詢生成、文獻標註（機械活，走背景配額池）
     _rt_meta()["db_used"] = _rt_meta().get("db_used", False)  # 保持既有 meta
 
@@ -3509,7 +3684,76 @@ def _render_history_process(proc: dict):
                     st.markdown(_emphasis_to_html(normalize_markdown_for_streamlit(rec.get("content") or "")),
                                 unsafe_allow_html=True)
 
-for msg in st.session_state.get("gm_chat_history", []):
+def _skill_label(name: str) -> str:
+    """白名單描述是「短名——細節」格式，取短名當顯示標籤。"""
+    desc = (SKILLS.get(name) or {}).get("description") or ""
+    head = desc.split("——")[0].strip()
+    return head or name
+
+
+def _compose_skill_flow(question: str, names: list[str]) -> str:
+    """按鈕觸發時才呼叫：用 BACKGROUND_MODEL（獨立配額池）組一套客製化流程。
+    失敗回空字串——這是加值功能，絕不能讓它擋住主流程。"""
+    try:
+        index = "\n".join(
+            f"- {n}：{(SKILLS.get(n) or {}).get('description') or ''}" for n in SKILLS
+        )[:3000]
+        resp = invoke_with_backoff(lambda: get_background_llm().invoke([
+            SystemMessage(
+                "你是工作流程設計師。根據使用者的問題與一份可用技能索引，設計一套 2-4 步的解題流程。"
+                "每一步格式：「步驟N. **技能名** — 在這一步具體做什麼（一句話）」。"
+                "只能使用索引中真實存在的技能名稱，不可自創。"
+                "最後補一行「⚠️ 這樣做的前提：…」點出這套流程最可能失效的假設。"
+                "全程繁體中文、台灣用語，不要客套開場白。"
+            ),
+            HumanMessage(
+                f"使用者的問題：{(question or '')[:600]}\n\n"
+                f"特別相關的技能：{'、'.join(names)}\n\n可用技能索引：\n{index}"
+            ),
+        ]))
+        return extract_text_from_content(resp.content).strip()
+    except Exception:
+        return ""
+
+
+def _render_skill_suggestion(msg: dict, idx: int) -> None:
+    """輕提示（零成本）＋『組一套流程』按鈕（按了才花一次背景池呼叫）。"""
+    sug = msg.get("suggest") or {}
+    names = [n for n in (sug.get("skills") or []) if n in SKILLS]
+    if not names:
+        return
+    # 用徽章而不是粗體：:gray[] 會把 **粗體** 吃掉，skill 名稱反而完全不突出，
+    # 跟「讓使用者發現功能」的目的背道而馳。徽章也和既有的 🧭 引導徽章同一套語言。
+    chips = " ".join(f":violet-badge[{_skill_label(n)}]" for n in names)
+    line = f":small[:gray[🧩 這類問題也可以搭配]] {chips}"
+    if sug.get("flow_name"):
+        steps = " → ".join(_skill_label(x) for x in (sug.get("flow_steps") or []))
+        line += f" :small[:gray[｜常見流程「{sug['flow_name']}」：{steps}]]"
+    st.markdown(line)
+
+    if sug.get("composed"):
+        with st.expander("🧩 建議流程", expanded=True):
+            st.markdown(sug["composed"])
+        return
+    if st.button("🧩 幫我組一套流程", key=f"gm_skillflow_{idx}"):
+        # 往前找最近一則使用者提問當作脈絡
+        hist = st.session_state.get("gm_chat_history") or []
+        question = ""
+        for j in range(min(idx, len(hist)) - 1, -1, -1):
+            if hist[j].get("role") == "user":
+                question = hist[j].get("text") or ""
+                break
+        with st.spinner("安妮亞在拼流程⋯"):
+            out = _compose_skill_flow(question, names)
+        if out:
+            sug["composed"] = out
+            msg["suggest"] = sug
+            st.rerun()
+        else:
+            st.caption("流程組不出來（背景模型暫時無法使用），稍後再試 🙏")
+
+
+for idx, msg in enumerate(st.session_state.get("gm_chat_history", [])):
     _avatar = _MODE_AVATAR.get(msg.get("mode")) if msg.get("role") == "assistant" else None
     with st.chat_message(msg.get("role", "assistant"), avatar=_avatar):
         if msg.get("badges"):
@@ -3540,6 +3784,11 @@ for msg in st.session_state.get("gm_chat_history", []):
                 _render_history_process(proc)
             except Exception:
                 pass
+        if msg.get("suggest"):
+            try:
+                _render_skill_suggestion(msg, idx)
+            except Exception:
+                pass   # 加值功能，壞掉不能影響對話本身
 
 # 提問引導模式指示器（模式狀態放 harness；按鈕或說「直接說」都能退出）
 if st.session_state.get("gm_mode_sticky") == "socratic":
@@ -3576,15 +3825,18 @@ def run_fast_turn_streaming(lc_msgs: list, renderer: "ShimmerStreamRenderer") ->
             "否則靠既有知識回答，不確定的具體事實一律加註「（未查證）」。）"
         )
     system = SystemMessage(sys_text)
-    base_llm = get_fast_llm()
-    llm = base_llm.bind_tools([GOOGLE_SEARCH_TOOL]) if grounding_up else base_llm
-
     def _consume():
         renderer.reset()
+        # 模型與 grounding 都在閉包「內部」解析：
+        #  - 被限流降級後，重試會自動改用備援模型（在外面解析就拿到舊的）
+        #  - grounding 配額掛掉時只要設 gm_grounding_down，下次重試自動退成無搜尋版
+        _llm = llm_for("fast")
+        if not st.session_state.get("gm_grounding_down"):
+            _llm = _llm.bind_tools([GOOGLE_SEARCH_TOOL])
         full = None
         gate_buf = ""
         gate_open = False
-        for c in llm.stream([system] + lc_msgs):
+        for c in _llm.stream([system] + lc_msgs):
             full = c if full is None else full + c
             tdelta = extract_thinking_from_content(c.content)
             if tdelta:
@@ -3620,10 +3872,10 @@ def run_fast_turn_streaming(lc_msgs: list, renderer: "ShimmerStreamRenderer") ->
                 raise
             if "free_tier_requests" in str(e):
                 # 模型本身 RPM 撞牆（非 grounding 配額）→ grounding 沒壞，照常退避重試
-                return invoke_with_backoff(_consume)
+                return invoke_with_backoff(_consume, purpose="fast")
             st.session_state["gm_grounding_down"] = True
-            llm = base_llm  # 退回無搜尋版重跑本回合（closure 讀同一個變數）
-    return invoke_with_backoff(_consume)
+            # 不必再重綁 llm：_consume 每次執行都重讀 gm_grounding_down 決定要不要掛搜尋
+    return invoke_with_backoff(_consume, purpose="fast")
 
 
 def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
@@ -3720,13 +3972,15 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     # ✅ 手動 sequential tool loop（不用 LangGraph ToolNode：它在 worker thread 執行工具，
     #    st.session_state / st.status 會靜默失效 → 計數器、log、進度 UI 全部丟失，實測確認）
     tool_map = {t.name: t for t in tools}
-    llm_with_tools = get_general_llm().bind_tools(tools)
+    _purpose = "socratic" if socratic else "general"
     msgs = [SystemMessage(instructions)] + list(lc_msgs)
     final_resp = None
 
     def _consume_round():
-        """串流一輪：thinking 片段與 text delta 都即時餵給 renderer。"""
+        """串流一輪：thinking 片段與 text delta 都即時餵給 renderer。
+        模型在這裡面才解析 → 被限流降級後，重試會自動改用備援模型。"""
         renderer.reset()
+        llm_with_tools = llm_for(_purpose, thinking="high").bind_tools(tools)
         full = None
         for c in llm_with_tools.stream(msgs):
             full = c if full is None else full + c
@@ -3745,7 +3999,7 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     code_run_demanded = False  # 程式碼未驗證守門，同樣只重試一次
 
     for _round in range(MAX_TOOL_ROUNDS):
-        resp = invoke_with_backoff(_consume_round)
+        resp = invoke_with_backoff(_consume_round, purpose=_purpose)
         msgs.append(resp)
         tool_calls = getattr(resp, "tool_calls", None) or []
         if not tool_calls:
@@ -3824,7 +4078,7 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
         def _consume_forced():
             renderer.reset()
             full = None
-            for c in get_general_llm().stream(msgs):
+            for c in llm_for(_purpose, thinking="high").stream(msgs):
                 full = c if full is None else full + c
                 tdelta = extract_thinking_from_content(c.content)
                 if tdelta:
@@ -3834,7 +4088,7 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
                     renderer.feed(delta)
             return full
 
-        final_resp = invoke_with_backoff(_consume_forced)
+        final_resp = invoke_with_backoff(_consume_forced, purpose=_purpose)
 
     ai_text = extract_text_from_content(final_resp.content).strip()
 
@@ -4034,6 +4288,8 @@ if prompt or retry_payload:
                             "docs": [],
                             "mode": "fast",
                             "badges": fast_badges_md,
+                            # Fast 沒有工具、載不了 skill → used 一律空
+                            "suggest": build_skill_suggestion(user_text, []),
                         })
                         status.update(label="✅ 安妮亞回答完了！", state="complete", expanded=False)
                         st.stop()
@@ -4062,8 +4318,14 @@ if prompt or retry_payload:
 
                     # badges_markdown 只認 fast/general/research，升級/引導標記用額外徽章附加
                     escalate_badge = " :orange-badge[↑ 自動升級]" if escalated_from_fast else ""
+                    # 跑在備援模型上要讓使用者知道，否則回答品質變差會找不到原因
+                    _dg_purpose = "socratic" if socratic_active else "general"
+                    downgrade_badge = (
+                        f" :orange-badge[↓ 備援 {current_model_name(_dg_purpose)}]"
+                        if is_downgraded(_dg_purpose) else ""
+                    )
                     socratic_badge = " :violet-badge[🧭 引導]" if socratic_active else ""
-                    badges_ph.markdown(badges_markdown(mode="General", db_used=False, web_used=False, doc_calls=0, web_calls=0) + escalate_badge + socratic_badge)
+                    badges_ph.markdown(badges_markdown(mode="General", db_used=False, web_used=False, doc_calls=0, web_calls=0) + escalate_badge + socratic_badge + downgrade_badge)
 
                     gif_in_status_ph = status.empty()
                     gif_in_status_ph.image("anime/anya-jumping-rope.gif")
@@ -4186,6 +4448,7 @@ if prompt or retry_payload:
                         "badges": general_badges_md,
                         "process": process_snapshot,
                         "widget": st.session_state["_gm_rt"].get("widget"),
+                        "suggest": build_skill_suggestion(user_text, meta.get("skills_loaded")),
                     })
 
                     # 跨 session 教訓：本回合若「策略卡關→最終解決」，背景蒸餾一條 search_strategy（fire-and-forget）
