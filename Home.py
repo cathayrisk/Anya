@@ -2197,7 +2197,7 @@ def think(reflection: str, key_finding: str, next_action: str, confidence: int) 
     action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
 
     _status(
-        f"💭 安妮亞在想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
+        f"💭 安妮亞再想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
         write=f"💭 **第 {think_count} 次反思**",
     )
     _step_done(f"💡 **發現**：{key_finding[:80]}{'…' if len(key_finding) > 80 else ''}")
@@ -3576,6 +3576,64 @@ def _maybe_summarized_history(hist: list[dict]) -> tuple[str, list[dict]]:
         pass
     return "", hist  # 摘要失敗：退回原始 trim 行為
 
+# 建議注入的兩個上限：只回看最近幾則、流程文字截斷長度。
+# 這是每回合都會付的 token 成本，所以刻意保守——只帶「最近一次」的建議。
+SUGGEST_NOTE_LOOKBACK = 4
+SUGGEST_NOTE_MAX_CHARS = 420
+
+
+def _suggestion_context_note(hist: list) -> str:
+    """把「畫面上提示過的技能／流程建議」轉成給模型的系統註記。
+
+    為什麼需要：那些建議存在 msg["suggest"]，而 build_lc_messages 只讀 msg["text"]
+    → 模型看不到自己建議過什麼。使用者說「依你的建議」時，沒有這段註記它只能猜。
+    只取最近一次、且限制在最近 SUGGEST_NOTE_LOOKBACK 則內（太舊的建議提了是噪音）。
+    純函式可測。"""
+    if not hist:
+        return ""
+    for m in reversed(hist[-SUGGEST_NOTE_LOOKBACK:]):
+        sug = m.get("suggest") or {}
+        names = [n for n in (sug.get("skills") or []) if n]
+        if not names:
+            continue
+        parts = [
+            "（系統：稍早已在畫面上向使用者提示過以下技能／流程建議）",
+            "相關技能：" + "、".join(names),
+        ]
+        flow = (sug.get("composed") or "").strip()
+        if flow:
+            parts.append("建議流程：" + flow[:SUGGEST_NOTE_MAX_CHARS])
+        elif sug.get("flow_name"):
+            steps = [x for x in (sug.get("flow_steps") or []) if x]
+            if steps:
+                parts.append(f"常見流程「{sug['flow_name']}」：" + " → ".join(steps))
+        parts.append(
+            "使用者若說「依你的建議」「照那個流程」「照上面說的」，即指這段；"
+            "需要時先用 load_skill 載入對應技能再作業。"
+        )
+        return "\n".join(parts)
+    return ""
+
+
+def _merge_consecutive_roles(msgs: list) -> list:
+    """合併連續同角色的訊息。
+
+    為什麼需要：429 時提問會保留在歷史裡並標記 pending_retry（讓使用者看得到自己
+    打的字）。若使用者接著改問別的，歷史就會以「未被回答的 user 訊息」收尾，
+    加上本回合的提問 → 連續兩則 user。Gemma 對角色交替敏感，先合併掉比較安全。
+    content 不是字串（含圖片 blocks）時一律不合併。純函式可測。"""
+    out: list = []
+    for m in msgs:
+        prev = out[-1] if out else None
+        if (prev is not None and type(prev) is type(m)
+                and isinstance(getattr(prev, "content", None), str)
+                and isinstance(getattr(m, "content", None), str)):
+            out[-1] = type(m)(prev.content + "\n\n" + m.content)
+        else:
+            out.append(m)
+    return out
+
+
 def build_lc_messages(current_text: str, current_images: list) -> list:
     """歷史（不含本回合）→ LC messages，最後接上本回合 HumanMessage（含圖片 blocks）。
     歷史過長時自動觸發滾動摘要（16k TPM 保護）。"""
@@ -3595,6 +3653,16 @@ def build_lc_messages(current_text: str, current_images: list) -> list:
         elif role == "assistant":
             msgs.append(AIMessage(text))
 
+    # 把畫面上的技能建議補進脈絡（模型讀不到 msg["suggest"]，見該函式 docstring）。
+    # 放在歷史之後、本回合提問之前 → 對模型而言是最新鮮的一段背景。
+    # 只在歷史以 assistant 收尾時注入：429 保留提問的情境下歷史可能以 user 收尾
+    # （見 pending_retry），那時再插一則 Human 會造成連續兩則同角色訊息。
+    # 這是每回合必經路徑，寧可少注入一次，也不要冒破壞角色順序的風險。
+    _sug_note = _suggestion_context_note(hist)
+    if _sug_note and (not msgs or isinstance(msgs[-1], AIMessage)):
+        msgs.append(HumanMessage(_sug_note))
+        msgs.append(AIMessage("了解，我記得剛才提示過的那組技能建議。"))
+
     blocks = []
     text = (current_text or "").strip() or "請根據對話內容回答。"
     blocks.append({"type": "text", "text": text})
@@ -3604,7 +3672,7 @@ def build_lc_messages(current_text: str, current_images: list) -> list:
         msgs.append(HumanMessage(text))
     else:
         msgs.append(HumanMessage(content=blocks))
-    return msgs
+    return _merge_consecutive_roles(msgs)
 
 def estimate_tokens_for_lc_messages(msgs: list) -> int:
     total_chars = 0
@@ -3811,6 +3879,16 @@ def _render_skill_suggestion(msg: dict, idx: int) -> None:
     if sug.get("composed"):
         with st.expander("🧩 建議流程", expanded=True):
             st.markdown(sug["composed"])
+        # 一鍵照做：不依賴模型理解「依你的建議」指什麼，直接送出明確指令。
+        # load_skill 只有 General 模式掛得到工具 → 同時設強制 General 旗標。
+        if st.button("▶️ 照這個流程做", key=f"gm_skillgo_{idx}"):
+            st.session_state["gm_pending_prompt"] = (
+                "請依照你剛才建議的流程處理：先用 load_skill 載入 "
+                + "、".join(names)
+                + "，再依照該流程重新處理我上一個問題。"
+            )
+            st.session_state["gm_force_general"] = True
+            st.rerun()
         return
     if st.button("🧩 幫我組一套流程", key=f"gm_skillflow_{idx}"):
         # 往前找最近一則使用者提問當作脈絡
@@ -4193,8 +4271,17 @@ if st.session_state.get("gm_retry_payload") and prompt is None:
     if st.button(f"🔁 重試上一次的提問：「{(_rp.get('text') or '')[:30]}…」", key="gm_retry_btn"):
         retry_payload = st.session_state.pop("gm_retry_payload")
 
-if prompt or retry_payload:
-    if retry_payload:
+# 「照這個流程做」按鈕塞的指令：無需再按一次，下一輪直接當成提問消費
+pending_prompt = None
+if st.session_state.get("gm_pending_prompt") and prompt is None:
+    pending_prompt = st.session_state.pop("gm_pending_prompt")
+
+if prompt or retry_payload or pending_prompt:
+    if pending_prompt:
+        user_text = (pending_prompt or "").strip()
+        images_for_history = []
+        files = []
+    elif retry_payload:
         user_text = (retry_payload.get("text") or "").strip()
         images_for_history = list(retry_payload.get("images") or [])
         files = []
@@ -4257,10 +4344,16 @@ if prompt or retry_payload:
     # ── 模式決定（零 LLM 呼叫的 heuristic；在 bubble 建立前決定 → avatar 可反映模式）──
     escalate_reason = None
     dr_interview_followup = False
+    # 讀取即消耗：放在 elif 鏈裡的話，前面分支命中時旗標不會被清掉而殘留到下一回合
+    _force_general = bool(st.session_state.pop("gm_force_general", False))
     if socratic_active:
         # 引導對話需要 31b 撐住「只問不答」的硬性禁止清單，flash-lite 撐不住會漏答案
         mode = "general"
         escalate_reason = "socratic_mode"
+    elif _force_general:
+        # 使用者按了「照這個流程做」→ 必須有工具才載得到 skill
+        mode = "general"
+        escalate_reason = "skill_flow_followup"
     elif images_for_history:
         mode = "general"
         escalate_reason = "contains_image"
