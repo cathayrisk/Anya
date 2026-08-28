@@ -2197,7 +2197,7 @@ def think(reflection: str, key_finding: str, next_action: str, confidence: int) 
     action_emoji = {"繼續搜尋": "🔄", "換工具": "🔀", "直接作答": "✅"}.get(next_action, "▶")
 
     _status(
-        f"💭 安妮亞再想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
+        f"💭 安妮亞在想一想⋯（第 {think_count} 次反思，完整度 {confidence}%）",
         write=f"💭 **第 {think_count} 次反思**",
     )
     _step_done(f"💡 **發現**：{key_finding[:80]}{'…' if len(key_finding) > 80 else ''}")
@@ -3908,6 +3908,20 @@ def _render_skill_suggestion(msg: dict, idx: int) -> None:
             st.caption("流程組不出來（背景模型暫時無法使用），稍後再試 🙏")
 
 
+def _render_latest_suggestion() -> None:
+    """把剛寫進歷史的那則建議「當回合」就畫出來。
+
+    為什麼需要：渲染建議的歷史迴圈在腳本更前面就跑完了，而建議是回合結束才寫進
+    歷史，接著 st.stop() → 本回合根本沒機會畫，使用者體感是「建議慢一拍」。
+    索引用 len-1：歷史迴圈本回合只畫到上一則，不會和這裡的按鈕 key 撞號。"""
+    h = st.session_state.get("gm_chat_history") or []
+    if h and h[-1].get("suggest"):
+        try:
+            _render_skill_suggestion(h[-1], len(h) - 1)
+        except Exception:
+            pass   # 加值功能，壞掉不能影響對話本身
+
+
 for idx, msg in enumerate(st.session_state.get("gm_chat_history", [])):
     _avatar = _MODE_AVATAR.get(msg.get("mode")) if msg.get("role") == "assistant" else None
     with st.chat_message(msg.get("role", "assistant"), avatar=_avatar):
@@ -4461,6 +4475,7 @@ if prompt or retry_payload or pending_prompt:
                             # Fast 沒有工具、載不了 skill → used 一律空
                             "suggest": build_skill_suggestion(user_text, []),
                         })
+                        _render_latest_suggestion()
                         status.update(label="✅ 安妮亞回答完了！", state="complete", expanded=False)
                         st.stop()
 
@@ -4628,6 +4643,7 @@ if prompt or retry_payload or pending_prompt:
                         except Exception:
                             pass
 
+                    _render_latest_suggestion()
                     status.update(label="✅ 安妮亞想好了！", state="complete", expanded=False)
                     st.stop()
 
