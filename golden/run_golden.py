@@ -19,13 +19,30 @@ import sys
 import ast
 import pathlib
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+def _find_root(start: pathlib.Path) -> pathlib.Path:
+    """往上找到含 Home.py 的目錄當專案根。
+
+    不要寫死 parents[N]：這個測試組可能放在 tests/golden/，也可能被搬到
+    repo 根的 golden/（實際部署就是後者），層數不一樣。"""
+    for p in [start, *start.parents]:
+        if (p / "Home.py").exists():
+            return p
+    return start.parents[min(2, len(start.parents) - 1)]
+
+
+ROOT = _find_root(pathlib.Path(__file__).resolve().parent)
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from tests.golden import cases as C           # noqa: E402
-from tests.golden import fixtures as F        # noqa: E402
+try:
+    from tests.golden import cases as C
+except ImportError:      # 測試組被搬到 repo 根的 golden/ 時
+    import cases as C           # noqa: E402
+try:
+    from tests.golden import fixtures as F
+except ImportError:
+    import fixtures as F        # noqa: E402
 
 _results: list[tuple[bool, str]] = []
 

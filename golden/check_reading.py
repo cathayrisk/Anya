@@ -22,12 +22,26 @@ import re
 import sys
 import pathlib
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+def _find_root(start: pathlib.Path) -> pathlib.Path:
+    """往上找到含 Home.py 的目錄當專案根。
+
+    不要寫死 parents[N]：這個測試組可能放在 tests/golden/，也可能被搬到
+    repo 根的 golden/（實際部署就是後者），層數不一樣。"""
+    for p in [start, *start.parents]:
+        if (p / "Home.py").exists():
+            return p
+    return start.parents[min(2, len(start.parents) - 1)]
+
+
+ROOT = _find_root(pathlib.Path(__file__).resolve().parent)
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from tests.golden import cases as C   # noqa: E402
+try:
+    from tests.golden import cases as C
+except ImportError:      # 測試組被搬到 repo 根的 golden/ 時
+    import cases as C   # noqa: E402
 
 PLANET_ZH = {
     "太陽": "Sun", "月亮": "Moon", "月球": "Moon", "水星": "Mercury",
@@ -197,7 +211,7 @@ def main():
         except ImportError:
             rep.add(False, "缺 kerykeion，落點無法查核（用有裝的直譯器重跑）")
 
-    check_citations(text, rep)
+    cited = check_citations(text, rep)
 
     if cid == 3:
         entry = bool(re.search(r"(想深入|要不要深入|可以單獨談|想先看哪)", text))
@@ -213,8 +227,13 @@ def main():
         rep.ask("是否只談十宮／天頂／十宮主星／土星／六宮，而非重講主線？")
         rep.ask("深度是否夠：配置 → 意義 → 自動 vs 成熟 → 可執行？")
     elif cid == 6:
-        rep.add(bool(re.search(r"(來源|依據|參考|查到|文章)", text)),
-                "有標明哪些說法有來源")
+        claims_src = bool(re.search(r"(文獻|來源|查證|參考).{0,12}(解讀|說法|內容|專文)?", text))
+        rep.add(claims_src, "有標明哪些說法有來源")
+        # 宣稱查證過卻不給網址 → 使用者無從核對。這條原本會「零網址空過」，
+        # 正式站實測就踩到：解讀寫「查證了權威占星文獻」但一個連結都沒有。
+        if claims_src:
+            rep.add(len(cited) >= 1,
+                    f"宣稱有查證就必須附網址（找到 {len(cited)} 個）")
         rep.ask("有來源與通則性說法是否分得出來？")
     elif cid == 10:
         hits = RE_PREDICT.findall(text)
