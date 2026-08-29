@@ -2471,7 +2471,7 @@ _WIDGET_EXTERNAL_RE = re.compile(r"""(?:src\s*=\s*["']?|url\(\s*["']?)\s*https?:
 
 @tool
 def get_natal_chart(name: str, birthdate: str, birth_time: str = "",
-                    lat: float = 0.0, lng: float = 0.0, tz: str = "",
+                    city: str = "", lat: float = 0.0, lng: float = 0.0, tz: str = "",
                     full_context: bool = False) -> str:
     """計算本命星盤（Swiss Ephemeris 精確計算，不是估算）。
 
@@ -2482,6 +2482,9 @@ def get_natal_chart(name: str, birthdate: str, birth_time: str = "",
     【重要】行星位置、宮位、相位一律以本工具回傳的數字為準，
     **絕對不可自行推測或憑印象編造任何位置**——那是這套方法論的第一原則。
     【參數】birthdate 與 birth_time 接受自然中文寫法（「1990年5月15日」「9點30分」）。
+    **使用者講了地名就一定要填 `city`**（「台北」「高雄」「東京」都認得），
+    不然會被當成沒給地點而移除宮位與上升——使用者明明說了，卻拿到降級盤。
+    只有在使用者真的沒提地點時才留空。知道精確座標時可改填 lat/lng/tz。
     不確定就留空，工具會回傳 warning。
     【資料不完整時】看到 warning 一律**先向使用者說明限制並詢問**，不要默默算完就長篇解讀。
     缺地點特別危險：同一時間台北是獅子上升、東京是處女上升，整個星座都不同 →
@@ -2495,7 +2498,8 @@ def get_natal_chart(name: str, birthdate: str, birth_time: str = "",
     _status(f"[{meta['tool_step']}] 🔮 排本命盤中…", write=f"🔮 本命盤：{name}")
     out = ASTRO.compute_natal(
         name=name, birthdate=birthdate, birth_time=birth_time or None,
-        lat=lat or None, lng=lng or None, tz=tz or None, detail=bool(full_context),
+        city=city or None, lat=lat or None, lng=lng or None, tz=tz or None,
+        detail=bool(full_context),
     )
     _astro_remember(out, {"kind": "natal", "name": name, "birthdate": birthdate,
                           "birth_time": birth_time or None, "lat": lat or None,
