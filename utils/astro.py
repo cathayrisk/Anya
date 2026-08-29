@@ -44,9 +44,15 @@ SIGN_RULER_ZH = {
     "Leo": "太陽", "Vir": "水星", "Lib": "金星", "Sco": "火星",
     "Sag": "木星", "Cap": "土星", "Aqu": "土星", "Pis": "木星",
 }
+# ⚠️ 節點的屬性名是 true_north_lunar_node，不是 mean_node。
+# 寫錯的話 getattr 靜默回 None → 南北交點從資料裡整個消失，
+# 而方法論多處要求解讀它 → 模型只能省略或編造。
 MAIN_BODIES = ["sun", "moon", "mercury", "venus", "mars",
                "jupiter", "saturn", "uranus", "neptune", "pluto",
-               "mean_node", "chiron"]
+               "chiron", "true_north_lunar_node", "true_south_lunar_node"]
+# 元素／模式分布只算行星，不算交點（交點是軸不是天體，算進去會扭曲統計）
+DISTRIBUTION_EXCLUDE = {"True_North_Lunar_Node", "True_South_Lunar_Node",
+                        "Mean_North_Lunar_Node", "Mean_South_Lunar_Node"}
 ANGLES = ["ascendant", "medium_coeli", "descendant", "imum_coeli"]
 
 
@@ -85,13 +91,25 @@ def parse_time(s: Optional[str]) -> Dict[str, Any]:
     if not s or not str(s).strip():
         return {"hour": 12, "minute": 0, "approximated": True}
     txt = str(s).strip()
+    # 上午／下午前綴：正式站實測「上午10點15分」會解析失敗，模型得自己重試才成功，
+    # 白白多花一次工具呼叫。這是使用者最自然的講法，應該由工具吸收。
+    pm = bool(re.search(r"下午|晚上|傍晚|夜(?:間|裡)?|pm", txt, re.I))
+    am = bool(re.search(r"上午|早上|凌晨|清晨|am", txt, re.I))
+    noon = bool(re.search(r"中午|正午", txt))
+    txt = re.sub(r"上午|早上|凌晨|清晨|下午|晚上|傍晚|夜間|夜裡|夜|中午|正午|am|pm", "", txt, flags=re.I).strip()
     txt = re.sub(r"[點時]", ":", txt).replace("分", "").strip().rstrip(":")
+    if noon and not txt:
+        txt = "12:00"
     if re.match(r"^\d{1,2}$", txt):        # 只給「9」→ 視為 9:00
         txt += ":00"
     m = re.match(r"^\s*(\d{1,2})[:：](\d{1,2})\s*$", txt)
     if not m:
         return _err("BAD_TIME", f"時間格式應為 HH:MM，收到：{s!r}")
     hh, mm = int(m.group(1)), int(m.group(2))
+    if pm and hh < 12:
+        hh += 12
+    elif am and hh == 12:      # 上午12點 = 半夜 0 點
+        hh = 0
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         return _err("BAD_TIME", f"時間超出範圍：{s!r}")
     return {"hour": hh, "minute": mm, "approximated": False}
@@ -124,6 +142,11 @@ def _point(obj: Any) -> Optional[Dict[str, Any]]:
     }
     if getattr(obj, "out_of_bounds", None):
         out["out_of_bounds"] = True
+    # 逼近星座交界：出生時間只要有一點誤差，星座就會翻掉。
+    # 實測小P的月亮在雙魚 0.2°，換算成時間只離交界 22 分鐘 ——
+    # 就算使用者「有給時間」，這種配置的星座仍然脆弱，必須標出來。
+    if out["deg"] < 1.0 or out["deg"] > 29.0:
+        out["near_cusp"] = True
     return out
 
 
@@ -154,12 +177,56 @@ def _distribution(points: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
          "Tau": "固定", "Leo": "固定", "Sco": "固定", "Aqu": "固定",
          "Gem": "變動", "Vir": "變動", "Sag": "變動", "Pis": "變動"}
     for p in points:
+        if (p.get("name") or "") in DISTRIBUTION_EXCLUDE:
+            continue
         s = p.get("sign")
         if s in E:
             elem[E[s]] += 1
         if s in M:
             mode[M[s]] += 1
     return {"element": elem, "mode": mode}
+
+
+def moon_uncertainty(birthdate: str, lat: Optional[float] = None,
+                     lng: Optional[float] = None, tz: Optional[str] = None) -> Dict[str, Any]:
+    """未知出生時間時，月亮當天的可能範圍。
+
+    月亮一天移動約 13 度，落在星座交界附近時，**星座本身就是未知的**。
+    實測 1990-05-18：00:00 是水瓶 24.6°、23:59 是雙魚 7.8° —— 講哪一個都是猜。
+    比較當日首尾兩端，若跨星座就明白標示。失敗回空 dict（不擋主流程）。
+    """
+    try:
+        d = parse_date(birthdate)
+        if "error" in d:
+            return {}
+        from kerykeion import AstrologicalSubjectFactory
+        ends = []
+        for hh, mm in ((0, 0), (23, 59)):
+            sub = AstrologicalSubjectFactory.from_birth_data(
+                name="_moonprobe", year=d["year"], month=d["month"], day=d["day"],
+                hour=hh, minute=mm,
+                lng=DEFAULT_LNG if lng is None else float(lng),
+                lat=DEFAULT_LAT if lat is None else float(lat),
+                tz_str=tz or DEFAULT_TZ, zodiac_type="Tropical",
+                houses_system_identifier="P", calculate_lunar_phase=False, online=False)
+            m = getattr(sub, "moon", None)
+            ends.append((getattr(m, "sign", None), round(float(getattr(m, "position", 0.0)), 2)))
+        (s0, d0), (s1, d1) = ends
+        out = {
+            "range_start": {"sign": s0, "sign_zh": sign_zh(s0), "deg": d0},
+            "range_end": {"sign": s1, "sign_zh": sign_zh(s1), "deg": d1},
+            "crosses_sign": s0 != s1,
+        }
+        if s0 != s1:
+            out["note"] = (f"當天月亮從{sign_zh(s0)}跨到{sign_zh(s1)}——"
+                           "**沒有出生時間就無法確定月亮星座**，"
+                           "必須告訴使用者兩種可能，不可任選一個當事實。")
+        else:
+            out["note"] = (f"當天月亮都在{sign_zh(s0)}（{d0}°→{d1}°），星座確定，"
+                           "但度數與相位容許度仍有不確定性。")
+        return out
+    except Exception:
+        return {}
 
 
 def _build_subject(name: str, birthdate: str, birth_time: Optional[str],
@@ -213,23 +280,37 @@ def build_warning(meta: Dict[str, Any], who: str = "") -> str:
     return "；".join(parts) + "。" + tail
 
 
-def _subject_summary(subject: Any) -> Dict[str, Any]:
+def _subject_summary(subject: Any, houses_ok: bool = True) -> Dict[str, Any]:
+    """houses_ok=False 時**完全不輸出**宮位與四軸。
+
+    這是刻意的：出生時間或地點不可信時，宮位與上升是算得出來、但沒有意義的數字。
+    留著只會讓模型拿去做看似精確的解讀。拿掉之後它想講也沒有資料。"""
     pts = []
     for b in MAIN_BODIES:
         p = _point(getattr(subject, b, None))
         if p:
+            if not houses_ok:
+                p.pop("house", None)
             pts.append(p)
     angles = {}
-    for a in ANGLES:
-        p = _point(getattr(subject, a, None))
-        if p:
-            angles[a] = {"sign": p["sign"], "sign_zh": p["sign_zh"], "deg": p["deg"]}
+    if houses_ok:
+        for a in ANGLES:
+            p = _point(getattr(subject, a, None))
+            if p:
+                angles[a] = {"sign": p["sign"], "sign_zh": p["sign_zh"], "deg": p["deg"]}
     lp = getattr(subject, "lunar_phase", None)
     out: Dict[str, Any] = {
         "points": pts,
-        "angles": angles,
         "distribution": _distribution(pts),
+        "houses_available": bool(houses_ok),
     }
+    if houses_ok:
+        out["angles"] = angles
+    else:
+        out["houses_unavailable_reason"] = (
+            "出生時間或地點不可信，宮位與上升／天頂等四軸已從資料中移除。"
+            "不可以推測或宣稱任何宮位配置。"
+        )
     if lp is not None:
         out["lunar_phase"] = {
             "name": getattr(lp, "moon_phase_name", None),
@@ -238,6 +319,14 @@ def _subject_summary(subject: Any) -> Dict[str, Any]:
     oob = [p["name"] for p in pts if p.get("out_of_bounds")]
     if oob:
         out["out_of_bounds"] = oob
+    cusp = [f"{p['name']}（{p['sign_zh']}{p['deg']}°）" for p in pts if p.get("near_cusp")]
+    if cusp:
+        out["near_cusp_warning"] = {
+            "points": cusp,
+            "note": ("這些星體離星座交界不到 1 度。出生時間只要差幾十分鐘，"
+                     "星座就會變成隔壁那個。解讀時要說明這個脆弱性，"
+                     "若使用者的出生時間本身是聽說的、非戶籍精確時間，更要謹慎。"),
+        }
     return out
 
 
@@ -254,23 +343,34 @@ def compute_natal(name: str, birthdate: str, birth_time: Optional[str] = None,
             return meta
         from kerykeion import ChartDataFactory
         cd = ChartDataFactory.create_natal_chart_data(subject)
+        houses_ok = not (meta["time_approximated"] or meta["location_defaulted"])
         out: Dict[str, Any] = {
             "kind": "natal",
             "name": name,
             "birthdate": birthdate,
-            "birth_time": meta["birth_time"],
+            "birth_time": meta["birth_time"] if not meta["time_approximated"] else None,
             "location": {"lat": DEFAULT_LAT if lat is None else lat,
                          "lng": DEFAULT_LNG if lng is None else lng,
                          "tz": tz or DEFAULT_TZ},
-            **_subject_summary(subject),
+            **_subject_summary(subject, houses_ok=houses_ok),
             "aspects": _aspects(cd),
         }
         w = build_warning(meta)
         if w:
             out["warning"] = w
+        if meta["time_approximated"]:
+            mu = moon_uncertainty(birthdate, lat, lng, tz)
+            if mu:
+                out["moon_uncertainty"] = mu
         if detail:
-            from kerykeion import to_context
-            out["context"] = to_context(cd)
+            if houses_ok:
+                from kerykeion import to_context
+                out["context"] = to_context(cd)
+            else:
+                # to_context 內含宮位與四軸，資料不可信時給了等於把剛拿掉的東西還回去
+                out["context_withheld"] = (
+                    "出生時間或地點不可信，完整技術脈絡含大量宮位資料，已不提供，"
+                    "以免據以做出不可靠的解讀。")
         return out
     except Exception as e:
         return _err("KERYKEION_ERROR", f"計算本命盤失敗：{type(e).__name__}: {e}")
@@ -295,10 +395,12 @@ def compute_synastry(a_name: str, a_birthdate: str, a_birth_time: Optional[str],
             return m2
         from kerykeion import ChartDataFactory
         scd = ChartDataFactory.create_synastry_chart_data(s1, s2)
+        a_ok = not (m1["time_approximated"] or m1["location_defaulted"])
+        b_ok = not (m2["time_approximated"] or m2["location_defaulted"])
         out: Dict[str, Any] = {
             "kind": "synastry",
-            "a": {"name": a_name, **_subject_summary(s1)},
-            "b": {"name": b_name, **_subject_summary(s2)},
+            "a": {"name": a_name, **_subject_summary(s1, houses_ok=a_ok)},
+            "b": {"name": b_name, **_subject_summary(s2, houses_ok=b_ok)},
             "cross_aspects": _aspects(scd, limit=20),
         }
         warns = [w for w in (build_warning(m1, a_name), build_warning(m2, b_name)) if w]
@@ -503,12 +605,13 @@ def compute_solar_return(name: str, birthdate: str, birth_time: Optional[str],
         # 從「生日當天」往後找最近一次返照
         ret = rf.next_return_from_date(ty, bd["month"], bd["day"], return_type=return_type)
         rcd = ChartDataFactory.create_natal_chart_data(ret)
+        houses_ok = not (meta["time_approximated"] or meta["location_defaulted"])
         out: Dict[str, Any] = {
             "kind": "solar_return" if return_type == "Solar" else "lunar_return",
             "name": name,
             "target_year": ty,
             "return_type": return_type,
-            **_subject_summary(ret),
+            **_subject_summary(ret, houses_ok=houses_ok),
             "aspects": _aspects(rcd, limit=14),
         }
         w = build_warning(meta)
