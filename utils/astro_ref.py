@@ -74,15 +74,42 @@ _INDEX: Optional[set] = None
 
 # ---------------------------------------------------------------- 索引
 def load_index(path: str = INDEX_PATH) -> set:
-    """載入 slug 索引（9,285 筆、約 277KB）。整份**不進脈絡**，只用來比對。"""
+    """載入 slug 索引（9,285 筆、約 277KB）。整份**不進脈絡**，只用來比對。
+
+    ⚠️ 失敗時**不要快取**。原本失敗會把空集合寫進 `_INDEX`，於是那個
+    process 之後永遠讀不到索引——檔案後來補上也沒用，要整個重啟才會好。
+    正式站疑似踩到：索引檔補上之後，工具仍然把真實存在的文章回報成 not_found。
+    """
     global _INDEX
-    if _INDEX is None:
+    if _INDEX:
+        return _INDEX
+    # 多試幾個位置：__file__ 相對路徑在多數部署下正確，但工作目錄不一定是專案根，
+    # 而部署環境的目錄佈局不一定跟本機一樣。找不到就下次再試，不要記住失敗。
+    candidates = [path,
+                  os.path.join(os.getcwd(), "data", "kerykeion-slugs.txt"),
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "data", "kerykeion-slugs.txt")]
+    for p in candidates:
         try:
-            with open(path, encoding="utf-8") as fh:
-                _INDEX = {ln.strip() for ln in fh if ln.strip()}
+            with open(p, encoding="utf-8") as fh:
+                loaded = {ln.strip() for ln in fh if ln.strip()}
+            if loaded:
+                _INDEX = loaded      # 只有成功才快取
+                return _INDEX
         except Exception:
-            _INDEX = set()
-    return _INDEX
+            continue
+    return set()                     # 這次失敗，下次再試
+
+
+def index_available() -> bool:
+    """索引本身是否可用。
+
+    分辨「這篇不存在」與「索引根本沒載入」很重要：索引檔沒部署時，
+    `exists()` 會對每個 slug 都回 False，結果是**所有引用被靜默拒絕**，
+    而錯誤訊息還怪到 slug 頭上。正式站實測踩過這個坑——
+    兩篇真實存在（網站回 200、索引檔裡也有）的文章被回報成 not_found。
+    """
+    return len(load_index()) > 100      # 正常是 9,285 筆；極少表示載入失敗
 
 
 def exists(slug: str) -> bool:
@@ -91,17 +118,35 @@ def exists(slug: str) -> bool:
 
 
 def suggest(slug: str, limit: int = 5) -> List[str]:
-    """slug 不存在時給相近選項——讓模型改用真實存在的文章，而不是再猜一個。"""
+    """slug 不存在時給相近選項——讓模型改用真實存在的文章，而不是再猜一個。
+
+    第一個詞是**家族前綴**（natal／transit／synastry…），權重要高：
+    查 `transit-saturn-square-natal-moon` 時，正確答案是
+    `transit-saturn-moon-aspects`，但純以詞數計分會讓一堆 `natal-moon-*-saturn`
+    排在它前面、把正解擠出前 5——模型看不到就只能再猜一次，
+    整個「不要猜網址」的設計就白費了。
+    """
     idx = load_index()
     if not idx:
         return []
     toks = [t for t in re.split(r"[-/]", slug.lower()) if len(t) > 2]
     if not toks:
         return []
-    scored = [(sum(t in s for t in toks), s) for s in idx]
-    scored = [x for x in scored if x[0] > 0]
-    scored.sort(key=lambda x: (-x[0], len(x[1])))
-    return [s for _, s in scored[:limit]]
+    family = toks[0]
+    # 相位名不是 slug 的一部分（文章內含全部五種），拿來比對只會製造雜訊
+    body_toks = [t for t in toks[1:] if t not in ASPECT_WORDS
+                 and t not in ("aspects", "natal")]
+    scored = []
+    for s in idx:
+        hit = sum(t in s for t in body_toks)
+        if not hit:
+            continue
+        score = hit * 2 + (5 if s.startswith(family + "-") else 0)
+        if s.endswith("-aspects"):
+            score += 1                       # 主相位文章比冷門單一相位頁有用
+        scored.append((-score, len(s), s))
+    scored.sort()
+    return [s for _, _, s in scored[:limit]]
 
 
 # ---------------------------------------------------------------- 切片
@@ -208,6 +253,13 @@ class Broker:
             return {"status": "budget", "detail": f"已達抓取次數上限（{MAX_FETCH_ATTEMPTS}）"}
         if self.remaining_tokens() < 400:
             return {"status": "budget", "detail": "素材 token 預算已用盡"}
+        if not index_available():
+            # 索引沒載入時**不要**假裝在做比對。寧可放行去抓（抓不到自然會 miss），
+            # 也不要把每一篇都誤判成不存在，讓解讀在無聲中失去全部引用。
+            self.misses.append({"slug": slug, "reason": "index_unavailable"})
+            return {"status": "index_unavailable", "slug": slug,
+                    "detail": ("伺服器缺少 data/kerykeion-slugs.txt，無法驗證網址。"
+                               "本回合請不要引用外部文章，並在解讀中說明沒有查證來源。")}
         if not exists(slug):
             return {"status": "not_found", "slug": slug,
                     "detail": "索引裡沒有這篇；**不要猜別的網址**，改用下列存在的其中一篇，或不引用。",
