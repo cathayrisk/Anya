@@ -221,7 +221,20 @@ SKILL_HINT_RES: dict[str, re.Pattern] = {
     # 占星必須強制升級 General：Fast 模式沒有 get_natal_chart 也沒有 load_skill，
     # 落到 Fast 的結果是模型憑記憶編造行星位置（實測 1990-05-18 缺時間時，
     # 它自信地說「月亮雙魚」，但那天月亮中午前後才從水瓶跨到雙魚，等於擲硬幣）。
-    "astro-natal": re.compile(r"星盤|本命盤|命盤|占星|上升星座|太陽星座|月亮星座"),
+    # 只認「星盤／占星」這類招牌詞是不夠的：實測「小P的太陽三分土星要怎麼用？
+    # 請查證後回答」整句沒有招牌詞 → 留在 Fast → Fast 沒有 get_astro_reference，
+    # 查不了卻照樣寫出「以下為查證資訊」。追問通常只講配置本身，不會再說一次「星盤」。
+    # 因此加上「行星＋占星專屬語彙」的組合（雙向），既擴大覆蓋又不會誤抓
+    # 一般對話裡的「金星」「土星」。
+    "astro-natal": re.compile(
+        r"星盤|本命盤|命盤|占星|上升星座|太陽星座|月亮星座"
+        r"|(?:太陽|月亮|水星|金星|火星|木星|土星|天王星|海王星|冥王星|凱龍|"
+        r"上升|天頂|下降|天底|[南北]交點)"
+        r"[^。！？\n]{0,10}?(?:星座|落[在入]|[一二三四五六七八九十幾]+宮|\d{1,2}\s*宮|"
+        r"牡羊|金牛|雙子|巨蟹|獅子|處女|天秤|天蠍|射手|摩羯|水瓶|雙魚|"
+        r"合相|三分|四分|六分|對分|梅花|刑|拱|相位|逆行)"
+        r"|(?:合相|三分|四分|六分|對分|刑|拱)[^。！？\n]{0,6}?"
+        r"(?:太陽|月亮|水星|金星|火星|木星|土星|天王星|海王星|冥王星|凱龍|上升|天頂)"),
     "astro-forecast": re.compile(r"流年|行運|返照|小限|今年.{0,6}運[勢氣]"),
     "astro-relationship": re.compile(r"合盤|兩人.{0,4}星盤|配對.{0,4}星盤|契合度"),
 }
@@ -4206,6 +4219,29 @@ def run_fast_turn_streaming(lc_msgs: list, renderer: "ShimmerStreamRenderer") ->
             "請依升級規則輸出 [[ESCALATE]]（深思模式有替代搜尋工具）；"
             "否則靠既有知識回答，不確定的具體事實一律加註「（未查證）」。）"
         )
+    # 星盤正典也要進 Fast。實測「那工作那塊呢？」這種占星追問不會命中
+    # SKILL_HINT_RES（沒有占星關鍵字），於是留在 Fast 模式——而 Fast 沒有
+    # 占星工具，只能從對話歷史裡讀先前解讀的敘述。歷史一旦被摘要壓縮，
+    # 它就會拿有損轉述當事實推理，正是正典層要防的那件事。
+    if ASTRO_STATE is not None:
+        try:
+            _f = ASTRO_STATE.active(st.session_state)
+            if _f:
+                _p = ASTRO_STATE.project(_f)
+                if _p:
+                    # 護欄：投影只涵蓋「這一張」盤。使用者問另一個人時，Fast 沒有
+                    # 計算工具，若照著手上的投影回答就是把 A 的盤講成 B 的。
+                    # 實測 Fast 模式被問到沒算過的盤時會直接編（月亮宮位講錯），
+                    # 所以這種情況一律升級。
+                    sys_text += (
+                        "\n\n" + _p +
+                        f"\n※ 以上只是「{(_f.get('spec') or {}).get('name') or '目前這張'}」"
+                        "這一張盤。使用者若問的是**其他人**的盤、或需要重新計算"
+                        "（流年、合盤、換出生資料），你沒有計算工具，"
+                        "**一律輸出 [[ESCALATE]]**，絕不可拿這張盤的數字去回答另一個人。"
+                    )
+        except Exception:
+            pass
     system = SystemMessage(sys_text)
     def _consume():
         renderer.reset()
@@ -4279,6 +4315,11 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     rt["dr_summary_line"] = None
     rt["t_start"] = time.time()
     rt["meta"] = {"db_used": False, "web_used": False, "doc_calls": 0, "web_calls": 0, "tool_step": 0, "code_runs": 0}
+    # 占星素材預算是「每回合」的，而 _gm_rt 跨回合存活 —— 不在這裡重設的話，
+    # 一個 session 用掉 3 篇之後就永遠回 budget。正式站實測踩到：
+    # 第二次提問直接被擋，模型改去用 web_search 抓未經驗證的來源，
+    # 反而比查 kerykeion 更糟（整個索引比對的設計被繞過）。
+    rt["astro_broker"] = None
 
     # 動態 fulltext budget（Gemma 256K context；免費額度下保守設定）
     MAX_CONTEXT_TOKENS = 200_000
