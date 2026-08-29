@@ -76,8 +76,12 @@ def skill_hint_match(text: str) -> list[str]:
     if not blk:
         return []
     hits = []
-    for k, pat in re.findall(r'"([a-z0-9-]+)":\s*re\.compile\(r"([^"]+)"', blk.group(0)):
-        if re.search(pat, text):
+    # 樣式可能寫成跨多行的相鄰 raw string（astro-natal 就是），
+    # 只認單行 re.compile(r"...") 會整條抓不到 → 誤判成「沒有這個路由」。
+    for k, body in re.findall(
+            r'"([a-z0-9-]+)":\s*re\.compile\(\s*((?:\s*r"[^"]*"\s*)+)\)', blk.group(0)):
+        pat = "".join(re.findall(r'r"([^"]*)"', body))
+        if pat and re.search(pat, text):
             hits.append(k)
     return hits
 
@@ -193,6 +197,13 @@ def case_9(HAS_K):
     bl = src[src.index("def build_lc_messages"):src.index("def estimate_tokens_for_lc_messages")]
     check("ASTRO_STATE" not in bl, "build_lc_messages 不碰正典（訊息串乾淨）")
     check("note_for_summarizer" in src, "摘要器已被指示不要寫入星盤數字")
+    # 素材預算必須每回合歸零：_gm_rt 跨回合存活，忘了重設就會在用掉 3 篇之後
+    # 永久鎖死，模型改去 web_search 抓未驗證來源（正式站實測踩過）。
+    check('rt["astro_broker"] = None' in src, "素材 broker 每回合重設")
+    # Fast 模式也要拿到正典：占星追問常常不含關鍵字而留在 Fast，
+    # 那裡沒有占星工具，只能靠歷史敘述——歷史被摘要後就會失真。
+    fast = src[src.index("def run_fast_turn_streaming"):src.index("def run_general_turn")]
+    check("ASTRO_STATE" in fast, "Fast 模式也注入正典投影")
     if not HAS_K:
         return
     from utils.astro import compute_natal

@@ -56,6 +56,25 @@ SIGNS = ["牡羊", "金牛", "雙子", "巨蟹", "獅子", "處女",
 CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
           "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
 
+PLANET_EN = {
+    "sun": "Sun", "moon": "Moon", "mercury": "Mercury", "venus": "Venus",
+    "mars": "Mars", "jupiter": "Jupiter", "saturn": "Saturn", "uranus": "Uranus",
+    "neptune": "Neptune", "pluto": "Pluto", "chiron": "Chiron",
+    "north node": "True_North_Lunar_Node", "node": "True_North_Lunar_Node",
+    "ascendant": "ascendant", "asc": "ascendant", "mc": "medium_coeli",
+}
+SIGN_EN = {"aries": "牡羊", "taurus": "金牛", "gemini": "雙子", "cancer": "巨蟹",
+           "leo": "獅子", "virgo": "處女", "libra": "天秤", "scorpio": "天蠍",
+           "sagittarius": "射手", "capricorn": "摩羯", "aquarius": "水瓶",
+           "pisces": "雙魚"}
+# 小標題常用英文：實測正式站寫「(Moon/Node in Pisces, H7)」，而那句剛好把
+# 北交點的星座講錯了（實際在水瓶）。只比對中文名就會整個放過。
+# 間隔只允許空白：寫成「任意 12 字」時，「Moon/Node in Pisces」會被配成
+# 「Moon in Pisces」（這個是對的）而把 Node 整個吞掉——findall 不找重疊，
+# 於是真正講錯的那一個（北交點在水瓶，不是雙魚）就溜過去了。
+RE_EN = re.compile(r"\b(" + "|".join(sorted(PLANET_EN, key=len, reverse=True))
+                   + r")\b[ \t]*(?:is[ \t]+)?in[ \t]+(" + "|".join(SIGN_EN) + r")\b", re.I)
+
 _BODY = "|".join(list(PLANET_ZH) + list(ANGLE_ZH))
 _SIGN = "|".join(SIGNS)
 _NUM = r"[0-9]{1,2}|十[一二]?|[一二三四五六七八九]"
@@ -63,7 +82,11 @@ _NUM = r"[0-9]{1,2}|十[一二]?|[一二三四五六七八九]"
 # 水星在金牛，不是上升在金牛。少了這個負向後查，正確的解讀會被誤判成錯誤——
 # 查核器一旦會喊假警報就沒人會信它。
 _NOT_OBJ = r"(?<![刑沖合拱對分座])"
-RE_SIGN = re.compile(rf"{_NOT_OBJ}({_BODY})[ \t]*(?:落?在|位於|是|為|→|:|：)?[ \t]*({_SIGN})座?")
+# 允許星體與星座之間夾「星座」二字：正式站實測寫的是「上升星座：獅子座」，
+# 少了這段就整句漏抓——報告會說「全部相符」，其實根本沒檢查到最重要的那幾個宣稱。
+# 漏抓比誤判更隱蔽，因為它看起來像通過。
+RE_SIGN = re.compile(
+    rf"{_NOT_OBJ}({_BODY})(?:星座|座)?[ \t]*(?:落?在|位於|是|為|→|:|：)?[ \t]*({_SIGN})座?")
 # 星體與宮位之間常夾著星座名（「太陽落在金牛座第10宮」）或語助詞（「水星也在金牛10宮」），
 # 所以允許一小段不含句讀的間隔。全程禁止跨行（用 [ \t] 而不是 \s——
 # \s 會吃掉換行，把「（金星刑海王星）⏎六宮群星」誤配成「金星六宮」）。
@@ -122,14 +145,17 @@ def check_placements(text, chart, rep):
     houses_ok = chart.get("houses_available", True)
 
     sign_claims = RE_SIGN.findall(text)
+    for en_body, en_sign in RE_EN.findall(text):
+        sign_claims.append((PLANET_EN[en_body.lower()], SIGN_EN[en_sign.lower()]))
     bad = []
     for body_zh, sign_zh in sign_claims:
-        if body_zh in PLANET_ZH:
-            p = pts.get(PLANET_ZH[body_zh])
-            actual = p.get("sign_zh") if p else None
-        else:
-            a = angs.get(ANGLE_ZH[body_zh])
+        key = PLANET_ZH.get(body_zh) or ANGLE_ZH.get(body_zh) or body_zh
+        if key in angs:
+            a = angs.get(key)
             actual = a.get("sign_zh") if a else None
+        else:
+            p = pts.get(key)
+            actual = p.get("sign_zh") if p else None
         if actual is None:
             bad.append(f"{body_zh}{sign_zh}（資料裡沒有這個點）")
         elif actual != sign_zh:
