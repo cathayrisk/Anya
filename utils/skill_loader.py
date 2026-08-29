@@ -32,6 +32,10 @@ SKILL_WHITELIST: dict[str, str] = {
     "business-investment-advisor": "投資與資本支出評估——ROI/IRR/NPV/回收期、該不該買設備或投新事業",
     "andreessen": "市場優先的直白壓力測試——用 Andreessen 框架挑戰點子、產品與押注，不留情面",
     # ── 程式碼與資料庫 ──
+    # 占星（三層分工：utils/astro.py 算資料 → 這些方法論指導解讀）
+    "astro-natal": "本命星盤解讀——工具算資料、你負責解讀；A–E 主題、自動反應vs成熟表達",
+    "astro-forecast": "流年預測解讀——行運/太陽返照/年度小限；一律對照本命、講時機不講命定",
+    "astro-relationship": "合盤解讀——交互相位/組合盤/相容性評分；先讀懂兩個人再看相遇",
     "security-checklist": "程式碼安全檢查——涉及 secrets/資料庫/檔案 IO/網路請求/使用者輸入時必查",
     "sql-and-database": "SQL 與資料庫實務——SQLAlchemy/原生 SQL/交易/連線管理/migration",
     "developing-with-streamlit": "Streamlit 開發——快取/版面/session_state/效能，會再路由到 14 個子技能",
