@@ -150,20 +150,88 @@ def _point(obj: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
-def _aspects(chart_data: Any, limit: int = 18) -> List[Dict[str, Any]]:
-    """取相位並依容許度由緊到鬆排序——最緊的相位資訊量最高。"""
+ANGLE_NAMES = {"Ascendant", "Descendant", "Medium_Coeli", "Imum_Coeli"}
+MAJOR_ASPECTS = {"conjunction", "opposition", "square", "trine", "sextile"}
+
+# 軸的另一端。上升／下降、天頂／天底、南北交點各自是**一條軸的兩頭**，
+# 所以「水星四分上升」與「水星四分下降」講的是同一件事，kerykeion 兩筆都給。
+# 不去重的話，前 18 名會被鏡像佔掉一半——實測小P 的清單裡光交點與四軸的鏡像
+# 就吃掉 7 個名額，把「太陽四分月亮」（orb 3.3）整個擠出去。
+AXIS_PARTNER = {
+    "Descendant": "Ascendant",
+    "Imum_Coeli": "Medium_Coeli",
+    "True_South_Lunar_Node": "True_North_Lunar_Node",
+    "Mean_South_Lunar_Node": "Mean_North_Lunar_Node",
+}
+# 端點換到軸的另一頭時，相位跟著鏡射（180° 之差）
+_MIRROR_ASPECT = {"conjunction": "opposition", "opposition": "conjunction",
+                  "trine": "sextile", "sextile": "trine", "square": "square"}
+
+
+def _dedupe_axis_mirrors(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把軸點鏡像收斂成一筆，保留指向主要端（上升／天頂／北交點）的那筆。"""
+    seen, out = set(), []
+    for r in rows:
+        p1, p2, asp = r.get("p1"), r.get("p2"), r.get("aspect")
+        flips = 0
+        c1 = AXIS_PARTNER.get(p1, p1)
+        c2 = AXIS_PARTNER.get(p2, p2)
+        flips += (c1 != p1) + (c2 != p2)
+        casp = asp
+        if flips == 1:                       # 只有一端被鏡射 → 相位要跟著換
+            casp = _MIRROR_ASPECT.get(asp, asp)
+        key = (frozenset((c1, c2)), casp, r.get("orb"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def _reported_bodies(subject: Any, houses_ok: bool = True) -> set:
+    """實際會出現在 points/angles 裡的名稱集合——相位只能提到這些。"""
+    names = {getattr(getattr(subject, b, None), "name", None) for b in MAIN_BODIES}
+    if houses_ok:
+        names |= ANGLE_NAMES
+    return {n for n in names if n}
+
+
+def _aspects(chart_data: Any, limit: int = 18, houses_ok: bool = True,
+             allowed: Optional[set] = None) -> List[Dict[str, Any]]:
+    """取相位並依容許度由緊到鬆排序——最緊的相位資訊量最高。
+
+    houses_ok=False 時**必須濾掉牽涉四軸的相位**。
+    這裡曾經漏過：摘要區塊已經拿掉宮位與上升，相位清單卻還留著
+    「Moon 對分 Ascendant 0.72」——等於把剛拿掉的東西從後門還回去，
+    而且帶著看起來很精確的容許度。降級要在每一個出口都做，不是只做主要那個。
+
+    allowed 用來把相位限縮在有回報位置的星體上：若相位提到 Mean_Lilith
+    但星體清單裡沒有它，模型看得到關係卻不知道它在哪，只能靠猜。
+    """
     rows = []
     for a in (getattr(chart_data, "aspects", None) or []):
         try:
+            p1 = getattr(a, "p1_name", None)
+            p2 = getattr(a, "p2_name", None)
+            if not houses_ok and (p1 in ANGLE_NAMES or p2 in ANGLE_NAMES):
+                continue
+            if allowed is not None and not (p1 in allowed and p2 in allowed):
+                continue
             rows.append({
-                "p1": getattr(a, "p1_name", None),
-                "p2": getattr(a, "p2_name", None),
+                "p1": p1, "p2": p2,
                 "aspect": getattr(a, "aspect", None),
                 "orb": round(float(getattr(a, "orbit", 0.0)), 2),
             })
         except Exception:
             continue
-    rows.sort(key=lambda r: abs(r.get("orb") or 99))
+    rows = _dedupe_axis_mirrors(rows)
+    # 主相位排在次相位前面，各自再依 orb。
+    # 純以 orb 排序會讓五分相（0.73°）壓過日月四分相（3.3°），
+    # 而清單只取前 18 個 → 對照 natal-reading-kit 實測，
+    # 小P 的「太陽四分月亮」就是這樣被兩個五分相擠出去的。
+    # 方法論把這張清單當重要性排序在用，所以順序本身就是判斷。
+    rows.sort(key=lambda r: (r.get("aspect") not in MAJOR_ASPECTS,
+                             abs(r.get("orb") or 99)))
     return rows[:limit]
 
 
@@ -229,10 +297,61 @@ def moon_uncertainty(birthdate: str, lat: Optional[float] = None,
         return {}
 
 
+# 常見出生地。正式站實測：使用者說「台北出生」，但模型沒把座標填進工具參數，
+# 於是 lat/lng 皆為 None → location_defaulted=True → 宮位與四軸被整組移除。
+# 使用者**明明給了地點**，卻拿到降級盤。地名是人類最自然的講法，該由工具吸收。
+CITIES = {
+    "台北": (25.0330, 121.5654, "Asia/Taipei"), "臺北": (25.0330, 121.5654, "Asia/Taipei"),
+    "新北": (25.0169, 121.4628, "Asia/Taipei"), "基隆": (25.1276, 121.7392, "Asia/Taipei"),
+    "桃園": (24.9936, 121.3010, "Asia/Taipei"), "新竹": (24.8138, 120.9675, "Asia/Taipei"),
+    "苗栗": (24.5602, 120.8214, "Asia/Taipei"), "台中": (24.1477, 120.6736, "Asia/Taipei"),
+    "臺中": (24.1477, 120.6736, "Asia/Taipei"), "彰化": (24.0518, 120.5161, "Asia/Taipei"),
+    "南投": (23.9609, 120.9719, "Asia/Taipei"), "雲林": (23.7092, 120.4313, "Asia/Taipei"),
+    "嘉義": (23.4801, 120.4491, "Asia/Taipei"), "台南": (22.9999, 120.2269, "Asia/Taipei"),
+    "臺南": (22.9999, 120.2269, "Asia/Taipei"), "高雄": (22.6273, 120.3014, "Asia/Taipei"),
+    "屏東": (22.5519, 120.5487, "Asia/Taipei"), "宜蘭": (24.7021, 121.7378, "Asia/Taipei"),
+    "花蓮": (23.9871, 121.6015, "Asia/Taipei"), "台東": (22.7583, 121.1444, "Asia/Taipei"),
+    "臺東": (22.7583, 121.1444, "Asia/Taipei"), "澎湖": (23.5712, 119.5793, "Asia/Taipei"),
+    "金門": (24.4493, 118.3767, "Asia/Taipei"),
+    # 海外（缺地點最危險的情況——同一時間台北是獅子上升、東京是處女上升）
+    "東京": (35.6762, 139.6503, "Asia/Tokyo"), "大阪": (34.6937, 135.5023, "Asia/Tokyo"),
+    "首爾": (37.5665, 126.9780, "Asia/Seoul"), "香港": (22.3193, 114.1694, "Asia/Hong_Kong"),
+    "新加坡": (1.3521, 103.8198, "Asia/Singapore"), "上海": (31.2304, 121.4737, "Asia/Shanghai"),
+    "北京": (39.9042, 116.4074, "Asia/Shanghai"), "曼谷": (13.7563, 100.5018, "Asia/Bangkok"),
+    "紐約": (40.7128, -74.0060, "America/New_York"),
+    "洛杉磯": (34.0522, -118.2437, "America/Los_Angeles"),
+    "舊金山": (37.7749, -122.4194, "America/Los_Angeles"),
+    "溫哥華": (49.2827, -123.1207, "America/Vancouver"),
+    "多倫多": (43.6532, -79.3832, "America/Toronto"),
+    "倫敦": (51.5074, -0.1278, "Europe/London"), "巴黎": (48.8566, 2.3522, "Europe/Paris"),
+    "雪梨": (-33.8688, 151.2093, "Australia/Sydney"),
+    "墨爾本": (-37.8136, 144.9631, "Australia/Melbourne"),
+    "taipei": (25.0330, 121.5654, "Asia/Taipei"), "kaohsiung": (22.6273, 120.3014, "Asia/Taipei"),
+    "taichung": (24.1477, 120.6736, "Asia/Taipei"), "tainan": (22.9999, 120.2269, "Asia/Taipei"),
+    "tokyo": (35.6762, 139.6503, "Asia/Tokyo"), "new york": (40.7128, -74.0060, "America/New_York"),
+    "london": (51.5074, -0.1278, "Europe/London"),
+}
+
+
+def resolve_city(city: Optional[str]) -> Optional[Tuple[float, float, str]]:
+    """地名 → (lat, lng, tz)。認不出來回 None（呼叫端該去問使用者，不要亂猜）。"""
+    if not city:
+        return None
+    t = str(city).strip().lower()
+    t = re.sub(r"(市|縣|區|巿)$", "", t).strip()
+    if t in CITIES:
+        return CITIES[t]
+    for k, v in CITIES.items():          # 「台北市信義區」這種寫法
+        if k in t:
+            return v
+    return None
+
+
 def _build_subject(name: str, birthdate: str, birth_time: Optional[str],
                    lat: Optional[float], lng: Optional[float], tz: Optional[str],
                    zodiac_type: str = "Tropical",
-                   houses_system: str = "P") -> Tuple[Any, Dict[str, Any]]:
+                   houses_system: str = "P",
+                   city: Optional[str] = None) -> Tuple[Any, Dict[str, Any]]:
     """建立 kerykeion subject。回傳 (subject, meta)；失敗時 subject 為 None、
     meta 是 error dict。"""
     d = parse_date(birthdate)
@@ -241,6 +360,15 @@ def _build_subject(name: str, birthdate: str, birth_time: Optional[str],
     t = parse_time(birth_time)
     if "error" in t:
         return None, t
+
+    # 地名補位：使用者說「台北出生」而模型沒填座標時，這裡把它補上，
+    # 並且**不算 location_defaulted**——使用者確實給了地點。
+    city_hit = None
+    if lat is None and lng is None:
+        city_hit = resolve_city(city)
+        if city_hit:
+            lat, lng = city_hit[0], city_hit[1]
+            tz = tz or city_hit[2]
 
     from kerykeion import AstrologicalSubjectFactory
     subject = AstrologicalSubjectFactory.from_birth_data(
@@ -257,6 +385,7 @@ def _build_subject(name: str, birthdate: str, birth_time: Optional[str],
     )
     return subject, {"time_approximated": t["approximated"],
                      "location_defaulted": (lat is None and lng is None),
+                     "location_from_city": bool(city_hit),
                      "birth_time": f"{t['hour']:02d}:{t['minute']:02d}"}
 
 
@@ -332,13 +461,14 @@ def _subject_summary(subject: Any, houses_ok: bool = True) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------- 對外 API
 def compute_natal(name: str, birthdate: str, birth_time: Optional[str] = None,
+                  city: Optional[str] = None,
                   lat: Optional[float] = None, lng: Optional[float] = None,
                   tz: Optional[str] = None, detail: bool = False) -> Dict[str, Any]:
     """本命盤。detail=True 才附上 kerykeion 完整 context（約 10K 字元）。"""
     if _kerykeion() is None:
         return _err("NO_KERYKEION", "伺服器未安裝 kerykeion，占星功能暫時無法使用。")
     try:
-        subject, meta = _build_subject(name, birthdate, birth_time, lat, lng, tz)
+        subject, meta = _build_subject(name, birthdate, birth_time, lat, lng, tz, city=city)
         if subject is None:
             return meta
         from kerykeion import ChartDataFactory
@@ -353,7 +483,8 @@ def compute_natal(name: str, birthdate: str, birth_time: Optional[str] = None,
                          "lng": DEFAULT_LNG if lng is None else lng,
                          "tz": tz or DEFAULT_TZ},
             **_subject_summary(subject, houses_ok=houses_ok),
-            "aspects": _aspects(cd),
+            "aspects": _aspects(cd, houses_ok=houses_ok,
+                                allowed=_reported_bodies(subject, houses_ok)),
         }
         w = build_warning(meta)
         if w:
@@ -401,7 +532,7 @@ def compute_synastry(a_name: str, a_birthdate: str, a_birth_time: Optional[str],
             "kind": "synastry",
             "a": {"name": a_name, **_subject_summary(s1, houses_ok=a_ok)},
             "b": {"name": b_name, **_subject_summary(s2, houses_ok=b_ok)},
-            "cross_aspects": _aspects(scd, limit=20),
+            "cross_aspects": _aspects(scd, limit=20, houses_ok=(a_ok and b_ok)),
         }
         warns = [w for w in (build_warning(m1, a_name), build_warning(m2, b_name)) if w]
         if warns:
@@ -612,7 +743,8 @@ def compute_solar_return(name: str, birthdate: str, birth_time: Optional[str],
             "target_year": ty,
             "return_type": return_type,
             **_subject_summary(ret, houses_ok=houses_ok),
-            "aspects": _aspects(rcd, limit=14),
+            "aspects": _aspects(rcd, limit=14, houses_ok=houses_ok,
+                                allowed=_reported_bodies(ret, houses_ok)),
         }
         w = build_warning(meta)
         if w:
