@@ -72,9 +72,14 @@ description: >
 ## 查證（同 astro-natal 的有限度原則）
 
 最多查 **2 篇**，只查你判定最關鍵的那一兩個配置。
-前綴 `https://kerykeion.net/content/learn-astrology/`，用 `fetch_webpage`。
-本主題相關的 slug：`synastry-<行星1>-<行星2>-aspects`；查不到就退到 `foundation-<行星>`。
-完整網址規則見 astro-natal skill。**絕不杜撰網址或引文**，查不到就明說。
+用 `get_astro_reference(slug, aspect)`，不要用 `fetch_webpage`。
+
+主要 slug：`synastry-<星A>-<星B>-aspects`（例 `synastry-sun-moon-aspects`，索引 515 篇）；
+查不到就退到 `foundation-<行星>`。
+
+⚠️ **相位名稱不要放進 slug** —— 一篇就涵蓋五種相位，你要的那一種用 `aspect` 參數指定。
+`not_found` 就改用回傳的 `suggestions`，`miss` 就照實說這點沒有來源。
+完整規則見 astro-natal skill。**絕不杜撰網址或引文。**
 
 ## 語氣紅線
 

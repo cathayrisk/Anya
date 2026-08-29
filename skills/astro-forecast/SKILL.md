@@ -91,16 +91,21 @@ description: >
 ## 查證（同 astro-natal 的有限度原則）
 
 最多查 **2 篇**，只查你判定最關鍵的那一兩個配置。
-前綴 `https://kerykeion.net/content/learn-astrology/`，用 `fetch_webpage`。
-本主題可用的路徑（**以下為實際驗證過的**）：
-- 行運總綱：`transit-introduction`
-- 某行星的行運相位分類頁：`category/transits/<行星>-transits/aspects`（例 saturn-transits）
-- 退一層的行星原型：`foundation-<行星>`（例 `foundation-saturn`，已驗證）
+用 `get_astro_reference(slug, aspect)`，不要用 `fetch_webpage`。
 
-⚠️ 個別行運文章的 slug 規則**未經驗證**，不要自己拼湊
-（`transit-saturn-square-natal-moon` 這種寫法實測是 404）。
-拼不出確定的網址時，就從分類頁進去或直接用 `foundation-<行星>`。
-完整網址規則見 astro-natal skill。**絕不杜撰網址或引文**，查不到就明說。
+| 要查什麼 | slug | 範例 |
+|---|---|---|
+| 行運星打本命星 | `transit-<行運星>-<本命星>-aspects` | `transit-saturn-moon-aspects` |
+| 行運星過宮位 | `transit-<行運星>-<序數>-house` | `transit-saturn-eighth-house` |
+| 行星原型 | `foundation-<行星>` | `foundation-saturn` |
+
+⚠️ 先前的警告已經解決：`transit-saturn-square-natal-moon` 之所以 404，
+是因為**相位名稱不屬於 slug**——`transit-saturn-moon-aspects` 一篇就涵蓋五種相位，
+你要的那一種用 `aspect` 參數指定（conjunction／sextile／square／trine／opposition）。
+現在有索引比對，這類 404 不會再發生。
+
+`not_found` 就改用回傳的 `suggestions`，`miss` 就照實說這點沒有來源。
+完整規則見 astro-natal skill。**絕不杜撰網址或引文。**
 
 ## 語氣紅線（比本命解讀更嚴格）
 
