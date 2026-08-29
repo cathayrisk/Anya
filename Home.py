@@ -208,6 +208,12 @@ SKILL_HINT_RES: dict[str, re.Pattern] = {
     "statistical-analyst": re.compile(r"假設檢定|顯著性|信賴區間|p\s*值|迴歸分析|統計檢定"),
     "financial-analyst": re.compile(r"DCF|現金流折現|估值|財報比率|CAC|LTV|ARR|MRR", re.IGNORECASE),
     "data-quality-auditor": re.compile(r"資料品質|缺值|離群值|資料清理"),
+    # 占星必須強制升級 General：Fast 模式沒有 get_natal_chart 也沒有 load_skill，
+    # 落到 Fast 的結果是模型憑記憶編造行星位置（實測 1990-05-18 缺時間時，
+    # 它自信地說「月亮雙魚」，但那天月亮中午前後才從水瓶跨到雙魚，等於擲硬幣）。
+    "astro-natal": re.compile(r"星盤|本命盤|命盤|占星|上升星座|太陽星座|月亮星座"),
+    "astro-forecast": re.compile(r"流年|行運|返照|小限|今年.{0,6}運[勢氣]"),
+    "astro-relationship": re.compile(r"合盤|兩人.{0,4}星盤|配對.{0,4}星盤|契合度"),
 }
 # deep research pipeline Phase 1 的方法論注入來源（與 skills_loaded 取交集）
 # 註：原本還有 product-research（不加引號以免被死參照檢查器誤判），
