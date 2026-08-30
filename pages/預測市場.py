@@ -20,7 +20,11 @@ Polymarket 財經向儀表板（官方 Gamma / CLOB REST）
 實測校正（2026-08-30 於 Streamlit Cloud，見 pages/預測市場_診斷.py）：
 - /events 的 limit 上限是 100，不是坊間教學說的 500；超過會靜默回 100 筆 + HTTP 200。
 - 多結果事件的價格加總並非都接近 1（實測樣本低到 0.091），所以正規化必須設防呆區間。
-- bestBid 覆蓋率 90%、bestAsk 100%；價差 > $0.10 的 market 佔 25%，中價規則會實際 fallback。
+- bestBid 覆蓋率 ~91%、bestAsk 100%、outcomePrices ~90%；價差 > $0.10 的 market 佔 ~21%。
+- negRisk 欄位存在但**不能當判準**：覆蓋率 92%，且 126 個多結果事件裡有 8 個 negRisk=True
+  卻加總落在區間外、6 個 negRisk=False 卻加總接近 1。維持以價格加總為準，negRisk 只作揭露。
+- 多結果事件有 **51%** 加總落在區間外（「by date」階梯市場與複選市場），
+  正規化防呆擋下的是一半的事件，不是零星例外。
 
 已知環境限制：部分境內網路會把 *.polymarket.com 的 DNS 導向非官方 IP，
 造成 TLS 自簽憑證錯誤。那是網路層攔截，不是程式問題——錯誤訊息會分類指出。
@@ -91,6 +95,10 @@ EVENT_KEEP = ("id", "slug", "title", "volume24hr", "volume", "liquidity", "endDa
 MARKET_KEEP = (
     "outcomes", "outcomePrices", "clobTokenIds", "bestBid", "bestAsk",
     "lastTradePrice", "spread", "groupItemTitle", "question", "enableOrderBook",
+    # 診斷頁倒出完整欄位後才發現這三個一直在，只是沒取：
+    "acceptingOrders",        # 此刻能不能下單（enableOrderBook 只說市場型別支援掛單簿）
+    "umaResolutionStatuses",  # 解析狀態註記＝解析風險，先前誤以為盤面看不到
+    "oneMonthPriceChange",    # API 自帶的一個月價格變化，免費，不用打 prices-history
 )
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -286,6 +294,30 @@ def to_float(x) -> float | None:
         return None
 
 
+def month_change_pp(x) -> float | None:
+    """
+    API 自帶的一個月價格變化 → 百分點。
+
+    單位尚未實測確認（診斷頁探針 8 會拿它跟真實一個月走勢對帳）。
+    其他價格欄位都是 0–1，所以先假設它也是價格空間的差值；
+    上面那道 1.5 的保險絲是防「萬一 API 給的已經是百分點」被誤放大 100 倍。
+    """
+    v = to_float(x)
+    if v is None:
+        return None
+    return round(v * 100, 1) if abs(v) <= 1.5 else round(v, 1)
+
+
+def uma_flag(m: dict) -> str | None:
+    """解析狀態註記。語意未實測，所以原樣呈現、不自作主張解讀。"""
+    v = m.get("umaResolutionStatuses")
+    if v in (None, "", [], "[]"):
+        return None
+    items = as_list(v) if isinstance(v, str) else (v if isinstance(v, list) else [v])
+    items = [str(x).strip() for x in items if str(x).strip()]
+    return "、".join(items) if items else None
+
+
 def pick_price(m: dict, fallback: float | None = None) -> tuple[float | None, str, float | None]:
     """官方規則：預設中價；價差 > $0.10 才退回最後成交價。回傳 (價格, 來源, 價差)。"""
     bid = to_float(m.get("bestBid"))
@@ -340,6 +372,9 @@ def event_outcomes(ev: dict) -> tuple[pd.DataFrame, float | None, bool]:
             rows.append({
                 "outcome": nm, "raw": raw, "來源": src, "價差": spd,
                 "token_id": tokens[i] if i < len(tokens) else None,
+                "可交易": m.get("acceptingOrders"),
+                "解析註記": uma_flag(m),
+                "月變化_pp": month_change_pp(m.get("oneMonthPriceChange")) if i == 0 else None,
             })
     else:
         for m in mkts:
@@ -350,6 +385,9 @@ def event_outcomes(ev: dict) -> tuple[pd.DataFrame, float | None, bool]:
             rows.append({
                 "outcome": label, "raw": raw, "來源": src, "價差": spd,
                 "token_id": tokens[0] if tokens else None,
+                "可交易": m.get("acceptingOrders"),
+                "解析註記": uma_flag(m),
+                "月變化_pp": month_change_pp(m.get("oneMonthPriceChange")),
             })
 
     df = pd.DataFrame(rows)
@@ -400,16 +438,23 @@ def events_to_frame(events: list[dict]) -> pd.DataFrame:
         binary = is_binary_event(ev)
         top = primary_row(odf, binary)
         top_label, top_prob, top_spread = None, None, None
+        top_month, top_tradable = None, None
         if top is not None:
             top_label = str(top["outcome"])
             top_prob = to_float(top["機率_%"])
             top_spread = to_float(top["價差"])
+            top_month = to_float(top.get("月變化_pp"))
+            top_tradable = top.get("可交易")
         rows.append({
             "event_id": str(ev.get("id") or ev.get("slug") or ""),
             "title": str(ev.get("title") or ev.get("slug") or "(無標題)"),
             "二元": binary,
             "主要結果": top_label,
             "機率_%": top_prob,
+            "月變化_pp": top_month,
+            "可交易": top_tradable,
+            "解析註記": "、".join(sorted({x for x in odf.get("解析註記", pd.Series(dtype=object)).dropna()})) or None
+                        if not odf.empty else None,
             "價差": top_spread,
             "結果數": int(len(odf)),
             "overround": round(total, 4) if total else None,
@@ -516,6 +561,25 @@ def render_event_detail(ev: dict, row: pd.Series, key_prefix: str) -> None:
         end_d = row.get("endDate_台北")
         c4.metric("結束（台北）", end_d.isoformat() if end_d else "N/A")
 
+        # 解析風險與可交易性：先前的免責聲明說「解析風險不會反映在盤面上」，
+        # 那是因為沒去取欄位，不是真的看不到。
+        notes = sorted({x for x in odf.get("解析註記", pd.Series(dtype=object)).dropna()})
+        if notes:
+            st.warning(
+                "⚖️ 這個事件有解析狀態註記：`" + "`、`".join(notes) + "`。"
+                "代表解析程序有進行中的狀態（可能爭議中），盤面價格不會反映這件事。"
+                "註記的確切語意尚未實測，這裡原樣呈現，請自行到原始頁面確認。"
+            )
+        if "可交易" in odf.columns and (odf["可交易"] == False).any():   # noqa: E712
+            n_no = int((odf["可交易"] == False).sum())                   # noqa: E712
+            st.info(f"ℹ️ {n_no}/{len(odf)} 個結果目前暫停接單（acceptingOrders=false）——價格看得到但成交不了。")
+
+        # 實測 outcomePrices 覆蓋率只有 90%，所以「加總偏低」有兩種完全不同的成因：
+        # 真的不互斥窮盡，或只是有幾個 market 缺價格。混為一談會冤枉後者。
+        priced = int(odf["raw"].notna().sum())
+        n_out = len(odf)
+        neg = ev.get("negRisk")
+
         if total is None:
             pass
         elif normalized:
@@ -523,12 +587,28 @@ def render_event_detail(ev: dict, row: pd.Series, key_prefix: str) -> None:
                 f"原始價格加總 **{total:.3f}** → 超出 1 的 {(total - 1) * 100:.1f}% 是價差造成的"
                 "隱含抽水（overround）。下表「機率_%」已做乘法正規化。"
             )
+            if neg is False:
+                st.caption(
+                    "註：這個事件的 `negRisk` 是 False，與「加總接近 1」的判斷不一致。"
+                    "實測 negRisk 與價格加總在 126 個多結果事件裡有 14 個彼此矛盾，以價格加總為準。"
+                )
+        elif priced < n_out:
+            st.warning(
+                f"原始價格加總 **{total:.3f}**，但 {n_out} 個結果裡只有 {priced} 個抓得到價格"
+                f"（缺 {n_out - priced} 個）——**加總偏低很可能是資料不全，不是結果不互斥**。"
+                "無論何者都不該正規化，下表顯示原始價格。"
+            )
         else:
+            extra = ""
+            if neg is True:
+                extra = ("（註：這個事件的 `negRisk` 標為 True，與價格加總矛盾；"
+                         "實測有 8 個事件如此，以價格加總為準。）")
             st.warning(
                 f"原始價格加總 **{total:.3f}**，落在合理區間 "
-                f"{NORMALIZE_BAND[0]}–{NORMALIZE_BAND[1]} 之外——這組結果很可能**不是互斥且窮盡**的"
-                "（例如把幾個獨立問題綁成同一個事件）。硬做正規化會生出假機率，"
-                "所以下表直接顯示原始價格，未做任何調整。"
+                f"{NORMALIZE_BAND[0]}–{NORMALIZE_BAND[1]} 之外，且每個結果都有價格——"
+                "這組結果**不是互斥且窮盡**的。常見於「by date」階梯市場"
+                "（會不會在某日前發生）與複選市場。硬做正規化會生出假機率，"
+                f"所以下表直接顯示原始價格，未做任何調整。{extra}"
             )
 
         if odf.empty:
@@ -536,14 +616,16 @@ def render_event_detail(ev: dict, row: pd.Series, key_prefix: str) -> None:
             return
 
         st.dataframe(
-            odf[["outcome", "機率_%", "原始_%", "價差", "來源"]],
+            odf[["outcome", "機率_%", "原始_%", "月變化_pp", "價差", "來源", "可交易"]],
             hide_index=True,
             column_config={
                 "outcome": st.column_config.TextColumn("結果", width="large"),
                 "機率_%": st.column_config.NumberColumn("機率 %（正規化）", format="%.1f"),
                 "原始_%": st.column_config.NumberColumn("原始 %", format="%.1f"),
+                "月變化_pp": st.column_config.NumberColumn("月變化 pp", format="%+.1f"),
                 "價差": st.column_config.NumberColumn("買賣價差", format="%.3f"),
                 "來源": st.column_config.TextColumn("價格來源"),
+                "可交易": st.column_config.CheckboxColumn("可交易"),
             },
         )
 
@@ -620,6 +702,11 @@ with top[2]:
     min_liq = st.number_input("最低流動性（USD）", min_value=0, value=1000, step=500,
                               help="流動性太低的市場報價噪音大於訊號，預設濾掉。")
 
+only_tradable = st.checkbox(
+    "只看此刻可下單的市場（acceptingOrders）", value=True,
+    help="關掉會一併顯示暫停接單的市場——那些價格看得到但成交不了。",
+)
+
 kw = st.text_input("關鍵字（事件標題包含）", "", placeholder="例：Fed、Taiwan、tariff")
 
 try:
@@ -640,6 +727,12 @@ if kw:
 if min_liq > 0:
     df = df[df["liquidity"].fillna(0) >= float(min_liq)]
 
+# 過濾一定要講出來砍了幾筆，不能靜默縮水
+n_before_trade = len(df)
+if only_tradable and "可交易" in df.columns:
+    df = df[df["可交易"] != False]      # noqa: E712 — None（欄位缺）視為未知，保留
+n_untradable = n_before_trade - len(df)
+
 if df.empty:
     st.warning("篩選後沒有結果。放寬關鍵字或降低流動性門檻。")
     st.stop()
@@ -650,10 +743,16 @@ tab_hot, tab_move = st.tabs(["熱門事件", "異常變動"])
 
 # ---- Tab 1：熱門事件 ----
 with tab_hot:
-    st.caption(f"主題「{cat_name}」共 {len(df)} 個進行中事件。點一列看明細。")
+    msg = f"主題「{cat_name}」共 {len(df)} 個進行中事件。點一列看明細。"
+    if n_untradable:
+        msg += f" 另有 {n_untradable} 個暫停接單已濾掉（取消勾選上方選項可看）。"
+    flagged = int(df["解析註記"].notna().sum()) if "解析註記" in df.columns else 0
+    if flagged:
+        msg += f" 其中 {flagged} 個帶有解析狀態註記。"
+    st.caption(msg)
 
-    show = df[["title", "主要結果", "機率_%", "已正規化", "價差", "結果數",
-               "volume24hr", "liquidity", "endDate_台北"]]
+    show = df[["title", "主要結果", "機率_%", "月變化_pp", "已正規化", "可交易",
+               "解析註記", "價差", "結果數", "volume24hr", "liquidity", "endDate_台北"]]
     sel = st.dataframe(
         show.head(80),
         hide_index=True,
@@ -667,6 +766,18 @@ with tab_hot:
                 help="二元事件固定顯示 Yes 的機率（不顯示 No），多結果事件顯示機率最高者。",
             ),
             "機率_%": st.column_config.NumberColumn("機率 %", format="%.1f"),
+            "月變化_pp": st.column_config.NumberColumn(
+                "月變化 pp", format="%+.1f",
+                help="API 自帶的一個月價格變化，不需另外抓走勢。單位待探針 8 對帳確認。",
+            ),
+            "可交易": st.column_config.CheckboxColumn(
+                "可交易",
+                help="acceptingOrders：此刻能不能下單。enableOrderBook 只說市場型別支援掛單簿。",
+            ),
+            "解析註記": st.column_config.TextColumn(
+                "解析註記",
+                help="umaResolutionStatuses：有值代表解析程序有狀態註記（可能爭議中），語意未實測，原樣呈現。",
+            ),
             "已正規化": st.column_config.CheckboxColumn(
                 "已正規化",
                 help="未打勾＝各結果加總落在合理區間外，很可能不是互斥窮盡的一組，顯示的是原始價格。",
@@ -717,22 +828,53 @@ with tab_hot:
 
 # ---- Tab 2：異常變動 ----
 with tab_move:
-    st.caption("對主題內成交量前 K 名事件抓走勢，計算區間內的淨變化 / 全距 / 標準差。")
+    st.caption(
+        "兩段式：先用 API 自帶的 `oneMonthPriceChange` 立刻排序（零請求），"
+        "再只對你挑的前幾名抓走勢，算出該區間的全距與標準差。"
+    )
 
-    m1, m2, m3, m4 = st.columns([1.4, 1, 1, 1.6])
+    # ── 第一段：零請求的即時排行 ──
+    quick = df[df["月變化_pp"].notna()].copy()
+    if quick.empty:
+        st.warning("這個主題的事件都沒有 oneMonthPriceChange，只能走第二段抓走勢。")
+    else:
+        quick["月變化絕對值"] = quick["月變化_pp"].abs()
+        quick = quick.sort_values("月變化絕對值", ascending=False, na_position="last")
+        n_missing = len(df) - len(quick)
+        st.caption(
+            f"即時排行：{len(quick)} 個事件有月變化資料"
+            + (f"（另 {n_missing} 個沒有，未列入）。" if n_missing else "。")
+        )
+        st.dataframe(
+            quick[["title", "主要結果", "機率_%", "月變化_pp", "可交易", "volume24hr"]].head(30),
+            hide_index=True,
+            column_config={
+                "title": st.column_config.TextColumn("事件", width="large"),
+                "機率_%": st.column_config.NumberColumn("機率 %", format="%.1f"),
+                "月變化_pp": st.column_config.NumberColumn("月變化 pp", format="%+.1f"),
+                "可交易": st.column_config.CheckboxColumn("可交易"),
+                "volume24hr": st.column_config.NumberColumn("24h 量", format="compact"),
+            },
+        )
+
+    st.markdown("---")
+    st.markdown("**細部走勢**（只對前 N 名發請求）")
+
+    m1, m2, m3, m4 = st.columns([1.6, 1, 1, 1.4])
     with m1:
         mv_range = st.segmented_control("區間", list(RANGE_MAP.keys()), default="1D", key="mv_range") or "1D"
     with m2:
-        top_k = st.number_input("Top K", min_value=5, max_value=80, value=25, step=5, key="mv_k")
+        top_k = st.number_input("抓前幾名", min_value=3, max_value=40, value=10, step=1, key="mv_k")
     with m3:
         mv_fid = st.slider("fidelity", 1, 60, 10, 1, key="mv_fid")
     with m4:
         rank_by = st.selectbox("排序依據", ["全距_pp", "波動度_pp", "淨變化_pp（絕對值）"],
                                index=0, key="mv_rank")
 
-    if st.button("開始掃描"):
-        cands = df.head(int(top_k))
-        pairs: list[tuple[str, str, str]] = []   # (token_id, event_id, 結果標籤)
+    if st.button("抓走勢細節"):
+        base_rank = quick if not quick.empty else df
+        cands = base_rank.head(int(top_k))
+        pairs: list[tuple[str, str, str]] = []
         skipped: list[tuple[str, str]] = []
         for _, r in cands.iterrows():
             ev = events_by_id.get(r["event_id"])
@@ -755,7 +897,7 @@ with tab_move:
             pairs.append((str(best["token_id"]), r["event_id"], str(best["outcome"])))
 
         if not pairs:
-            st.warning("這批事件沒有可用的掛單簿 token，換個主題或提高 Top K。")
+            st.warning("這批事件沒有可用的掛單簿 token，換個主題或提高名次。")
         else:
             with st.spinner(f"併發抓取 {len(pairs)} 個走勢…"):
                 try:
@@ -766,20 +908,20 @@ with tab_move:
                     hist_map = {}
                     st.error(explain_network_error(e))
 
-            results = []
-            empty_n = 0
+            results, empty_n = [], 0
             for token_id, event_id, label in pairs:
                 stats = series_stats(build_series(hist_map.get(token_id, [])))
                 if not stats:
                     empty_n += 1
                     continue
-                base = df[df["event_id"] == event_id].head(1)
+                b = df[df["event_id"] == event_id].head(1)
                 results.append({
                     "event_id": event_id,
-                    "title": base["title"].iloc[0] if not base.empty else event_id,
+                    "title": b["title"].iloc[0] if not b.empty else event_id,
                     "結果": label,
                     **stats,
-                    "volume24hr": base["volume24hr"].iloc[0] if not base.empty else None,
+                    "月變化_pp": b["月變化_pp"].iloc[0] if not b.empty else None,
+                    "volume24hr": b["volume24hr"].iloc[0] if not b.empty else None,
                 })
 
             # 存進 session_state：不然一動下方任何 widget，button 就變 False，整塊結果會消失
@@ -791,7 +933,7 @@ with tab_move:
 
     results = st.session_state.get("mv_results")
     if results is None:
-        st.info("按「開始掃描」計算。")
+        st.info("上面的即時排行不需要任何請求。要看區間內的全距與標準差，按「抓走勢細節」。")
     elif not results:
         st.warning("沒有算出結果——該區間成交太少，或 API 回空。試 ALL 區間。")
     else:
@@ -803,22 +945,23 @@ with tab_move:
         skipped = st.session_state.get("mv_skipped", [])
         scanned = st.session_state.get("mv_scanned", 0)
         st.caption(
-            f"掃描於 {st.session_state.get('mv_at', '?')}（台北）｜範圍 {scanned} 個事件 → "
-            f"成功 {len(results)}、無足夠成交資料 {empty_n}、無法掃描 {len(skipped)}。"
+            f"抓取於 {st.session_state.get('mv_at', '?')}（台北）｜範圍 {scanned} 個事件 → "
+            f"成功 {len(results)}、無足夠成交資料 {empty_n}、無法抓取 {len(skipped)}。"
         )
         if skipped:
             with st.expander(f"被跳過的 {len(skipped)} 個事件（點開看原因）"):
-                st.dataframe(
-                    pd.DataFrame(skipped, columns=["事件", "原因"]),
-                    hide_index=True,
-                )
+                st.dataframe(pd.DataFrame(skipped, columns=["事件", "原因"]), hide_index=True)
 
         st.dataframe(
-            res[["title", "結果", "現值_%", "淨變化_pp", "全距_pp", "波動度_pp", "樣本數", "volume24hr"]].head(30),
+            res[["title", "結果", "現值_%", "月變化_pp", "淨變化_pp", "全距_pp",
+                 "波動度_pp", "樣本數", "volume24hr"]].head(30),
             hide_index=True,
             column_config={
                 "title": st.column_config.TextColumn("事件", width="large"),
                 "現值_%": st.column_config.NumberColumn("現值 %", format="%.1f"),
+                "月變化_pp": st.column_config.NumberColumn(
+                    "月變化 pp", format="%+.1f",
+                    help="API 自帶的一個月變化，與右邊實際抓來的區間統計可互相對照。"),
                 "淨變化_pp": st.column_config.NumberColumn("淨變化 pp", format="%+.1f",
                                                         help="方向性漂移（末值 − 首值），不是波動。"),
                 "全距_pp": st.column_config.NumberColumn("全距 pp", format="%.1f",
@@ -832,15 +975,16 @@ with tab_move:
         pick_title = st.selectbox("看哪一個的明細", res["title"].tolist(), key="mv_pick")
         if pick_title:
             eid = res.loc[res["title"] == pick_title, "event_id"].iloc[0]
-            base = df[df["event_id"] == eid].head(1)
+            b = df[df["event_id"] == eid].head(1)
             ev = events_by_id.get(eid)
-            if ev is not None and not base.empty:
-                render_event_detail(ev, base.iloc[0], key_prefix="mvdet")
+            if ev is not None and not b.empty:
+                render_event_detail(ev, b.iloc[0], key_prefix="mvdet")
 
 st.divider()
 st.caption(
     "⚠️ 市場價格不等於校準後的真實機率：預測市場普遍存在 favorite-longshot bias"
     "（低機率端系統性高估、高機率端低估，且離到期越遠越嚴重），本頁未做校準調整。"
-    "另外解析風險（UMA 爭議、規則措辭）不會反映在盤面價格上。"
+    "另外解析風險不會反映在盤面價格上——本頁已把 UMA 解析狀態註記標示出來，"
+    "但規則措辭的模糊性仍需自行到原始頁面判讀。"
 )
 st.caption("本頁僅為資訊呈現，不構成投資建議。")

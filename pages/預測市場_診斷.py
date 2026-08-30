@@ -11,6 +11,7 @@ Polymarket API 契約診斷頁（唯讀，可安全部署）
   3. limit 的上限，以及超過上限時是否靜默截斷
   4. 巢狀 markets[] 上 bestBid / bestAsk / groupItemTitle 等欄位的實際覆蓋率
   5. negRisk 旗標是否存在，且是否真的等於「互斥且窮盡」（能否取代價格加總啟發式）
+  6. 手續費欄位的實際分布（只調查，不改計算），並對帳 oneMonthPriceChange 的單位
 
 設計原則：**每個探針都要有負向對照**。
 最危險的失敗不是 API 回 4xx——那會被看見；而是 API 收下了參數卻默默忽略，
@@ -593,6 +594,116 @@ def probe_history(gamma: str, clob: str) -> Probe:
 
 
 # -----------------------
+# 探針 8：手續費分布 ＋ 剛開始依賴的三個欄位對帳
+# -----------------------
+def probe_fees_and_new_fields(gamma: str, clob: str, sample_n: int) -> Probe:
+    """
+    三件事：
+      1. 手續費：feesEnabled / feeType / takerBaseFee 的實際分布。只調查，不改計算——
+         要先看清楚 feeSchedule 的結構，才知道手續費怎麼折進隱含機率。
+      2. oneMonthPriceChange 的單位對帳：主頁假設它是 0–1 的價格差值（×100 換百分點）。
+         拿同一個 market 的真實一個月走勢比對，錯了就是 100 倍的誤差。
+      3. acceptingOrders 與 umaResolutionStatuses 的值分布：主頁已經開始拿它們
+         做過濾與警示，總得知道實際長什麼樣、以及 umaResolutionStatuses 有哪些值。
+    """
+    p = Probe("8. 手續費分布 ＋ 新依賴欄位對帳")
+    events: list[dict] = []
+    for tid, name in [(120, "Finance"), (100265, "Geopolitics")]:
+        data = call_json(
+            p, f"{gamma}/events",
+            {"limit": sample_n, "order": "volume24hr", "ascending": "false",
+             "closed": "false", "active": "true", "tag_id": tid, "related_tags": "true"},
+            f"tag_id={tid}（{name}）取樣",
+        )
+        if isinstance(data, list):
+            events.extend(x for x in data if isinstance(x, dict))
+
+    mkts = markets_of(events)
+    if not mkts:
+        p.verdict, p.summary = "FAIL", "取樣沒有 market。"
+        return p
+
+    def dist(key: str, cap: int = 8) -> dict:
+        d: dict[str, int] = {}
+        for m in mkts:
+            v = m.get(key, "(欄位不存在)")
+            k = repr(v)[:60]
+            d[k] = d.get(k, 0) + 1
+        return dict(sorted(d.items(), key=lambda kv: -kv[1])[:cap])
+
+    fees_on = sum(1 for m in mkts if m.get("feesEnabled") is True)
+    taker = [f(m.get("takerBaseFee")) for m in mkts]
+    taker = [x for x in taker if x is not None]
+    nonzero_taker = [x for x in taker if x != 0]
+
+    # oneMonthPriceChange 單位對帳：挑一個有該欄位又有 token 的 market
+    unit_check: dict = {"狀態": "找不到可對帳的 market"}
+    for m in mkts:
+        omc = f(m.get("oneMonthPriceChange"))
+        toks = as_list(m.get("clobTokenIds"))
+        if omc is None or omc == 0 or not toks:
+            continue
+        hist = call_json(p, f"{clob}/prices-history",
+                         {"market": str(toks[0]), "interval": "1m", "fidelity": 60},
+                         "取一個月走勢對帳 oneMonthPriceChange")
+        rows = hist.get("history", []) if isinstance(hist, dict) else []
+        ps = [f(x.get("p")) for x in rows if isinstance(x, dict)]
+        ps = [x for x in ps if x is not None]
+        if len(ps) < 2:
+            unit_check = {"狀態": "走勢資料不足，無法對帳"}
+            break
+        actual = ps[-1] - ps[0]                      # 價格空間（0–1）的實際一個月變化
+        unit_check = {
+            "oneMonthPriceChange 原始值": omc,
+            "走勢實算的一個月價格差": round(actual, 4),
+            "兩者比值": round(omc / actual, 3) if actual else None,
+            "判讀": ("單位一致（都是 0–1 價格差）" if actual and 0.5 <= abs(omc / actual) <= 2
+                     else "單位不一致——主頁的 ×100 假設要改"),
+        }
+        break
+
+    uma_nonempty = sum(1 for m in mkts if m.get("umaResolutionStatuses") not in (None, "", [], "[]"))
+    accepting_false = sum(1 for m in mkts if m.get("acceptingOrders") is False)
+
+    p.evidence = {
+        "取樣": f"{len(events)} 個事件 / {len(mkts)} 個 market",
+        "── 手續費 ──": "",
+        "feesEnabled=True": f"{fees_on}/{len(mkts)}（{fees_on / len(mkts):.0%}）",
+        "feeType 分布": dist("feeType"),
+        "takerBaseFee 分布": dist("takerBaseFee"),
+        "makerBaseFee 分布": dist("makerBaseFee"),
+        "feeSchedule 分布": dist("feeSchedule", cap=5),
+        "takerBaseFee 非零的比例": f"{len(nonzero_taker)}/{len(taker)}",
+        "── oneMonthPriceChange 單位 ──": "",
+        "對帳": unit_check,
+        "有該欄位的比例": f"{sum(1 for m in mkts if m.get('oneMonthPriceChange') is not None)}/{len(mkts)}",
+        "── 新依賴欄位 ──": "",
+        "acceptingOrders 分布": dist("acceptingOrders"),
+        "acceptingOrders=False": f"{accepting_false}/{len(mkts)}",
+        "umaResolutionStatuses 非空": f"{uma_nonempty}/{len(mkts)}",
+        "umaResolutionStatuses 值分布": dist("umaResolutionStatuses"),
+        "orderPriceMinTickSize 分布": dist("orderPriceMinTickSize"),
+    }
+
+    verdicts = []
+    if fees_on:
+        verdicts.append(f"手續費：{fees_on}/{len(mkts)} 個 market 已啟用，隱含機率需扣費才是有效機率")
+    else:
+        verdicts.append("手續費：取樣中全部未啟用，隱含機率可直接用")
+    if isinstance(unit_check, dict) and "不一致" in str(unit_check.get("判讀", "")):
+        verdicts.append("⚠️ oneMonthPriceChange 單位假設錯誤，主頁的月變化欄位會差 100 倍")
+        p.verdict = "FAIL"
+    elif accepting_false or uma_nonempty:
+        p.verdict = "PASS"
+        verdicts.append(f"acceptingOrders=False {accepting_false} 個、解析註記非空 {uma_nonempty} 個——新過濾與警示都有實際作用")
+    else:
+        p.verdict = "WARN"
+        verdicts.append("取樣中沒有暫停接單也沒有解析註記，新增的過濾與警示無從驗證")
+    p.summary = "；".join(verdicts) + "。"
+    return p
+
+
+# -----------------------
 # UI
 # -----------------------
 st.set_page_config(page_title="Polymarket API 診斷", layout="wide", initial_sidebar_state="collapsed")
@@ -620,6 +731,7 @@ if st.button("開始診斷", type="primary"):
         ("欄位覆蓋率", lambda: probe_fields(gamma, int(sample_n))),
         ("走勢區間", lambda: probe_history(gamma, clob)),
         ("negRisk", lambda: probe_negrisk(gamma, int(sample_n))),
+        ("手續費與新欄位", lambda: probe_fees_and_new_fields(gamma, clob, int(sample_n))),
     ]
     bar = st.progress(0.0, text="準備中…")
     for i, (label, fn) in enumerate(steps, start=1):
@@ -640,7 +752,7 @@ if st.button("開始診斷", type="primary"):
 probes: list[Probe] | None = st.session_state.get("diag_probes")
 
 if probes is None:
-    st.info("按「開始診斷」。全部跑完約 15–40 秒，會發出約 28 個請求。")
+    st.info("按「開始診斷」。全部跑完約 15–40 秒，會發出約 31 個請求。")
     st.stop()
 
 # 總覽
