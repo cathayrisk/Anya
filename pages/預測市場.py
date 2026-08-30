@@ -29,8 +29,10 @@ Polymarket 財經向儀表板（官方 Gamma / CLOB REST）
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -38,8 +40,10 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-GAMMA = "https://gamma-api.polymarket.com"
-CLOB = "https://clob.polymarket.com"
+# 可用環境變數覆寫：本機因 DNS 攔截連不到官方端點時能指向代理，
+# 也讓 UI 能對著 mock server 被實際點過一遍（見 tests/ 與 scratchpad 的 mock）。
+GAMMA = os.getenv("POLYMARKET_GAMMA_BASE", "https://gamma-api.polymarket.com").rstrip("/")
+CLOB = os.getenv("POLYMARKET_CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 
 TPE = ZoneInfo("Asia/Taipei")
 
@@ -289,7 +293,7 @@ def pick_price(m: dict, fallback: float | None = None) -> tuple[float | None, st
     last = to_float(m.get("lastTradePrice"))
 
     if bid is not None and ask is not None and ask >= bid:
-        spread = ask - bid
+        spread = round(ask - bid, 4)
         if spread <= SPREAD_FALLBACK + SPREAD_EPS:
             return (bid + ask) / 2.0, "mid", spread
         if last is not None:
@@ -299,6 +303,7 @@ def pick_price(m: dict, fallback: float | None = None) -> tuple[float | None, st
     # 實測 bestBid 只有 90% 覆蓋率（冷門選項沒人掛買單），但 Gamma 自己的 spread 欄位是 100%。
     # 算不出中價時，至少把價差顯示出來，不要讓這一欄空著。
     reported = to_float(m.get("spread"))
+    reported = round(reported, 4) if reported is not None else None
     if last is not None:
         return last, "last(無雙邊報價)", reported
     if fallback is not None:
@@ -325,9 +330,13 @@ def event_outcomes(ev: dict) -> tuple[pd.DataFrame, float | None, bool]:
         p0, src0, spread0 = pick_price(m, fallback=prices[0] if prices else None)
         for i, nm in enumerate(names):
             if i == 0:
-                raw, src, spd = p0, src0, spread0
+                raw, src = p0, src0
             else:
-                raw, src, spd = (prices[i] if i < len(prices) else None), "outcomePrices", None
+                raw, src = (prices[i] if i < len(prices) else None), "outcomePrices"
+            # 價差是「這個掛單簿」的屬性，不是某個結果的屬性——Yes 和 No 共用同一本簿子。
+            # 之前只給 index 0，導致「領先結果是 No」的二元事件在列表上價差永遠顯示 None
+            # （實測 6 個事件裡有 2 個中招，真實資料中凡是機率低於 50% 的市場都會）。
+            spd = spread0
             rows.append({
                 "outcome": nm, "raw": raw, "來源": src, "價差": spd,
                 "token_id": tokens[i] if i < len(tokens) else None,
@@ -360,20 +369,46 @@ def event_outcomes(ev: dict) -> tuple[pd.DataFrame, float | None, bool]:
     return df, total, normalized
 
 
+def is_binary_event(ev: dict) -> bool:
+    """單一 market ＝ 二元事件（Yes / No 兩個結果共用一本掛單簿）。"""
+    return len([m for m in (ev.get("markets") or []) if isinstance(m, dict)]) == 1
+
+
+def primary_row(odf: pd.DataFrame, binary: bool) -> pd.Series | None:
+    """
+    挑出代表這個事件的那一列。
+
+    二元事件固定取 Yes（第 0 列），**不是**取機率較高的那一邊——
+    一個 3% 的尾部風險事件如果顯示成「No 97%」，語意整個反過來，
+    而且列表裡會混雜 Yes 機率與 No 機率，沒辦法上下掃描比較。
+    Polymarket 官方介面顯示的也是「3% chance」。
+    多結果事件沒有 Yes/No 的概念，才取機率最高者。
+    """
+    if odf.empty:
+        return None
+    if binary:
+        return odf.iloc[0]
+    if odf["機率_%"].notna().any():
+        return odf.loc[odf["機率_%"].idxmax()]
+    return odf.iloc[0]
+
+
 def events_to_frame(events: list[dict]) -> pd.DataFrame:
     rows = []
     for ev in events:
         odf, total, normalized = event_outcomes(ev)
+        binary = is_binary_event(ev)
+        top = primary_row(odf, binary)
         top_label, top_prob, top_spread = None, None, None
-        if not odf.empty and odf["機率_%"].notna().any():
-            top = odf.loc[odf["機率_%"].idxmax()]
+        if top is not None:
             top_label = str(top["outcome"])
-            top_prob = float(top["機率_%"])
+            top_prob = to_float(top["機率_%"])
             top_spread = to_float(top["價差"])
         rows.append({
             "event_id": str(ev.get("id") or ev.get("slug") or ""),
             "title": str(ev.get("title") or ev.get("slug") or "(無標題)"),
-            "領先結果": top_label,
+            "二元": binary,
+            "主要結果": top_label,
             "機率_%": top_prob,
             "價差": top_spread,
             "結果數": int(len(odf)),
@@ -438,20 +473,27 @@ def to_taipei_date(v):
         return None
 
 
-def compact_number(x, digits: int = 2) -> str:
-    """5413482.27 -> 5.41M；None/NaN -> N/A"""
+def compact_number(x, digits: int = 1) -> str:
+    """
+    5413482.27 -> 541.3萬；None/NaN -> N/A
+
+    用萬／億而不是 K／M：表格欄位設了 format="compact"，Streamlit 會依語系
+    在地化成「246萬」，指標若還用 K／M 就會出現同一頁兩套單位制。
+    """
     v = to_float(x)
     if v is None:
         return "N/A"
     sign = "-" if v < 0 else ""
     v = abs(v)
     unit, scale = "", 1.0
-    for u, s in [("", 1.0), ("K", 1e3), ("M", 1e6), ("B", 1e9), ("T", 1e12)]:
-        unit, scale = u, s
-        if v < s * 1000:
+    for u, sc in [("", 1.0), ("萬", 1e4), ("億", 1e8), ("兆", 1e12)]:
+        unit, scale = u, sc
+        if v < sc * 10_000:
             break
     val = v / scale
-    return f"{sign}{val:,.0f}" if unit == "" else f"{sign}{val:.{digits}f}{unit}"
+    if unit == "":
+        return f"{sign}{val:,.0f}"
+    return f"{sign}{val:.{digits}f}{unit}" if val < 100 else f"{sign}{val:.0f}{unit}"
 
 
 # -----------------------
@@ -464,9 +506,12 @@ def render_event_detail(ev: dict, row: pd.Series, key_prefix: str) -> None:
         st.markdown(f"### {row.get('title', '')}")
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("領先結果", str(row.get("領先結果") or "N/A"))
+        c1.metric("主要結果" if not row.get("二元") else "結果", str(row.get("主要結果") or "N/A"))
         prob = to_float(row.get("機率_%"))
-        c2.metric("機率（正規化）", f"{prob:.1f}%" if prob is not None else "N/A")
+        c2.metric(
+            "機率（正規化）" if normalized else "機率（原始價）",
+            f"{prob:.1f}%" if prob is not None else "N/A",
+        )
         c3.metric("24h 成交量", compact_number(row.get("volume24hr")))
         end_d = row.get("endDate_台北")
         c4.metric("結束（台北）", end_d.isoformat() if end_d else "N/A")
@@ -512,10 +557,10 @@ def render_event_detail(ev: dict, row: pd.Series, key_prefix: str) -> None:
             labels = tradable["outcome"].tolist()
             pick_label = st.selectbox("看哪個結果的走勢", labels, key=f"{key_prefix}_outcome")
         with ctrl[1]:
-            range_ui = st.radio(
-                "區間", list(RANGE_MAP.keys()), horizontal=True, index=4,
+            range_ui = st.segmented_control(
+                "區間", list(RANGE_MAP.keys()), default="1M",
                 key=f"{key_prefix}_range",
-            )
+            ) or "1M"
         with ctrl[2]:
             fidelity = st.slider("fidelity（分鐘）", 1, 60, 10, 1, key=f"{key_prefix}_fid")
 
@@ -607,7 +652,7 @@ tab_hot, tab_move = st.tabs(["熱門事件", "異常變動"])
 with tab_hot:
     st.caption(f"主題「{cat_name}」共 {len(df)} 個進行中事件。點一列看明細。")
 
-    show = df[["title", "領先結果", "機率_%", "已正規化", "價差", "結果數",
+    show = df[["title", "主要結果", "機率_%", "已正規化", "價差", "結果數",
                "volume24hr", "liquidity", "endDate_台北"]]
     sel = st.dataframe(
         show.head(80),
@@ -617,7 +662,10 @@ with tab_hot:
         key="hot_table",
         column_config={
             "title": st.column_config.TextColumn("事件", width="large"),
-            "領先結果": st.column_config.TextColumn("領先結果"),
+            "主要結果": st.column_config.TextColumn(
+                "主要結果",
+                help="二元事件固定顯示 Yes 的機率（不顯示 No），多結果事件顯示機率最高者。",
+            ),
             "機率_%": st.column_config.NumberColumn("機率 %", format="%.1f"),
             "已正規化": st.column_config.CheckboxColumn(
                 "已正規化",
@@ -626,22 +674,46 @@ with tab_hot:
             "價差": st.column_config.NumberColumn("價差", format="%.3f",
                                                  help="買賣價差。> 0.10 時價格改用最後成交價。"),
             "結果數": st.column_config.NumberColumn("結果數", format="%d"),
-            "volume24hr": st.column_config.NumberColumn("24h 量", format="%.0f"),
-            "liquidity": st.column_config.NumberColumn("流動性", format="%.0f"),
+            "volume24hr": st.column_config.NumberColumn("24h 量", format="compact"),
+            "liquidity": st.column_config.NumberColumn("流動性", format="compact"),
             "endDate_台北": st.column_config.DateColumn("結束（台北）"),
         },
     )
 
+    # 表格是 canvas 畫的：合成點擊進不去，無障礙層的元素尺寸是 0×0，
+    # 等於「點一列」這個主要互動既寫不了 e2e 測試、螢幕閱讀器也用不了。
+    # 所以另外給一個純 DOM 的下拉當備援入口，兩者共用同一份選取狀態。
+    NONE_LABEL = "（未選取）"
+    titles = df["title"].head(80).tolist()
+    options = [NONE_LABEL] + titles
+
     picked = sel.selection.rows if sel and sel.selection else []
-    if not picked:
-        st.info("點選上表任一列，下方顯示結果分布與走勢。")
+    prev = st.session_state.get("_hot_prev_rows")
+    if picked != prev:
+        # 表格這一輪有動作 → 表格優先，並把下拉同步過去
+        st.session_state["_hot_prev_rows"] = picked
+        st.session_state["hot_pick"] = str(df.iloc[picked[0]]["title"]) if picked else NONE_LABEL
+    if st.session_state.get("hot_pick") not in options:
+        st.session_state["hot_pick"] = NONE_LABEL   # 換主題後舊標題可能已不存在
+
+    chosen = st.selectbox(
+        "或用下拉選取（表格點選在螢幕閱讀器與自動化環境下不可用）",
+        options, key="hot_pick",
+    )
+
+    if chosen == NONE_LABEL:
+        st.info("點選上表任一列，或用上面的下拉選單挑一個事件。")
     else:
-        row = df.iloc[picked[0]]
-        ev = events_by_id.get(row["event_id"])
-        if ev is None:
-            st.warning("找不到該事件的原始資料，請重新整理。")
+        match = df[df["title"] == chosen].head(1)
+        if match.empty:
+            st.warning("找不到該事件，請重新選一次。")
         else:
-            render_event_detail(ev, row, key_prefix="hot")
+            row = match.iloc[0]
+            ev = events_by_id.get(row["event_id"])
+            if ev is None:
+                st.warning("找不到該事件的原始資料，請重新整理。")
+            else:
+                render_event_detail(ev, row, key_prefix="hot")
 
 # ---- Tab 2：異常變動 ----
 with tab_move:
@@ -649,7 +721,7 @@ with tab_move:
 
     m1, m2, m3, m4 = st.columns([1.4, 1, 1, 1.6])
     with m1:
-        mv_range = st.radio("區間", list(RANGE_MAP.keys()), horizontal=True, index=2, key="mv_range")
+        mv_range = st.segmented_control("區間", list(RANGE_MAP.keys()), default="1D", key="mv_range") or "1D"
     with m2:
         top_k = st.number_input("Top K", min_value=5, max_value=80, value=25, step=5, key="mv_k")
     with m3:
@@ -661,17 +733,25 @@ with tab_move:
     if st.button("開始掃描"):
         cands = df.head(int(top_k))
         pairs: list[tuple[str, str, str]] = []   # (token_id, event_id, 結果標籤)
+        skipped: list[tuple[str, str]] = []
         for _, r in cands.iterrows():
             ev = events_by_id.get(r["event_id"])
             if not ev:
+                skipped.append((str(r["title"]), "找不到原始事件"))
                 continue
             odf, _, _ = event_outcomes(ev)
             if odf.empty:
+                skipped.append((str(r["title"]), "無可解析的結果"))
                 continue
             valid = odf[odf["token_id"].notna()]
             if valid.empty:
+                skipped.append((str(r["title"]), "沒有 clobTokenIds（非掛單簿市場）"))
                 continue
-            best = valid.loc[valid["機率_%"].idxmax()] if valid["機率_%"].notna().any() else valid.iloc[0]
+            # 二元事件追 Yes：追 No 等於在監控一條鏡像曲線，漲跌方向剛好相反。
+            best = primary_row(valid.reset_index(drop=True), bool(r.get("二元")))
+            if best is None:
+                skipped.append((str(r["title"]), "找不到可追蹤的結果"))
+                continue
             pairs.append((str(best["token_id"]), r["event_id"], str(best["outcome"])))
 
         if not pairs:
@@ -705,6 +785,9 @@ with tab_move:
             # 存進 session_state：不然一動下方任何 widget，button 就變 False，整塊結果會消失
             st.session_state["mv_results"] = results
             st.session_state["mv_empty_n"] = empty_n
+            st.session_state["mv_skipped"] = skipped
+            st.session_state["mv_scanned"] = len(cands)
+            st.session_state["mv_at"] = datetime.now(TPE).strftime("%H:%M:%S")
 
     results = st.session_state.get("mv_results")
     if results is None:
@@ -717,8 +800,18 @@ with tab_move:
         res = res.sort_values(rank_by, ascending=False, na_position="last")
 
         empty_n = st.session_state.get("mv_empty_n", 0)
-        if empty_n:
-            st.caption(f"註：另有 {empty_n} 個事件在此區間沒有足夠成交資料，已排除（非靜默截斷）。")
+        skipped = st.session_state.get("mv_skipped", [])
+        scanned = st.session_state.get("mv_scanned", 0)
+        st.caption(
+            f"掃描於 {st.session_state.get('mv_at', '?')}（台北）｜範圍 {scanned} 個事件 → "
+            f"成功 {len(results)}、無足夠成交資料 {empty_n}、無法掃描 {len(skipped)}。"
+        )
+        if skipped:
+            with st.expander(f"被跳過的 {len(skipped)} 個事件（點開看原因）"):
+                st.dataframe(
+                    pd.DataFrame(skipped, columns=["事件", "原因"]),
+                    hide_index=True,
+                )
 
         st.dataframe(
             res[["title", "結果", "現值_%", "淨變化_pp", "全距_pp", "波動度_pp", "樣本數", "volume24hr"]].head(30),
@@ -732,7 +825,7 @@ with tab_move:
                                                        help="區間內最高 − 最低，衡量擺盪幅度。"),
                 "波動度_pp": st.column_config.NumberColumn("標準差 pp", format="%.2f"),
                 "樣本數": st.column_config.NumberColumn("點數", format="%d"),
-                "volume24hr": st.column_config.NumberColumn("24h 量", format="%.0f"),
+                "volume24hr": st.column_config.NumberColumn("24h 量", format="compact"),
             },
         )
 
