@@ -623,11 +623,11 @@ def probe_fees_and_new_fields(gamma: str, clob: str, sample_n: int) -> Probe:
         p.verdict, p.summary = "FAIL", "取樣沒有 market。"
         return p
 
-    def dist(key: str, cap: int = 8) -> dict:
+    def dist(key: str, cap: int = 8, width: int = 60) -> dict:
         d: dict[str, int] = {}
         for m in mkts:
             v = m.get(key, "(欄位不存在)")
-            k = repr(v)[:60]
+            k = repr(v)[:width]
             d[k] = d.get(k, 0) + 1
         return dict(sorted(d.items(), key=lambda kv: -kv[1])[:cap])
 
@@ -694,7 +694,16 @@ def probe_fees_and_new_fields(gamma: str, clob: str, sample_n: int) -> Probe:
         "feeType 分布": dist("feeType"),
         "takerBaseFee 分布": dist("takerBaseFee"),
         "makerBaseFee 分布": dist("makerBaseFee"),
-        "feeSchedule 分布": dist("feeSchedule", cap=5),
+        # 上一輪 feeSchedule 被 60 字截斷，rebateRate 沒看到 → 這次放寬到 400
+        "feeSchedule 分布": dist("feeSchedule", cap=5, width=400),
+        "feeSchedule 完整樣本": next(
+            (m.get("feeSchedule") for m in mkts if m.get("feeSchedule")), "(取樣中沒有)"
+        ),
+        "收費 market 的 takerBaseFee 是否恆定": (
+            "是（所以它不是實際費率，feeSchedule.rate 才是）"
+            if len({repr(m.get("takerBaseFee")) for m in mkts if m.get("feesEnabled")}) == 1
+            else "否——需重新確認哪個欄位是實際費率"
+        ),
         "takerBaseFee 非零的比例": f"{len(nonzero_taker)}/{len(taker)}",
         "── oneMonthPriceChange 單位 ──": "",
         "值域判定（主判準）": unit_verdict,
@@ -706,7 +715,7 @@ def probe_fees_and_new_fields(gamma: str, clob: str, sample_n: int) -> Probe:
         "acceptingOrders 分布": dist("acceptingOrders"),
         "acceptingOrders=False": f"{accepting_false}/{len(mkts)}",
         "umaResolutionStatuses 非空": f"{uma_nonempty}/{len(mkts)}",
-        "umaResolutionStatuses 值分布": dist("umaResolutionStatuses"),
+        "umaResolutionStatuses 值分布": dist("umaResolutionStatuses", cap=10, width=200),
         "orderPriceMinTickSize 分布": dist("orderPriceMinTickSize"),
     }
 
