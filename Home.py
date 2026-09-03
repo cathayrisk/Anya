@@ -211,6 +211,21 @@ CODING_HINT_RE = re.compile(
 GENERAL_HINT_RE = re.compile(
     r"系統性比較|深入分析|完整報告|全面評估|交叉比對|魔鬼代言人|蘇格拉底|專家團隊"
 )
+# 災防即時查詢：get_earthquake_info／get_typhoon_info 只掛在 General，落到 Fast 就只能憑記憶答。
+# 實測（2026-09-03，台北正發布豪雨特報當下）問「最近有地震嗎？有沒有颱風要來？」→ 留在 Fast、
+# 零工具、5 秒答完，自信地說「目前無颱風」還自行補了成因「受低壓帶影響」。災防是後果最重的
+# 一類問題，寧可多花一次 General 呼叫，也不能拿模型的既有知識當即時警報用。
+# 註：「天氣」類問題實測會由 Fast 的 sentinel 自行升級（get_weather 有拿到真實 CWA 資料），
+# 不放進來以免「天氣真好」這種閒聊也吃掉一次 General 配額（免費層限流很緊）。
+HAZARD_HINT_RE = re.compile(
+    r"地震|震度|餘震|海嘯|颱風|台風|颶風|豪雨|大雨特報|豪雨特報|陸上警報|海上警報|氣象署|氣象局"
+)
+# 使用者明確要求查證：只有 General 有 web_search／fetch_webpage 這類「拿得出網址」的工具。
+# 實測整句寫明「請你實際查證後回答」仍然留在 Fast，且回覆開頭寫「安妮亞幫你查好了 🔍」——
+# 沒查卻宣稱查過，比答錯更傷。詞保持窄（都是使用者刻意講出口的動詞），避免誤升級一般問句。
+VERIFY_HINT_RE = re.compile(
+    r"查證|求證|核實|查核|事實查核|fact\s*check", re.IGNORECASE
+)
 # per-skill 確定性 nudge：高精度關鍵詞 → 建議先載入對應 skill（首個命中生效）。
 # 命中同時升級 General（否則落 Fast 無工具，hint 無從生效）。pattern 保持窄以控誤升級。
 SKILL_HINT_RES: dict[str, re.Pattern] = {
@@ -3477,6 +3492,9 @@ FAST_GEMMA_PROMPT = """
 - 撰寫或除錯程式碼（Python／VBA／腳本）——深思模式有程式實測驗證迴路，交付品質更可靠
 - 使用者指名要「魔鬼代言人／蘇格拉底導師／研究團隊專家」等特定角色出馬（深思模式才有專家團隊）
 - 涉及嚴肅專業領域（法律、醫療、財經投資、學術研究）且需要嚴謹論證與大量查證
+- **災防即時狀況（地震、颱風、豪雨特報、海嘯、警報）——深思模式才有氣象署官方資料工具，
+  你憑記憶答出來的「目前無颱風」可能正好發生在警報發布當下**
+- **使用者開口要求「查證／求證／核實」——深思模式才有拿得出網址的搜尋工具**
 - 你判斷無法在一則訊息內給出可靠、完整的答案
 一般翻譯、摘要、改寫、簡單問答、時事快查：不需要升級，直接回答。
 
@@ -3488,12 +3506,21 @@ FAST_GEMMA_PROMPT = """
 （不得輸出任何其他文字——深思模式的蘇格拉底引導者會用提問幫使用者自己想通）
 
 ✅ **搜尋能力（系統已自動接上 Google 搜尋）**
-- 需要最新資訊（新聞、行情、版本、日期）時直接作答即可，系統會自動搜尋並把結果提供給你。
+- 需要最新資訊（新聞、行情、版本、日期）時直接作答即可，系統會嘗試自動搜尋並把結果提供給你。
 - 涉及時效性事實（價格、匯率、法規、統計數字、日期、現任職位）時，【優先使用搜尋查證】而非憑記憶回答——
   你的既有知識可能已過時。
 - **不要**輸出任何「## 來源」或來源清單區塊——來源由系統自動附在回覆末尾。
 - 對沒有把握的具體事實（商品名／菜單品項／店家／人名／法條編號／統計數字），若搜尋結果沒有涵蓋，
   必須在該項目後加「（未查證）」標記，不可「聽起來合理就直接列」。
+
+🚫 **禁止宣稱查證動作（硬規則，優先序等同「事實正確、不可捏造」）**
+自動搜尋**不保證每次都會執行**，而且你收不到「這次到底有沒有搜到」的通知——所以你無從得知
+自己是不是真的查過。因此不論結果如何，都**禁止寫出任何描述自己查證動作的句子**，包括但不限於：
+「（幫你）查好了」「我查了一下」「已為你確認」「查詢結果顯示」「根據最新資料／最新消息」
+「經查」「以下為查證資訊」。
+- 正確做法：**直接陳述內容本身**（例：「目前沒有颱風警報。」而不是「幫你查好了！目前沒有颱風警報。」）。
+- 查證與否由系統的 badge 與提示負責標示，不是由你在內文自述。
+- 違反這條的成本很高：使用者會把一段憑記憶的回答當成查證過的事實。
 
 ✅ **High-risk self-check（Fast版）**
 如果主題涉及醫療／法律／投資理財決策／資安／危險操作／自傷他傷／重大損失風險：
@@ -4652,6 +4679,15 @@ if prompt or retry_payload or pending_prompt:
     elif gm_has_docstore_index():
         mode = "general"
         escalate_reason = "docstore_indexed_prefer_general"
+    elif HAZARD_HINT_RE.search(user_text or ""):
+        # 災防查詢：工具（get_earthquake_info／get_typhoon_info）只在 General。
+        # 單獨一格而不併進 keyword_hint，是為了在 badge／日誌上看得出「這次是災防強制升級」。
+        mode = "general"
+        escalate_reason = "hazard_hint"
+    elif VERIFY_HINT_RE.search(user_text or ""):
+        # 使用者開口要查證 → 一定要給有 web_search／fetch_webpage 的那一邊
+        mode = "general"
+        escalate_reason = "verify_hint"
     elif (DEEP_RESEARCH_HINT_RE.search(user_text or "") or GENERAL_HINT_RE.search(user_text or "")
           or CODING_HINT_RE.search(user_text or "")
           or (WIDGET_HINT_RE and WIDGET_HINT_RE.search(user_text or ""))
