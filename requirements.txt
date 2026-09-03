@@ -1,5 +1,16 @@
 # Core dependencies
 streamlit>=1.40.0          # 1.40+ 的 pb2 檔案與 protobuf 5.x 相容
+# Gemini 主腦（Home.py:43 `from langchain_google_genai import ChatGoogleGenerativeAI`）。
+# 釘到 production 在 2026-09-03 推定跑的版本（未釘版時 9/3 部署會解析到 9/1、9/2 發布的最新版），
+# 目的是凍結現狀、讓原始碼行號分析與線上一致，不改變線上行為。
+# 這兩版的重試語意（anya-docstore-討論結論-20260903.md 附錄）：
+#   - google-genai 2.22.0 的 tenacity 會重試 httpx.TimeoutException（含 ReadTimeout），
+#     但只包 headers 前的 _request_once；body 串流卡死仍在 SDK retry 之外，由 app 的
+#     invoke_with_backoff 處理 → 兩種卡死機制並存，需 attempt 級 telemetry 才分得出。
+#   - 若 Cloud 部署 log 顯示實際安裝的不是這兩版，以 log 為準修正 pin。
+# 升級前先重驗上述結論。
+langchain-google-genai==4.4.0
+google-genai==2.22.0
 langgraph
 langchain
 langchain-community
@@ -12,7 +23,6 @@ openai-agents
 deepagents
 #gpt-researcher>=0.10.0,<0.15.0
 langsmith
-langchain-google-genai
 
 # Document processing
 faiss-cpu
