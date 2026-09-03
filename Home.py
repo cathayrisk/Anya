@@ -64,6 +64,10 @@ import uuid as _uuid
 from utils.rich_styles import inject_rich_styles
 from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
 from utils.honesty import strip_false_verification_claims
+from utils import telemetry as TELE
+
+# 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
+TELE_VERSIONS = TELE.versions(app_file=os.path.abspath(__file__))
 
 # 占星計算（kerykeion）。缺模組或缺套件時 ASTRO=None → 不註冊占星工具，其餘功能不受影響。
 try:
@@ -1448,11 +1452,25 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
         if delay or delay_override:
             _sleep_with_heartbeat(delay_override if delay_override is not None else delay)
         delay_override = None
+        # telemetry：每次 attempt 一筆。只觀測，不改任何重試決策。
+        _rt_now = _rt()
+        _rec = TELE.new_attempt(
+            turn_id=_rt_now.get("turn_id") or "-", purpose=purpose or "-",
+            model=current_model_name(purpose) if purpose else "-",
+            tier=_model_tiers().get(purpose, (0, 0.0))[0] if purpose else 0,
+            attempt_n=attempt,
+        )
+        _rec.update(TELE_VERSIONS)
+        _rt_now["_attempt"] = _rec
         try:
-            return fn()
+            _result = fn()
+            TELE.emit(TELE.finish_ok(_rec, _result), sink=_rt_now.get("telemetry"))
+            _rt_now["_attempt"] = None
+            return _result
         except Exception as e:
             name = type(e).__name__
             if name in ("StopException", "RerunException"):  # streamlit 控制流例外不可吞
+                _rt_now["_attempt"] = None
                 raise
             msg = str(e)
             is_quota = (
@@ -1481,6 +1499,10 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
                 or "InternalServerError" in name
             )
             last_exc = e
+            # telemetry：例外結束——帶 app 的分類旗標與 429 的 QuotaFailure 維度（沿 __cause__ 找）
+            TELE.emit(TELE.finish_exc(_rec, e, is_quota=is_quota, is_stuck=is_stuck, retriable=retriable),
+                      sink=_rt_now.get("telemetry"))
+            _rt_now["_attempt"] = None
 
             # 模型 ID 不存在／不支援 → 標記後立刻換下一格，不浪費退避次數
             if purpose and ("404" in msg or "NOT_FOUND" in msg
@@ -2797,7 +2819,8 @@ def _run_subagent(persona: str, payload: str, model_llm, *,
         if renderer is not None:
             renderer.reset()
         full = None
-        for c in model_llm.stream(msgs):
+        _rec = _rt().get("_attempt") or {}   # telemetry：首/末 chunk 時間寫回進行中的 attempt
+        for c in TELE.timed_stream(model_llm.stream(msgs), _rec):
             full = c if full is None else full + c
             if renderer is not None:
                 td = extract_thinking_from_content(c.content)
@@ -4282,7 +4305,8 @@ def run_fast_turn_streaming(lc_msgs: list, renderer: "ShimmerStreamRenderer") ->
         full = None
         gate_buf = ""
         gate_open = False
-        for c in _llm.stream([system] + lc_msgs):
+        _rec = _rt().get("_attempt") or {}   # telemetry：首/末 chunk 時間寫回進行中的 attempt
+        for c in TELE.timed_stream(_llm.stream([system] + lc_msgs), _rec):
             full = c if full is None else full + c
             tdelta = extract_thinking_from_content(c.content)
             if tdelta:
@@ -4343,6 +4367,9 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     rt["dr_summary_line"] = None
     rt["t_start"] = time.time()
     rt["meta"] = {"db_used": False, "web_used": False, "doc_calls": 0, "web_calls": 0, "tool_step": 0, "code_runs": 0}
+    # （telemetry 的 turn_id / telemetry list 不在這裡初始化：Fast 路徑不經過本函式，
+    #   放這裡會讓 Fast 回合繼承上一個 General 回合的 turn_id 並 append 進舊 list。
+    #   統一在 Fast/General 共同的分派點初始化——見 `with st.chat_message("assistant", …)` 前。）
     # 占星素材預算是「每回合」的，而 _gm_rt 跨回合存活 —— 不在這裡重設的話，
     # 一個 session 用掉 3 篇之後就永遠回 budget。正式站實測踩到：
     # 第二次提問直接被擋，模型改去用 web_search 抓未經驗證的來源，
@@ -4450,7 +4477,8 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
         renderer.reset()
         llm_with_tools = llm_for(_purpose, thinking="high").bind_tools(tools)
         full = None
-        for c in llm_with_tools.stream(msgs):
+        _rec = _rt().get("_attempt") or {}   # telemetry：首/末 chunk 時間寫回進行中的 attempt
+        for c in TELE.timed_stream(llm_with_tools.stream(msgs), _rec):
             full = c if full is None else full + c
             tdelta = extract_thinking_from_content(c.content)
             if tdelta:
@@ -4546,7 +4574,8 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
         def _consume_forced():
             renderer.reset()
             full = None
-            for c in llm_for(_purpose, thinking="high").stream(msgs):
+            _rec = _rt().get("_attempt") or {}   # telemetry：首/末 chunk 時間寫回進行中的 attempt
+            for c in TELE.timed_stream(llm_for(_purpose, thinking="high").stream(msgs), _rec):
                 full = c if full is None else full + c
                 tdelta = extract_thinking_from_content(c.content)
                 if tdelta:
@@ -4699,6 +4728,13 @@ if prompt or retry_payload or pending_prompt:
     else:
         mode = "fast"
 
+    # telemetry：每回合一個 id，attempt 記錄累積在這裡（?dev=1 可看；stdout 另有一份給 Cloud logs）。
+    # 放在 Fast/General 分派之前，兩條路徑都經過；_gm_rt 跨回合存活，所以每回合必須重置。
+    _tele_rt = st.session_state["_gm_rt"]
+    _tele_rt["turn_id"] = TELE.new_turn_id()
+    _tele_rt["telemetry"] = []
+    _tele_rt["_attempt"] = None   # 進行中的 attempt 記錄；timed_stream 往這裡寫首/末 chunk 時間
+
     # 助理區塊（avatar 依模式：⚡ Fast / 💬 General / 🧭 引導；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
     with st.chat_message("assistant", avatar=("🧭" if socratic_active else "⚡" if mode == "fast" else "💬")):
         status_area = st.container()
@@ -4774,6 +4810,9 @@ if prompt or retry_payload or pending_prompt:
                         if DEV_MODE:
                             with st.expander("🔧 [dev] Fast response metadata", expanded=False):
                                 st.json(getattr(fast_resp, "response_metadata", {}) or {})
+                            with st.expander(f"🔧 [dev] LLM attempts（{len(_rt().get('telemetry') or [])}）", expanded=False):
+                                st.json({"versions": TELE_VERSIONS, "turn_id": _rt().get("turn_id"),
+                                         "attempts": _rt().get("telemetry") or []})
 
                         ensure_session_defaults()
                         st.session_state.gm_chat_history.append({
@@ -4857,6 +4896,10 @@ if prompt or retry_payload or pending_prompt:
                         elapsed_s=round(time.time() - t_start, 1),
                     ) + escalate_badge + socratic_badge
                     badges_ph.markdown(general_badges_md)
+                    if DEV_MODE:
+                        with st.expander(f"🔧 [dev] LLM attempts（{len(_rt().get('telemetry') or [])}）", expanded=False):
+                            st.json({"versions": TELE_VERSIONS, "turn_id": _rt().get("turn_id"),
+                                     "attempts": _rt().get("telemetry") or []})
                     # 深度研究過程摘要行（來源數 / CP1 / CP2 / 降級）
                     dr_summary_line = st.session_state["_gm_rt"].get("dr_summary_line")
                     if dr_summary_line:
