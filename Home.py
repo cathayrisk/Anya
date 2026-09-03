@@ -63,6 +63,7 @@ import uuid as _uuid
 
 from utils.rich_styles import inject_rich_styles
 from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
+from utils.honesty import strip_false_verification_claims
 
 # 占星計算（kerykeion）。缺模組或缺套件時 ASTRO=None → 不註冊占星工具，其餘功能不受影響。
 try:
@@ -4761,11 +4762,14 @@ if prompt or retry_payload or pending_prompt:
                         )
                         badges_ph.markdown(fast_badges_md)
 
+                        # 未搜尋 → 系統握有事實，不信任模型措辭（Fix C，2026-09-03 線上驗證 V3 後）：
+                        # 1) 剝掉「幫你查好了」這類自稱查證的句子——FAST_GEMMA_PROMPT 的禁令實測對 flash-lite 無效
+                        # 2) banner 一律顯示，不再只看有沒有年份或 %——「目前無颱風」這種沒數字的斷言也該標
+                        if not web_happened:
+                            fast_text = strip_false_verification_claims(fast_text)
                         final_text = renderer.finish(fast_text, scope_key="gm_fast")
-
-                        # 未搜尋卻含時效性數字 → 誠實提示（模型憑既有知識作答，可能過時）
-                        if not web_happened and re.search(r"20\d{2}|％|%", fast_text):
-                            st.caption("💡 本回覆未經網路查證，數字來自模型既有知識，可能不是最新；需要查證可以再問一次並要求搜尋。")
+                        if not web_happened:
+                            st.caption("💡 本回覆未經網路查證，內容來自模型既有知識，可能不是最新；需要查證可以再問一次並要求搜尋。")
 
                         if DEV_MODE:
                             with st.expander("🔧 [dev] Fast response metadata", expanded=False):
