@@ -113,11 +113,11 @@ def parse_quota_failure(exc: BaseException | None) -> dict[str, Any]:
 
 # ── attempt 記錄 ────────────────────────────────────────────────────────────────
 
-def new_attempt(*, turn_id: str, purpose: str, model: str, tier: int, attempt_n: int,
-                mode: str | None = None) -> dict[str, Any]:
-    """一次模型呼叫開始時建立。時間全用 time.time()（epoch 秒），事後用差值。"""
+def new_attempt(*, turn_id: str, purpose: str, model: str, tier: int, attempt_n: int) -> dict[str, Any]:
+    """一次模型呼叫開始時建立。時間全用 time.time()（epoch 秒），事後用差值。
+    （purpose 已能區分 fast/general/research/socratic，不另設 mode 欄位。）"""
     return {
-        "turn_id": turn_id, "purpose": purpose, "mode": mode, "model": model, "tier": tier,
+        "turn_id": turn_id, "purpose": purpose, "model": model, "tier": tier,
         "attempt_n": attempt_n, "t_start": time.time(),
         "t_first_chunk": None, "t_last_chunk": None, "n_chunks": 0,
         "outcome": None, "exc_type": None, "exc_msg": None,
@@ -135,15 +135,38 @@ def timed_stream(it: Iterable[Any], rec: dict[str, Any]) -> Iterator[Any]:
             rec["t_first_chunk"] = now
         rec["t_last_chunk"] = now
         rec["n_chunks"] = rec.get("n_chunks", 0) + 1
+        # finish_reason 只在最後一個 chunk 的 response_metadata 出現；逐 chunk 覆寫，留下的就是最後一個
+        fr = _finish_reason_of(c)
+        if fr:
+            rec["finish_reason"] = fr
         yield c
 
 
+def _finish_reason_of(obj: Any) -> str | None:
+    """從 langchain message / chunk 取 finish_reason；不是 message 就回 None。"""
+    meta = getattr(obj, "response_metadata", None)
+    if isinstance(meta, dict) and meta.get("finish_reason"):
+        return str(meta["finish_reason"])
+    gi = getattr(obj, "generation_info", None)
+    if isinstance(gi, dict) and gi.get("finish_reason"):
+        return str(gi["finish_reason"])
+    return None
+
+
 def finish_ok(rec: dict[str, Any], result: Any = None) -> dict[str, Any]:
-    """成功結束：補 finish_reason（langchain 聚合 chunk 的 response_metadata）與耗時。"""
+    """成功結束：補 finish_reason 與耗時。
+
+    result 的形狀依呼叫端而異：General 的 _consume_round 回傳聚合 message；
+    Fast 的 _consume 回傳 (message, escalate_flag) tuple（線上實測 finish_reason 為 NULL 的原因）。
+    這裡對 tuple/list 逐元素找第一個有 finish_reason 的；timed_stream 已記到的值優先保留。"""
     rec["outcome"] = "ok"
-    meta = getattr(result, "response_metadata", None)
-    if isinstance(meta, dict):
-        rec["finish_reason"] = meta.get("finish_reason")
+    if not rec.get("finish_reason"):
+        candidates = list(result) if isinstance(result, (tuple, list)) else [result]
+        for cand in candidates:
+            fr = _finish_reason_of(cand)
+            if fr:
+                rec["finish_reason"] = fr
+                break
     return _close(rec)
 
 
