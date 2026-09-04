@@ -67,6 +67,7 @@ from utils.honesty import strip_false_verification_claims
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
+from utils.model_health import ModelHealth, pick_model, OVERLOAD_QUARANTINE_SECS
 from utils import telemetry as TELE
 
 # 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
@@ -163,7 +164,7 @@ BACKGROUND_MODEL = "gemma-4-26b-a4b-it"    # 純備援：general/socratic/resear
 # （全表最緊），而雜活（摘要／查詢生成／教訓萃取／流程組合）跟 General 主腦搶的就是這個分鐘窗：
 # 主腦 31b 溢出時本來要退 26b，偏偏 26b 正在被雜活佔用。搬到 lite（250K TPM、500 次/天、獨立池）
 # 之後 26b 回歸純備援，且雜活不再因為 gemma 的分鐘窗而排隊。品質風險可控：這四件事都是機械活。
-CHORE_MODEL = "gemini-3.5-flash-lite"      # 背景雜活：歷史摘要 / 查詢生成 / 文獻標註 / 教訓萃取（使用者看不到輸出）
+CHORE_MODEL = FAST_MODEL                   # 背景雜活：歷史摘要 / 查詢生成 / 文獻標註 / 教訓萃取（使用者看不到輸出）
 GEMINI_EMBED_MODEL = "gemini-embedding-001"
 
 # ── 模型備援鏈：撞配額(429)時往後退一格，冷卻後自動升回第一格 ──────────────
@@ -183,10 +184,17 @@ GEMINI_EMBED_MODEL = "gemini-embedding-001"
 #   → 自動鏈一律不放 RPD-20 模型；它們只留給單次高價值呼叫（PREMIUM_MODEL 的 CP1/CP2）。
 #   flash-lite 家族（3.1 / 3.5）：每天 500 次、15 RPM、250K TPM（gemma 的 15 倍）——
 #   同樣的 context 送到 lite 不會撞 TPM，是唯一能填「gemma 分鐘窗」洞的 TPM 型備援。
+# ── 2026-09-05 線上測試後修正：`gemini-3.5-flash-lite` 從所有鏈移除 ──────────────
+#   它連續 30 小時以上全部回 503（09-04 21/21、09-05 2/2；同期 3.1-flash-lite 全部正常）。
+#   當時它是 general 的最後一格 → gemma 撞 TPM 掉到它身上、downgrade_model() 因「已到底」
+#   回 False → 退避階梯反覆重打死模型 → 回合靜默失敗（實測 7 回合失敗 5 個）。
+#   現在 lite 家族只用 3.1-flash-lite 一顆（Fast 主力／general 第三格／雜活）。三者共用同一個
+#   配額桶：500 RPD（dashboard 28 天峰值僅 43，餘裕大）、15 RPM（這才是要盯的數字）。
+#   模型本身掛掉的情況改由 utils/model_health.py 處理：連續 3 次 503 隔離 10 分鐘，鏈自動跳過。
 MODEL_CHAINS: dict[str, tuple[str, ...]] = {
     # Gemma 主腦優先（風格與工具行為一致）。兩顆 gemma 各自 16K input token/分（全表最緊）；
-    # 兩顆都撞牆時退到 3.5-flash-lite（實測 function calling ✓）——用品質換可用性，閒聊夠用。
-    "general":  (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash-lite"),
+    # 兩顆都撞牆時退到 3.1-flash-lite（250K TPM，同樣的 context 不會撞）——用品質換可用性。
+    "general":  (GENERAL_MODEL, BACKGROUND_MODEL, FAST_MODEL),
     # socratic 刻意只用「大模型」：SOCRATIC_OVERLAY 的硬性禁止清單（只問不答）
     # 需要夠強的模型才撐得住，本專案實測 flash-lite 會漏答案 → 全鏈不含任何 lite 變體。
     # 原第三格 gemini-3.5-flash 是 RPD-20，移除後兩顆 gemma 都撞牆就走退避階梯等分鐘窗
@@ -199,11 +207,9 @@ MODEL_CHAINS: dict[str, tuple[str, ...]] = {
     # 這條鏈存在的另一個理由：雜活原本呼叫 invoke_with_backoff 時沒帶 purpose，
     # 於是 429／503 都不會換模型，只能把退避階梯燒完才放棄——摘要那條會直接卡住整個回合。
     "chore":    (CHORE_MODEL, BACKGROUND_MODEL),
-    # Fast 要的是「快」→ 兩顆 lite 輪替（各 500/天、15 RPM，互相獨立）。
-    # 原第三格 gemini-3.5-flash（RPD-20）移除；原第四格 gemini-2.5-flash-lite 已 404（09-04 實測）。
-    # 注意：3.5-flash-lite 09-04 上午曾連續 21 次 503——503 已改為直接換模型（utils/llm_errors.py），
-    # 兩顆都掛時走退避階梯，不再卡死在第二格。
-    "fast":     (FAST_MODEL, "gemini-3.5-flash-lite"),
+    # Fast 只剩一格：另一顆 lite（3.5）長期 503、完整版 flash 全是 RPD-20 不能當自動備援、
+    # 2.5-flash-lite 已 404。Fast 撞 429 時走退避階梯等分鐘窗（15 RPM，等一下就回來）。
+    "fast":     (FAST_MODEL,),
 }
 MODEL_COOLDOWN_SECS = 180      # 降級後多久嘗試升回主力模型
 GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -1524,6 +1530,7 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
         _rt_now["_attempt"] = _rec
         try:
             _result = fn()
+            _health().record_success(_rec.get("model") or "")   # 成功即清掉 503 連續計數
             TELE.emit(TELE.finish_ok(_rec, _result), sink=_rt_now.get("telemetry"))
             _rt_now["_attempt"] = None
             return _result
@@ -1537,6 +1544,12 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
             _k = classify_llm_error(e)
             is_quota, is_stuck, is_overloaded, retriable = _k.is_quota, _k.is_stuck, _k.is_overloaded, _k.retriable
             last_exc = e
+            # 503：連續 N 次就隔離這顆模型，讓 current_model_name 之後自動跳過。
+            # 2026-09-05 之前沒有這層，3.5-flash-lite 連掛 30 小時仍被反覆重打（回合靜默失敗）。
+            if is_overloaded:
+                _m = _rec.get("model") or ""
+                if _health().record_overload(_m) and purpose:
+                    _status(f"⚠️ {_m} 持續壅塞，暫時停用 {OVERLOAD_QUARANTINE_SECS // 60} 分鐘")
             # telemetry：例外結束——帶 app 的分類旗標與 429 的 QuotaFailure 維度（沿 __cause__ 找）
             TELE.emit(TELE.finish_exc(_rec, e, is_quota=is_quota, is_stuck=is_stuck, retriable=retriable,
                                       is_overloaded=is_overloaded),
@@ -1607,7 +1620,13 @@ def _model_tiers() -> dict:
 
 
 def _dead_models() -> set:
-    return st.session_state.setdefault("gm_model_dead", set())  # 確認不可用的模型 ID
+    return st.session_state.setdefault("gm_model_dead", set())  # 確認不可用的模型 ID（404，永久）
+
+
+def _health() -> ModelHealth:
+    """503 隔離狀態：連續 OVERLOAD_STRIKES 次就隔離 OVERLOAD_QUARANTINE_SECS 秒。
+    與 _dead_models() 分開——404 是永久的，503 是暫時的容量問題。"""
+    return ModelHealth(st.session_state.setdefault("gm_model_health", {}))
 
 
 def _chain_for(purpose: str) -> tuple:
@@ -1622,11 +1641,7 @@ def current_model_name(purpose: str) -> str:
     if tier and (time.time() - ts) > MODEL_COOLDOWN_SECS:
         tier = 0                       # 冷卻結束：試著升回主力模型
         tiers[purpose] = (0, 0.0)
-    dead = _dead_models()
-    for i in range(tier, len(chain)):
-        if chain[i] not in dead:
-            return chain[i]
-    return chain[-1]
+    return pick_model(chain, tier, _dead_models(), _health())
 
 
 def downgrade_model(purpose: str) -> bool:
