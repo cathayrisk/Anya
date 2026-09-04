@@ -64,6 +64,7 @@ import uuid as _uuid
 from utils.rich_styles import inject_rich_styles
 from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
 from utils.honesty import strip_false_verification_claims
+from utils.llm_errors import classify_llm_error
 from utils import telemetry as TELE
 
 # 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
@@ -172,7 +173,10 @@ MODEL_CHAINS: dict[str, tuple[str, ...]] = {
     "socratic": (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash"),
     "research": (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash"),
     # Fast 要的是「快」→ 優先在 lite 變體之間輪替，真的都掛了才用完整版 flash。
-    "fast":     (FAST_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash-lite"),
+    # 2026-09-04 實測：原第四格 gemini-2.5-flash-lite 已 404「no longer available to new users」
+    # （用 tools/list-google-models.py + 單次 smoke call 確認），拿掉以免白浪費一次呼叫。
+    # 前三格皆實測 200 且 3.5-flash-lite 支援 function calling。
+    "fast":     (FAST_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash"),
 }
 MODEL_COOLDOWN_SECS = 180      # 降級後多久嘗試升回主力模型
 GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -1442,6 +1446,7 @@ def parse_retry_delay(msg: str) -> float | None:
 def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
     """暫時性錯誤時指數退避重試：429/quota（免費額度）＋ 503 UNAVAILABLE（flash 高峰）
     ＋ 500 INTERNAL（Google 端暫時性，gemma 池實測常見）。其他錯誤直接拋出。
+    429／逾時／503 三種在 purpose 有備援時都直接換模型（2026-09-04 起 503 也換）；500 仍同顆短退避。
     配額類錯誤（429/quota——RPM/TPM 都是「分鐘窗」）短階梯根本等不完，會白白燒光重試次數：
     優先採用 Google 錯誤訊息自帶的建議秒數，沒有就把該段升級成長階梯對應值。
     長等待期間由 _sleep_with_heartbeat 切段送心跳，不會觸發代理閒置逾時斷線。
@@ -1473,41 +1478,18 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
                 _rt_now["_attempt"] = None
                 raise
             msg = str(e)
-            is_quota = (
-                "429" in msg
-                or "ResourceExhausted" in name
-                or "rate" in msg.lower()
-                or "quota" in msg.lower()
-                or "exhausted" in msg.lower()
-            )
-            # 逾時／連線中斷：卡住的模型不值得再等，直接換下一個
-            is_stuck = (
-                "timeout" in msg.lower()
-                or "timed out" in msg.lower()
-                or "deadline" in msg.lower()
-                or "DeadlineExceeded" in name
-                or name in ("TimeoutError", "ReadTimeout", "ConnectTimeout")
-            )
-            retriable = (
-                is_quota
-                or is_stuck
-                or "503" in msg
-                or "UNAVAILABLE" in msg
-                or "ServiceUnavailable" in name
-                or "500" in msg
-                or "Internal error" in msg
-                or "InternalServerError" in name
-            )
+            # 分類規則搬到 utils/llm_errors.py（純函式、可測）；舊規則逐字保留，新增 is_overloaded（503）
+            _k = classify_llm_error(e)
+            is_quota, is_stuck, is_overloaded, retriable = _k.is_quota, _k.is_stuck, _k.is_overloaded, _k.retriable
             last_exc = e
             # telemetry：例外結束——帶 app 的分類旗標與 429 的 QuotaFailure 維度（沿 __cause__ 找）
-            TELE.emit(TELE.finish_exc(_rec, e, is_quota=is_quota, is_stuck=is_stuck, retriable=retriable),
+            TELE.emit(TELE.finish_exc(_rec, e, is_quota=is_quota, is_stuck=is_stuck, retriable=retriable,
+                                      is_overloaded=is_overloaded),
                       sink=_rt_now.get("telemetry"))
             _rt_now["_attempt"] = None
 
             # 模型 ID 不存在／不支援 → 標記後立刻換下一格，不浪費退避次數
-            if purpose and ("404" in msg or "NOT_FOUND" in msg
-                            or "not found" in msg.lower()
-                            or "is not supported" in msg.lower()):
+            if purpose and _k.is_dead:
                 _mark_model_dead(current_model_name(purpose))
                 if downgrade_model(purpose):
                     delay_override = 0.0
@@ -1517,10 +1499,12 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
             if not retriable:
                 raise
 
-            # 配額錯誤或卡住，且還有備援模型 → 直接換模型重試
-            #（配額：不同池不必等退避；卡住：再等也是白等）
-            if (is_quota or is_stuck) and purpose and downgrade_model(purpose):
-                _reason = "限流" if is_quota else "沒有回應"
+            # 配額錯誤、卡住、或 503 壅塞，且還有備援模型 → 直接換模型重試
+            #（配額：不同池不必等退避；卡住：再等也是白等；壅塞：Google 只說「稍後再試」——
+            #  2026-09-04 實測 3.5-flash-lite 連續 21 次 503 跨 8 分鐘，舊版同顆重打整條階梯
+            #  （每階內 SDK 還自帶 API_MAX_RETRIES 次）才放棄，備援鏈完全沒用上）
+            if (is_quota or is_stuck or is_overloaded) and purpose and downgrade_model(purpose):
+                _reason = "限流" if is_quota else ("壅塞（503）" if is_overloaded else "沒有回應")
                 _status(f"⏳ 主模型{_reason}，改用備援模型（{current_model_name(purpose)}）…")
                 delay_override = 0.0
                 continue
