@@ -66,6 +66,7 @@ from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon
 from utils.honesty import strip_false_verification_claims
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
+from utils.token_budget import fulltext_budget
 from utils import telemetry as TELE
 
 # 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
@@ -236,7 +237,7 @@ DR_PHASES = [                          # (todo 文案, status 文案)
 DEEP_RESEARCH_HINT_RE = re.compile(
     r"深度研究|研究報告|文獻回顧|文獻探討|系統性(?:回顧|調查)|deep\s*research|literature\s*review"
 )
-# 明確的「寫程式」請求：直送 General（有 run_python 驗證迴路與 coding_expert）
+# 明確的「寫程式」請求：直送 General（有 run_python 驗證迴路；VBA 走 excel-vba skill 自檢）
 CODING_HINT_RE = re.compile(
     r"(?:寫|幫我做|產生|生成).{0,8}(?:程式|腳本|函式|巨集|macro|script|function)|"
     r"(?:python|vba|pandas).{0,12}(?:程式|腳本|函式|巨集|寫)|debug|除錯|重構",
@@ -287,6 +288,20 @@ SKILL_HINT_RES: dict[str, re.Pattern] = {
         r"(?:太陽|月亮|水星|金星|火星|木星|土星|天王星|海王星|冥王星|凱龍|上升|天頂)"),
     "astro-forecast": re.compile(r"流年|行運|返照|小限|今年.{0,6}運[勢氣]"),
     "astro-relationship": re.compile(r"合盤|兩人.{0,4}星盤|配對.{0,4}星盤|契合度"),
+    # Excel VBA：CODING_HINT_RE 只認「寫/產生+程式」與「vba+程式」的組合，
+    # 「這段 VBA 為什麼跑不動」「我的巨集會當掉」「幫我看巨集哪裡有問題」全都不命中 →
+    # 落 Fast（無 load_skill、無任何工具），skill 形同虛設。這條專門補故障/審查語句。
+    # 錨點只有三個可單獨命中：vba、巨集、.xlsm。刻意不收中國用語「宏」——使用者是
+    # 台灣金融分析人員，「宏碁」「宏達電」「宏觀」會大量誤升級（20 RPD 配額燒不起）。
+    # 英文 macro 也不單獨命中：金融語境常見 macro outlook / macro risk，必須在 24 字內
+    # 配到 Excel 實體詞或程式故障詞才算。測試集見 tests/test_excel_vba_hint.py。
+    "excel-vba": re.compile(
+        r"\bvba\b|巨集|\.xlsm\b"
+        r"|\bmacros?\b[\s\S]{0,24}(?:excel|workbook|worksheet|\.xlsm|vbe|module|\bsub\b|code"
+        r"|程式碼|模組|活頁簿|工作表|跑不動|當掉|不能跑|無法執行|除錯|撰寫)"
+        r"|(?:excel|workbook|worksheet|\.xlsm|vbe|module|\bsub\b|code"
+        r"|程式碼|模組|活頁簿|工作表|跑不動|當掉|不能跑|無法執行|除錯|撰寫)[\s\S]{0,24}\bmacros?\b",
+        re.IGNORECASE),
 }
 # deep research pipeline Phase 1 的方法論注入來源（與 skills_loaded 取交集）
 # 註：原本還有 product-research（不加引號以免被死參照檢查器誤判），
@@ -318,6 +333,12 @@ SKILL_SUGGEST_RES: dict[str, re.Pattern] = {
     "sql-and-database": re.compile(r"SQL|資料庫|查詢語法|migration|索引|交易|SQLAlchemy", re.I),
     "developing-with-streamlit": re.compile(r"streamlit|session_state|cache_data|st\.cache|重跑|rerun", re.I),
     "python_best_practices": re.compile(r"python|type hint|pytest|型別註記|單元測試", re.I),
+    # 比 SKILL_HINT_RES 那條寬（這裡零成本、不影響路由），但仍不收單獨的「工作表/儲存格」，
+    # 否則公式、樞紐、資料分析類提問會整片誤觸建議。
+    "excel-vba": re.compile(
+        r"\bvba\b|巨集|\.xlsm\b"
+        r"|excel[\s\S]{0,20}(?:macros?|自動化|程式碼)"
+        r"|(?:macros?)[\s\S]{0,20}(?:excel|活頁簿|工作表|儲存格|程式碼)", re.I),
     "md-document": re.compile(r"轉成HTML|轉成 HTML|排版|做成文件|報告格式|目錄", re.I),
     "md-slides": re.compile(r"簡報|投影片|slides|deck|做成 PPT", re.I),
     "md-review": re.compile(r"code review|程式碼審查|PR 審查|審查意見|review 這段", re.I),
@@ -2157,7 +2178,18 @@ def doc_get_fulltext(title: str, token_budget: int = 20000) -> str:
     _gif("anime/anya-cheerfully-writing.gif")
     _status(f"[{meta['tool_step']}] 📄 安妮亞把整份文件都讀一遍！（{title}）", write=f"📄 安妮亞讀全文：{title}")
     asked_budget = int(token_budget or 20000)
-    budget_hint = int(_rt().get("doc_fulltext_budget_hint") or 20000)
+    # ⚠️ 不可寫 `or 20000`：hint 為 0 是「這一分鐘的 token 擠不出全文額度」的明確訊號，
+    #    不是「沒設定」。用 or 會把它當假值而放行 20,000，正好是 D-3 要修的那個爆窗。
+    _hint = _rt().get("doc_fulltext_budget_hint")
+    budget_hint = 20000 if _hint is None else int(_hint)
+    if budget_hint <= 0:
+        _step_done(f"⚠️ fulltext `{title[:30]}` → 本回合 token 額度不足，改用 doc_search")
+        return json.dumps({
+            "error": "budget_exhausted",
+            "title": title,
+            "hint": "本回合剩餘的 token 額度不足以讀整份文件。請改用 doc_search 檢索需要的段落"
+                    "（可分多次、換不同關鍵字），不要重試 doc_get_fulltext。",
+        }, ensure_ascii=False)
     safe_budget = max(2000, budget_hint)
     capped_budget = max(2000, min(asked_budget, safe_budget))
     t0 = time.time()
@@ -3760,7 +3792,7 @@ def _build_general_instructions(socratic: bool = False) -> str:
         # 分類只影響索引排版（幫 31b 選中），不動 entry schema；未歸類自動落「其他」
         groups: dict[str, list[str]] = {
             "程式碼品質": ["python_best_practices", "security-checklist", "sql-and-database",
-                          "developing-with-streamlit"],
+                          "developing-with-streamlit", "excel-vba"],
             "研究與分析方法": ["market-research", "statistical-analyst", "financial-analyst",
                               "data-quality-auditor", "business-investment-advisor",
                               "andreessen", "deep_research_process"],
@@ -4425,13 +4457,20 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     # 反而比查 kerykeion 更糟（整個索引比對的設計被繞過）。
     rt["astro_broker"] = None
 
-    # 動態 fulltext budget（Gemma 256K context；免費額度下保守設定）
+    # 動態 fulltext budget：context 容量與「每分鐘 input token」兩個上限取小者。
+    # 2026-09-04（D-3）之前只算 context，給到 60,000——是 gemma 整個分鐘窗（16K）的近四倍，
+    # 單位錯配。而且工具結果會留在 msgs、之後每輪重送，所以 TPM 那一側要攤到重送輪數上。
     MAX_CONTEXT_TOKENS = 200_000
     OUTPUT_BUDGET = 3_000
     SAFETY_MARGIN = 4_000
     base_tokens = estimate_tokens_for_lc_messages(lc_msgs) + _ds_est_tokens_from_chars(len(ANYA_SYSTEM_PROMPT))
-    budget = max(0, MAX_CONTEXT_TOKENS - OUTPUT_BUDGET - SAFETY_MARGIN - base_tokens)
-    rt["doc_fulltext_budget_hint"] = max(0, min(budget, 60_000))
+    ctx_budget = max(0, MAX_CONTEXT_TOKENS - OUTPUT_BUDGET - SAFETY_MARGIN - base_tokens)
+    # 用「目前這一格」的模型算：降級到 flash-lite 之後 TPM 是 250K，預算可以放寬
+    rt["doc_fulltext_budget_hint"] = fulltext_budget(
+        current_model_name("socratic" if socratic else "general"),
+        base_tokens,
+        context_budget=ctx_budget,
+    )
 
     # 工具清單（有 URL 時禁用 web_search，改導向 fetch_webpage —— 同 Anya_Test 行為）
     tools = [fetch_webpage, think, write_todos, run_python]
@@ -4505,8 +4544,10 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
         " load_skill(\"python_best_practices, security-checklist\")。\n"
         "- 你交付的 Python 程式碼【必須】先附最小測試（assert）並用 run_python 實際執行驗證；"
         "失敗→修正→重驗（最多 2 輪），通過才輸出最終答案，並註明「✅ 已實測通過」。\n"
-        "- VBA 無法執行：完成後改用 consult_expert(role=\"coding_expert\") 做靜態複審，"
-        "把審查結論整合進回答。\n"
+        "- 撰寫或修改 Excel VBA／巨集前先 load_skill(\"excel-vba\")。\n"
+        "- VBA 在伺服器【無法編譯也無法執行】：交付前依 excel-vba 的靜態自檢清單逐條核對並修正，"
+        "【禁止】宣稱已編譯／已實測／跑過；改附「請先執行 Debug > Compile VBAProject 再以小量資料試跑」"
+        "與手動測試案例。run_python 只驗證 Python，不能當作 VBA 測過的證據。\n"
         "- 動手前先把需求拆成檢查表，交付前逐條核對（隱含需求如「總金額」=聚合也要覆蓋）。\n"
         "- 程式碼裡的【官方常數／對照表／費率／法規數值】不得憑記憶硬編——先用 web_search 查證，"
         "或明確請使用者提供權威來源；查證不到就在程式碼註解標「（未查證，請核對官方來源）」。"
