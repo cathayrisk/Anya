@@ -157,7 +157,12 @@ PREMIUM_MODEL = "gemini-3-flash-preview"   # 稀缺精銳：免費層實測「�
 # → 五顆輪著用 = 每天 100 次審查額度（台灣 15:00 重置）。輪替／用盡／死亡狀態見 utils/premium_pool.py。
 # 五顆都實測 function calling ✓（3.5/3.6 原為 general 備援鏈實跑；3.7/3.8 09-04 smoke test）。
 PREMIUM_POOL = (PREMIUM_MODEL, "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash")
-BACKGROUND_MODEL = "gemma-4-26b-a4b-it"    # 背景雜活：歷史摘要 / 查詢生成 / 文獻標註（獨立配額池，使用者看不到輸出）
+BACKGROUND_MODEL = "gemma-4-26b-a4b-it"    # 純備援：general/socratic/research 鏈的第二格 + 雜活鏈的第二格（30 RPM、16K input token/分）
+# 2026-09-04：背景雜活從 26b 搬到 flash-lite。理由是 dashboard 實測——兩顆 gemma 各自只有 16K input token/分
+# （全表最緊），而雜活（摘要／查詢生成／教訓萃取／流程組合）跟 General 主腦搶的就是這個分鐘窗：
+# 主腦 31b 溢出時本來要退 26b，偏偏 26b 正在被雜活佔用。搬到 lite（250K TPM、500 次/天、獨立池）
+# 之後 26b 回歸純備援，且雜活不再因為 gemma 的分鐘窗而排隊。品質風險可控：這四件事都是機械活。
+CHORE_MODEL = "gemini-3.5-flash-lite"      # 背景雜活：歷史摘要 / 查詢生成 / 文獻標註 / 教訓萃取（使用者看不到輸出）
 GEMINI_EMBED_MODEL = "gemini-embedding-001"
 
 # ── 模型備援鏈：撞配額(429)時往後退一格，冷卻後自動升回第一格 ──────────────
@@ -189,6 +194,10 @@ MODEL_CHAINS: dict[str, tuple[str, ...]] = {
     # research 同理：深研的綜整／報告階段用 lite 會拉低整份報告；pipeline 本來就用
     # BACKOFF_DELAYS_LONG（15/30/60s）等分鐘窗，不需要第三格。
     "research": (GENERAL_MODEL, BACKGROUND_MODEL),
+    # 背景雜活：lite 優先（不跟 gemma 搶 16K 分鐘窗），撞牆才借用 26b。
+    # 這條鏈存在的另一個理由：雜活原本呼叫 invoke_with_backoff 時沒帶 purpose，
+    # 於是 429／503 都不會換模型，只能把退避階梯燒完才放棄——摘要那條會直接卡住整個回合。
+    "chore":    (CHORE_MODEL, BACKGROUND_MODEL),
     # Fast 要的是「快」→ 兩顆 lite 輪替（各 500/天、15 RPM，互相獨立）。
     # 原第三格 gemini-3.5-flash（RPD-20）移除；原第四格 gemini-2.5-flash-lite 已 404（09-04 實測）。
     # 注意：3.5-flash-lite 09-04 上午曾連續 21 次 503——503 已改為直接換模型（utils/llm_errors.py），
@@ -1651,10 +1660,14 @@ def get_search_llm() -> ChatGoogleGenerativeAI:
     """web_search tool 內部的 grounding 呼叫用（同樣需要預設 thinking 才會觸發搜尋）。"""
     return _make_llm(FAST_MODEL)
 
-@st.cache_resource(show_spinner=False)
-def get_background_llm() -> ChatGoogleGenerativeAI:
-    """背景雜活（歷史摘要／查詢生成／文獻標註）：走 gemma-4-26b 獨立配額池，不佔主腦額度。"""
-    return _make_llm(BACKGROUND_MODEL)
+def get_chore_llm() -> ChatGoogleGenerativeAI:
+    """背景雜活（歷史摘要／查詢生成／文獻標註／教訓萃取）：走 "chore" 鏈（flash-lite → 26b），
+    不佔主腦的 gemma 分鐘窗。
+
+    ⚠️ 刻意不加 @st.cache_resource：這裡要的就是「每次呼叫重新解析目前該用哪一格」，
+    快取住會讓降級後仍拿到舊模型（_llm_by_name 本身有快取，不會重複建物件）。
+    ⚠️ 在 invoke_with_backoff 的重試閉包『內部』呼叫，理由同 llm_for 的說明。"""
+    return llm_for("chore")
 
 @st.cache_resource(show_spinner=False)
 def get_premium_llm(model: str = PREMIUM_MODEL) -> ChatGoogleGenerativeAI:
@@ -2489,7 +2502,7 @@ def _maybe_distill_search_lesson(run_id: str) -> None:
         "搜尋任務軌跡（過程曾卡關、最終解決）：\n"
         f"使用過的查詢：{'；'.join(q[:60] for q in queries[:8])}\n\n{trail}"
     )
-    llm = get_background_llm()   # cache_resource 在主線程解析後傳入 worker
+    llm = get_chore_llm()   # 主線程解析後傳入 worker（worker 不可碰 session_state）
     store = LESSONS_STORE
 
     def _worker():
@@ -2952,7 +2965,7 @@ def run_deep_research_pipeline(topic: str, focus: str = "") -> dict:
     # research 用途的備援鏈；pipeline 內模型只解析一次（各階段共用同一顆），
     # 所以它承接的是「本回合開始前已發生的降級」，不會在 pipeline 中途換模型。
     llm_brain = llm_for("research", thinking="high")   # 預設 gemma-4-31b：定題、來源分級、綜整、報告
-    llm_bg = get_background_llm()   # gemma-4-26b：查詢生成、文獻標註（機械活，走背景配額池）
+    llm_bg = get_chore_llm()   # "chore" 鏈（3.5-flash-lite → 26b）：查詢生成、文獻標註（機械活，不搶 gemma 分鐘窗）
     _rt_meta()["db_used"] = _rt_meta().get("db_used", False)  # 保持既有 meta
 
     set_todos([{"content": label, "status": "pending"} for label, _ in DR_PHASES])
@@ -3865,14 +3878,14 @@ def _maybe_summarized_history(hist: list[dict]) -> tuple[str, list[dict]]:
             (f"既有摘要：\n{prev_summary}\n\n" if prev_summary and prev_count else "")
             + f"新增對話：\n{convo}"
         )
-        resp = invoke_with_backoff(lambda: get_background_llm().invoke([
+        resp = invoke_with_backoff(lambda: get_chore_llm().invoke([
             SystemMessage(
                 "你是對話摘要員。把對話（含既有摘要）壓縮成 300 字內的繁體中文重點摘要，"
                 "保留：使用者的目標與偏好、已確定的結論、重要數字與專有名詞。只輸出摘要本身。"
                 + ("\n" + ASTRO_STATE.note_for_summarizer() if ASTRO_STATE else "")
             ),
             HumanMessage(payload),
-        ]))
+        ]), purpose="chore")
         summary = extract_text_from_content(resp.content).strip()
         if summary:
             st.session_state["gm_history_summary"] = {"count": len(older), "summary": summary}
@@ -4145,7 +4158,7 @@ def _compose_skill_flow(question: str, names: list[str]) -> str:
         index = "\n".join(
             f"- {n}：{(SKILLS.get(n) or {}).get('description') or ''}" for n in SKILLS
         )[:3000]
-        resp = invoke_with_backoff(lambda: get_background_llm().invoke([
+        resp = invoke_with_backoff(lambda: get_chore_llm().invoke([
             SystemMessage(
                 "你是工作流程設計師。根據使用者的問題與一份可用技能索引，設計一套 2-4 步的解題流程。"
                 "每一步格式：「步驟N. **技能名** — 在這一步具體做什麼（一句話）」。"
@@ -4157,7 +4170,7 @@ def _compose_skill_flow(question: str, names: list[str]) -> str:
                 f"使用者的問題：{(question or '')[:600]}\n\n"
                 f"特別相關的技能：{'、'.join(names)}\n\n可用技能索引：\n{index}"
             ),
-        ]))
+        ]), purpose="chore")
         return extract_text_from_content(resp.content).strip()
     except Exception:
         return ""
