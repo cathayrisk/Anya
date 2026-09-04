@@ -150,7 +150,7 @@ except Exception:
 # §B 常數
 # =============================================================================
 FAST_MODEL = "gemini-3.1-flash-lite"       # 前線快答：Fast mode / web_search / pipeline 並行搜尋（15 RPM 分鐘制，實測首字 ~1s）
-GENERAL_MODEL = "gemma-4-31b-it"           # 主腦：General mode / pipeline 定題・綜整・報告 / consult_expert（15 RPM 分鐘制、無日限）
+GENERAL_MODEL = "gemma-4-31b-it"           # 主腦：General mode / pipeline 定題・綜整・報告 / consult_expert（30 RPM、16K input token/分——實際撞的是這個、日限 14.4K 形同無限）
 PREMIUM_MODEL = "gemini-3-flash-preview"   # 稀缺精銳：免費層實測「每天只有 20 次」→ 只用在 CP1/CP2 審查，用盡自動退 31b
 BACKGROUND_MODEL = "gemma-4-26b-a4b-it"    # 背景雜活：歷史摘要 / 查詢生成 / 文獻標註（獨立配額池，使用者看不到輸出）
 GEMINI_EMBED_MODEL = "gemini-embedding-001"
@@ -165,18 +165,30 @@ GEMINI_EMBED_MODEL = "gemini-embedding-001"
 # ⚠️ 「免費」不等於「配額大」：同一頁把 gemini-3-flash-preview 也標為免費，
 #    但本專案實測它每天只有 20 次 → 稀缺模型不可放進高頻用途（見 PREMIUM_MODEL）。
 #    每個模型有各自的 RPM/RPD，換模型能繞開的是「單一模型的分鐘窗」。
+# ── 2026-09-04 依 AI Studio rate-limit dashboard 實際數字重組（見 anya-模型配額型態研究-20260904.md §五～§七）──
+#   Gemini 3.x flash「非 lite」全系列（3 / 3.5 / 3.6 / 3.7 / 3.8 / flash-latest）：每天 20 次 + 每分鐘 5 次。
+#   它們當自動備援的實際下場（28 天 dashboard）：3.5-flash 30/20、3.6-flash 27/20——一波溢出就燒光，
+#   之後整天不在，鏈形同少一格；且冷卻 180s 後又回頭打，多吃 RPM（3.6-flash 亮 6/5）。
+#   → 自動鏈一律不放 RPD-20 模型；它們只留給單次高價值呼叫（PREMIUM_MODEL 的 CP1/CP2）。
+#   flash-lite 家族（3.1 / 3.5）：每天 500 次、15 RPM、250K TPM（gemma 的 15 倍）——
+#   同樣的 context 送到 lite 不會撞 TPM，是唯一能填「gemma 分鐘窗」洞的 TPM 型備援。
 MODEL_CHAINS: dict[str, tuple[str, ...]] = {
-    # Gemma 主腦優先（風格與工具行為一致），撐不住才跨到 Gemini flash 家族。
-    "general":  (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash", "gemini-3.6-flash"),
+    # Gemma 主腦優先（風格與工具行為一致）。兩顆 gemma 各自 16K input token/分（全表最緊）；
+    # 兩顆都撞牆時退到 3.5-flash-lite（實測 function calling ✓）——用品質換可用性，閒聊夠用。
+    "general":  (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash-lite"),
     # socratic 刻意只用「大模型」：SOCRATIC_OVERLAY 的硬性禁止清單（只問不答）
     # 需要夠強的模型才撐得住，本專案實測 flash-lite 會漏答案 → 全鏈不含任何 lite 變體。
-    "socratic": (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash"),
-    "research": (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash"),
-    # Fast 要的是「快」→ 優先在 lite 變體之間輪替，真的都掛了才用完整版 flash。
-    # 2026-09-04 實測：原第四格 gemini-2.5-flash-lite 已 404「no longer available to new users」
-    # （用 tools/list-google-models.py + 單次 smoke call 確認），拿掉以免白浪費一次呼叫。
-    # 前三格皆實測 200 且 3.5-flash-lite 支援 function calling。
-    "fast":     (FAST_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash"),
+    # 原第三格 gemini-3.5-flash 是 RPD-20，移除後兩顆 gemma 都撞牆就走退避階梯等分鐘窗
+    # （gemma 是 TPM 型，60s 內必恢復；等一分鐘比降到 lite 漏答案好）。
+    "socratic": (GENERAL_MODEL, BACKGROUND_MODEL),
+    # research 同理：深研的綜整／報告階段用 lite 會拉低整份報告；pipeline 本來就用
+    # BACKOFF_DELAYS_LONG（15/30/60s）等分鐘窗，不需要第三格。
+    "research": (GENERAL_MODEL, BACKGROUND_MODEL),
+    # Fast 要的是「快」→ 兩顆 lite 輪替（各 500/天、15 RPM，互相獨立）。
+    # 原第三格 gemini-3.5-flash（RPD-20）移除；原第四格 gemini-2.5-flash-lite 已 404（09-04 實測）。
+    # 注意：3.5-flash-lite 09-04 上午曾連續 21 次 503——503 已改為直接換模型（utils/llm_errors.py），
+    # 兩顆都掛時走退避階梯，不再卡死在第二格。
+    "fast":     (FAST_MODEL, "gemini-3.5-flash-lite"),
 }
 MODEL_COOLDOWN_SECS = 180      # 降級後多久嘗試升回主力模型
 GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
