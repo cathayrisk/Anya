@@ -171,12 +171,14 @@ def finish_ok(rec: dict[str, Any], result: Any = None) -> dict[str, Any]:
 
 
 def finish_exc(rec: dict[str, Any], exc: BaseException, *, is_quota: bool = False,
-               is_stuck: bool = False, retriable: bool = False) -> dict[str, Any]:
+               is_stuck: bool = False, retriable: bool = False,
+               is_overloaded: bool = False) -> dict[str, Any]:
     """例外結束：型別、訊息（截 300 字）、app 的分類旗標、以及 429 的結構化維度。"""
     rec["outcome"] = "exc"
     rec["exc_type"] = type(exc).__name__
     rec["exc_msg"] = str(exc)[:300]
     rec["is_quota"] = bool(is_quota)
+    rec["is_overloaded"] = bool(is_overloaded)   # 503：2026-09-04 起會觸發換模型
     rec["is_stuck"] = bool(is_stuck)
     rec["retriable"] = bool(retriable)
     rec.update({k: v for k, v in parse_quota_failure(exc).items() if v is not None})
