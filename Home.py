@@ -400,7 +400,15 @@ SOCRATIC_SENTINEL = "[[ESCALATE:SOCRATIC]]"    # Fast 判斷使用者「卡住�
 DR_MIN_FOCUS_CHARS = 15   # focus 短於此值視為空泛 → pipeline 不開跑，先反問使用者（每個 topic 只擋一次）
 
 # --- 對話歷史壓縮 ---
-HISTORY_SUMMARY_TRIGGER_TOKENS = 6_000   # 歷史估算超過此值就觸發滾動摘要（免費層 TPM／token 經濟保護）
+# 2026-09-04 由 6,000 降到 2,500（D-1）。依據 tools/measure-doc-budget.py 的實測拆解：
+# 一個「讀文件」回合是 5 輪 LLM 呼叫，而歷史在每一輪都會重送 → 歷史是單一最大宗成本（佔 53%）。
+#   門檻 6,000：一回合合計送出 56,519 tok = gemma 16K TPM 的 3.5 倍
+#   門檻 2,500：                39,019 tok = 2.4 倍（仍超標，但配合 general 鏈退 3.5-flash-lite 不會中斷）
+# 代價：摘要跑得更頻繁（摘要員在 "chore" 鏈上是 flash-lite），細節流失風險提高。
+# 邊界：保留的近期原文（HISTORY_KEEP_RECENT_USER_TURNS 組問答）在一般回答長度下約 1,000–1,800 tok，
+# 低於門檻；但若連續多則回答都超過 ~2,500 字，recent 本身就會超過門檻 → 每回合都會重新摘要
+# （不會出錯、payload 也只含新增部分，但每回合多一次 flash-lite 往返）。真的常態化再考慮調 keep 值。
+HISTORY_SUMMARY_TRIGGER_TOKENS = 2_500   # 歷史估算超過此值就觸發滾動摘要（免費層 TPM／token 經濟保護）
 HISTORY_KEEP_RECENT_USER_TURNS = 4       # 摘要時保留原文的近期使用者回合數
 DR_REPORT_HISTORY_CHARS = 1_200          # 深度研究報告存入歷史的截斷長度
 
