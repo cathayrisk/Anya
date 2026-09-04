@@ -69,6 +69,7 @@ from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
 from utils.model_health import ModelHealth, pick_model, OVERLOAD_QUARANTINE_SECS
 from utils.mathtext import latex_to_plain
+from utils.turn_salvage import strip_orphan_widget_source, describe_completed_work
 from utils import telemetry as TELE
 
 # 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
@@ -5041,8 +5042,26 @@ if prompt or retry_payload or pending_prompt:
                     web_sources = collect_web_sources_from_log(run_id)
                     ai_text = (ai_text + build_doc_sources_footer(run_id=run_id) + build_web_sources_footer(web_sources)).strip()
 
+                    # Bug B（2026-09-05 使用者截圖）：模型有時把 widget_* 模板的 <script>
+                    # 直接寫進 markdown 而不是呼叫 create_widget，後面還接「請點選上方的互動表格」
+                    # ——上方根本沒有元件。widget 真的建成時不動，避免誤刪正確敘述。
+                    _w = st.session_state["_gm_rt"].get("widget")
+                    ai_text, _stripped = strip_orphan_widget_source(ai_text, bool(_w))
+                    if _stripped:
+                        ai_text = (ai_text + "\n\n:small[:gray[（互動元件這次沒有生成成功，"
+                                             "已改以文字呈現；再說一次「做成互動表格」可以重試。）]]").strip()
+
                     if not ai_text:
-                        ai_text = "抱歉，安妮亞這次沒有取得回應，請再試一次。"
+                        # Bug A：tool loop 成功、產物都在（widget 已渲染、todo 全打勾），
+                        # 只有最終文字是空的。原本一律回道歉 → 使用者一邊看著可用的元件、
+                        # 一邊被告知「沒有取得回應」，還會重試一次白燒配額。
+                        ai_text = describe_completed_work(
+                            widget_title=(_w or {}).get("title"),
+                            todos=st.session_state.get("gm_todos"),
+                            has_report=bool(st.session_state["_gm_rt"].get("dr_report")),
+                            n_web=int(meta.get("web_calls") or 0),
+                            n_doc=int(meta.get("doc_calls") or 0),
+                        ) or "抱歉，安妮亞這次沒有取得回應，請再試一次。"
 
                     # Phase 2：串流已即時顯示過程，這裡用清理後的最終文字（含 footer）覆蓋收尾
                     final_text = renderer.finish(ai_text, scope_key="gm_general")
