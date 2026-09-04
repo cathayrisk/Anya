@@ -65,6 +65,7 @@ from utils.rich_styles import inject_rich_styles
 from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
 from utils.honesty import strip_false_verification_claims
 from utils.llm_errors import classify_llm_error
+from utils.premium_pool import PremiumPool, quota_scope
 from utils import telemetry as TELE
 
 # 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
@@ -152,6 +153,10 @@ except Exception:
 FAST_MODEL = "gemini-3.1-flash-lite"       # 前線快答：Fast mode / web_search / pipeline 並行搜尋（15 RPM 分鐘制，實測首字 ~1s）
 GENERAL_MODEL = "gemma-4-31b-it"           # 主腦：General mode / pipeline 定題・綜整・報告 / consult_expert（30 RPM、16K input token/分——實際撞的是這個、日限 14.4K 形同無限）
 PREMIUM_MODEL = "gemini-3-flash-preview"   # 稀缺精銳：免費層實測「每天只有 20 次」→ 只用在 CP1/CP2 審查，用盡自動退 31b
+# 2026-09-04 AI Studio dashboard 實證：3.x flash 非 lite 全系列都是「每天 20 次 + 每分鐘 5 次」，且 per model 各自獨立
+# → 五顆輪著用 = 每天 100 次審查額度（台灣 15:00 重置）。輪替／用盡／死亡狀態見 utils/premium_pool.py。
+# 五顆都實測 function calling ✓（3.5/3.6 原為 general 備援鏈實跑；3.7/3.8 09-04 smoke test）。
+PREMIUM_POOL = (PREMIUM_MODEL, "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash")
 BACKGROUND_MODEL = "gemma-4-26b-a4b-it"    # 背景雜活：歷史摘要 / 查詢生成 / 文獻標註（獨立配額池，使用者看不到輸出）
 GEMINI_EMBED_MODEL = "gemini-embedding-001"
 
@@ -1652,10 +1657,10 @@ def get_background_llm() -> ChatGoogleGenerativeAI:
     return _make_llm(BACKGROUND_MODEL)
 
 @st.cache_resource(show_spinner=False)
-def get_premium_llm() -> ChatGoogleGenerativeAI:
-    """gemini-3-flash：免費層每天僅 20 次（quotaId 實證 PerDay）。只給 CP1/CP2 審查用，
-    呼叫端必須自帶「失敗退 31b」的 fallback，且不可退避重試（日額用盡重試無意義）。"""
-    return _make_llm(PREMIUM_MODEL, thinking_level="high")
+def get_premium_llm(model: str = PREMIUM_MODEL) -> ChatGoogleGenerativeAI:
+    """PREMIUM_POOL 的任一顆（免費層每顆每天僅 20 次，quotaId 實證 PerDay）。只給 CP1/CP2 審查用，
+    呼叫端（_run_devils_advocate）負責輪替與「全池不可用退 31b」，且不可退避重試（日額用盡重試無意義）。"""
+    return _make_llm(model, thinking_level="high")
 
 # =============================================================================
 # §I docstore client（OpenAI 相容端點 proxy，docstore.py 零修改重用）
@@ -2836,15 +2841,42 @@ def _run_subagent(persona: str, payload: str, model_llm, *,
 
 
 def _run_devils_advocate(persona: str, payload: str, fallback_llm, *, status_label: str = "") -> str:
-    """CP1/CP2 審查：優先用 premium flash（每天僅 20 次、推理最強→花在審查刀口上），
-    單次嘗試不退避；配額用盡或任何失敗即退 fallback_llm（31b）照常審查。"""
-    try:
-        return _run_subagent(persona, payload, get_premium_llm(),
-                             status_label=status_label, use_backoff=False)
-    except Exception as e:
-        if type(e).__name__ in ("StopException", "RerunException"):
-            raise
-        return _run_subagent(persona, payload, fallback_llm, status_label=status_label)
+    """CP1/CP2 審查：在 PREMIUM_POOL（五顆 RPD-20 flash，各自獨立 20 次/天 → 合計 100 次）輪替。
+    每顆單次嘗試不退避：429 日額 → 記到太平洋日（台灣 15:00 才回來）；404 → 標死；
+    503／逾時／其他 → 直接下一顆。全池都不可用才退 fallback_llm（31b）照常審查。
+    每次嘗試都進 telemetry（purpose="premium"），?dev=1 看得到輪到哪顆、為何跳過。"""
+    pool = PremiumPool(PREMIUM_POOL, st.session_state.setdefault("gm_premium_pool", {}))
+    _rt_now = _rt()
+    for i, model in enumerate(pool.candidates()):
+        _rec = TELE.new_attempt(
+            turn_id=_rt_now.get("turn_id") or "-", purpose="premium",
+            model=model, tier=PREMIUM_POOL.index(model), attempt_n=i,
+        )
+        _rec.update(TELE_VERSIONS)
+        _rt_now["_attempt"] = _rec
+        try:
+            out = _run_subagent(persona, payload, get_premium_llm(model),
+                                status_label=status_label, use_backoff=False)
+            TELE.emit(TELE.finish_ok(_rec, out), sink=_rt_now.get("telemetry"))
+            _rt_now["_attempt"] = None
+            pool.advance(model)
+            return out
+        except Exception as e:
+            _rt_now["_attempt"] = None
+            if type(e).__name__ in ("StopException", "RerunException"):
+                raise
+            _k = classify_llm_error(e)
+            TELE.emit(TELE.finish_exc(_rec, e, is_quota=_k.is_quota, is_stuck=_k.is_stuck,
+                                      retriable=_k.retriable, is_overloaded=_k.is_overloaded),
+                      sink=_rt_now.get("telemetry"))
+            if _k.is_dead:
+                pool.mark_dead(model)
+            elif _k.is_quota and quota_scope(TELE.parse_quota_failure(e)) != "minute":
+                # PerDay、或抓不到明細 → 保守當日額用盡（RPD 型重打同一顆毫無意義）；
+                # 只有明確的 PerMinute（5 RPM）才不記，讓它下一回合還能被輪到
+                pool.mark_exhausted(model)
+            continue  # 503／逾時／空輸出／分鐘窗：換下一顆
+    return _run_subagent(persona, payload, fallback_llm, status_label=status_label)
 
 
 def _dr_log(phase: str, content: str):
