@@ -37,6 +37,7 @@ SKILL_WHITELIST: dict[str, str] = {
     "astro-forecast": "流年預測解讀——行運/太陽返照/年度小限；一律對照本命、講時機不講命定",
     "astro-relationship": "合盤解讀——交互相位/組合盤/相容性評分；先讀懂兩個人再看相遇",
     "security-checklist": "程式碼安全檢查——涉及 secrets/資料庫/檔案 IO/網路請求/使用者輸入時必查",
+    "excel-vba": "Excel VBA／巨集——撰寫/除錯/審查規範：物件限定、陣列效能、狀態還原、交付格式",
     "sql-and-database": "SQL 與資料庫實務——SQLAlchemy/原生 SQL/交易/連線管理/migration",
     "developing-with-streamlit": "Streamlit 開發——快取/版面/session_state/效能，會再路由到 14 個子技能",
     # ── 文件與交付 ──
