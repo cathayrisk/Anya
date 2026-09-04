@@ -68,6 +68,7 @@ from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
 from utils.model_health import ModelHealth, pick_model, OVERLOAD_QUARANTINE_SECS
+from utils.mathtext import latex_to_plain
 from utils import telemetry as TELE
 
 # 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
@@ -184,17 +185,28 @@ GEMINI_EMBED_MODEL = "gemini-embedding-001"
 #   → 自動鏈一律不放 RPD-20 模型；它們只留給單次高價值呼叫（PREMIUM_MODEL 的 CP1/CP2）。
 #   flash-lite 家族（3.1 / 3.5）：每天 500 次、15 RPM、250K TPM（gemma 的 15 倍）——
 #   同樣的 context 送到 lite 不會撞 TPM，是唯一能填「gemma 分鐘窗」洞的 TPM 型備援。
-# ── 2026-09-05 線上測試後修正：`gemini-3.5-flash-lite` 從所有鏈移除 ──────────────
-#   它連續 30 小時以上全部回 503（09-04 21/21、09-05 2/2；同期 3.1-flash-lite 全部正常）。
+# ── 2026-09-05 線上測試後修正：`gemini-3.5-flash-lite` 一度從所有鏈移除 ────────────
+#   它曾連續 30 小時以上全部回 503（09-04 21/21、09-05 上午 2/2；同期 3.1-flash-lite 全部正常）。
 #   當時它是 general 的最後一格 → gemma 撞 TPM 掉到它身上、downgrade_model() 因「已到底」
-#   回 False → 退避階梯反覆重打死模型 → 回合靜默失敗（實測 7 回合失敗 5 個）。
-#   現在 lite 家族只用 3.1-flash-lite 一顆（Fast 主力／general 第三格／雜活）。三者共用同一個
-#   配額桶：500 RPD（dashboard 28 天峰值僅 43，餘裕大）、15 RPM（這才是要盯的數字）。
-#   模型本身掛掉的情況改由 utils/model_health.py 處理：連續 3 次 503 隔離 10 分鐘，鏈自動跳過。
+#   回 False → 退避階梯反覆重打死模型 → 回合靜默失敗。
+#   同日稍晚 5/5 成功、ttfb 中位 1.03s（比 3.1 還快），確認只是暫時性容量問題，故重新納入。
+#   之所以敢放回去：模型掛掉現在由 utils/model_health.py 接住——連續 3 次 503 隔離 10 分鐘、
+#   鏈自動跳過、到期自動放行，不會再出現「反覆重打死模型」。
+#
+# ── 2026-09-05 依當日 dashboard（1 Day）排序：吃緊的是 gemma 的 TPM，不是 lite ──────
+#   當日用量／上限：26B **28.56K/16K TPM（178%，紅）**、31B 15.6K/16K（98%，黃）；
+#   3.5-lite 9/15 RPM・114K/250K TPM、3.1-lite 6/15 RPM・28K/250K TPM（最閒的一顆）。
+#   → gemma 撞的是 TPM（同樣的大 context 送兩次就爆），兩顆 lite 各有 250K TPM 正好接手。
+#   兩顆 lite 是**獨立配額桶**（各 500 RPD／15 RPM／250K TPM），一起放進鏈等於備援容量翻倍。
+#   3.5 排在 3.1 前面：3.1 同時是 Fast 主力，先用 3.5 才不會兩邊搶同一個 15 RPM。
 MODEL_CHAINS: dict[str, tuple[str, ...]] = {
     # Gemma 主腦優先（風格與工具行為一致）。兩顆 gemma 各自 16K input token/分（全表最緊）；
-    # 兩顆都撞牆時退到 3.1-flash-lite（250K TPM，同樣的 context 不會撞）——用品質換可用性。
-    "general":  (GENERAL_MODEL, BACKGROUND_MODEL, FAST_MODEL),
+    # 都撞牆時退到兩顆 lite（250K TPM，同樣的 context 不會撞）——用品質換可用性。
+    # 四顆的能力實測（tools/compare-chain-models.py，短指令三題）：硬指令遵循、台灣用語、
+    # 推理正確性四顆全過；差別在 ttfb（lite 0.5s vs gemma 8~20s）與答案深度（gemma 較厚）。
+    # ⚠️ 但那是短 prompt 的結果——General 的 system prompt 有 6,658 字、十幾條規則互相競爭，
+    # lite 在長 prompt 下漏規則是實測過的（V3 誠實性），所以 lite 只當備援、不當主腦。
+    "general":  (GENERAL_MODEL, BACKGROUND_MODEL, "gemini-3.5-flash-lite", FAST_MODEL),
     # socratic 刻意只用「大模型」：SOCRATIC_OVERLAY 的硬性禁止清單（只問不答）
     # 需要夠強的模型才撐得住，本專案實測 flash-lite 會漏答案 → 全鏈不含任何 lite 變體。
     # 原第三格 gemini-3.5-flash 是 RPD-20，移除後兩顆 gemma 都撞牆就走退避階梯等分鐘窗
@@ -207,8 +219,9 @@ MODEL_CHAINS: dict[str, tuple[str, ...]] = {
     # 這條鏈存在的另一個理由：雜活原本呼叫 invoke_with_backoff 時沒帶 purpose，
     # 於是 429／503 都不會換模型，只能把退避階梯燒完才放棄——摘要那條會直接卡住整個回合。
     "chore":    (CHORE_MODEL, BACKGROUND_MODEL),
-    # Fast 只剩一格：另一顆 lite（3.5）長期 503、完整版 flash 全是 RPD-20 不能當自動備援、
-    # 2.5-flash-lite 已 404。Fast 撞 429 時走退避階梯等分鐘窗（15 RPM，等一下就回來）。
+    # Fast 刻意只留一格：3.5-lite 雖已復活，但它是 general 的第三格——Fast 若也用它，
+    # 兩邊會搶同一個 15 RPM，等於白費「兩個獨立桶」的好處。Fast 撞 429 就走退避階梯
+    # 等分鐘窗（15 RPM，等一下就回來），比跟 General 互搶好。
     "fast":     (FAST_MODEL,),
 }
 MODEL_COOLDOWN_SECS = 180      # 降級後多久嘗試升回主力模型
@@ -972,6 +985,11 @@ def normalize_markdown_for_streamlit(text: str) -> str:
     t = _strip_unbalanced_code_fences(t)
     t = _maybe_unindent_indented_block(t)
     t = re.sub(r"\\([*_`])", r"\1", t)
+    # LaTeX → 純文字。系統提示（見 ANYA_SYSTEM_PROMPT「數學公式：不用 LaTeX」）擋不住：
+    # 2026-09-05 使用者截圖到兩種壞法——(1) `\text{...} \implies ...` 讓 KaTeX 解析失敗，
+    # 而 KaTeX 失敗的行為就是「把原始碼印成紅色」；(2) `\nRightarrow`(⇏) 字型沒有該字 → 黑框。
+    # 同 Fix C 的教訓：對弱模型下的格式禁令不可靠，要在後處理層兜底。
+    t = latex_to_plain(t)
     t = _repair_color_directives(t)
     return t
 
