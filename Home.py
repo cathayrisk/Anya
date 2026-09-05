@@ -67,6 +67,7 @@ from utils.honesty import strip_false_verification_claims, finalize_response
 from utils import evidence as EV
 from utils.hazard_intent import classify_hazard_intent
 from utils import hazard_prefetch as HZPF
+from utils import hazard_render as HZRENDER
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
@@ -4263,7 +4264,8 @@ with st.popover("📚 引用資料夾"):
 # =============================================================================
 # §O 顯示歷史 + 輸入框
 # =============================================================================
-_MODE_AVATAR = {"fast": "⚡", "general": "💬", "research": "🔬", "socratic": "🧭"}
+_MODE_AVATAR = {"fast": "⚡", "general": "💬", "research": "🔬", "socratic": "🧭",
+                "cwa": "🌐"}   # 純即時災防題：程式直接渲染，沒有經過模型
 
 def _render_history_process(proc: dict):
     """歷史回合的過程記錄（快照回放：摘要/todo/搜尋/反思/研究產物）。"""
@@ -4956,8 +4958,23 @@ if prompt or retry_payload or pending_prompt:
     except Exception:
         st.session_state["gm_hazard_intent"] = None
 
-    # 助理區塊（avatar 依模式：⚡ Fast / 💬 General / 🧭 引導；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
-    with st.chat_message("assistant", avatar=("🧭" if socratic_active else "⚡" if mode == "fast" else "💬")):
+    # 純即時災防題 → 由程式模板直接作答，不經模型（第 5 步，見 utils/hazard_render.py）。
+    # 判定只看文字與分類結果，不需要 prefetch 結果，所以放在這裡——avatar 要用得到。
+    _hz_pure, _hz_pure_why = (False, "分類失敗")
+    try:
+        if _hz is not None:
+            _hz_pure, _hz_pure_why = HZRENDER.is_pure_live(user_text or "", _hz)
+        _hi = st.session_state.get("gm_hazard_intent")
+        if isinstance(_hi, dict):
+            _hi["pure_live"] = _hz_pure
+            _hi["pure_reason"] = _hz_pure_why
+    except Exception:
+        _hz_pure, _hz_pure_why = (False, "判定例外")
+
+    # 助理區塊（avatar 依模式：🌐 氣象署直答 / ⚡ Fast / 💬 General / 🧭 引導；
+    # sentinel 中途升級時本輪維持 ⚡，歷史會校正）
+    with st.chat_message("assistant", avatar=("🌐" if _hz_pure else "🧭" if socratic_active
+                                              else "⚡" if mode == "fast" else "💬")):
         status_area = st.container()
         output_area = st.container()
 
@@ -5049,6 +5066,58 @@ if prompt or retry_payload or pending_prompt:
                           f"scopes={list(_pf_scopes)} "
                           f"statuses={[r['status'] for r in _pf_results]} "
                           f"elapsed={_pf_elapsed:.2f}s", flush=True)
+
+                # ────────── 純即時災防題：程式直接渲染（第 5 步）──────────
+                # 第 4 步保證資料一定進 context，但**沒有保證模型會正確使用**——實測就看到
+                # 它把 payload 的 moving_direction "SSW" 寫成「向西南西南西方向移動」。
+                # 這次只是措辭亂掉，但同一個機制寫錯規模或時間也完全可能，而那看起來會跟
+                # 正確答案一模一樣。
+                #
+                # 對「最近有地震嗎」這種題，模型沒有加值空間：答案就是把官方欄位唸出來。
+                # 那就不要給它出錯的機會。順帶的好處是零 LLM 配額、秒答、方位詞查表不會亂寫。
+                #
+                # 閘門（is_pure_live）刻意偏嚴，有疑慮一律交回模型——模型手上已經有第 4 步
+                # 的官方資料，交回去只是慢一點；誤判成純即時題則會把混合題的另一半整個吃掉。
+                if _hz_pure and _pf_results:
+                    _hr_payloads = {}
+                    for _r in _pf_results:
+                        if _r.get("status") == EV.STATUS_OK and _r.get("payload"):
+                            try:
+                                _hr_payloads[_r["scope"]] = json.loads(_r["payload"])
+                            except Exception:
+                                pass
+                    _hr_text = HZRENDER.render(_pf_results, payloads=_hr_payloads)
+                    if _hr_text:
+                        # 刻意不過 finalize_response：那是用來剝除**模型**的不實查證宣稱的，
+                        # 這段文字是程式自己產生的，沒有東西需要剝。
+                        renderer.plain = True
+                        final_text = renderer.finish(_hr_text, scope_key="gm_hazard")
+                        _hr_badges_md = badges_markdown(
+                            mode="cwa", db_used=False, web_used=False,
+                            elapsed_s=round(time.time() - _t_pf, 1))
+                        badges_ph.markdown(_hr_badges_md)
+                        if DEV_MODE:
+                            _ev = st.session_state.get("gm_evidence_log") or []
+                            with st.expander(f"🔧 [dev] evidence ledger（{len(_ev)}）", expanded=False):
+                                st.json({"summary": EV.summarize(_ev), "events": _ev})
+                            with st.expander("🔧 [dev] hazard intent（shadow）", expanded=False):
+                                st.json(st.session_state.get("gm_hazard_intent"))
+                        ensure_session_defaults()
+                        st.session_state.gm_chat_history.append({
+                            "role": "assistant", "text": final_text, "images": [], "docs": [],
+                            "mode": "cwa", "badges": _hr_badges_md,
+                            "suggest": build_skill_suggestion(user_text, []),
+                        })
+                        _render_latest_suggestion()
+                        print(f"[hazard_render] turn={_rt().get('turn_id')} rendered "
+                              f"scopes={[r['scope'] for r in _pf_results]} "
+                              f"statuses={[r['status'] for r in _pf_results]}", flush=True)
+                        status.update(label="✅ 已直接取自中央氣象署（未經模型）",
+                                      state="complete", expanded=False)
+                        st.stop()
+                    # render 回空字串＝欄位長相變了，退回讓模型作答（資料仍在 context）
+                    print(f"[hazard_render] turn={_rt().get('turn_id')} "
+                          "render 回空，退回模型作答", flush=True)
 
                 # ────────────────────────── Fast ──────────────────────────
                 if mode == "fast":
