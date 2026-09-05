@@ -1578,7 +1578,7 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
                     _status(f"⚠️ {_m} 持續壅塞，暫時停用 {OVERLOAD_QUARANTINE_SECS // 60} 分鐘")
             # telemetry：例外結束——帶 app 的分類旗標與 429 的 QuotaFailure 維度（沿 __cause__ 找）
             TELE.emit(TELE.finish_exc(_rec, e, is_quota=is_quota, is_stuck=is_stuck, retriable=retriable,
-                                      is_overloaded=is_overloaded),
+                                      is_overloaded=is_overloaded, is_bad_request=_k.is_bad_request),
                       sink=_rt_now.get("telemetry"))
             _rt_now["_attempt"] = None
 
@@ -1586,6 +1586,19 @@ def invoke_with_backoff(fn, delays: tuple = BACKOFF_DELAYS, purpose: str = ""):
             if purpose and _k.is_dead:
                 _mark_model_dead(current_model_name(purpose))
                 if downgrade_model(purpose):
+                    delay_override = 0.0
+                    continue
+                raise
+
+            # 400 / INVALID_ARGUMENT → 換模型，但**不標記死亡**。
+            # 2026-09-05 T15：gemma-4-31b-it 回 400，舊版四個旗標全 False → 直接往上拋，
+            # 備援鏈一格都沒試，整輪丟失並印出 traceback（當下 3.5-flash-lite 明明可用）。
+            # 「哪些參數合法」逐模型不同，所以同顆重試沒意義、換一顆通常會過；
+            # 但這顆模型沒壞，標記死亡會白白毀掉一整格。
+            if purpose and _k.is_bad_request:
+                if downgrade_model(purpose):
+                    _status(f"⚠️ 主模型拒絕了這個請求（400），改用備援模型"
+                            f"（{current_model_name(purpose)}）…")
                     delay_override = 0.0
                     continue
                 raise
@@ -4412,6 +4425,11 @@ for idx, msg in enumerate(st.session_state.get("gm_chat_history", [])):
     with st.chat_message(msg.get("role", "assistant"), avatar=_avatar):
         if msg.get("badges"):
             st.markdown(msg["badges"])
+        # 查證標示要跟著歷史一起重播。2026-09-05 測試發現：banner 原本只用 st.caption()
+        # 當回合畫，沒存進歷史，於是**下一次 rerun 之後整串對話一個 banner 都不剩**——
+        # 誠實標示只在送出後那一瞬間看得到，捲回去或重新整理就消失了。
+        if msg.get("banner"):
+            st.caption(msg["banner"])
         if msg.get("text"):
             _display_text = _RE_HTML_COMMENT.sub("", msg["text"]).strip()
             st.markdown(_emphasis_to_html(normalize_markdown_for_streamlit(_display_text)), unsafe_allow_html=True)
@@ -5218,6 +5236,7 @@ if prompt or retry_payload or pending_prompt:
                             "docs": [],
                             "mode": "fast",
                             "badges": fast_badges_md,
+                            "banner": _fast_banner,          # 查證標示要能跟著歷史重播
                             # Fast 沒有工具、載不了 skill → used 一律空
                             "suggest": build_skill_suggestion(user_text, []),
                         })
@@ -5416,6 +5435,7 @@ if prompt or retry_payload or pending_prompt:
                         "mode": ("research" if was_deep
                                  else "socratic" if socratic_active else "general"),
                         "badges": general_badges_md,
+                        "banner": _gen_banner,               # 查證標示要能跟著歷史重播
                         "process": process_snapshot,
                         "widget": st.session_state["_gm_rt"].get("widget"),
                         "suggest": build_skill_suggestion(user_text, meta.get("skills_loaded")),
