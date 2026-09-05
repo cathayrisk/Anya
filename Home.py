@@ -2607,17 +2607,22 @@ def _maybe_distill_search_lesson(run_id: str) -> None:
 def render_widget_html(html: str, *, height: int, scrolling: bool = True) -> None:
     """渲染自包含 HTML（iframe）。
 
-    2026-09-05 Streamlit Cloud 開始警告：`st.components.v1.html` 已棄用、
-    「will be removed after 2026-06-01」——那個日期其實已經過了，等於隨時可能真的消失。
-    但替代的 `st.iframe` 是新 API：本機 streamlit 1.55.0 還沒有它。
-    requirements.txt 又只寫 `streamlit>=1.40.0`（不釘版），本機與 Cloud 版本必然分歧，
-    所以這裡有就用新的、沒有就退回舊的——兩邊都能跑，等 Cloud 真的移除也不會壞。
+    ⚠️ 2026-09-05：一度改成「有 `st.iframe` 就用新的」，**那是錯的，已回退**。
+    線上實測 `create_widget` 全部失敗：
+        渲染失敗：TypeError: IframeMixin.iframe() got an unexpected keyword argument 'scrolling'
+    查簽名才發現錯了兩層：
+        IframeMixin._iframe(src, ...)   ← 吃 **URL**
+        components.iframe(src, ...)     ← 吃 **URL**
+        components.html(html, ...)      ← 吃 **HTML**（本專案要的是這個）
+    也就是 `st.iframe` 是 `components.iframe`（URL 版）的公開版，**不是 `components.html` 的替代品**。
+    Cloud 的棄用警告叫人「replace st.components.v1.html with st.iframe」，但參數語意不同；
+    那個 TypeError 反而救了一命——否則整段 HTML 會被當成 URL，**靜默渲染出空白**而不報錯。
+
+    要再嘗試遷移前，必須先驗證：新 API 的第一個位置參數是否真的接受 raw HTML
+    （而不是 URL）、以及是否有等同 `scrolling` 的參數。在那之前一律用 `components.html`：
+    它雖已標棄用，但在 1.63.0 仍然存在且可用。
     """
-    fn = getattr(st, "iframe", None)
-    if callable(fn):
-        fn(html, height=height, scrolling=scrolling)
-    else:
-        components.html(html, height=height, scrolling=scrolling)
+    components.html(html, height=height, scrolling=scrolling)
 
 
 # --- 互動 widget（自包含 HTML，render_widget_html iframe 渲染）---
