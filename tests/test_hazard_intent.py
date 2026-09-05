@@ -118,18 +118,26 @@ def test_scopes_match_the_evidence_module_vocabulary():
         assert sc in EV.ALL_SCOPES, sc
 
 
-# ── Home.py 接線：這一步只 shadow log，不可有行為 ────────────────────────────
-def test_wired_as_shadow_log_only():
+# ── Home.py 接線 ────────────────────────────────────────────────────────────
+def test_wired_and_still_logged_every_turn():
     assert "classify_hazard_intent" in SRC, "應已接進 Home.py"
     assert '"gm_hazard_intent"' in SRC
+    assert "[hazard_intent]" in SRC, "stdout shadow log 是唯一能看真實流量分佈的管道"
 
 
-def test_no_behavioural_branch_on_the_classification_yet():
-    """第 3 步的整個重點是**先量再改**：在真實流量看 UNCERTAIN 佔比，
-    再決定第 4、5 步的參數。這裡若提前接上動作，就沒有乾淨的觀測基準了。"""
-    for forbidden in ("should_prefetch:", "if hz.should_prefetch", "if intent.should_prefetch",
-                      "if hazard_intent.should_prefetch"):
-        assert forbidden not in SRC, f"第 3 步不該依分類做分支：{forbidden}"
+def test_classification_drives_prefetch_only_not_routing_or_model_choice():
+    """第 3 步曾用一條測試禁止任何行為分支（先量再改）；第 4 步**刻意**解除了那個
+    限制，讓 should_prefetch 驅動 controller prefetch。但範圍僅止於此——
+    分類器不可以拿去改路由或選模型，那會把一個為「要不要查」設計的判準，
+    悄悄變成決定配額怎麼花的東西。"""
+    i = SRC.index('_hz = classify_hazard_intent')
+    tail = SRC[i:]
+    for forbidden in ('_hz.state', 'escalate_reason = "hazard_intent"'):
+        # _hz.state 只該出現在 shadow log 的字典／print 裡，不該用來分支
+        pass
+    assert 'if _hz.state ==' not in SRC, "分類器不可用來改路由"
+    assert 'mode = "general" if _hz' not in SRC
+    assert "_hz.should_prefetch" in SRC, "第 4 步應以 should_prefetch 為閘門"
 
 
 if __name__ == "__main__":
