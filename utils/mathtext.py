@@ -32,6 +32,9 @@ _CMD_MAP = {
     r"\geq": "≥", r"\ge": "≥", r"\leq": "≤", r"\le": "≤",
     r"\neq": "≠", r"\ne": "≠", r"\approx": "≈", r"\sim": "～",
     r"\times": "×", r"\div": "÷", r"\pm": "±", r"\cdot": "・",
+    # 邏輯連接詞：條件式（「A 且 B 則 C」）在金融題很常見，被當未知指令刪掉會讓語意消失
+    r"\land": "且", r"\wedge": "且", r"\lor": "或", r"\vee": "或", r"\neg": "非",
+    r"\in": "∈", r"\notin": "∉", r"\forall": "任意", r"\exists": "存在",
     r"\alpha": "α", r"\beta": "β", r"\Delta": "Δ", r"\delta": "δ",
     r"\infty": "∞", r"\%": "%", r"\$": "$", r"\&": "&",
     r"\ldots": "…", r"\dots": "…", r"\quad": " ", r"\qquad": "  ",
@@ -57,16 +60,35 @@ _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff]")
 
 
 def _convert_commands(s: str) -> str:
+    s = re.sub(r"\\\\", " ", s)              # LaTeX 換行；不處理會留下裸露的反斜線
     for _ in range(3):                       # \text{\mathbf{x}} 這種巢狀最多拆三層
         new = _TEXT_WRAP_RE.sub(r"\1", s)
         if new == s:
             break
         s = new
+    # 下標／上標：先把 {} 併進去，否則後面統一去大括號會讓 P(R_{cut}) 變成 P(R_cut) 之外
+    # 更糟的情況——KaTeX 對 CJK 下標常直接吃掉內容，畫面上只剩 "I_"（實測 2026-09-05）。
+    s = re.sub(r"([_^])\s*\{([^{}]*)\}", r"\1\2", s)
     # 長指令先換，避免 \le 先吃掉 \leq 的前綴
     for cmd in sorted(_CMD_MAP, key=len, reverse=True):
         s = s.replace(cmd, _CMD_MAP[cmd])
     s = s.replace("{", "").replace("}", "")
     return re.sub(r"[ \t]{2,}", " ", s).strip()
+
+
+def _looks_like_math(inner: str) -> str:
+    """`$...$` 裡的內容是數學還是貨幣？
+
+    2026-09-05 實測：只認「含指令或箭頭」不夠——模型也會寫裸露的 `$C$`、`$D_{mild}$`，
+    那些會漏給 KaTeX 渲染成斜體數學字，於是同一份清單裡一半是 𝐶、一半是純文字 P(R)，
+    樣式不一致；CJK 下標還會被 KaTeX 整段吃掉。所以變數式也要收。
+    """
+    if re.search(r"\\|[⇒→⇐←≥≤≠±×÷≈]|[_^]", inner):
+        return True
+    # 短的純符號變數式（C、P(R)、a + b = c）；貨幣那種「100 美元，另一件 」不會命中
+    return bool(len(inner) <= 16
+                and re.fullmatch(r"[A-Za-z0-9\s()+\-*/=.,%']+", inner)
+                and re.search(r"[A-Za-z]", inner))
 
 
 def _fix_tofu(s: str) -> str:
@@ -96,14 +118,15 @@ def latex_to_plain(text: str) -> str:
 
     def _span(m: re.Match) -> str:
         inner = m.group("dd") or m.group("d") or m.group("p") or m.group("b") or ""
-        # 純數字/貨幣的 $...$ 不是數學（例：$100），原樣保留
-        if m.group("d") is not None and not re.search(r"\\|[⇒→≥≤≠]", inner):
-            return m.group(0)
+        if m.group("d") is not None and not _looks_like_math(inner):
+            return m.group(0)               # 貨幣（$100 … $200）原樣保留
         return _convert_commands(inner)
 
     t = _MATH_SPAN_RE.sub(_span, t)
     t = _convert_commands(t)          # 收框外裸露的指令
     t = _fix_tofu(t)
     t = _LEFTOVER_CMD_RE.sub("", t)   # 沒收錄的指令直接拿掉，總比印紅字好
+    t = re.sub(r"\\(?![A-Za-z])", "", t)   # 落單的反斜線（\\ 換行、\, 之類的殘骸）
+    t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], t)
