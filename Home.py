@@ -2604,7 +2604,23 @@ def _maybe_distill_search_lesson(run_id: str) -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
-# --- 互動 widget（自包含 HTML，components.html iframe 渲染）---
+def render_widget_html(html: str, *, height: int, scrolling: bool = True) -> None:
+    """渲染自包含 HTML（iframe）。
+
+    2026-09-05 Streamlit Cloud 開始警告：`st.components.v1.html` 已棄用、
+    「will be removed after 2026-06-01」——那個日期其實已經過了，等於隨時可能真的消失。
+    但替代的 `st.iframe` 是新 API：本機 streamlit 1.55.0 還沒有它。
+    requirements.txt 又只寫 `streamlit>=1.40.0`（不釘版），本機與 Cloud 版本必然分歧，
+    所以這裡有就用新的、沒有就退回舊的——兩邊都能跑，等 Cloud 真的移除也不會壞。
+    """
+    fn = getattr(st, "iframe", None)
+    if callable(fn):
+        fn(html, height=height, scrolling=scrolling)
+    else:
+        components.html(html, height=height, scrolling=scrolling)
+
+
+# --- 互動 widget（自包含 HTML，render_widget_html iframe 渲染）---
 _WIDGET_MAX_CHARS = 20_000
 _WIDGET_EXTERNAL_RE = re.compile(r"""(?:src\s*=\s*["']?|url\(\s*["']?)\s*https?://""", re.IGNORECASE)
 
@@ -2826,7 +2842,7 @@ def create_widget(title: str, height: int, html: str) -> str:
     try:
         if area is not None:
             with area:
-                components.html(h, height=hh, scrolling=True)
+                render_widget_html(h, height=hh, scrolling=True)
     except Exception as e:
         return json.dumps({"error": f"渲染失敗：{type(e).__name__}: {str(e)[:150]}"}, ensure_ascii=False)
     rt["widget"] = {"title": (title or "互動元件")[:60], "html": h, "height": hh}
@@ -4335,8 +4351,8 @@ for idx, msg in enumerate(st.session_state.get("gm_chat_history", [])):
                 st.caption(f"📎 {fn}")
         if msg.get("widget"):
             try:  # 互動元件歷史回放（iframe 重建；元件內操作狀態不跨 rerun 保留）
-                components.html(msg["widget"]["html"],
-                                height=msg["widget"].get("height", 420), scrolling=True)
+                render_widget_html(msg["widget"]["html"],
+                                   height=msg["widget"].get("height", 420), scrolling=True)
             except Exception:
                 pass
         proc = msg.get("process") or {}
