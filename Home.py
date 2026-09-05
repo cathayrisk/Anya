@@ -64,6 +64,7 @@ import uuid as _uuid
 from utils.rich_styles import inject_rich_styles
 from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
 from utils.honesty import strip_false_verification_claims, finalize_response
+from utils import evidence as EV
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
@@ -600,6 +601,7 @@ st.session_state.setdefault("gm_ds_processed_keys", set())  # set[(file_sig, use
 st.session_state.setdefault("gm_ds_last_index_stats", None)
 
 st.session_state.setdefault("gm_ds_doc_search_log", [])     # list[dict]
+st.session_state.setdefault("gm_evidence_log", [])           # 每回合檢索憑證（scope/status/completed_at）
 st.session_state.setdefault("gm_ds_web_search_log", [])     # list[dict]
 st.session_state.setdefault("gm_ds_think_log", [])          # list[dict]
 st.session_state.setdefault("gm_ds_active_run_id", None)    # str | None
@@ -1887,6 +1889,22 @@ def _rt() -> dict:
 def _rt_meta() -> dict:
     return _rt().setdefault("meta", {"db_used": False, "web_used": False, "doc_calls": 0, "web_calls": 0, "tool_step": 0})
 
+def _log_evidence(*, tool: str, scope: str, status: str, detail=None) -> None:
+    """記一筆檢索憑證（見 utils/evidence.py）。
+
+    ⚠️ **例外也必須記**——原本 CWA 三支的 except 只把錯誤字串回給模型，系統這側
+    完全不留痕跡，於是事後分不出「查了但沒資料」「API 掛了」「根本沒查」。
+    這個函式本身絕不可拋例外：憑證記錄失敗不該連帶弄壞回答。"""
+    try:
+        st.session_state.setdefault("gm_evidence_log", []).append(
+            EV.make_event(tool=tool, scope=scope, status=status,
+                          run_id=st.session_state.get("gm_ds_active_run_id"),
+                          detail=detail)
+        )
+    except Exception:
+        pass
+
+
 def _status(label: str, write: str | None = None):
     status = _rt().get("status")
     if status is None:
@@ -2114,6 +2132,10 @@ def web_search(query: str) -> str:
         return json.dumps({"error": f"搜尋失敗：{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
 
     elapsed = time.time() - t0
+    # 搜尋成功但 0 筆 → empty。web 的 authority 是 open_web，**不等於「已查證」**。
+    _log_evidence(tool="web_search", scope=EV.SCOPE_WEB,
+                  status=EV.STATUS_OK if sources else EV.STATUS_EMPTY,
+                  detail={"query": q[:80], "n": len(sources)})
     _step_done(f"✅ web_search `{q[:40]}` → **{len(sources)} 個來源** ⏱ {elapsed:.1f}s")
     return json.dumps({"summary": text, "sources": sources[:8]}, ensure_ascii=False)
 
@@ -2185,6 +2207,9 @@ def doc_search(query: str, k: int = 8, difficulty: str = "medium") -> str:
     output = doc_search_payload(get_docstore_client(), st.session_state.get("gm_ds_store", None), q, k=k, difficulty=diff)
     elapsed = time.time() - t0
     hits = len(output.get("hits") or [])
+    _log_evidence(tool="doc_search", scope=EV.SCOPE_DOC,
+                  status=EV.STATUS_OK if hits else EV.STATUS_EMPTY,
+                  detail={"query": q[:80], "hits": hits})
     _step_done(f"✅ doc_search `{q[:40]}` → **{hits} 筆** ⏱ {elapsed:.1f}s")
     try:
         st.session_state.gm_ds_doc_search_log.append({
@@ -2281,6 +2306,8 @@ def get_weather(location: str = "") -> str:
         return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
     elapsed = time.time() - t0
     resolved = output.get("resolved_county") or output.get("status", "—")
+    _log_evidence(tool="get_weather", scope=EV.SCOPE_WEATHER, status=EV.STATUS_OK,
+                  detail={"location": str(label)[:40]})
     _step_done(f"✅ get_weather `{label}` → {resolved} ⏱ {elapsed:.1f}s")
     return json.dumps(output, ensure_ascii=False, default=str)
 
@@ -2300,9 +2327,17 @@ def get_earthquake_info() -> str:
     try:
         output = get_earthquake_impl()
     except Exception as e:
+        _log_evidence(tool="get_earthquake_info", scope=EV.SCOPE_EARTHQUAKE,
+                      status=EV.STATUS_ERROR, detail=f"{type(e).__name__}: {str(e)[:120]}")
         _step_done(f"⚠️ get_earthquake_info 失敗：{type(e).__name__}")
         return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
     elapsed = time.time() - t0
+    # found=False 是「CWA 這次沒回傳可顯示的事件」，**不等於「近期沒有地震」**——
+    # 記成 empty 而非 ok，之後渲染措辭才不會把兩者混為一談。
+    _log_evidence(tool="get_earthquake_info", scope=EV.SCOPE_EARTHQUAKE,
+                  status=EV.STATUS_OK if output.get("found") else EV.STATUS_EMPTY,
+                  detail={"origin_time": output.get("origin_time"),
+                          "magnitude": output.get("magnitude")} if output.get("found") else None)
     _step_done(f"✅ get_earthquake_info ⏱ {elapsed:.1f}s")
     return json.dumps(output, ensure_ascii=False, default=str)
 
@@ -2325,9 +2360,16 @@ def get_typhoon_info() -> str:
     try:
         output = get_typhoon_impl()
     except Exception as e:
+        _log_evidence(tool="get_typhoon_info", scope=EV.SCOPE_TYPHOON,
+                      status=EV.STATUS_ERROR, detail=f"{type(e).__name__}: {str(e)[:120]}")
         _step_done(f"⚠️ get_typhoon_info 失敗：{type(e).__name__}")
         return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
     elapsed = time.time() - t0
+    # 颱風的語意比地震好：has_active_taiwan_warning 是明確布林，
+    # 「目前無對台生效警報」是官方給的**有效答案**（ok），不是資料缺漏（empty）。
+    _log_evidence(tool="get_typhoon_info", scope=EV.SCOPE_TYPHOON, status=EV.STATUS_OK,
+                  detail={"has_active_taiwan_warning": output.get("has_active_taiwan_warning"),
+                          "tracked": len(output.get("tracked_cyclones") or [])})
     _step_done(f"✅ get_typhoon_info ⏱ {elapsed:.1f}s")
     return json.dumps(output, ensure_ascii=False, default=str)
 
@@ -4893,6 +4935,9 @@ if prompt or retry_payload or pending_prompt:
     _tele_rt["turn_id"] = TELE.new_turn_id()
     _tele_rt["telemetry"] = []
     _tele_rt["_attempt"] = None   # 進行中的 attempt 記錄；timed_stream 往這裡寫首/末 chunk 時間
+    # 檢索憑證帳本同樣是**每回合**的：跨回合累積會讓「這回合查過地震嗎」永遠答 yes，
+    # 那正是要防的事。與 turn_id 一起重置，兩條路徑都經過這裡。
+    st.session_state["gm_evidence_log"] = []
 
     # 助理區塊（avatar 依模式：⚡ Fast / 💬 General / 🧭 引導；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
     with st.chat_message("assistant", avatar=("🧭" if socratic_active else "⚡" if mode == "fast" else "💬")):
@@ -4971,6 +5016,9 @@ if prompt or retry_payload or pending_prompt:
                         if DEV_MODE:
                             with st.expander("🔧 [dev] Fast response metadata", expanded=False):
                                 st.json(getattr(fast_resp, "response_metadata", {}) or {})
+                            _ev = st.session_state.get("gm_evidence_log") or []
+                            with st.expander(f"🔧 [dev] evidence ledger（{len(_ev)}）", expanded=False):
+                                st.json({"summary": EV.summarize(_ev), "events": _ev})
                             with st.expander(f"🔧 [dev] LLM attempts（{len(_rt().get('telemetry') or [])}）", expanded=False):
                                 st.json({"versions": TELE_VERSIONS, "turn_id": _rt().get("turn_id"),
                                          "attempts": _rt().get("telemetry") or []})
@@ -5058,6 +5106,9 @@ if prompt or retry_payload or pending_prompt:
                     ) + escalate_badge + socratic_badge
                     badges_ph.markdown(general_badges_md)
                     if DEV_MODE:
+                        _ev = st.session_state.get("gm_evidence_log") or []
+                        with st.expander(f"🔧 [dev] evidence ledger（{len(_ev)}）", expanded=False):
+                            st.json({"summary": EV.summarize(_ev), "events": _ev})
                         with st.expander(f"🔧 [dev] LLM attempts（{len(_rt().get('telemetry') or [])}）", expanded=False):
                             st.json({"versions": TELE_VERSIONS, "turn_id": _rt().get("turn_id"),
                                      "attempts": _rt().get("telemetry") or []})
