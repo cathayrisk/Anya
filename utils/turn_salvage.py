@@ -16,6 +16,13 @@ markdown，而不是呼叫 `create_widget`；後面還接一句「請點選上�
 但上方根本沒有元件。使用者看到的是一段 JS 原始碼加一個指向空氣的指示。
 `create_widget` 的 docstring 早就寫了「必須…再呼叫本工具」——同 Fix C／LaTeX 的教訓，
 **對弱模型的流程指令不可靠，要在後處理層兜底。**
+
+**Bug B2（2026-09-05 線上測試補上）：連原始碼都沒有，只有一句口頭宣稱。**
+請它做 VBA 抽認卡，它載入了模板、卻**完全沒有呼叫 `create_widget`**，直接寫散文並附上
+「（註：如果 widget 沒有顯示，請確認您的瀏覽器支援 iframe。）」——上方沒有任何元件。
+原本的 `strip_orphan_widget_source` 接不住，因為它開頭就 `if not _WIDGET_SRC_RE.search(text)`
+提早返回：**沒有原始碼可剝，指向空氣的句子那段就永遠跑不到**。
+兩種樣態的共通點是「這回合沒有 widget」，所以判斷條件應該只看 `widget_created`。
 """
 from __future__ import annotations
 
@@ -28,28 +35,45 @@ _WIDGET_SRC_RE = re.compile(
     r"|(?:<!--[^\n]*?互動[^\n]*?-->\s*)?<script\b[^>]*>.*?</script>",
     re.S,
 )
-# 指向不存在元件的句子（模型以為自己建了）
+# 指向不存在元件的句子（模型以為自己建了）。
+# ⚠️ 只在 widget_created=False 時套用，所以「下方」也收得安全——真的有元件時
+# 「下方的抽認卡」是正確敘述，那條路徑根本不會走到這裡。
+_POS = r"(?:上方|上面|下方|下面|以下|底下)"
 _DANGLING_RE = re.compile(
-    r"[（(]?\s*(?:請)?點[選擊][^。\n）)]{0,20}(?:上方|上面)[^。\n）)]{0,20}"
-    r"(?:互動|元件|表格|矩陣)[^。\n）)]{0,30}[）)]?[。\n]?"
-    r"|上方(?:是|為)[^。\n]{0,20}互動[^。\n]{0,20}[。\n]?"
+    r"[（(]?\s*(?:請)?點[選擊][^。\n）)]{0,20}" + _POS + r"[^。\n）)]{0,20}"
+    r"(?:互動|元件|表格|矩陣|卡片|閃卡|抽認卡)[^。\n）)]{0,30}[）)]?[。\n]?"
+    + r"|" + _POS + r"(?:是|為)[^。\n]{0,20}互動[^。\n]{0,20}[。\n]?"
+    # Bug B2 的實際長相：「（註：如果 widget 沒有顯示，請確認您的瀏覽器支援 iframe。）」
+    # 這句預設「元件應該在那裡」，是最誤導的一種——它把「沒做出來」講成「你的瀏覽器有問題」。
+    + r"|[（(]?\s*(?:註\s*[：:]\s*)?如果[^。\n]{0,12}(?:widget|元件|互動元件)[^。\n]{0,12}"
+      r"(?:沒有顯示|沒顯示|未顯示|看不到|無法顯示)[^。\n]{0,50}[。]?\s*[）)]?",
+    re.IGNORECASE,
 )
 
 
 def strip_orphan_widget_source(text: str, widget_created: bool) -> tuple[str, bool]:
-    """widget 沒建成卻把模板原始碼寫進答案時，把原始碼與「請點上方元件」的指示拿掉。
+    """這回合沒有 widget，卻寫了模板原始碼或指向元件的句子時，把它們拿掉。
 
-    widget_created=True（這回合真的呼叫過 create_widget）時原樣返回——
-    那種情況下「上方是互動比較矩陣」是正確的敘述，不可誤刪。
+    `widget_created=True`（真的呼叫過 create_widget）時原樣返回——
+    那種情況下「上方是互動比較矩陣」是正確敘述，不可誤刪。**唯一的判斷依據就是它**：
+    系統知道這回合到底有沒有建成元件，不需要（也不該）去猜模型的措辭是真是假。
+
+    ⚠️ 原本這裡有一行 `if not _WIDGET_SRC_RE.search(text): return` 提早返回，
+    於是「沒有原始碼、只有一句口頭宣稱」（Bug B2）永遠接不住。兩種樣態要各自獨立判斷。
 
     回傳 (清理後文字, 是否有動過)。
     """
     if not text or widget_created:
         return text or "", False
-    if not _WIDGET_SRC_RE.search(text):
+    out, changed = text, False
+    if _WIDGET_SRC_RE.search(out):
+        out = _WIDGET_SRC_RE.sub("", out)
+        changed = True
+    if _DANGLING_RE.search(out):
+        out = _DANGLING_RE.sub("", out)
+        changed = True
+    if not changed:
         return text, False
-    out = _WIDGET_SRC_RE.sub("", text)
-    out = _DANGLING_RE.sub("", out)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out, True
 
