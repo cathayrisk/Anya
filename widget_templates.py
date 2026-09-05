@@ -22,7 +22,8 @@ WIDGET_RULES = """【互動 widget 規則】
 何時使用：數字試算或參數探索 → widget_calculator；多對象多維度比較 → widget_comparison_matrix；研究來源探索 → widget_source_browser；從文件重點學習 → widget_flashcards。
 何時不用：答案用敘述文字就能講清楚時，不要做 widget；每回合最多 1 個 widget。
 流程：先用 load_skill 載入對應模板 → 只替換「資料區」內的 DATA（與範例同結構的真實資料），不改結構、CSS 與 JS 邏輯 → 呼叫 create_widget(title, height, html)。
-硬規則：HTML 必須完全自包含；禁止外部資源（CDN、字體、圖片 URL）；禁止 fetch/XHR；height 依內容估 200-800。"""
+硬規則：HTML 必須完全自包含；禁止外部資源（CDN、字體、圖片 URL）；禁止 fetch/XHR；height 依內容估 200-800。
+不要自己重寫 HTML/JS：模板的 JS 有接 `AnyaState`（狀態保存），自己寫的沒有——使用者操作後只要畫面重新整理就會全部重置（實測：翻到第 3 張卡片，送出下一則訊息後跳回第 1 張）。create_widget 會擋下沒接狀態的自製元件並要求改用模板。"""
 
 
 WIDGET_TEMPLATES: dict[str, dict] = {
