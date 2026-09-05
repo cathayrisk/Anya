@@ -28,6 +28,142 @@ WIDGET_RULES = """【互動 widget 規則】
 WIDGET_TEMPLATES: dict[str, dict] = {
 
     # ------------------------------------------------------------------
+    "widget_natal_chart": {
+        "description": "占星輪盤：12 星座扇區 + 行星落點 + 相位連線 + 元素/模式分布。資料來自 get_natal_chart。",
+        "content": r"""用途：把 get_natal_chart / get_astro_forecast 算出的星盤畫成輪盤圖＋落點表。
+可改：僅「資料區」內的 const DATA — title、subtitle、points（n 名稱、d 絕對黃道度 0-360、s 星座中文、h 宮位、r 是否逆行）、
+      aspects（a/b 兩端點名、t 相位、o 容許度）、dist（element/mode 統計）、asc_deg（上升絕對度，用來旋轉輪盤）。
+不可動：資料區以外的 HTML 結構、CSS 與 JS 邏輯。
+height 建議：420-560。
+注意：行星度數一律用工具算出來的值，不可自行編造。
+
+<style>
+#anya-nat{--brand:#AD4746;--bg:#FFF6F7;--ink:#4B3832;--line:#E8D5D3;--soft:#5b8c7b;--hard:#c2683f;
+  font-family:"SF Pro Rounded",-apple-system,"Segoe UI","Microsoft JhengHei",sans-serif;
+  background:var(--bg);color:var(--ink);padding:16px;border-radius:10px;}
+#anya-nat h3{margin:0 0 2px;font-size:17px;}
+#anya-nat .sub{font-size:12px;opacity:.75;margin-bottom:12px;}
+#anya-nat .wrap{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start;}
+#anya-nat table{border-collapse:collapse;font-size:12.5px;}
+#anya-nat td{padding:3px 9px 3px 0;border-bottom:1px solid var(--line);white-space:nowrap;}
+#anya-nat td.rx{color:var(--hard);font-size:11px;}
+#anya-nat .dist{margin-top:12px;font-size:12px;line-height:1.9;}
+#anya-nat .bar{display:inline-block;height:9px;background:var(--brand);border-radius:5px;
+  vertical-align:middle;margin:0 6px;opacity:.85;}
+#anya-nat .note{margin-top:14px;font-size:11.5px;opacity:.7;line-height:1.6;
+  border-top:1px solid var(--line);padding-top:8px;}
+</style>
+
+<div id="anya-nat">
+  <h3 id="nat-t"></h3>
+  <div class="sub" id="nat-s"></div>
+  <div class="wrap">
+    <svg id="nat-w" viewBox="0 0 320 320" width="320" height="320" aria-label="星盤輪盤"></svg>
+    <div>
+      <table id="nat-tb"></table>
+      <div class="dist" id="nat-d"></div>
+    </div>
+  </div>
+  <div class="note">象徵性的自我覺察工具，不是命運判決。行星位置由 Swiss Ephemeris 精確計算。</div>
+</div>
+
+<script>
+// ========== 資料區（只改這裡） ==========
+const DATA = {
+  title: "示範星盤",
+  subtitle: "1990-05-15 12:00 · 台北",
+  asc_deg: 147.8,
+  points: [
+    {n:"Sun", d:54.07, s:"金牛", h:9, r:0},
+    {n:"Moon", d:280.5, s:"摩羯", h:5, r:0}
+  ],
+  aspects: [
+    {a:"Sun", b:"Moon", t:"trine", o:1.2}
+  ],
+  dist: {element:{"火":1,"土":6,"風":0,"水":4}, mode:{"開創":7,"固定":3,"變動":1}}
+};
+// ========== 資料區結束 ==========
+
+(function(){
+  const SIGNS = ["牡羊","金牛","雙子","巨蟹","獅子","處女","天秤","天蠍","射手","摩羯","水瓶","雙魚"];
+  const SOFT = ["trine","sextile"];
+  const svg = document.getElementById("nat-w");
+  const NS = "http://www.w3.org/2000/svg";
+  const CX = 160, CY = 160, R_OUT = 150, R_IN = 108, R_PL = 128, R_ASP = 100;
+  // 以上升點為左側水平（占星慣例：上升在九點鐘方向）
+  const rot = (DATA.asc_deg || 0);
+  const toXY = (deg, r) => {
+    const a = (180 - (deg - rot)) * Math.PI / 180;
+    return [CX + r * Math.cos(a), CY - r * Math.sin(a)];
+  };
+  const mk = (t, attrs, txt) => {
+    const e = document.createElementNS(NS, t);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (txt !== undefined) e.textContent = txt;
+    svg.appendChild(e); return e;
+  };
+
+  mk("circle", {cx:CX, cy:CY, r:R_OUT, fill:"none", stroke:"#E8D5D3", "stroke-width":1});
+  mk("circle", {cx:CX, cy:CY, r:R_IN, fill:"none", stroke:"#E8D5D3", "stroke-width":1});
+
+  for (let i = 0; i < 12; i++) {
+    const d = i * 30;
+    const [x1,y1] = toXY(d, R_IN), [x2,y2] = toXY(d, R_OUT);
+    mk("line", {x1,y1,x2,y2, stroke:"#E8D5D3", "stroke-width":1});
+    const [tx,ty] = toXY(d + 15, (R_IN + R_OUT) / 2);
+    mk("text", {x:tx, y:ty+4, "text-anchor":"middle", "font-size":11, fill:"#4B3832",
+                opacity:.75}, SIGNS[i]);
+  }
+
+  (DATA.aspects || []).forEach(a => {
+    const p1 = (DATA.points||[]).find(p => p.n === a.a);
+    const p2 = (DATA.points||[]).find(p => p.n === a.b);
+    if (!p1 || !p2) return;
+    const [x1,y1] = toXY(p1.d, R_ASP), [x2,y2] = toXY(p2.d, R_ASP);
+    mk("line", {x1,y1,x2,y2, stroke: SOFT.includes(a.t) ? "#5b8c7b" : "#c2683f",
+                "stroke-width":1, opacity:.5});
+  });
+
+  // 星群（stellium）常有 3-4 顆星擠在十幾度內，固定半徑放標籤會疊成一團看不清，
+  // 而那通常正是整張盤最關鍵的地方。依角度排序後分層外推，讓擁擠處自動散開。
+  const sorted = (DATA.points || []).slice().sort((a,b) => a.d - b.d);
+  let lastDeg = -999, tier = 0;
+  sorted.forEach(p => {
+    tier = (Math.abs(p.d - lastDeg) < 9) ? (tier + 1) % 3 : 0;
+    lastDeg = p.d;
+    const [x,y] = toXY(p.d, R_PL);
+    mk("circle", {cx:x, cy:y, r:3.4, fill:"#AD4746"});
+    const rLabel = R_PL - 16 - tier * 14;
+    if (tier > 0) {   // 拉出引線，才看得出標籤屬於哪一顆
+      const [gx,gy] = toXY(p.d, rLabel + 7);
+      mk("line", {x1:x, y1:y, x2:gx, y2:gy, stroke:"#AD4746", "stroke-width":.6, opacity:.4});
+    }
+    const [lx,ly] = toXY(p.d, rLabel);
+    mk("text", {x:lx, y:ly+3, "text-anchor":"middle", "font-size":9.5,
+                fill:"#4B3832"}, p.n.slice(0,3) + (p.r ? "℞" : ""));
+  });
+
+  document.getElementById("nat-t").textContent = DATA.title || "星盤";
+  document.getElementById("nat-s").textContent = DATA.subtitle || "";
+  document.getElementById("nat-tb").innerHTML = (DATA.points || []).map(p =>
+    `<tr><td><b>${p.n}</b></td><td>${p.s}</td><td>${(p.d % 30).toFixed(1)}°</td>` +
+    `<td>${p.h ? p.h + "宮" : "-"}</td><td class="rx">${p.r ? "逆行" : ""}</td></tr>`).join("");
+
+  const dist = DATA.dist || {};
+  const rows = [];
+  for (const grp of ["element", "mode"]) {
+    const obj = dist[grp]; if (!obj) continue;
+    const max = Math.max(1, ...Object.values(obj));
+    rows.push(Object.entries(obj).map(([k,v]) =>
+      `${k} <span class="bar" style="width:${Math.round(v / max * 46)}px"></span>${v}`).join("　"));
+  }
+  document.getElementById("nat-d").innerHTML = rows.join("<br>");
+})();
+</script>
+""",
+    },
+
+    # ------------------------------------------------------------------
     "widget_comparison_matrix": {
         "description": "互動比較矩陣：2-4 個對象 × 4-8 個維度，維度可勾選顯示/隱藏，點格子標記優勝方。",
         "content": r"""用途：多個對象跨維度的互動比較表（凍結表頭、維度篩選、優勝方標記）。
@@ -83,6 +219,30 @@ const DATA = {
 <script>
 (function () {
   const on = DATA.criteria.map(() => true);
+  // 狀態保存：iframe 會在每次 rerun 重建，不存就會把使用者的勾選與標記全部丟掉。
+  // 只存「檢視狀態」（顯示哪些維度、哪格被標記），不存任何使用者輸入的內容。
+  // AnyaState 由 Home.py 注入（utils/widget_state.py）；沒注入時就當作沒有還原。
+  const HAS_STATE = typeof AnyaState !== "undefined";
+  function saveState() {
+    if (!HAS_STATE) return;
+    AnyaState.save({ on: on.slice(), win: DATA.criteria.map(function (c) { return c.winner; }) });
+  }
+  (function restore() {
+    if (!HAS_STATE) return;
+    const st = AnyaState.load();
+    if (!st) return;
+    // 長度不符代表資料已變（理論上 fingerprint 就會擋掉，這裡是第二道防線）
+    if (Array.isArray(st.on) && st.on.length === on.length) {
+      st.on.forEach(function (v, i) { on[i] = !!v; });
+    }
+    if (Array.isArray(st.win) && st.win.length === DATA.criteria.length) {
+      st.win.forEach(function (w, i) {
+        // 越界或非法值一律忽略，不可讓壞資料把畫面標到不存在的欄位
+        DATA.criteria[i].winner =
+          (w === null || (Number.isInteger(w) && w >= 0 && w < DATA.items.length)) ? w : null;
+      });
+    }
+  })();
   document.getElementById("cmx-title").textContent = DATA.title;
   const head = document.getElementById("cmx-head");
   head.innerHTML = "<tr><th>維度</th>" +
@@ -93,12 +253,13 @@ const DATA = {
   const chips = document.getElementById("cmx-chips");
   DATA.criteria.forEach(function (c, ci) {
     const chip = document.createElement("span");
-    chip.className = "cmx-chip";
-    chip.textContent = "✓ " + c.name;
+    chip.className = "cmx-chip" + (on[ci] ? "" : " off");
+    chip.textContent = (on[ci] ? "✓ " : "– ") + c.name;
     chip.addEventListener("click", function () {
       on[ci] = !on[ci];
       chip.classList.toggle("off", !on[ci]);
       chip.textContent = (on[ci] ? "✓ " : "– ") + c.name;
+      saveState();
       render();
     });
     chips.appendChild(chip);
@@ -121,6 +282,7 @@ const DATA = {
         td.textContent = v;
         td.addEventListener("click", function () {
           c.winner = (c.winner === vi ? null : vi);
+          saveState();
           render();
         });
         tr.appendChild(td);
