@@ -70,6 +70,7 @@ from utils.token_budget import fulltext_budget
 from utils.model_health import ModelHealth, pick_model, OVERLOAD_QUARANTINE_SECS
 from utils.mathtext import latex_to_plain
 from utils.turn_salvage import strip_orphan_widget_source, describe_completed_work
+from utils.widget_state import content_fingerprint, inject_state_helper
 from utils import telemetry as TELE
 
 # 版本標記：每筆 telemetry 都帶，讓「行號證據」在 SDK 升級或 Home.py 改動後不會失效而不自知
@@ -2604,7 +2605,8 @@ def _maybe_distill_search_lesson(run_id: str) -> None:
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def render_widget_html(html: str, *, height: int, scrolling: bool = True) -> None:
+def render_widget_html(html: str, *, height: int, scrolling: bool = True,
+                       wid: str | None = None, fingerprint: str | None = None) -> None:
     """渲染自包含 HTML（iframe）。
 
     ⚠️ 2026-09-05：一度改成「有 `st.iframe` 就用新的」，**那是錯的，已回退**。
@@ -2621,8 +2623,12 @@ def render_widget_html(html: str, *, height: int, scrolling: bool = True) -> Non
     要再嘗試遷移前，必須先驗證：新 API 的第一個位置參數是否真的接受 raw HTML
     （而不是 URL）、以及是否有等同 `scrolling` 的參數。在那之前一律用 `components.html`：
     它雖已標棄用，但在 1.63.0 仍然存在且可用。
+
+    wid／fingerprint 有值時注入狀態保存小工具（見 utils/widget_state.py）——
+    存的是**模型 HTML 之外**的東西，所以 create_widget 的安全檢查不受影響（那是對模型輸入做的）。
     """
-    components.html(html, height=height, scrolling=scrolling)
+    components.html(inject_state_helper(html, wid, fingerprint),
+                    height=height, scrolling=scrolling)
 
 
 # --- 互動 widget（自包含 HTML，render_widget_html iframe 渲染）---
@@ -2843,14 +2849,20 @@ def create_widget(title: str, height: int, html: str) -> str:
         hh = 420
     meta["tool_step"] += 1
     _status(f"[{meta['tool_step']}] 🧩 生成互動元件：{(title or '')[:30]}", write=f"🧩 互動元件：{(title or '')[:40]}")
+    # 每個 widget occurrence 一個不可變 UUID：歷史回放沿用同一個，狀態才對得上。
+    # 不可用 title 或內容 hash 當 id——同標題不同資料會互相污染（見 utils/widget_state.py）。
+    _wid = _uuid.uuid4().hex[:16]
+    _fp = content_fingerprint(h)
     area = rt.get("widget_area")
     try:
         if area is not None:
             with area:
-                render_widget_html(h, height=hh, scrolling=True)
+                render_widget_html(h, height=hh, scrolling=True,
+                                   wid=_wid, fingerprint=_fp)
     except Exception as e:
         return json.dumps({"error": f"渲染失敗：{type(e).__name__}: {str(e)[:150]}"}, ensure_ascii=False)
-    rt["widget"] = {"title": (title or "互動元件")[:60], "html": h, "height": hh}
+    rt["widget"] = {"title": (title or "互動元件")[:60], "html": h, "height": hh,
+                    "wid": _wid, "fp": _fp}
     _step_done(f"🧩 已生成互動元件：{(title or '')[:40]}")
     return json.dumps({
         "ok": True,
@@ -4357,7 +4369,9 @@ for idx, msg in enumerate(st.session_state.get("gm_chat_history", [])):
         if msg.get("widget"):
             try:  # 互動元件歷史回放（iframe 重建；元件內操作狀態不跨 rerun 保留）
                 render_widget_html(msg["widget"]["html"],
-                                   height=msg["widget"].get("height", 420), scrolling=True)
+                                   height=msg["widget"].get("height", 420), scrolling=True,
+                                   wid=msg["widget"].get("wid"),
+                                   fingerprint=msg["widget"].get("fp"))
             except Exception:
                 pass
         proc = msg.get("process") or {}
