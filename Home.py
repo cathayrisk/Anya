@@ -69,6 +69,7 @@ from utils.hazard_intent import classify_hazard_intent
 from utils import hazard_prefetch as HZPF
 from utils import hazard_render as HZRENDER
 from utils import evidence_banner as EVBANNER
+from utils import widget_audit as WAUDIT
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
@@ -2915,6 +2916,19 @@ def create_widget(title: str, height: int, html: str) -> str:
             "error": "偵測到外部資源載入或網路請求（<script src> / src=http / url(http / fetch / XHR）。"
                      "元件必須完全自包含：把資源改為 inline 後重試。"
         }, ensure_ascii=False)
+    # 狀態流失稽核（2026-09-05 T20）：模型自己手寫 HTML 時不會呼叫 AnyaState，
+    # 於是使用者的操作在下一次 rerun 全部消失，而且**沒有任何訊號**。
+    # 在渲染之前擋——此時 widget 名額還沒被佔用，模型可以改用模板重來。
+    # 同一回合只擋一次：判定必然是啟發式的，擋兩次以上的風險（迴圈、使用者完全
+    # 拿不到元件）比「狀態流失」這個不便本身更大。
+    _wa = WAUDIT.audit_widget_html(h)
+    rt["widget_audit"] = _wa.as_dict()
+    print(f"[widget_audit] turn={_rt().get('turn_id')} {_wa.as_dict()}", flush=True)
+    if _wa.will_lose_state and not rt.get("widget_state_nudged"):
+        rt["widget_state_nudged"] = True
+        _step_done("↩️ 元件沒接狀態保存，請模型改用模板重做")
+        return json.dumps({"error": WAUDIT.RETRY_HINT}, ensure_ascii=False)
+
     try:
         hh = max(200, min(800, int(height)))
     except Exception:
@@ -4591,6 +4605,8 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
     rt["todo_ph"] = todo_ph
     rt["widget_area"] = widget_area
     rt["widget"] = None
+    rt["widget_audit"] = None
+    rt["widget_state_nudged"] = False   # 狀態流失只擋一次，每回合重置
     rt["dr_report"] = None
     rt["dr_summary_line"] = None
     rt["t_start"] = time.time()
@@ -5317,6 +5333,12 @@ if prompt or retry_payload or pending_prompt:
                             st.json({"summary": EV.summarize(_ev), "events": _ev})
                         with st.expander("🔧 [dev] hazard intent（shadow）", expanded=False):
                             st.json(st.session_state.get("gm_hazard_intent"))
+                        if _rt().get("widget_audit"):
+                            # 量「模型自製 vs 用模板」的比例——擋一次的設計要不要調，
+                            # 得先知道實際上多常發生（比照第 3 步的 shadow log 紀律）
+                            with st.expander("🔧 [dev] widget audit", expanded=False):
+                                st.json({**_rt()["widget_audit"],
+                                         "nudged": bool(_rt().get("widget_state_nudged"))})
                         with st.expander(f"🔧 [dev] LLM attempts（{len(_rt().get('telemetry') or [])}）", expanded=False):
                             st.json({"versions": TELE_VERSIONS, "turn_id": _rt().get("turn_id"),
                                      "attempts": _rt().get("telemetry") or []})
