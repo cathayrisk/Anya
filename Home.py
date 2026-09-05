@@ -63,7 +63,7 @@ import uuid as _uuid
 
 from utils.rich_styles import inject_rich_styles
 from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
-from utils.honesty import strip_false_verification_claims
+from utils.honesty import strip_false_verification_claims, finalize_response
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
@@ -4960,8 +4960,10 @@ if prompt or retry_payload or pending_prompt:
                         # 未搜尋 → 系統握有事實，不信任模型措辭（Fix C，2026-09-03 線上驗證 V3 後）：
                         # 1) 剝掉「幫你查好了」這類自稱查證的句子——FAST_GEMMA_PROMPT 的禁令實測對 flash-lite 無效
                         # 2) banner 一律顯示，不再只看有沒有年份或 %——「目前無颱風」這種沒數字的斷言也該標
-                        if not web_happened:
-                            fast_text = strip_false_verification_claims(fast_text)
+                        # 2026-09-05：改為一律剝除（原本只在 not web_happened 時做）。
+                        # 理由見 utils/honesty.py——「我幫你查好了」這種第一人稱查證動作宣稱
+                        # 本來就不該由模型主張，真相由 badge／來源 footer／evidence 面板負責。
+                        fast_text = finalize_response(fast_text, mode="fast")
                         final_text = renderer.finish(fast_text, scope_key="gm_fast")
                         if not web_happened:
                             st.caption("💡 本回覆未經網路查證，內容來自模型既有知識，可能不是最新；需要查證可以再問一次並要求搜尋。")
@@ -5072,6 +5074,11 @@ if prompt or retry_payload or pending_prompt:
                     ai_text = strip_trailing_model_citation_footer(ai_text)
                     ai_text = strip_doc_citation_tokens(ai_text)
                     ai_text = cleanup_report_markdown(ai_text)
+                    # 2026-09-05：General 過去**完全沒有**誠實性防線（Fix C 只掛在 Fast）。
+                    # 一小時測試 T5：問「最近台灣有地震嗎」→ CWA 工具 0 呼叫、2.1 秒，
+                    # 卻寫「安妮亞立刻幫你查中央氣象署的最新即時資訊」並給出半年前的地震資料。
+                    # 這裡先堵住「宣稱」；「內容是不是編的」要靠 evidence ledger（下一步）。
+                    ai_text = finalize_response(ai_text, mode="general")
 
                     # 來源 footer：不靠模型，從 log 聚合（永遠不會亂）
                     web_sources = collect_web_sources_from_log(run_id)
