@@ -65,6 +65,7 @@ from utils.rich_styles import inject_rich_styles
 from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon_impl
 from utils.honesty import strip_false_verification_claims, finalize_response
 from utils import evidence as EV
+from utils.hazard_intent import classify_hazard_intent
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
@@ -4938,6 +4939,21 @@ if prompt or retry_payload or pending_prompt:
     # 檢索憑證帳本同樣是**每回合**的：跨回合累積會讓「這回合查過地震嗎」永遠答 yes，
     # 那正是要防的事。與 turn_id 一起重置，兩條路徑都經過這裡。
     st.session_state["gm_evidence_log"] = []
+    # 災防意圖三態分類：**這一步只觀測、不接動作**。
+    # 目的是在真實流量上量 UNCERTAIN 佔比，再決定第 4 步（controller prefetch）要不要
+    # 把 UNCERTAIN 也一起強制查。先接動作就沒有乾淨的觀測基準了。
+    try:
+        _hz = classify_hazard_intent(user_text or "")
+        st.session_state["gm_hazard_intent"] = {
+            "state": _hz.state, "scopes": list(_hz.scopes), "uncovered": list(_hz.uncovered),
+            "would_prefetch": _hz.should_prefetch, "signals": _hz.signals,
+        }
+        if _hz.state != "none":
+            print(f"[hazard_intent] turn={_tele_rt['turn_id']} state={_hz.state} "
+                  f"scopes={list(_hz.scopes)} uncovered={list(_hz.uncovered)} "
+                  f"would_prefetch={_hz.should_prefetch}", flush=True)
+    except Exception:
+        st.session_state["gm_hazard_intent"] = None
 
     # 助理區塊（avatar 依模式：⚡ Fast / 💬 General / 🧭 引導；sentinel 中途升級時本輪維持 ⚡，歷史會校正）
     with st.chat_message("assistant", avatar=("🧭" if socratic_active else "⚡" if mode == "fast" else "💬")):
@@ -5019,6 +5035,8 @@ if prompt or retry_payload or pending_prompt:
                             _ev = st.session_state.get("gm_evidence_log") or []
                             with st.expander(f"🔧 [dev] evidence ledger（{len(_ev)}）", expanded=False):
                                 st.json({"summary": EV.summarize(_ev), "events": _ev})
+                            with st.expander("🔧 [dev] hazard intent（shadow）", expanded=False):
+                                st.json(st.session_state.get("gm_hazard_intent"))
                             with st.expander(f"🔧 [dev] LLM attempts（{len(_rt().get('telemetry') or [])}）", expanded=False):
                                 st.json({"versions": TELE_VERSIONS, "turn_id": _rt().get("turn_id"),
                                          "attempts": _rt().get("telemetry") or []})
@@ -5109,6 +5127,8 @@ if prompt or retry_payload or pending_prompt:
                         _ev = st.session_state.get("gm_evidence_log") or []
                         with st.expander(f"🔧 [dev] evidence ledger（{len(_ev)}）", expanded=False):
                             st.json({"summary": EV.summarize(_ev), "events": _ev})
+                        with st.expander("🔧 [dev] hazard intent（shadow）", expanded=False):
+                            st.json(st.session_state.get("gm_hazard_intent"))
                         with st.expander(f"🔧 [dev] LLM attempts（{len(_rt().get('telemetry') or [])}）", expanded=False):
                             st.json({"versions": TELE_VERSIONS, "turn_id": _rt().get("turn_id"),
                                      "attempts": _rt().get("telemetry") or []})
