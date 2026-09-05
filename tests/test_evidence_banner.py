@@ -142,6 +142,24 @@ def test_web_search_failure_is_logged():
     assert body.count("_log_evidence(") == 2, "成功與失敗都要記"
 
 
+def test_banner_survives_into_history_not_just_the_live_turn():
+    """⚠️ 2026-09-05 測試抓到的漏洞：banner 原本只用 st.caption() 當回合畫，沒存進歷史。
+    44 則訊息實測下來，**歷史訊息的 banner 全部是 0 個**——誠實標示只在送出後
+    到下一次 rerun 之間看得到，捲回去或重新整理就消失。badge 有存所以留得住，
+    對比之下更容易讓人誤以為 banner 也在。"""
+    assert SRC.count('"banner":') == 2, "Fast 與 General 兩條路徑都要存進歷史"
+    assert 'st.caption(msg["banner"])' in SRC, "歷史重播要畫出來"
+    # 存與畫的順序：畫的地方在歷史迴圈裡，必須在兩個 append 之前（腳本由上往下跑）
+    assert SRC.index('st.caption(msg["banner"])') < SRC.index('"banner": _fast_banner')
+
+
+def test_cwa_path_deliberately_has_no_banner():
+    """🌐 氣象署直答本來就有更強的「由程式直接取自中央氣象署、未經模型改寫」footer，
+    再加一句 banner 只是重複。"""
+    i = SRC.index('"mode": "cwa"')
+    assert '"banner"' not in SRC[i - 200: i + 300]
+
+
 def test_weather_not_found_is_not_logged_as_success():
     """get_weather 的 status=not_found／outside_taiwan 代表**沒拿到任何天氣資料**，
     一律記 ok 的話 banner 會宣稱「已查詢氣象署天氣」——那是說謊。"""
