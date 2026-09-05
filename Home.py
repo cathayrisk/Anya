@@ -4753,7 +4753,10 @@ def run_general_turn(lc_msgs: list, *, url_in_text: str | None, status, gif_ph,
         tool_calls = getattr(resp, "tool_calls", None) or []
         if not tool_calls:
             # 守門：用過搜尋類工具卻沒 think 就想交卷 → 硬性退回，要求先 think（僅重試一次）
-            # （tool_choice 強制指定在 Gemma 上會 hang，實測不可用，只能靠這裡）
+            # （tool_choice 強制指定**在 Gemma 上**會 hang，實測不可用，只能靠這裡。
+            #   ⚠️ 這個實測只做過 Gemma：2026-09-05 查 API 文件，tool_choice 在 API 層
+            #   是支援的，Gemini 系列從沒測過。要改走 tool_choice 之前先在目標模型實測，
+            #   不要把這句當成「這條路封死」。）
             if searches_since_think >= 1 and not think_demanded:
                 think_demanded = True
                 _step_done("🔁 安妮亞差點忘了反思，先想一想再作答")
