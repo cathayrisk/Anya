@@ -10,11 +10,15 @@ _MODE_LABEL = {
     "fast":     "⚡ Fast",
     "general":  "💬 General",
     "research": "🔬 Research",
+    # 純即時災防題由程式模板直接作答，完全沒有經過模型（見 utils/hazard_render.py）。
+    # 沿用 Fast／General 徽章會謊報是哪顆模型答的，所以單獨一格。
+    "cwa":      "🌐 氣象署直答",
 }
 _MODE_COLOR = {
     "fast":     "green",
     "general":  "blue",
     "research": "orange",
+    "cwa":      "orange",
 }
 
 def badges_markdown(
@@ -27,7 +31,7 @@ def badges_markdown(
     elapsed_s: float | None = None,
 ) -> str:
     mode_norm = (mode or "").strip().lower()
-    if mode_norm not in ("fast", "general", "research"):
+    if mode_norm not in ("fast", "general", "research", "cwa"):
         mode_norm = "general"
 
     items = [
