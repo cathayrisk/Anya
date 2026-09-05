@@ -52,6 +52,10 @@ def versions(app_file: str | None = None) -> dict[str, Any]:
     return {
         "langchain_google_genai": _pkg_version("langchain-google-genai"),
         "google_genai": _pkg_version("google-genai"),
+        # 2026-09-05 加入：Cloud 實際解析到哪一版 streamlit，本機看不到（本機 1.55.0、
+        # Cloud 較新）。釘版區間要不要調、以及 st.iframe／st.skeleton 這類新 API 能不能用，
+        # 都取決於這個數字——先前只能從「有沒有跳棄用警告」反推。
+        "streamlit": _pkg_version("streamlit"),
         "app_md5": _file_md5(app_file),
         "python": ".".join(map(str, sys.version_info[:3])),
     }
