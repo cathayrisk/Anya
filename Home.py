@@ -68,6 +68,7 @@ from utils import evidence as EV
 from utils.hazard_intent import classify_hazard_intent
 from utils import hazard_prefetch as HZPF
 from utils import hazard_render as HZRENDER
+from utils import evidence_banner as EVBANNER
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
@@ -2131,6 +2132,8 @@ def web_search(query: str) -> str:
     try:
         text, sources = web_search_impl(q)
     except Exception as e:
+        _log_evidence(tool="web_search", scope=EV.SCOPE_WEB, status=EV.STATUS_ERROR,
+                      detail=f"{type(e).__name__}: {str(e)[:120]}")
         _step_done(f"⚠️ web_search 失敗：{type(e).__name__}")
         return json.dumps({"error": f"搜尋失敗：{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
 
@@ -2163,9 +2166,15 @@ def fetch_webpage(url: str, max_chars: int = 60000, timeout_seconds: int = 20) -
         capped = max(1000, min(int(max_chars), 80000))
         out = fetch_webpage_impl_via_jina(url, max_chars=capped, timeout_seconds=int(timeout_seconds))
     except Exception as e:
+        _log_evidence(tool="fetch_webpage", scope=EV.SCOPE_PAGE, status=EV.STATUS_ERROR,
+                      detail=f"{type(e).__name__}: {str(e)[:120]}")
         _step_done(f"⚠️ fetch_webpage 失敗：{type(e).__name__}")
         return json.dumps({"error": f"讀取失敗：{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
     elapsed = time.time() - t0
+    # 抓到 0 字＝頁面沒有可讀內容（付費牆／JS-only），記 empty 不記 ok
+    _log_evidence(tool="fetch_webpage", scope=EV.SCOPE_PAGE,
+                  status=EV.STATUS_OK if (out.get("text") or "").strip() else EV.STATUS_EMPTY,
+                  detail={"url": str(url)[:120], "chars": len(out.get("text") or "")})
     _step_done(f"✅ fetch_webpage → {len(out.get('text') or '')} 字 ⏱ {elapsed:.1f}s")
     return json.dumps(out, ensure_ascii=False)
 
@@ -2305,12 +2314,17 @@ def get_weather(location: str = "") -> str:
     try:
         output = get_weather_impl(loc)
     except Exception as e:
+        _log_evidence(tool="get_weather", scope=EV.SCOPE_WEATHER, status=EV.STATUS_ERROR,
+                      detail=f"{type(e).__name__}: {str(e)[:120]}")
         _step_done(f"⚠️ get_weather 失敗：{type(e).__name__}")
         return json.dumps({"error": f"{type(e).__name__}: {str(e)[:200]}"}, ensure_ascii=False)
     elapsed = time.time() - t0
     resolved = output.get("resolved_county") or output.get("status", "—")
-    _log_evidence(tool="get_weather", scope=EV.SCOPE_WEATHER, status=EV.STATUS_OK,
-                  detail={"location": str(label)[:40]})
+    # status 不是 ok（not_found／outside_taiwan）代表**沒有取得任何天氣資料**，
+    # 卻一律記成 ok 的話，banner 會宣稱「已查詢氣象署天氣」——那是說謊。
+    _log_evidence(tool="get_weather", scope=EV.SCOPE_WEATHER,
+                  status=EV.STATUS_OK if output.get("status") == "ok" else EV.STATUS_EMPTY,
+                  detail={"location": str(label)[:40], "status": output.get("status")})
     _step_done(f"✅ get_weather `{label}` → {resolved} ⏱ {elapsed:.1f}s")
     return json.dumps(output, ensure_ascii=False, default=str)
 
@@ -5151,6 +5165,14 @@ if prompt or retry_payload or pending_prompt:
 
                         # 搜尋判定：queries 或 chunks 任一存在都算（模型可能搜了但沒產生引用 chunks）
                         web_happened = bool(fast_sources or fast_queries)
+                        # Fast 的「查證」不是走 web_search 工具，是 Gemini 的 grounding，
+                        # 所以帳本原本完全看不到它。banner 改由帳本生成之後，漏記這一筆
+                        # 就會讓有 grounding 的回合被說成「未經任何查證」。
+                        if web_happened:
+                            _log_evidence(tool="grounding", scope=EV.SCOPE_WEB,
+                                          status=EV.STATUS_OK if fast_sources else EV.STATUS_EMPTY,
+                                          detail={"queries": fast_queries[:3],
+                                                  "n_sources": len(fast_sources)})
                         fast_badges_md = badges_markdown(
                             mode="Fast",
                             db_used=False,
@@ -5169,8 +5191,12 @@ if prompt or retry_payload or pending_prompt:
                         # 本來就不該由模型主張，真相由 badge／來源 footer／evidence 面板負責。
                         fast_text = finalize_response(fast_text, mode="fast")
                         final_text = renderer.finish(fast_text, scope_key="gm_fast")
-                        if not web_happened:
-                            st.caption("💡 本回覆未經網路查證，內容來自模型既有知識，可能不是最新；需要查證可以再問一次並要求搜尋。")
+                        # banner 改由憑證帳本生成（第 6 步）。原本是 `if not web_happened`，
+                        # 只認得網路搜尋；第 4 步的 prefetch 讓 Fast 也可能握有氣象署官方
+                        # 資料，那個條件就開始說假話——**主動誤導比沒有 banner 更糟**。
+                        _fast_banner = EVBANNER.build_banner(st.session_state.get("gm_evidence_log") or [])
+                        if _fast_banner:
+                            st.caption(_fast_banner)
 
                         if DEV_MODE:
                             with st.expander("🔧 [dev] Fast response metadata", expanded=False):
@@ -5321,6 +5347,13 @@ if prompt or retry_payload or pending_prompt:
 
                     # Phase 2：串流已即時顯示過程，這裡用清理後的最終文字（含 footer）覆蓋收尾
                     final_text = renderer.finish(ai_text, scope_key="gm_general")
+
+                    # 查證標示（第 6 步）。General 過去**完全沒有** banner——09-05 實測
+                    # 問「宏碁跟宏達電的曝險差異」，模型把宏達電整段寫成緯創：格式專業、
+                    # 語氣肯定、零標示。對金融使用者最危險的就是這種「看起來很可信的錯」。
+                    _gen_banner = EVBANNER.build_banner(st.session_state.get("gm_evidence_log") or [])
+                    if _gen_banner:
+                        st.caption(_gen_banner)
 
                     render_evidence_panel_expander_in(
                         container=evidence_panel_ph,
