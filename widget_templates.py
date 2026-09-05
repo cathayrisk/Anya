@@ -471,6 +471,13 @@ const DATA = {
   const BANDS = [["全部", 1, 7], ["I-III", 1, 3], ["IV-V", 4, 5], ["VI-VII", 6, 7]];
   let band = BANDS[0];
   const selTopics = new Set();
+  // 狀態保存：只存「篩選條件」（等級區間、勾了哪些主題），不存任何來源內容本身。
+  const HAS_STATE = typeof AnyaState !== "undefined";
+  function saveState() {
+    if (!HAS_STATE) return;
+    AnyaState.save({ band: BANDS.indexOf(band), topics: Array.from(selTopics) });
+  }
+  const SAVED = HAS_STATE ? AnyaState.load() : null;
   document.getElementById("src-title").textContent = DATA.title;
   function badgeClass(lv) {
     const n = ROMAN[lv] || 7;
@@ -479,12 +486,17 @@ const DATA = {
   const levelBox = document.getElementById("src-levels");
   BANDS.forEach(function (b, i) {
     const chip = document.createElement("span");
-    chip.className = "src-chip" + (i === 0 ? " sel" : "");
+    // 還原時取 SAVED.band，越界或非整數一律退回預設的第 0 個
+    const savedBand = (SAVED && Number.isInteger(SAVED.band)
+                       && SAVED.band >= 0 && SAVED.band < BANDS.length) ? SAVED.band : 0;
+    if (i === savedBand) band = b;
+    chip.className = "src-chip" + (i === savedBand ? " sel" : "");
     chip.textContent = b[0];
     chip.addEventListener("click", function () {
       band = b;
       levelBox.querySelectorAll(".src-chip").forEach(function (c) { c.classList.remove("sel"); });
       chip.classList.add("sel");
+      saveState();
       render();
     });
     levelBox.appendChild(chip);
@@ -496,11 +508,14 @@ const DATA = {
   });
   allTopics.forEach(function (t) {
     const chip = document.createElement("span");
-    chip.className = "src-chip";
+    // 只還原「這批資料裡真的存在」的主題；資料換過時未知主題直接忽略
+    if (SAVED && Array.isArray(SAVED.topics) && SAVED.topics.indexOf(t) >= 0) selTopics.add(t);
+    chip.className = "src-chip" + (selTopics.has(t) ? " sel" : "");
     chip.textContent = "# " + t;
     chip.addEventListener("click", function () {
       if (selTopics.has(t)) selTopics.delete(t); else selTopics.add(t);
       chip.classList.toggle("sel", selTopics.has(t));
+      saveState();
       render();
     });
     topicBox.appendChild(chip);
@@ -621,7 +636,29 @@ const DATA = {
   let pool = DATA.cards.map(function (_, i) { return i; });
   let pos = 0, flipped = false;
   const card = document.getElementById("fc-card");
+  // 狀態保存：iframe 每次 rerun 都會重建，不存的話「已記住的卡片」與進度全部歸零。
+  // 只存 pool（剩哪些卡）與 pos（看到第幾張）——**刻意不存 flipped**：
+  // 翻開是當下的揭曉動作，還原成已翻開等於直接爆雷。
+  const HAS_STATE = typeof AnyaState !== "undefined";
+  function saveState() {
+    if (!HAS_STATE) return;
+    AnyaState.save({ pool: pool.slice(), pos: pos });
+  }
+  (function restore() {
+    if (!HAS_STATE) return;
+    const st = AnyaState.load();
+    if (!st || !Array.isArray(st.pool)) return;
+    // 只收合法且不重複的卡片索引；資料換過時 fingerprint 已擋掉，這是第二道防線
+    const seen = {};
+    const clean = st.pool.filter(function (i) {
+      if (!Number.isInteger(i) || i < 0 || i >= DATA.cards.length || seen[i]) return false;
+      seen[i] = 1; return true;
+    });
+    pool = clean;
+    pos = (Number.isInteger(st.pos) && st.pos >= 0 && st.pos < pool.length) ? st.pos : 0;
+  })();
   function show() {
+    saveState();
     if (pool.length === 0) {
       document.getElementById("fc-play").style.display = "none";
       document.getElementById("fc-done").style.display = "block";
