@@ -1,5 +1,13 @@
 # Core dependencies
-streamlit>=1.40.0          # 1.40+ 的 pb2 檔案與 protobuf 5.x 相容
+# 1.40+ 的 pb2 檔案與 protobuf 5.x 相容。
+# 2026-09-05 補上限：原本無上限，Cloud 每次重建都會裝當時最新版，而 1.53~1.63 之間
+# 移除了 st.cache（1.62）、use_column_width（1.61）、bokeh_chart（1.58）、
+# experimental_*（1.54）等 API——本專案目前全部沒用到，純屬運氣，下次未必躲得掉。
+# 上限訂在 <1.64（1.63.0 為 2026-09-05 當時最新），讓 Cloud 停在已驗證可用的區間；
+# 要升版時先看 release notes 再手動放寬，不要讓它自己跳。
+# ⚠️ 下限刻意維持 1.40 不動：拉到 1.56（st.iframe 出現的版本）並不會讓
+# render_widget_html() 的相容層變成可刪——本機開發環境是 1.55.0，仍需要舊版退路。
+streamlit>=1.40.0,<1.64
 # Gemini 主腦（Home.py:43 `from langchain_google_genai import ChatGoogleGenerativeAI`）。
 # 釘到 production 在 2026-09-03 推定跑的版本（未釘版時 9/3 部署會解析到 9/1、9/2 發布的最新版），
 # 目的是凍結現狀、讓原始碼行號分析與線上一致，不改變線上行為。
