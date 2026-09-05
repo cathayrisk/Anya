@@ -9,9 +9,21 @@ gating／誠實性問題」（另兩次：General 捏造引文、報告否認文
 所以改在後處理層做：呼叫端只在 `web_happened == False` 時呼叫，用 regex 剝掉「自稱已查證」的句子
 與小標。只動措辭、不動內容；純函式、零 API 呼叫、與模型無關，可離線測（tests/test_routing_honesty.py）。
 
+2026-09-05 修正涵蓋範圍（一小時測試 T5 ＋ OAI deep_think 兩輪）：
+原本只掛在 Fast 且 `web_happened == False` 時才呼叫，General 完全沒有防線。實測後果：
+問「最近台灣有地震嗎？」→ 正確升級 General、但 **CWA 工具 0 呼叫、1 個 attempt、2.1 秒**，
+回答卻寫「安妮亞**立刻幫你查中央氣象署的最新即時資訊**」，並給出精確到分秒的**半年前**地震資料。
+這是同一個模式的第五次（前四次：Fix C 本身、未查證標記、LaTeX 外洩、widget 原始碼外洩）。
+
+改為 **兩條路徑都一律剝除**，理由（採納 OAI 建議）：
+「我幫你查好了」這種**第一人稱查證動作宣稱本來就不該由模型主張**——真相由系統的 badge、
+來源 footer 與 evidence 面板負責，那些是程式產生的、不會說謊。
+而且「任一支工具成功」不能為整份回答的查證宣稱背書：General 一個回合可能跑 web_search、
+doc_search、CWA 三支、fetch_webpage，其中一支成功不代表句句有來源。
+
 不做什麼：
-- 不動 General 路徑——General 有工具時「查好了」可能是真話；General 的對應修法是 evidence receipt（另案）。
 - 不判斷內容真偽——「目前無颱風」這種斷言留給 banner 標示，這裡只剝「我查過了」這個動作宣稱。
+- 不產生 banner／來源敘述：那要靠 evidence ledger（scope／status／completed_at），是下一步。
 """
 from __future__ import annotations
 
@@ -27,10 +39,29 @@ _NOT_INSPECT = r"(?<![檢審調])"
 #      前綴最多 20 字、不跨 CJK 句界（。！？）；ASCII 的 ! ? 允許（「WakuWaku!」是感嘆語尾不是句界）。
 #      句尾吃掉標點與 emoji／空白（[^\w\n]：\w 在 Python 3 含 CJK，所以不會吃到下一句文字）。
 #   2. 小標／引導語：「🔍 查證結果」「查詢結果：」「經查」——剝標籤，保留其後的內容。
+# 句界字元（全形＋ASCII）；前綴視窗與句尾都用它
+_EOS = r"。！？!?"
+# 起算點：行首**或任何句界之後**。
+# ⚠️ 2026-09-05 修掉一個一直存在、但測試照不到的 bug：
+# 原本只寫 `^`，且前綴字元類是 `[^\n。！？]`（排除全形驚嘆號）。於是 production 最常見的
+# 開場「WakuWaku！安妮亞幫你查好了！」**完全比對不到**——「WakuWaku」後面那個全形「！」
+# 把 20 字的前綴視窗切斷了。而 09-03 我寫的測試用的是 ASCII 的「WakuWaku!」（前綴允許
+# ASCII 驚嘆號），所以**測試一直是綠的、線上卻一直沒作用**。
+# 改成句界之後也能起算：招呼語「WakuWaku！」保留，只剝掉後面的查證宣稱。
+_START = r"(?:^|(?<=[。！？!?]))"
+
 _FALSE_VERIFY_RE = re.compile(
-    r"^[^\n。！？]{0,20}?(?:幫你|為你|替你|已經|已|都)?" + _NEG + _NOT_INSPECT +
+    # 樣態 1：完成式宣稱——「安妮亞幫你查好了！」「已經確認過了」
+    _START + r"[^\n" + _EOS + r"]{0,20}?(?:幫你|為你|替你|已經|已|都)?" + _NEG + _NOT_INSPECT +
     r"(?:查好|查過|查證過|查到|確認過|核實過|查了一下|查了)"
-    r"[^\n。！!]*[。！!]?[^\w\n]*\n?"
+    r"[^\n" + _EOS + r"]*[" + _EOS + r"]?[^\w\n]*\n?"
+    # 樣態 2：進行式宣稱——「安妮亞立刻幫你查中央氣象署的最新即時資訊！」（T5 線上原句）
+    # 只認「幫你／為你／替你 ＋ 查」：這是「助理替使用者執行了動作」的明確標記。
+    # 刻意不收裸的「查」，否則「建議可至官網查詢」這種**要使用者自己去查**的句子會被誤刪。
+    r"|" + _START + r"[^\n" + _EOS + r"]{0,12}?(?:立刻|馬上|這就|正在|已)?"
+    r"(?:幫你|為你|替你)" + _NEG + _NOT_INSPECT + r"查(?:詢|閱)?"
+    r"[^\n" + _EOS + r"]*[" + _EOS + r"]?[^\w\n]*\n?"
+    # 樣態 3：小標／引導語——剝標籤、保留其後內容
     r"|^[^\w\n]*(?:查詢結果|查證結果|查證資訊|經查)[：:]?[^\w\n]*\n?",
     re.MULTILINE,
 )
@@ -42,3 +73,18 @@ def strip_false_verification_claims(text: str) -> str:
         return text
     out = _FALSE_VERIFY_RE.sub("", text)
     return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
+def finalize_response(text: str, *, mode: str) -> str:
+    """Fast 與 General 共用的回覆收尾。
+
+    目前只做一件事：剝除模型自稱查證動作的措辭。之所以獨立成一個函式而不是直接呼叫
+    `strip_false_verification_claims()`，是因為接下來還要往這裡加東西（依 evidence ledger
+    產生的來源狀態行、其他 invariant 的 validator），需要一個兩條路徑共同經過的收斂點——
+    這個專案已經吃過五次「防線只掛在其中一條路徑上」的虧。
+
+    mode 目前只用於日後分歧（例如 General 的來源行要列 scope、Fast 不用），現在兩者行為相同。
+    """
+    if not text:
+        return ""
+    return strip_false_verification_claims(text)
