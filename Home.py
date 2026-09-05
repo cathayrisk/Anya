@@ -66,6 +66,7 @@ from utils.cwa_weather import get_weather_impl, get_earthquake_impl, get_typhoon
 from utils.honesty import strip_false_verification_claims, finalize_response
 from utils import evidence as EV
 from utils.hazard_intent import classify_hazard_intent
+from utils import hazard_prefetch as HZPF
 from utils.llm_errors import classify_llm_error
 from utils.premium_pool import PremiumPool, quota_scope
 from utils.token_budget import fulltext_budget
@@ -4939,9 +4940,9 @@ if prompt or retry_payload or pending_prompt:
     # 檢索憑證帳本同樣是**每回合**的：跨回合累積會讓「這回合查過地震嗎」永遠答 yes，
     # 那正是要防的事。與 turn_id 一起重置，兩條路徑都經過這裡。
     st.session_state["gm_evidence_log"] = []
-    # 災防意圖三態分類：**這一步只觀測、不接動作**。
-    # 目的是在真實流量上量 UNCERTAIN 佔比，再決定第 4 步（controller prefetch）要不要
-    # 把 UNCERTAIN 也一起強制查。先接動作就沒有乾淨的觀測基準了。
+    # 災防意圖三態分類。第 3 步只 shadow log；第 4 步起 should_prefetch 會驅動
+    # controller prefetch（見下方 status 區塊內）。分類本身仍不改路由、不改模型選擇。
+    _hz = None
     try:
         _hz = classify_hazard_intent(user_text or "")
         st.session_state["gm_hazard_intent"] = {
@@ -4975,6 +4976,79 @@ if prompt or retry_payload or pending_prompt:
                 url_in_text = extract_first_url(user_text)
                 escalated_from_fast = False
                 renderer = ShimmerStreamRenderer(placeholder)
+
+                # ─────────────── 災防 controller prefetch（第 4 步）───────────────
+                # 把「要不要查」從模型手上收回來。T5 證明過：路由對、工具在，模型照樣
+                # 可以不呼叫就憑記憶答；而且是**間歇性**的（同一句話複驗時又正常了），
+                # 所以 prompt 叮嚀跟「測一次過」都不構成保證。
+                #
+                # 這裡保證三件事，全都與模型行為無關：①一定查 ②一定進 context
+                # ③一定留憑證。**不保證**模型正確使用——那是第 5 步的程式渲染。
+                #
+                # 放在 Fast/General 分派之後但兩條路徑之前：Fast 完全沒有工具，
+                # 反而是最需要被餵資料的一邊（例如「震央在哪」——HAZARD_HINT_RE 沒收
+                # 「震央」，會留在 Fast，但分類器抓得到）。
+                _pf_results = []
+                try:
+                    _pf_scopes = HZPF.prefetch_scopes(_hz.scopes) if (_hz and _hz.should_prefetch) else ()
+                except Exception:
+                    _pf_scopes = ()
+                if _pf_scopes:
+                    _t_pf = time.time()
+                    try:
+                        status.update(label="🌐 安妮亞先去氣象署查即時資料…", state="running", expanded=True)
+                    except Exception:
+                        pass
+
+                    def _pf_earthquake():
+                        o = get_earthquake_impl()
+                        # found=False 是「CWA 這次沒回傳可顯示的事件」，**不等於「近期沒有地震」**
+                        return (json.dumps(o, ensure_ascii=False, default=str),
+                                EV.STATUS_OK if o.get("found") else EV.STATUS_EMPTY)
+
+                    def _pf_typhoon():
+                        o = get_typhoon_impl()
+                        # has_active_taiwan_warning 是明確布林，「目前無警報」是官方的有效答案
+                        return (json.dumps(o, ensure_ascii=False, default=str), EV.STATUS_OK)
+
+                    _pf_results = HZPF.run_prefetch(_pf_scopes, {
+                        EV.SCOPE_EARTHQUAKE: _pf_earthquake,
+                        EV.SCOPE_TYPHOON: _pf_typhoon,
+                    })
+                    for _r in _pf_results:
+                        # tool 名前綴 prefetch/ 是為了事後分得出「程式代查」與「模型自己呼叫」，
+                        # scope 維持不變，覆蓋判斷（EV.coverage）才會照常生效。
+                        _log_evidence(tool="prefetch/" + HZPF.SCOPE_TOOLS.get(_r["scope"], _r["scope"]),
+                                      scope=_r["scope"], status=_r["status"],
+                                      detail={"prefetch": True, "error": _r["error"]})
+                    _pf_block = HZPF.build_context_block(_pf_results)
+                    if _pf_block:
+                        # 放在歷史之後、本回合提問之前——對模型而言是最新鮮的一段背景。
+                        # 用 Human+AI 一問一答的形狀是本檔既有慣例（滾動摘要、技能建議都這樣接）；
+                        # 直接 append 在最後會變成連續兩則 user，Gemma 對角色交替敏感。
+                        lc_msgs = (lc_msgs[:-1]
+                                   + [HumanMessage(_pf_block),
+                                      AIMessage("收到，我會直接根據這份氣象署即時資料回答，不用自己的記憶補。")]
+                                   + lc_msgs[-1:])
+                    _pf_elapsed = time.time() - _t_pf
+                    _pf_desc = "、".join(f"{HZPF.SCOPE_LABELS.get(r['scope'], r['scope']).split(' · ')[0]}"
+                                        f"（{r['status']}）" for r in _pf_results)
+                    try:
+                        status.write(f"🌐 已直接向氣象署查詢：{_pf_desc} ⏱ {_pf_elapsed:.1f}s")
+                    except Exception:
+                        pass
+                    try:
+                        _hi = st.session_state.get("gm_hazard_intent")
+                        if isinstance(_hi, dict):
+                            _hi["prefetched"] = [{"scope": r["scope"], "status": r["status"],
+                                                  "error": r["error"]} for r in _pf_results]
+                            _hi["prefetch_secs"] = round(_pf_elapsed, 2)
+                    except Exception:
+                        pass
+                    print(f"[hazard_prefetch] turn={_rt().get('turn_id')} "
+                          f"scopes={list(_pf_scopes)} "
+                          f"statuses={[r['status'] for r in _pf_results]} "
+                          f"elapsed={_pf_elapsed:.2f}s", flush=True)
 
                 # ────────────────────────── Fast ──────────────────────────
                 if mode == "fast":
