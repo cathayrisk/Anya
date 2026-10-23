@@ -622,6 +622,17 @@ MAJOR_ASPECTS = ("conjunction", "opposition", "trine", "square", "sextile")
 SLOW_BODIES = ("Jupiter", "Saturn", "Uranus", "Neptune", "Pluto", "Chiron")
 
 
+def _zone(tz_name: str):
+    """時區物件。優先用標準庫 zoneinfo（kerykeion 6 會一起裝 tzdata，Windows 也有資料）；
+    原本只用 pytz，但 requirements 沒列它、kerykeion 6 也不再帶它（2026-10-24 線上行運失敗的原因之一）。"""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz_name)
+    except Exception:
+        import pytz
+        return pytz.timezone(tz_name)
+
+
 def compute_transits(name: str, birthdate: str, birth_time: Optional[str],
                      start_date: str, days: int = 30, step: int = 2,
                      lat: Optional[float] = None, lng: Optional[float] = None,
@@ -647,8 +658,11 @@ def compute_transits(name: str, birthdate: str, birth_time: Optional[str],
             return _err("BAD_RANGE", "days／step 需為整數。")
 
         from datetime import datetime, timedelta
-        from kerykeion.ephemeris_data_factory import EphemerisDataFactory
-        from kerykeion.transits_time_range_factory import TransitsTimeRangeFactory
+        try:   # kerykeion 6：改從最上層匯出，舊模組路徑已移除（2026-10-24 線上行運全部失敗）
+            from kerykeion import EphemerisDataFactory, TransitsTimeRangeFactory
+        except ImportError:   # kerykeion 5
+            from kerykeion.ephemeris_data_factory import EphemerisDataFactory
+            from kerykeion.transits_time_range_factory import TransitsTimeRangeFactory
 
         tzs = tz or DEFAULT_TZ
         _lat = DEFAULT_LAT if lat is None else float(lat)
@@ -665,9 +679,7 @@ def compute_transits(name: str, birthdate: str, birth_time: Optional[str],
 
         # kerykeion 的時間戳是 UTC。直接截字串會讓 UTC+8 的日期整批早一天，
         # 讓整份預測的時機悄悄偏移（natal-reading-kit 踩過並修掉的坑）。
-        # 用 pytz 而非 zoneinfo：Windows 沒有內建 tz 資料庫，tzdata 未必裝得到。
-        import pytz
-        local_tz = pytz.timezone(tzs)
+        local_tz = _zone(tzs)
 
         def _local_date(iso: str) -> str:
             return datetime.fromisoformat(iso).astimezone(local_tz).strftime("%Y-%m-%d")
@@ -726,7 +738,10 @@ def compute_solar_return(name: str, birthdate: str, birth_time: Optional[str],
         except Exception:
             return _err("BAD_YEAR", f"年份需為整數，收到：{target_year!r}")
 
-        from kerykeion.planetary_return_factory import PlanetaryReturnFactory
+        try:   # kerykeion 6：改從最上層匯出
+            from kerykeion import PlanetaryReturnFactory
+        except ImportError:   # kerykeion 5
+            from kerykeion.planetary_return_factory import PlanetaryReturnFactory
         from kerykeion import ChartDataFactory
 
         rf = PlanetaryReturnFactory(natal,
