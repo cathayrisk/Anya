@@ -15,6 +15,10 @@ try:
     from widget_templates import WIDGET_HINT_RE
 except Exception:  # 缺檔時降級：不因互動元件關鍵詞升級
     WIDGET_HINT_RE = None
+try:   # 口語地震說法（有在搖、地牛翻身…）：和災防分類器共用同一條
+    from utils.hazard_intent import QUAKE_COLLOQUIAL_RE
+except Exception:
+    QUAKE_COLLOQUIAL_RE = None
 
 DEEP_RESEARCH_HINT_RE = re.compile(
     r"深度研究|研究報告|文獻回顧|文獻探討|系統性(?:回顧|調查)|deep\s*research|literature\s*review"
@@ -129,7 +133,7 @@ def decide(text: str, *, socratic_active: bool = False, has_images: bool = False
         return Route("deep", "has_docs")
     if TRANSLATE_RE.search(t) and not FORCE_DEEP_RE.search(t):
         return Route("fast", "translation")
-    if HAZARD_HINT_RE.search(t):
+    if HAZARD_HINT_RE.search(t) or (QUAKE_COLLOQUIAL_RE is not None and QUAKE_COLLOQUIAL_RE.search(t)):
         return Route("deep", "hazard_hint")
     if VERIFY_HINT_RE.search(t):
         return Route("deep", "verify_hint")

@@ -5,7 +5,9 @@
 節點跑在背景執行緒（spike T1 實測，v3 也一樣），在這裡呼叫 st.* 會壞或靜默失效。
 節點要讓畫面知道的事（升級、用量）一律用 get_stream_writer() 送 custom 事件。
 
-第 1 階段：Opus 只有 server tools（網路搜尋、讀網頁），第 2 階段換成 deepagents。
+第 1 階段：Opus 只有 server tools（網路搜尋、讀網頁）。
+第 2 階段：opus 節點改成呼叫 deepagents 的 deep agent（anya_claude/deep.py）——它是節點裡的子圖，
+頁面要用 subgraphs=True 串流才拿得到它的逐字與工具事件（tools/claude_spike/p2_stream_probe.py 實測）。
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from . import config as CFG
 from . import prompts as P
+from .deep_mw import final_answer, web_search_count
 
 CACHE = {"type": "ephemeral", "ttl": "1h"}   # 同事常隔超過 5 分鐘才問下一題，5m 快取會一直失效
 
@@ -55,12 +58,29 @@ def _models() -> dict[str, Any]:
     # 每次建圖時建一次；ChatAnthropic 本身可跨執行緒共用
     haiku = ChatAnthropic(model=CFG.HAIKU, max_tokens=CFG.HAIKU_MAX_TOKENS, effort=CFG.HAIKU_EFFORT,
                           thinking=CFG.HAIKU_THINKING)
-    opus = ChatAnthropic(model=CFG.OPUS, max_tokens=CFG.OPUS_MAX_TOKENS, effort=CFG.OPUS_EFFORT)
     return {
         "haiku": haiku.bind_tools([escalate_to_deep, *CFG.HAIKU_SERVER_TOOLS]),
         "haiku_solo": haiku.bind_tools(list(CFG.HAIKU_SERVER_TOOLS)),
-        "opus": opus.bind_tools(list(CFG.OPUS_SERVER_TOOLS)),
     }
+
+
+def _deep_agents() -> dict[str, Any]:
+    from . import deep   # 延遲 import：deepagents 很重，只有建圖時才載入
+    return {"assist": deep.build_deep_agent(socratic=False), "socratic": deep.build_deep_agent(socratic=True)}
+
+
+def _deep_files() -> dict:
+    from . import deep
+    return dict(deep.skill_files())
+
+
+def turn_note(state: TurnState, now=None, lessons_block: str | None = None) -> str:
+    """deep agent 每回合的系統訊息：日期＋長期記憶＋災防資料。三樣都會變，不放進固定系統提示（快取才不會失效）。"""
+    if lessons_block is None:
+        from . import lessons
+        lessons_block = lessons.block()
+    parts = (P.today_line(now), lessons_block, (state.get("context_block") or "").strip())
+    return "\n\n".join(x for x in parts if x)
 
 
 NO_ESCALATE_NOTE = "使用者指定這一題用一般模式回答：這回合不能升級，請直接盡力完整回答。"
@@ -78,17 +98,6 @@ def compose(system: str, state: TurnState, *, note: str = "") -> list[BaseMessag
     if block:
         msgs.append(SystemMessage(block))
     return msgs
-
-
-def web_search_count(msg: AIMessage) -> int:
-    meta = getattr(msg, "response_metadata", {}) or {}
-    stu = ((meta.get("usage") or {}).get("server_tool_use") or {})
-    n = stu.get("web_search_requests") if isinstance(stu, dict) else getattr(stu, "web_search_requests", 0)
-    if n:
-        return int(n)
-    blocks = msg.content if isinstance(msg.content, list) else []
-    return sum(1 for b in blocks if isinstance(b, dict) and b.get("type") == "server_tool_use"
-               and b.get("name") == "web_search")
 
 
 def _invoke(model, msgs: list[BaseMessage], *, label: str, model_id: str) -> tuple[AIMessage, list[dict]]:
@@ -117,8 +126,11 @@ def _invoke(model, msgs: list[BaseMessage], *, label: str, model_id: str) -> tup
     return merged, calls
 
 
-def build_graph():
+def build_graph(*, deep_agents: dict[str, Any] | None = None, deep_files=None):
+    """deep_agents／deep_files 給測試注入假的；正式使用時建 deepagents 的兩個 agent（一般／提問引導）。"""
     models = _models()
+    agents = deep_agents if deep_agents is not None else _deep_agents()
+    files_for = deep_files or _deep_files
 
     def haiku_node(state: TurnState):
         solo = state.get("allow_escalate") is False
@@ -135,9 +147,21 @@ def build_graph():
         return Command(goto=END, update={"answer": resp, "model_used": CFG.HAIKU, "calls": calls})
 
     def opus_node(state: TurnState):
-        resp, calls = _invoke(models["opus"], compose(P.opus_system(socratic=bool(state.get("socratic"))), state),
-                              label="Opus 深思", model_id=CFG.OPUS)
-        return {"answer": resp, "model_used": CFG.OPUS, "calls": calls}
+        # deep agent 是子圖：它的逐字、工具、用量事件（UsageEventsMiddleware）都從子圖串出去
+        socratic = bool(state.get("socratic"))
+        agent = agents["socratic" if socratic else "assist"]
+        msgs = list(state["messages"]) + [SystemMessage(turn_note(state))]
+        inp = {"messages": msgs, "files": files_for()}
+        if not socratic:
+            inp["rubric"] = P.DEEP_RUBRIC   # 寫完再檢查（RubricMiddleware 看到 rubric 才啟動）
+        out = agent.invoke(inp)
+        try:
+            from . import lessons
+            lessons.maybe_distill(out.get("messages") or [])   # 卡關後又解決 → 背景萃取搜尋教訓
+        except Exception:
+            pass
+        answer = final_answer(out.get("messages") or [])
+        return {"answer": answer or AIMessage(content=""), "model_used": CFG.OPUS}
 
     g = StateGraph(TurnState)
     g.add_node("haiku", haiku_node, destinations=("opus", END))
@@ -152,7 +176,7 @@ STREAM_MODES = ["messages", "custom", "updates"]
 
 
 def stream_in_thread(graph, state: TurnState) -> tuple[queue.Queue, threading.Event]:
-    """在背景執行緒跑 graph.stream，項目丟進 queue：("item", (mode, data)) / ("error", exc) / ("end", None)。
+    """在背景執行緒跑 graph.stream，項目丟進 queue：("item", (namespace, mode, data)) / ("error", exc) / ("end", None)。
 
     為什麼：Streamlit 只在 st.* 呼叫時檢查「停止」。直接在主執行緒 for 迴圈等 graph.stream，Opus
     默默跑程式、搜尋時沒有事件，主執行緒卡在等下一筆，按停止要等下一個事件才生效（實測晚了 70 秒，
@@ -164,7 +188,8 @@ def stream_in_thread(graph, state: TurnState) -> tuple[queue.Queue, threading.Ev
 
     def work():
         try:
-            for item in graph.stream(state, stream_mode=STREAM_MODES):
+            # subgraphs=True：deep agent（opus 節點裡的子圖）的事件才串得出來；每筆變成 (namespace, mode, data)
+            for item in graph.stream(state, stream_mode=STREAM_MODES, subgraphs=True):
                 if halt.is_set():
                     break
                 q.put(("item", item))

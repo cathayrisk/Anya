@@ -11,13 +11,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
 
 @dataclass
 class Ev:
-    kind: str                       # text | thinking | tool_start | search_results | fetch_result
-    node: str = ""                  # code_result | citations | escalate | usage | answer
+    kind: str                       # text | thinking | tool_start | search_results | fetch_result | code_result
+    node: str = ""                  # tool_call | tool_args | tool_result | citations | escalate | usage | reflect
+                                    # | evidence | answer
     text: str = ""
     data: dict = field(default_factory=dict)
 
@@ -32,8 +33,13 @@ def _citations(block: dict) -> list[dict]:
 
 
 def parse_message_chunk(chunk: Any, node: str) -> list[Ev]:
-    """只處理串流中的 AIMessageChunk。完整的 AIMessage（節點輸出被 LangGraph 再送一次）略過，
-    否則同一段文字會畫兩次——最終答案改從 updates 拿。"""
+    """只處理串流中的 AIMessageChunk 與工具結果（ToolMessage）。完整的 AIMessage（節點輸出被
+    LangGraph 再送一次）略過，否則同一段文字會畫兩次——最終答案改從 updates 拿。"""
+    if isinstance(chunk, ToolMessage):
+        # 階段 2：deep agent 的自訂工具（氣象署、skills 的 read_file、think…）跑完
+        text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+        return [Ev("tool_result", node, data={"name": chunk.name or "", "status": chunk.status or "success",
+                                              "text": text[:2000]})]
     if not isinstance(chunk, AIMessageChunk):
         return []
     content = chunk.content
@@ -56,6 +62,9 @@ def parse_message_chunk(chunk: Any, node: str) -> list[Ev]:
                 evs.append(Ev("thinking", node, text=s))
         elif t == "server_tool_use":
             evs.append(Ev("tool_start", node, data={"name": b.get("name") or "", "input": b.get("input") or {}}))
+        elif t == "tool_use" and b.get("name"):
+            # 自訂（client）工具開始：串流第一塊帶名稱，參數之後才以 input_json_delta 陸續送來
+            evs.append(Ev("tool_call", node, data={"name": b["name"], "id": b.get("id") or ""}))
         elif t == "web_search_tool_result":
             evs.append(Ev("search_results", node, data=_search_payload(b.get("content"))))
         elif t == "web_fetch_tool_result":
@@ -87,21 +96,45 @@ def _fetch_payload(content: Any) -> dict:
     return {"status": "error", "url": "", "error": code or "unknown"}
 
 
+CUSTOM_KINDS = ("escalate", "usage", "reflect", "evidence", "widget", "rubric_start", "rubric")
+
+
+def parse_item(item: tuple) -> list[Ev]:
+    """graph.stream 的一筆：subgraphs=False 是 (mode, data)，subgraphs=True 是 (namespace, mode, data)。
+    階段 2 的 deep agent 是節點裡的子圖，要 subgraphs=True 才拿得到它的逐字與工具事件（p2_stream_probe 實測）。"""
+    if len(item) == 3:
+        ns, mode, data = item
+        # 第二層以下的子圖（例如寫完再檢查的 grader agent）：它的逐字和節點更新不是回答，不能畫進答案區。
+        # custom 事件照收（工具、middleware 主動送的）。子代理目前關著，第二層沒有其他正當來源。
+        if len(ns) >= 2 and mode in ("messages", "updates"):
+            return []
+        return parse_stream_item(mode, data)
+    return parse_stream_item(*item)
+
+
 def parse_stream_item(mode: str, data: Any) -> list[Ev]:
     if mode == "messages":
         chunk, meta = data
         return parse_message_chunk(chunk, (meta or {}).get("langgraph_node", ""))
     if mode == "custom" and isinstance(data, dict):
         kind = data.get("type")
-        if kind in ("escalate", "usage"):
+        if kind in CUSTOM_KINDS:
             return [Ev(kind, data={k: v for k, v in data.items() if k != "type"})]
         return []
     if mode == "updates" and isinstance(data, dict):
         evs = []
         for node, upd in data.items():
-            if isinstance(upd, dict) and isinstance(upd.get("answer"), AIMessage):
+            if not isinstance(upd, dict):
+                continue
+            if isinstance(upd.get("answer"), AIMessage):
                 evs.append(Ev("answer", node, data={"message": upd["answer"],
                                                     "model": upd.get("model_used") or ""}))
+            # deep agent 的模型節點跑完：工具參數這時才完整（串流時只拿得到名稱）——時間軸要用它寫「讀了哪個 skill」
+            for m in upd.get("messages") or []:
+                if isinstance(m, AIMessage) and m.tool_calls:
+                    evs.append(Ev("tool_args", node, data={"calls": [
+                        {"name": tc.get("name") or "", "args": tc.get("args") or {}, "id": tc.get("id") or ""}
+                        for tc in m.tool_calls]}))
         return evs
     return []
 

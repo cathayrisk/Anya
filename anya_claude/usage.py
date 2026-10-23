@@ -23,18 +23,31 @@ class Call:
     usd: float
 
 
+def cache_writes(details: dict) -> tuple[int, int, int]:
+    """(5m 寫入, 1h 寫入, TTL 不明的寫入)。
+
+    langchain-anthropic：API 有回 5m／1h 細分時，會把 cache_creation 設成 0、改放
+    ephemeral_5m_input_tokens／ephemeral_1h_input_tokens（只讀 cache_creation 會把寫入算成 0）。
+    """
+    w5 = int(details.get("ephemeral_5m_input_tokens") or 0)
+    w1 = int(details.get("ephemeral_1h_input_tokens") or 0)
+    generic = int(details.get("cache_creation") or 0)
+    return w5, w1, (0 if (w5 or w1) else generic)
+
+
 def cost_usd(model: str, usage: dict | None, web_searches: int = 0, *, cache_ttl: str = "1h") -> float:
-    """usage = LangChain 的 usage_metadata（input_tokens 已含快取部分）。"""
+    """usage = LangChain 的 usage_metadata（input_tokens 已含快取部分）。
+    cache_ttl 只用在「API 沒回 5m／1h 細分」的寫入（保守算 1h 的價）。"""
     usage = usage or {}
     details = usage.get("input_token_details") or {}
     cache_read = int(details.get("cache_read") or 0)
-    cache_write = int(details.get("cache_creation") or 0)
+    w5_tok, w1_tok, unknown = cache_writes(details)
     total_in = int(usage.get("input_tokens") or 0)
     out = int(usage.get("output_tokens") or 0)
     base, w5, w1, rd, o = CFG.PRICES.get(model, CFG.PRICES[CFG.OPUS])
-    write_price = w1 if cache_ttl == "1h" else w5
-    plain = max(0, total_in - cache_read - cache_write)
-    return (plain * base + cache_write * write_price + cache_read * rd + out * o) / 1e6 \
+    unknown_price = w1 if cache_ttl == "1h" else w5
+    plain = max(0, total_in - cache_read - w5_tok - w1_tok - unknown)
+    return (plain * base + w5_tok * w5 + w1_tok * w1 + unknown * unknown_price + cache_read * rd + out * o) / 1e6 \
         + web_searches * CFG.WEB_SEARCH_USD
 
 
@@ -46,7 +59,7 @@ class TurnUsage:
         u = usage or {}
         d = u.get("input_token_details") or {}
         c = Call(label=label, model=model, input_tokens=int(u.get("input_tokens") or 0),
-                 cache_read=int(d.get("cache_read") or 0), cache_write=int(d.get("cache_creation") or 0),
+                 cache_read=int(d.get("cache_read") or 0), cache_write=sum(cache_writes(d)),
                  output_tokens=int(u.get("output_tokens") or 0), web_searches=int(web_searches or 0),
                  usd=cost_usd(model, u, web_searches))
         self.calls.append(c)

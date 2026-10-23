@@ -145,9 +145,52 @@ _FENCE_LINE_RE = re.compile(r"^[ \t]*`{3,}([\w-]*)", re.M)
 MERMAID_DRAWING = "\n\n:gray[🎨 安妮亞在畫圖…]"
 
 
+# ── 漏進正文的英文寫作規劃 ──
+# 2026-10-23 VBA 驗收：回答開頭是一段英文的「Make sure to hit the main points…Keep it concise.」，
+# 後面才是中文正文——模型把規劃寫進了回答。人設已經寫「不要把思考過程寫進回答」仍然發生，
+# 照舊版教訓（提示詞擋不住、後處理才有效）在這裡剝掉。條件刻意窄：第一段幾乎全英文、不是程式碼／表格／
+# 標題／清單、後面接著中文正文。使用者自己用英文問時後面也是英文，不會被剝。
+_CJK_RE = re.compile(r"[一-鿿]")
+PLAN_MIN_CHARS = 40
+PLAN_MAX_CJK = 6
+PLAN_MIN_ASCII_RATIO = 0.6
+REST_MIN_CJK = 20
+
+
+PLAN_MIN_WORDS = 8
+_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def _plan_shaped(para: str) -> bool:
+    """像一段英文散文：夠長、大多是英文字母、有好幾個英文單字、幾乎沒有中文，且不是程式碼／表格／標題／清單。"""
+    p = para.strip()
+    if len(p) < PLAN_MIN_CHARS or p.startswith(("```", "#", "|", "-", "*", ">", "1.")):
+        return False
+    letters = sum(1 for c in p if c.isascii() and c.isalpha())
+    return (letters / len(p) >= PLAN_MIN_ASCII_RATIO and len(_CJK_RE.findall(p)) <= PLAN_MAX_CJK
+            and len(_WORD_RE.findall(p)) >= PLAN_MIN_WORDS)
+
+
+def strip_leaked_plan(text: str, *, final: bool = True) -> str:
+    t = text or ""
+    lead = len(t) - len(t.lstrip())
+    cut = t.find("\n\n", lead)
+    if cut < 0:
+        # 第一段還沒寫完：串流中看起來像英文規劃就先藏著（等下一段出現再判斷）；定稿時照原樣
+        return "" if (not final and _plan_shaped(t)) else t
+    first, rest = t[lead:cut], t[cut:].lstrip("\n")
+    if not _plan_shaped(first):
+        return t
+    if len(_CJK_RE.findall(rest)) >= REST_MIN_CJK:
+        return rest
+    return rest if not final else t      # 串流中後面還不夠判斷：先藏第一段；定稿仍不像中文回答就還原
+
+
 def display_text(buf: str, *, final: bool) -> str:
     """串流中／定稿時要顯示的文字（尚未做 markdown 修復，交給 render_ready）。"""
-    t = finalize_response(buf or "", mode="claude")
+    # U+FFFD（無法顯示的字元）：2026-10-23 實測 Opus 在正式回答前送出只有這個字的文字區塊，畫面上變成一個「�」
+    t = (buf or "").replace("�", "")
+    t = strip_leaked_plan(finalize_response(t, mode="claude"), final=final)
     if not final and t:
         if t.count("```") % 2 == 1:
             # 畫到一半的 Mermaid 會變成紅色錯誤框（每次重畫都閃一次），整塊先藏起來，畫完才出現

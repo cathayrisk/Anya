@@ -23,6 +23,14 @@ OPUS_SERVER_TOOLS = [
     {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
     {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3},
 ]
+# 階段 2 的深思模式（deepagents，有自訂工具）用「沒有動態篩選」的版本。2026-10-23 實測：20260209 會在沙盒裡
+# 跑程式、從程式裡呼叫我們的自訂工具（氣象署），程式暫停等結果；續跑要把沙盒 container 帶回去，deepagents／
+# LangChain 都沒帶 → 第二次呼叫 400「code_execution tool use … without a corresponding result」，或模型在
+# 程式裡呼叫失敗後說「有查但沒拿到」。基本版沒有沙盒，模型只能直接呼叫工具：可靠、時間軸也看得到。
+DEEP_SERVER_TOOLS = [
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3},
+]
 
 # server tool 的迴圈太長時 API 會回 stop_reason="pause_turn"，要把回應接回去再送一次
 MAX_PAUSE_CONTINUES = 3

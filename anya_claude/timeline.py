@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -39,6 +40,27 @@ ROUTE_WHY = {
 }
 MAX_TITLES = 5
 THINK_TAIL = 240
+
+# deep agent 的自訂工具 → 時間軸的哪一類步驟（group, 圖示, 動作）
+CLIENT_TOOLS = {
+    "get_weather": ("cwa", "🌐", "查氣象署天氣"),
+    "get_earthquake_info": ("cwa", "🌐", "查氣象署地震"),
+    "get_typhoon_info": ("cwa", "🌐", "查氣象署颱風"),
+    "read_file": ("skill", "📚", "讀技能說明"),
+    "ls": ("files", "📂", "翻資料夾"),
+    "glob": ("files", "📂", "翻資料夾"),
+    "grep": ("files", "📂", "在資料裡找字"),
+    "write_file": ("notes", "🗒️", "寫筆記"),
+    "edit_file": ("notes", "🗒️", "改筆記"),
+    "write_todos": ("todo", "📝", "列待辦"),
+    "think": ("reflect", "💭", "停下來反思"),
+    "create_widget": ("widget", "🧩", "做互動元件"),
+    "save_lesson": ("lesson", "🧠", "記下教訓"),
+    "get_natal_chart": ("astro", "🔮", "排本命盤"),
+    "get_astro_forecast": ("astro", "🔮", "推算流年"),
+    "get_synastry": ("astro", "🔮", "計算合盤"),
+    "get_astro_reference": ("astro_ref", "📖", "查占星原型文章"),
+}
 _WAIT_SEARCH = "等待搜尋結果…"
 _WAIT_FETCH = "等待網頁內容…"
 
@@ -183,6 +205,113 @@ class Timeline:
             cur.kind, lambda _s: "🧮 用程式整理了資料")(cur)
         self._complete(cur)
 
+    # ── deep agent 的自訂工具（階段 2）──
+    # 串流順序：tool_call（只有名稱）→ tool_args（模型節點跑完，參數完整）→ tool_result（工具跑完）
+    def tool_call(self, name: str) -> None:
+        group, icon, verb = CLIENT_TOOLS.get(name, ("tool", "🧰", f"用工具 {name}"))
+        cur = self.current
+        if cur.kind == group and group != "reflect":           # 連續同類（例如讀好幾個檔）併成一步
+            cur.state, cur.calls = "running", cur.calls + 1
+            cur.label = f"{icon} :shimmer[{verb}…]"
+            self._bump()
+            return
+        detail = {"reflect": ["檢查資料夠不夠回答問題"], "cwa": ["中央氣象署開放資料"]}.get(group, [verb])
+        self._open(Step(group, f"{icon} :shimmer[{verb}…]", calls=1, detail=list(detail)))
+
+    def tool_args(self, calls: list[dict]) -> None:
+        cur = self.current
+        changed = False
+        for c in calls or []:
+            name, args = c.get("name") or "", c.get("args") or {}
+            if name == "read_file" and cur.kind == "skill":
+                path = str(args.get("file_path") or args.get("path") or "")
+                skill = path.split("/")[2] if path.startswith("/skills/") and path.count("/") >= 3 else ""
+                line = f"- {skill}" if skill else f"- {_plain(path, 60)}"
+                cur.detail = [d for d in cur.detail if d != "讀技能說明"]
+                if line not in cur.detail:
+                    cur.detail.append(line)
+                    changed = True
+            elif name == "save_lesson" and cur.kind == "lesson":
+                cur.detail = [f"[{_plain(args.get('category'), 20)}] {_plain(args.get('summary'), 80)}"]
+                changed = True
+            elif name == "write_todos" and cur.kind == "todo":
+                mark = {"completed": "✅", "in_progress": "▶️"}
+                cur.detail = [f"- {mark.get(t.get('status'), '⬜')} {_plain(t.get('content'), 60)}"
+                              for t in (args.get("todos") or [])][:10] or cur.detail
+                changed = True
+        if changed:
+            self._bump()
+
+    def tool_result(self, name: str, status: str = "success", text: str = "") -> None:
+        group = CLIENT_TOOLS.get(name, ("tool",))[0]
+        cur = self.current
+        if cur.kind != group or group == "reflect":   # think 由 reflect 事件收尾
+            return
+        failed = status == "error" or '"ok": false' in (text or "")[:200]
+        if group == "cwa":
+            what = CLIENT_TOOLS[name][2].replace("查氣象署", "")
+            cur.detail = [d for d in cur.detail if d != "中央氣象署開放資料"] + [f"{what}：{'✗ 沒拿到' if failed else '✓ 有拿到'}"]
+            cur.label = "🌐 查了氣象署即時資料"
+        elif group == "skill":
+            skills = [d[2:] for d in cur.detail if d.startswith("- ")]
+            cur.label = f"📚 讀了技能：{'、'.join(skills[:3])}" if skills else "📚 讀了技能說明"
+        elif group == "lesson":
+            cur.label = "🧠 記住了（之後的對話都會參考）" if '"ok": true' in (text or "") else "🧠 這條沒記成功"
+        elif group == "widget":
+            ok = '"ok": true' in (text or "")
+            cur.label = "🧩 做好了互動元件" if ok else "🧩 互動元件被退回重做"
+            if not ok:
+                try:
+                    cur.detail = [_plain(str(json.loads(text).get("error") or text), 80)]
+                except (ValueError, AttributeError):
+                    cur.detail = [_plain(text, 80)]
+        else:
+            cur.label = _unshimmer(cur.label).rstrip("…") + ("（失敗）" if failed else "")
+        self._complete(cur)
+
+    # ── 寫完再檢查（RubricMiddleware）──
+    def rubric_start(self, reason: str = "") -> None:
+        detail = ["對照：有沒有漏答、查過的有沒有根據、會變動的有沒有日期、沒查到的有沒有說"]
+        if reason:
+            detail.insert(0, f"為什麼要檢查：{_plain(reason, 60)}")
+        self._open(Step("rubric", "🔍 :shimmer[自我檢查回答…]", detail=detail))
+
+    def rubric_done(self, data: dict) -> None:
+        if self.current.kind != "rubric" or self.current.state != "running":
+            self.rubric_start()
+        cur = self.current
+        total, passed = int(data.get("total") or 0), int(data.get("passed") or 0)
+        gaps = [f"- {_plain(g, 120)}" for g in data.get("gaps") or [] if g]
+        result = data.get("result")
+        if result == "satisfied":
+            cur.label = f"🔍 自我檢查：{total} 項全部通過" if total else "🔍 自我檢查：通過"
+        elif result == "needs_revision":
+            cur.label = f"🔍 自我檢查：{total - passed} 項要補，重寫中"
+            cur.detail = gaps or cur.detail
+        elif result == "max_iterations_reached":
+            cur.label = f"🔍 補寫後仍有 {total - passed} 項沒過（照現況交出）"
+            cur.detail = gaps or cur.detail
+        else:
+            cur.label = "🔍 自我檢查沒跑完（不影響回答）"
+        self._complete(cur)
+
+    def widget(self, title: str) -> None:
+        """create_widget 通過檢查、送出元件（在 tool_result 之前到）：時間軸寫上元件標題。"""
+        if self.current.kind == "widget":
+            self.current.detail = [_plain(title, 60)]
+            self._bump()
+
+    def reflect(self, data: dict) -> None:
+        if self.current.kind != "reflect" or self.current.state != "running":
+            self.tool_call("think")
+        cur = self.current
+        cur.label = (f"💭 第 {data.get('n', 1)} 次反思・完整度 {data.get('confidence', 0)}%・"
+                     f"{data.get('next_action') or '繼續'}")
+        cur.detail = [f"💡 {_plain(data.get('key_finding') or '（沒寫發現）', 120)}"]
+        if data.get("hint"):
+            cur.detail.append("⚠️ 完整度偏低，系統提示改變查法")
+        self._complete(cur)
+
     # ── 模型 ──
     def escalate(self, *, reason: str, socratic: bool) -> None:
         label = "🧭 交給提問引導模式（Opus 5.5）" if socratic else "↗️ 升級到深思模式（Opus 5.5）"
@@ -265,8 +394,9 @@ class Timeline:
         took = _secs(self.clock() - cur.started)
         done = {"cwa": "🌐 查了氣象署即時資料", "search": self._search_label(cur),
                 "fetch": self._fetch_label(cur), "code": "🧮 用程式整理了資料",
-                "think": f"🧠 想了 {took}", "write": f"✍️ 寫好了・{took}"}
-        cur.label = done.get(cur.kind, _unshimmer(cur.label))
+                "think": f"🧠 想了 {took}", "write": f"✍️ 寫好了・{took}",
+                "skill": "📚 讀了技能說明", "files": "📂 翻了資料", "notes": "🗒️ 寫了筆記", "todo": "📝 列了待辦"}
+        cur.label = done.get(cur.kind, _unshimmer(cur.label).rstrip("…"))
         cur.state, cur.ended = "complete", self.clock()
 
     def _complete(self, step: Step) -> None:

@@ -12,8 +12,10 @@ from __future__ import annotations
 import time
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from utils import evidence as EV
+from utils.widget_state import inject_state_helper
 
 from . import mdfix as M
 from .events import Ev, paragraph_break
@@ -38,16 +40,31 @@ _BARS = ("<div class='rjsk'><span class='b' style='width:92%'></span><span class
 MIN_REDRAW = 0.06   # 重畫節流（秒）
 THINK_REDRAW = 0.15
 _TOOL_STAGE = {"web_search": "searching", "web_fetch": "fetching"}
+_CLIENT_STAGE = {"get_weather": "cwa", "get_earthquake_info": "cwa", "get_typhoon_info": "cwa",
+                 "read_file": "skill", "think": "reflect"}
 # 狀態列台詞多久換一句（秒）。背景執行緒不能動 st.*，所以是主執行緒「有事件進來、或每 0.5 秒
 # 的 pulse()」時順便檢查。
 ROTATE_WAIT = 4.0
 ROTATE_WRITING = 10.0
-_WAIT_STAGES = {"received", "thinking", "deep_thinking", "searching", "fetching", "organizing", "escalate",
-                "socratic"}
+_WAIT_STAGES = {"received", "thinking", "deep_thinking", "searching", "fetching", "organizing", "skill",
+                "reflect", "escalate", "socratic"}
 
 
 def _step_detail(rec: dict) -> str:
     return "  \n".join(rec.get("detail") or [])
+
+
+def render_widget(widget: dict) -> None:
+    """互動元件（create_widget 送來的自包含 HTML）。
+
+    一定要用 components.html（吃 HTML）；st.iframe 吃的是 URL——舊版 2026-09-05 換過一次，線上全部壞掉
+    （見 Home.py render_widget_html 的註解）。wid／fp 注入狀態保存小工具，歷史回放沿用同一個 wid。
+    """
+    try:
+        components.html(inject_state_helper(widget["html"], widget.get("wid"), widget.get("fp")),
+                        height=int(widget.get("height") or 420), scrolling=True)
+    except Exception as e:
+        st.caption(f"⚠️ 互動元件顯示失敗：{type(e).__name__}")
 
 
 def render_saved_status(header: str, state: str, steps: list[dict]) -> None:
@@ -81,6 +98,8 @@ class TurnView:
         self.think_ph = st.empty()
         self.answer_ph = st.empty()
         self.banner_ph = st.empty()
+        self.widget_ph = st.empty()
+        self.widget: dict | None = None
         self._pulse_ph = st.empty()   # 看不見；pulse() 用它讓停止要求即時生效
         self.mode = mode
         self.buf = ""
@@ -146,6 +165,41 @@ class TurnView:
             self._expand(True)
         elif k == "code_result":
             self.tl.code_done()
+        elif k == "tool_call":                      # 階段 2：deep agent 的自訂工具
+            name = ev.data.get("name") or ""
+            if name == "escalate_to_deep":          # Haiku 的升級工具由 escalate 事件處理
+                return
+            self._gap = True
+            self.tl.tool_call(name)
+            self.set_stage(_CLIENT_STAGE.get(name, "organizing"))
+            self._expand(True)
+        elif k == "tool_args":
+            self.tl.tool_args(ev.data.get("calls") or [])
+        elif k == "tool_result":
+            self.tl.tool_result(ev.data.get("name") or "", ev.data.get("status") or "success",
+                                ev.data.get("text") or "")
+        elif k == "reflect":
+            self.tl.reflect(ev.data)
+        elif k == "rubric_start":                   # 寫完再檢查：回答留在畫面上，標題換成「檢查中」
+            self.tl.rubric_start(ev.data.get("reason") or "")
+            self.set_stage("reflect")
+        elif k == "rubric":
+            self.tl.rubric_done(ev.data)
+            if ev.data.get("result") == "needs_revision":
+                # 第一版沒過：清掉、等補寫（最終答案只取補寫後那一版）；攤開時間軸讓人看到要補什麼
+                self.buf, self._gap = "", False
+                self.answer_ph.empty()
+                self._show_wait()
+                self.stage, self._stage_t = "reflect", time.time()
+                self._expand(True)
+        elif k == "widget":                         # create_widget 通過檢查：主執行緒畫出來
+            self.widget = {key: ev.data.get(key) for key in ("title", "html", "height", "wid", "fp")}
+            self.tl.widget(self.widget.get("title") or "")
+            with self.widget_ph.container():
+                render_widget(self.widget)
+        elif k == "evidence":                       # 氣象署工具的查證紀錄 → banner
+            self._evidence(ev.data.get("tool") or "", ev.data.get("scope") or "", ev.data.get("status") or "",
+                           ev.data.get("detail"))
         elif k == "search_results":
             results = ev.data.get("results") or []
             self.sources += results
@@ -301,7 +355,10 @@ class TurnView:
 
     def saved_status(self) -> dict:
         """存進歷史的狀態列（重畫時用 render_saved_status）。"""
-        return {"status": self.header, "status_state": self.header_state, "steps": self.tl.records()}
+        out = {"status": self.header, "status_state": self.header_state, "steps": self.tl.records()}
+        if self.widget:
+            out["widget"] = self.widget
+        return out
 
     def stopped_record(self, *, stopped: bool = True) -> dict:
         """使用者按了停止（或程式中途出了沒接住的錯）之後：不能再呼叫 st.*，只把已經收到的部分
@@ -310,6 +367,9 @@ class TurnView:
             self.tl.stop()
         else:
             self.tl.fail()
-        return {"status": "⏹️ 已停止" if stopped else "⚠️ 這次沒有完成",
-                "status_state": "complete" if stopped else "error", "steps": self.tl.records(),
-                "text": M.display_text(self.buf, final=True), "mode": self.mode}
+        out = {"status": "⏹️ 已停止" if stopped else "⚠️ 這次沒有完成",
+               "status_state": "complete" if stopped else "error", "steps": self.tl.records(),
+               "text": M.display_text(self.buf, final=True), "mode": self.mode}
+        if self.widget:
+            out["widget"] = self.widget
+        return out
