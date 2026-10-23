@@ -171,14 +171,35 @@ def _plan_shaped(para: str) -> bool:
             and len(_WORD_RE.findall(p)) >= PLAN_MIN_WORDS)
 
 
+# ── 漏進正文的中文內部判斷 ──
+# 2026-10-24 Haiku 占星題：回答開頭「這是占星／算命類的問題，屬於沒有科學依據的領域。依照我的規則，這類問題
+# 不需要升級，也不需要搜尋，我直接回答。」——把路由判斷寫進了正文。用語刻意窄（「系統不需要升級」這種正常
+# 回答不能誤剝），只看第一段：短段整段拿掉，長段只拿掉那幾句。
+_META_RE = re.compile(
+    r"(?:依照|根據|按照)我的(?:規則|設定|指示)|(?:這類問題|這題|這個問題)[^。！？\n]{0,6}不(?:需要|用|必)升級"
+    r"|escalate_to_deep|(?:不需要|不用|無需)(?:搜尋|上網)[^。！？\n]{0,12}(?:直接|我就)(?:回答|作答)")
+META_PARA_MAX = 160
+_SENTENCE_RE = re.compile(r"[^。！？!?]+[。！？!?]?")
+
+
+def _drop_meta_sentences(para: str) -> str:
+    return "".join(s for s in _SENTENCE_RE.findall(para) if not _META_RE.search(s)).strip()
+
+
 def strip_leaked_plan(text: str, *, final: bool = True) -> str:
     t = text or ""
     lead = len(t) - len(t.lstrip())
     cut = t.find("\n\n", lead)
     if cut < 0:
-        # 第一段還沒寫完：串流中看起來像英文規劃就先藏著（等下一段出現再判斷）；定稿時照原樣
-        return "" if (not final and _plan_shaped(t)) else t
+        # 第一段還沒寫完：串流中看起來像規劃就先藏著（等下一段出現再判斷）；定稿時只拿掉內部判斷那幾句
+        if not final and (_plan_shaped(t) or _META_RE.search(t)):
+            return ""
+        return (_drop_meta_sentences(t) or t) if _META_RE.search(t) else t
     first, rest = t[lead:cut], t[cut:].lstrip("\n")
+    if _META_RE.search(first):
+        if len(first.strip()) > META_PARA_MAX:
+            return _drop_meta_sentences(first) + t[cut:]
+        return rest if (rest.strip() or not final) else t
     if not _plan_shaped(first):
         return t
     if len(_CJK_RE.findall(rest)) >= REST_MIN_CJK:

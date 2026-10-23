@@ -144,14 +144,20 @@ _FENCE_RE = re.compile(r"^[ \t]*```([\w+#.-]*)[^\n]*\n(.*?)^[ \t]*```", re.M | r
 _HEADING_RE = re.compile(r"^#{1,4}\s+\S", re.M)
 
 
-def _this_turn(messages: list) -> list:
-    """這回合的訊息：最後一則「使用者真的說的」HumanMessage 之後（評分回饋也是 HumanMessage，要跳過）。"""
+def _last_user_index(messages: list) -> int | None:
+    """最後一則「使用者真的說的」HumanMessage 的位置（評分回饋也是 HumanMessage，要跳過）。"""
     from deepagents.middleware.rubric import RUBRIC_GRADER_MESSAGE_SOURCE
     for i in range(len(messages or []) - 1, -1, -1):
         m = messages[i]
         if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_source") != RUBRIC_GRADER_MESSAGE_SOURCE:
-            return list(messages[i + 1:])
-    return list(messages or [])
+            return i
+    return None
+
+
+def _this_turn(messages: list) -> list:
+    """這回合的訊息：最後一則使用者提問之後。"""
+    i = _last_user_index(messages)
+    return list(messages or []) if i is None else list(messages[i + 1:])
 
 
 def deliverable_reason(messages: list) -> str:
@@ -254,11 +260,44 @@ def _server_tool_digest(msg: AIMessage) -> str:
     return ("[這次回應裡的網路查詢紀錄（伺服器端工具，內容已省略）]\n" + "\n".join(lines)) if lines else ""
 
 
+PRIOR_QUESTION_CHARS = 200
+PRIOR_ANSWER_CHARS = 400
+
+
+def _prior_note(prior: list) -> str:
+    """前一題縮成一小段：只讓 grader 看得懂「上面那份改短」這類接續的提問。"""
+    q = next((m for m in reversed(prior) if isinstance(m, HumanMessage)), None)
+    a = next((m for m in reversed(prior) if isinstance(m, AIMessage) and m.text.strip()), None)
+    if q is None and a is None:
+        return ""
+    lines = ["（先前的對話，只供理解這次的提問，不在評分範圍；前面查過的紀錄不會出現在下面的對話裡）"]
+    if q is not None:
+        lines.append(f"上一題：{q.text.strip()[:PRIOR_QUESTION_CHARS]}")
+    if a is not None:
+        lines.append(f"上一題的回答開頭：{a.text.strip()[:PRIOR_ANSWER_CHARS]}…")
+    return "\n".join(lines)
+
+
 def grader_view(messages: list) -> list:
-    """給寫完再檢查的 grader 看的對話：deepagents 的轉錄只收文字與自訂工具呼叫，看不到伺服器端的搜尋／讀網頁，
-    會誤判「說查過但沒有工具紀錄」（2026-10-23 實測）。在每則有查詢的回應前面補一段查詢紀錄。"""
+    """給寫完再檢查的 grader 看的對話。兩件事：
+
+    - 只給這一題：deepagents 的轉錄一定保留整段對話的「第一則」提問當原始問題。2026-10-24 線上：先問 SOP
+      再問流年，流年那題被評「SOP 標示已查證卻沒有查詢紀錄」（前一題的紀錄不會帶進歷史），Opus 還照回饋
+      去補查勞保法規。前一題縮成一小段併進這題的提問，標明不評分。
+    - 補上伺服器端的搜尋／讀網頁：deepagents 的轉錄只收文字與自訂工具呼叫，看不到它們，會誤判「說查過但
+      沒有工具紀錄」（2026-10-23 實測）。在每則有查詢的回應前面補一段查詢紀錄。"""
+    msgs = list(messages or [])
+    start = _last_user_index(msgs)
+    if start:
+        note = _prior_note(msgs[:start])
+        q = msgs[start]
+        if note:
+            content = (f"{note}\n\n這次的提問：{q.content}" if isinstance(q.content, str)
+                       else [{"type": "text", "text": note + "\n\n這次的提問："}, *q.content])
+            q = q.model_copy(update={"content": content})
+        msgs = [q, *msgs[start + 1:]]
     out = []
-    for m in messages or []:
+    for m in msgs:
         if isinstance(m, AIMessage):
             digest = _server_tool_digest(m)
             if digest:
