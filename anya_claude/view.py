@@ -343,16 +343,26 @@ class TurnView:
 
     # ── 收尾 ──
     def finish(self, final_text: str, *, badges: str, banner: str, elapsed_s: float) -> None:
+        self.close(elapsed_s)
+        self.draw_finish(final_text, badges=badges, banner=banner)
+
+    def close(self, elapsed_s: float) -> None:
+        """收尾的資料部分（不碰 st.*）：時間軸加上「完成」、標題換成完成台詞。
+        頁面先 close、存進歷史，再 draw_finish——畫到一半連線斷了，回答也已經存好。"""
+        if self.tl.current.kind != "done":
+            self.tl.finish(elapsed_s)
+        self.header, self.header_state = self.mono.done(self.mode), "complete"
+
+    def draw_finish(self, final_text: str, *, badges: str, banner: str) -> None:
         self.think_ph.empty()
         self.answer_ph.markdown(M.render_ready(final_text) if final_text else "安妮亞這次沒有拿到回答 🙏",
                                 unsafe_allow_html=True)
         self.badges_ph.markdown(badges)
         if banner:
             self.banner_ph.caption(banner)
-        self.tl.finish(elapsed_s)
         self._sync_steps()
         self._expanded = False
-        self._header(self.mono.done(self.mode), "complete")
+        self._header(self.header, "complete")
 
     def fail(self, message: str) -> None:
         self.think_ph.empty()

@@ -76,8 +76,27 @@ def normalize_markdown_for_streamlit(text: str) -> str:
     t = _maybe_unindent_indented_block(t)
     t = re.sub(r"\\([*_`])", r"\1", t)
     t = latex_to_plain(t)
+    t = _escape_dollars(t)
     t = _repair_color_directives(t)
     return t
+
+
+def _escape_dollars(t: str) -> str:
+    """latex_to_plain 之後還留著的 $ 都是貨幣（數學式已經轉成純文字），一律跳脫成 \\$。
+    2026-10-24 實測：「NT$10M … NT$10M」兩個 $ 中間被 Streamlit 當成數學式，畫成一個字一行的斜體字母。
+    程式碼（``` 與 `）原樣不動。"""
+    if "$" not in t:
+        return t
+    stash: list[str] = []
+
+    def _hold(m: re.Match) -> str:
+        stash.append(m.group(0))
+        return "\x00d%d\x00" % (len(stash) - 1)
+
+    t = re.sub(r"```.*?```", _hold, t, flags=re.S)
+    t = re.sub(r"`[^`\n]*`", _hold, t)
+    t = re.sub(r"(?<!\\)\$", r"\\$", t)
+    return re.sub(r"\x00d(\d+)\x00", lambda m: stash[int(m.group(1))], t)
 
 
 def emphasis_to_html(t: str) -> str:

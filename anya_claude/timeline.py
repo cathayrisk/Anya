@@ -39,6 +39,7 @@ ROUTE_WHY = {
     "keyword_hint": "需要深入處理的任務",
     "contains_image": "有附圖片",
     "has_docs": "有附文件",
+    "has_url": "附了網址，要讀原文",
     "socratic_mode": "提問引導模式中",
     "user_redo_deep": "你要求改用深思模式重答",
     "user_redo_fast": "你要求改用一般模式重答",
@@ -342,11 +343,17 @@ class Timeline:
     # ── 模型 ──
     def escalate(self, *, reason: str, socratic: bool) -> None:
         label = "🧭 交給提問引導模式（Opus 5.5）" if socratic else "↗️ 升級到深思模式（Opus 5.5）"
+        preamble = self.mode == "fast" and self.current.kind == "write"
         self.mode = "socratic" if socratic else "deep"
         self._finish_current()
         now = self.clock()
-        self.steps.append(Step("escalate", label, "complete",
-                               [_plain(reason, 80) or "Haiku 判斷這題需要深入處理"], started=now, ended=now))
+        step = Step("escalate", label, "complete", [_plain(reason, 80) or "Haiku 判斷這題需要深入處理"],
+                    started=now, ended=now)
+        if preamble:
+            # Haiku 升級前先寫了幾個字（畫面上已經清掉）：那一格「寫好了 N 秒」直接換成升級（2026-10-24 實測常見）
+            self.steps[-1] = step
+        else:
+            self.steps.append(step)
         self._bump()
 
     def think(self, text: str = "") -> None:

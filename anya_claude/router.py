@@ -45,6 +45,10 @@ FORCE_DEEP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 貼了網址要它讀：一般模式只有搜尋、沒有讀網頁的工具（2026-10-24 實測：Haiku 回「沒辦法打開網址」），
+# 深思模式才有 web_fetch。放在翻譯之前——「翻譯這篇 https://…」也要先讀得到原文。
+URL_RE = re.compile(r"https?://[^\s<>\"'）)]+", re.IGNORECASE)
+
 # 翻譯請求：交給 Haiku（2026-10-23 使用者回報：翻譯一篇文章被送去深思，應該只有特殊任務才用深思）
 TRANSLATE_RE = re.compile(r"翻譯|翻成|譯成|翻為|譯為|中翻英|英翻中|日翻中|translate", re.IGNORECASE)
 
@@ -141,6 +145,8 @@ def decide(text: str, *, socratic_active: bool = False, has_images: bool = False
         return Route("deep", "contains_image")
     if has_docs:
         return Route("deep", "has_docs")
+    if URL_RE.search(t):
+        return Route("deep", "has_url")
     if TRANSLATE_RE.search(t) and not FORCE_DEEP_RE.search(t):
         return Route("fast", "translation")
     if HAZARD_HINT_RE.search(t) or (QUAKE_COLLOQUIAL_RE is not None and QUAKE_COLLOQUIAL_RE.search(t)):
