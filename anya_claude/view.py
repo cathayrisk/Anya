@@ -5,7 +5,7 @@
 「先純文字流光、最後淡化成 markdown」的兩段式，也沒有收尾的 0.9 秒等待。
 
 狀態列（2026-10-23）：收合的那一行是安妮亞心裡話（monologue.py），展開是步驟時間軸
-（timeline.py，st.status(type="step")）。深思摘要放在時間軸的「深思中」那一步裡。
+（timeline.py，st.status(type="step")）。英文的深思摘要不顯示；think 工具的中文反思放在「想了 N 秒」那一步裡。
 """
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ class TurnView:
         # compact：收合時只有一行心裡話；一般模式先收著（通常一兩秒就答完），深思模式一開始就展開時間軸
         self._expanded = mode != "fast"
         self.status = st.status(self.header, expanded=self._expanded, type="compact")
-        self._steps: list[list] = []       # 每步一組 [status 容器, detail 佔位, label, state, detail]
+        self._steps: list[list] = []       # 每步一組 [status 容器, detail 佔位, label, state, detail, 攤開]
         self._tl_ver = -1
         self._last_step_draw = 0.0
         self._sync_steps()
@@ -302,23 +302,26 @@ class TurnView:
             return
         self._tl_ver, self._last_step_draw = self.tl.version, now
         try:
+            # 最新一次寫好的反思攤開（看得到中文反思）；有新的反思時，舊的收起來
+            last_reflect = max((i for i, s in enumerate(self.tl.steps)
+                                if s.kind == "reflect" and s.state == "complete"), default=-1)
             for i, s in enumerate(self.tl.steps):
                 detail = "  \n".join(s.detail)
-                open_ = s.kind == "think" and s.state == "running"   # 深思中那一步展開，看得到思考摘要
+                open_ = i == last_reflect
                 if i < len(self._steps):
                     row = self._steps[i]
-                    if (row[2], row[3]) != (s.label, s.state):
+                    if (row[2], row[3], row[5]) != (s.label, s.state, open_):
                         row[0].update(label=s.label, state=s.state, expanded=open_)
                     if row[4] != detail and row[1] is not None:
                         row[1].caption(detail)
-                    row[2:] = [s.label, s.state, detail]
+                    row[2:] = [s.label, s.state, detail, open_]
                 else:
                     h = self.status.status(s.label, type="step", state=s.state, expanded=open_)
                     ph = None
                     if detail:   # 沒有內容的 step 會結束時間軸，所以只有最後一步可以空著
                         ph = h.empty()
                         ph.caption(detail)
-                    self._steps.append([h, ph, s.label, s.state, detail])
+                    self._steps.append([h, ph, s.label, s.state, detail, open_])
         except Exception:
             pass   # 時間軸畫壞不該連帶弄壞回答
 

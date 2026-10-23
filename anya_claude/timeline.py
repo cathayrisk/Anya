@@ -11,6 +11,8 @@
 - Opus 的 web_search_20260209 會用 code_execution 包住搜尋再篩選結果（串流順序：程式開始 → 搜尋 → 結果 →
   程式結果）。緊鄰搜尋的程式併進搜尋那一步，不然一題會冒出好幾個「搜尋 0 筆」；單獨跑的程式才算「整理資料」。
 - 思考摘要是在下一個動作前一次送來的，從第一個摘要字算會變成「想了 0.1 秒」；改從上一步結束算。
+- Opus 的思考摘要是英文的，2026-10-23 使用者決定不顯示：「想了 N 秒」只記時間和接著做了什麼；
+  想完緊接著呼叫 think 工具時併成同一步，底下放它寫的中文反思。
 """
 from __future__ import annotations
 
@@ -39,7 +41,8 @@ ROUTE_WHY = {
     "user_redo_fast": "你要求改用一般模式重答",
 }
 MAX_TITLES = 5
-THINK_TAIL = 240
+THINKING = "在想下一步怎麼做"      # 深思中那一步的內容（英文摘要不顯示；step 不能沒內容）
+REFLECT_LINES = 8
 
 # deep agent 的自訂工具 → 時間軸的哪一類步驟（group, 圖示, 動作）
 CLIENT_TOOLS = {
@@ -53,7 +56,7 @@ CLIENT_TOOLS = {
     "write_file": ("notes", "🗒️", "寫筆記"),
     "edit_file": ("notes", "🗒️", "改筆記"),
     "write_todos": ("todo", "📝", "列待辦"),
-    "think": ("reflect", "💭", "停下來反思"),
+    "think": ("reflect", "🧠", "寫下反思"),
     "create_widget": ("widget", "🧩", "做互動元件"),
     "save_lesson": ("lesson", "🧠", "記下教訓"),
     "get_natal_chart": ("astro", "🔮", "排本命盤"),
@@ -85,6 +88,18 @@ def _unshimmer(label: str) -> str:
     return re.sub(r":shimmer\[(.*)\]", r"\1", label)
 
 
+def _verb(label: str) -> str:
+    """「🔎 :shimmer[上網搜尋…]」→「上網搜尋」"""
+    return _unshimmer(label).split(" ", 1)[-1].rstrip("…")
+
+
+def _reflection_lines(text) -> list[str]:
+    """think 工具的中文反思（照五點寫）：保留分行，拿掉標題記號，每行限長，最多 REFLECT_LINES 行。"""
+    lines = [_plain(re.sub(r"^#+\s*", "", ln.strip()), 160) for ln in str(text or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    return lines[:REFLECT_LINES] + (["…"] if len(lines) > REFLECT_LINES else [])
+
+
 @dataclass
 class Step:
     kind: str                    # received | cwa | search | fetch | code | escalate | think | write | done | error | stopped
@@ -95,7 +110,6 @@ class Step:
     ended: float = 0.0
     calls: int = 0               # 搜尋／讀網頁的次數
     hits: int = 0                # 搜尋結果筆數
-    text: str = ""               # 深思摘要累積
 
     def record(self) -> dict:
         return {"label": self.label, "state": self.state, "detail": list(self.detail)}
@@ -210,6 +224,12 @@ class Timeline:
     def tool_call(self, name: str) -> None:
         group, icon, verb = CLIENT_TOOLS.get(name, ("tool", "🧰", f"用工具 {name}"))
         cur = self.current
+        if group == "reflect" and cur.kind == "think" and cur.state == "running":
+            # 想完緊接著寫反思：併成同一步，秒數從開始想算起，內容換成中文反思
+            cur.kind, cur.calls = "reflect", 1
+            cur.label, cur.detail = f"{icon} :shimmer[{verb}…]", ["檢查資料夠不夠回答問題"]
+            self._bump()
+            return
         if cur.kind == group and group != "reflect":           # 連續同類（例如讀好幾個檔）併成一步
             cur.state, cur.calls = "running", cur.calls + 1
             cur.label = f"{icon} :shimmer[{verb}…]"
@@ -305,9 +325,10 @@ class Timeline:
         if self.current.kind != "reflect" or self.current.state != "running":
             self.tool_call("think")
         cur = self.current
-        cur.label = (f"💭 第 {data.get('n', 1)} 次反思・完整度 {data.get('confidence', 0)}%・"
-                     f"{data.get('next_action') or '繼續'}")
-        cur.detail = [f"💡 {_plain(data.get('key_finding') or '（沒寫發現）', 120)}"]
+        cur.label = (f"🧠 想了 {_secs(self.clock() - cur.started)}・第 {data.get('n', 1)} 次反思・"
+                     f"完整度 {data.get('confidence', 0)}%・{data.get('next_action') or '繼續'}")
+        cur.detail = ([f"💡 {_plain(data.get('key_finding') or '（沒寫發現）', 120)}"]
+                      + _reflection_lines(data.get("reflection")))
         if data.get("hint"):
             cur.detail.append("⚠️ 完整度偏低，系統提示改變查法")
         self._complete(cur)
@@ -322,19 +343,13 @@ class Timeline:
                                [_plain(reason, 80) or "Haiku 判斷這題需要深入處理"], started=now, ended=now))
         self._bump()
 
-    def think(self, text: str) -> None:
+    def think(self, text: str = "") -> None:
+        """模型在想。摘要內容（英文）不顯示，只開一步記時間；想完做什麼由下一步補上。"""
         cur = self.current
-        if cur.kind != "think" or cur.state != "running":
-            prev = cur
-            self._open(Step("think", "🧠 :shimmer[深思中…]", detail=["💭 …"]))
-            cur = self.current
-            cur.started = prev.ended or cur.started   # 模型在上一步結束後就開始想了
-        cur.text += text or ""
-        tail = re.sub(r"\s+", " ", cur.text).strip()
-        if len(tail) > THINK_TAIL:
-            tail = "… " + tail[-THINK_TAIL:]
-        cur.detail = [f"💭 {_plain(tail, THINK_TAIL + 2)}"] if tail else ["💭 …"]
-        self._bump()
+        if cur.kind == "think" and cur.state == "running":
+            return
+        self._open(Step("think", "🧠 :shimmer[深思中…]", detail=[THINKING]))
+        self.current.started = cur.ended or self.current.started   # 模型在上一步結束後就開始想了
 
     def write(self) -> None:
         if self.current.kind == "write" and self.current.state == "running":
@@ -382,7 +397,10 @@ class Timeline:
             cur.label = _unshimmer(cur.label).rstrip("…") + "（中斷）"
 
     def _open(self, step: Step) -> None:
+        prev = self.current
         self._finish_current()
+        if prev.kind == "think":
+            prev.detail = [f"接著：{_verb(step.label)}"]
         step.started = self.clock()
         self.steps.append(step)
         self._bump()

@@ -189,6 +189,7 @@ def think(reflection: str, key_finding: str, next_action: str, confidence: int, 
 
     何時用：每輪搜尋告一段落、準備作答前，呼叫一次；同一輪多次搜尋合併成一次。沒有搜尋的回合不用呼叫。
     reflection：寫五件事——1.發現摘要 2.和原本假設的對比 3.來源之間的矛盾 4.還缺的資訊 5.下一步策略。
+    reflection 和 key_finding 用正體中文寫，會顯示在使用者的畫面上。
     key_finding：1–2 句，這一輪最重要的發現。
     next_action：「繼續搜尋」「換工具」「直接作答」三選一。
     confidence：0–100，目前能完整回答問題的程度；≥80 就直接作答。
