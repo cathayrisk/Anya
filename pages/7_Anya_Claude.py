@@ -120,7 +120,7 @@ def _render_message(msg: dict) -> None:
         st.caption(f"🖼 {name}")
     if msg.get("stopped") and msg.get("role") == "assistant":
         st.markdown(":gray-badge[⏹️ 已停止] :small[:gray[沒寫完的這則不會帶進之後的對話。]]")
-    elif msg.get("pending") and not msg.get("stopped"):
+    elif msg.get("pending") and not msg.get("stopped") and not msg.get("inflight"):
         st.markdown(":orange-badge[⏳ 沒有拿到回答] :small[:gray[這則不會帶進之後的對話。]]")
     if DEV and msg.get("dev"):
         with st.expander("🔧 [dev] 本回合", expanded=False):
@@ -163,25 +163,111 @@ def _telemetry(rec: dict) -> None:
         pass
 
 
-def run_turn(user_entry: dict, text: str, images: list[dict], route: R.Route, hist: list[dict], *,
-             allow_escalate: bool = True) -> None:
-    """跑一回合。使用者按「停止」時 Streamlit 在下一個 st.* 呼叫丟 StopException（BaseException，
-    1.63 實測 finally 會執行）：這時畫面已經不能動，只把收到的部分存進歷史、標成已停止。"""
-    user_entry["pending"] = True   # 答完才拿掉；中途失敗或按停止，這則提問就不帶進之後的對話
-    ctx = {"view": None, "done": False, "t0": time.time()}
+# ── 連線中斷後接著答（2026-10-24）──
+# 線上偶爾整題變成「⏹️ 已停止」，沒人按停止：Streamlit 在連線斷掉時會停掉正在跑的題目
+# （websocket_session_manager.disconnect_session → request_script_stop），前端自動重連後同一個
+# 工作階段重畫，就看到已停止（本機在題目中途關掉 websocket 可以重現）。Reboot 後第一題、跑很久的
+# 題目最常碰到。圖本來就在背景執行緒跑，所以連線斷掉時讓它繼續跑，重連後接著畫：
+# - 模型已經開始：已收到的事件重播一次，再接著讀還沒讀的（resume）
+# - 模型還沒開始就斷了：重連後整題重跑（restart，最多 MAX_RESTARTS 次）
+# 使用者自己按停止時連線沒換，照舊停下來。
+MAX_RESTARTS = 2
+
+
+def _client_now():
+    """這個工作階段目前的連線物件（斷線時是 None，重連後是新的物件）。拿不到就 None。"""
     try:
-        _run_turn(ctx, user_entry, text, images, route, hist, allow_escalate)
+        from streamlit.runtime import get_instance
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_instance().get_client(get_script_run_ctx().session_id)
+    except Exception:
+        return None
+
+
+def _stopped_by_disconnect(client0) -> bool:
+    """這次的 StopException 是連線斷掉造成的（不是使用者按停止）？回合開始時記下的連線和現在不同就是斷過線。
+    Streamlit 先要求停止、才把連線拿掉（同一個呼叫），稍等一下再看。"""
+    if client0 is None:
+        return False
+    time.sleep(0.2)
+    return _client_now() is not client0
+
+
+def run_turn(user_entry: dict, text: str, images: list[dict], route: R.Route, hist: list[dict], *,
+             allow_escalate: bool = True, resume: dict | None = None) -> None:
+    """跑一回合（resume＝連線中斷後接著畫同一題）。使用者按「停止」時 Streamlit 在下一個 st.* 呼叫丟
+    StopException（BaseException，1.63 實測 finally 會執行）：這時畫面已經不能動，只把收到的部分存進
+    歷史、標成已停止。連線斷掉造成的停止則交給下一次重畫接著做（見上面）。"""
+    user_entry["pending"] = True   # 答完才拿掉；中途失敗或按停止，這則提問就不帶進之後的對話
+    ctx = {"view": None, "done": False, "t0": (resume or {}).get("t0") or time.time(), "client": _client_now(),
+           "box": st.session_state["ac_box"],
+           "turn": {"user_entry": user_entry, "text": text, "images": images, "route": route,
+                    "allow_escalate": allow_escalate, "restarts": (resume or {}).get("restarts", 0)}}
+    ctx["box"]["active"] = True   # 回合進行中（含停止後的收尾）；見頁面開頭的等待
+    try:
+        if resume and resume.get("q") is not None:
+            _resume_turn(ctx, resume, hist)
+        else:
+            _run_turn(ctx, user_entry, text, images, route, hist, allow_escalate)
     except BaseException as e:
-        view = ctx["view"]
-        if not ctx["done"] and view is not None:
-            stopped = type(e).__name__ == "StopException"
-            rec = view.stopped_record(stopped=stopped)
-            hist.append({"role": "assistant", **rec, "pending": True, "stopped": True})
-            user_entry["stopped"] = True
-            _telemetry({"route": route.reason, "stopped": stopped,
-                        "error": None if stopped else f"{type(e).__name__}: {str(e)[:300]}",
-                        "secs": round(time.time() - ctx["t0"], 2), "usage": view.usage.as_rows()})
+        try:
+            _on_turn_stopped(ctx, e, user_entry, route, hist)
+        finally:
+            ctx["box"].pop("active", None)
         raise
+    ctx["box"].pop("active", None)
+
+
+def _on_turn_stopped(ctx: dict, e: BaseException, user_entry: dict, route: R.Route, hist: list[dict]) -> None:
+    """回合被中斷：連線斷掉的寄放起來等重連接續，其他的（按停止、出錯）照舊存成已停止。
+    停止中不碰 st.*：寄放用回合開始時拿好的 dict。"""
+    if ctx["done"]:
+        return
+    view = ctx["view"]
+    stopped = type(e).__name__ == "StopException"
+    if stopped and _stopped_by_disconnect(ctx["client"]):
+        turn = ctx["turn"]
+        if turn.get("q") is not None or turn["restarts"] < MAX_RESTARTS:
+            if turn.get("q") is None:
+                turn["restarts"] += 1
+            ctx["box"]["turn"] = turn
+            user_entry["inflight"] = True
+            _telemetry({"route": route.reason, "disconnected": True, "resume": turn.get("q") is not None,
+                        "secs": round(time.time() - ctx["t0"], 2)})
+            return
+    if view is not None:
+        rec = view.stopped_record(stopped=stopped)
+        hist.append({"role": "assistant", **rec, "pending": True, "stopped": True})
+        user_entry["stopped"] = True
+        _telemetry({"route": route.reason, "stopped": stopped,
+                    "error": None if stopped else f"{type(e).__name__}: {str(e)[:300]}",
+                    "secs": round(time.time() - ctx["t0"], 2), "usage": view.usage.as_rows()})
+
+
+def _wait_for_previous_turn(box: dict, timeout: float = 3.0) -> None:
+    """連線斷掉、前端重連時，Streamlit 會立刻開新的一輪，舊的一輪可能還在停止後的收尾（判斷是不是斷線、
+    寄放題目）。先等它收完再畫，不然新的一輪看不到寄放的題目（本機重現過）。"""
+    end = time.time() + timeout
+    while box.get("active") and time.time() < end:
+        time.sleep(0.05)
+    box.pop("active", None)
+
+
+def _resume_turn(ctx: dict, turn: dict, hist: list[dict]) -> None:
+    """重連後接著畫同一題：同樣的狀態列，先重播已收到的事件，再接著讀背景執行緒還沒讀的。"""
+    with st.chat_message("assistant", avatar=AVATAR[turn["start_mode"]]):
+        view = TurnView(mode=turn["start_mode"], user_text=turn["text"], serious=turn["serious"],
+                        route_reason=turn["route"].reason)
+        ctx["view"] = view
+        if turn.get("pf_results"):
+            view.cwa_start()
+            view.cwa_done(turn["pf_results"])
+            view.add_evidence(turn["pf_evidence"])
+        for ev in turn["events"]:
+            view.on(ev)
+        turn["resumed"] = True
+        ctx["turn"] = turn
+        _consume_and_finish(ctx, view, turn, hist)
 
 
 def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route: R.Route, hist: list[dict],
@@ -205,6 +291,7 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
 
         # ── 災防 controller prefetch：把「要不要查」從模型手上收回來 ──
         pf_results: list[dict] = []
+        pf_evidence: list[dict] = []
         block = ""
         if intent is not None and intent.should_prefetch:
             scopes = HZPF.prefetch_scopes(intent.scopes)
@@ -213,10 +300,11 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
                 pf_results = HZPF.run_prefetch(scopes, {EV.SCOPE_EARTHQUAKE: _pf_earthquake,
                                                         EV.SCOPE_TYPHOON: _pf_typhoon})
                 view.cwa_done(pf_results)
-                view.add_evidence([EV.make_event(tool="prefetch/" + HZPF.SCOPE_TOOLS.get(r["scope"], r["scope"]),
-                                                 scope=r["scope"], status=r["status"],
-                                                 detail={"prefetch": True, "error": r["error"]})
-                                   for r in pf_results])
+                pf_evidence = [EV.make_event(tool="prefetch/" + HZPF.SCOPE_TOOLS.get(r["scope"], r["scope"]),
+                                             scope=r["scope"], status=r["status"],
+                                             detail={"prefetch": True, "error": r["error"]})
+                               for r in pf_results]
+                view.add_evidence(pf_evidence)
                 block = HZPF.build_context_block(pf_results)
 
         dev = {"route": route.reason, "start_mode": start_mode,
@@ -239,12 +327,13 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
                 view.mode = "cwa"
                 dev.update({"final_mode": "cwa", "escalated": False, "secs": round(time.time() - t0, 2), "usd": 0.0})
                 badges = M.badges_markdown(mode="cwa", elapsed_s=time.time() - t0)
-                # 自帶來源 footer，刻意不加 banner（沿用舊版）
-                view.finish(hr_text, badges=badges, banner="", elapsed_s=time.time() - t0)
-                ctx["done"] = True
-                user_entry.pop("pending", None)
+                view.close(time.time() - t0)       # 先存進歷史再畫：畫到一半斷線也不會丟
                 hist.append({"role": "assistant", "text": hr_text, "mode": "cwa", "badges": badges,
                              "dev": dev, **view.saved_status()})
+                ctx["done"] = True
+                user_entry.pop("pending", None)
+                # 自帶來源 footer，刻意不加 banner（沿用舊版）
+                view.draw_finish(hr_text, badges=badges, banner="")
                 _telemetry(dev)
                 _redo_menu(len(hist) - 1, hist[-1])
                 return
@@ -257,63 +346,80 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
                                 route=route.mode, socratic=route.socratic, context_block=block,
                                 allow_escalate=allow_escalate)
         q, halt = G.stream_in_thread(get_graph(), state)
-        try:
-            while True:
-                try:
-                    kind, payload = q.get(timeout=PULSE_SECS)
-                except queue.Empty:
-                    view.pulse()   # 空檔也碰一下畫面：讓「停止」即時生效、台詞照樣輪替
-                    continue
-                if kind == "end":
-                    break
-                if kind == "error":
-                    raise payload
-                for ev in E.parse_item(payload):
-                    view.on(ev)
-        except Exception as e:
-            view.fail(U.friendly_error(e))
-            ctx["done"] = True             # 提問維持 pending：沒答到的不帶進之後的對話（舊版「孤兒訊息污染」的教訓）
-            _telemetry({"route": route.reason, "error": f"{type(e).__name__}: {str(e)[:300]}",
-                        "usage": view.usage.as_rows()})
-            if DEV:
-                st.code(traceback.format_exc()[-3000:])
-            return
-        finally:
-            halt.set()   # 按了停止（StopException）或出錯：背景執行緒不再往下讀
+        ctx["turn"].update(q=q, halt=halt, events=[], start_mode=start_mode, serious=serious, dev=dev,
+                           pf_results=pf_results, pf_evidence=pf_evidence, t0=t0)
+        _consume_and_finish(ctx, view, ctx["turn"], hist)
 
-        if view.escalated and view.socratic:
-            # Haiku 判定使用者「卡住需要引導」→ 進入 sticky 引導模式，之後的回合維持到退出詞（沿用舊版）
-            st.session_state["ac_mode_sticky"] = "socratic"
-        msg = view.answer_msg
-        final = M.display_text(E.answer_text(msg), final=True)
-        if not final.strip():
-            view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
-            ctx["done"] = True
-            _telemetry({"route": route.reason, "error": "empty_answer", "usage": view.usage.as_rows()})
-            return
-        footer = M.build_web_sources_footer(view.sources + E.answer_citations(msg))
-        # 只在「這回合真的查過東西」（網路搜尋、讀網頁、氣象署）時才標示；什麼都沒查的
-        # 「💡 本回覆未經任何查證…」不顯示——2026-10-23 使用者決定，每則都掛很怪。
-        banner = EVB.build_banner(view.evidence) if view.evidence else ""
-        elapsed = time.time() - t0
-        badges = M.badges_markdown(mode=view.mode, web_calls=view.usage.web_searches,
-                                   elapsed_s=elapsed, escalated=view.escalated)
-        view.finish(final + footer, badges=badges, banner=banner, elapsed_s=elapsed)
-        ctx["done"] = True
-        user_entry.pop("pending", None)
 
-        dev.update({"final_mode": view.mode, "escalated": view.escalated,
-                    "escalate_reason": view.escalate_reason, "secs": round(elapsed, 2),
-                    "first_text_s": view.first_text_s,
-                    "usd": round(view.usage.usd, 5), "calls": view.usage.as_rows(),
-                    "evidence": EV.summarize(view.evidence), "trace": view.trace})
-        hist.append({"role": "assistant", "text": final + footer, "mode": view.mode,
-                     "badges": badges, "banner": banner, "dev": dev, **view.saved_status()})
-        _telemetry(dev)
-        _redo_menu(len(hist) - 1, hist[-1])
+def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict]) -> None:
+    """讀背景執行緒的事件畫到畫面上，讀完收尾存進歷史。新回合和重連接續共用。"""
+    q, halt, route, user_entry, dev, t0 = (turn["q"], turn["halt"], turn["route"], turn["user_entry"],
+                                           turn["dev"], turn["t0"])
+    try:
+        while True:
+            try:
+                kind, payload = q.get(timeout=PULSE_SECS)
+            except queue.Empty:
+                view.pulse()   # 空檔也碰一下畫面：讓「停止」即時生效、台詞照樣輪替
+                continue
+            if kind == "end":
+                break
+            if kind == "error":
+                raise payload
+            for ev in E.parse_item(payload):
+                turn["events"].append(ev)   # 連線中斷後重畫時要重播
+                view.on(ev)
+    except Exception as e:
+        halt.set()
+        view.fail(U.friendly_error(e))
+        ctx["done"] = True             # 提問維持 pending：沒答到的不帶進之後的對話（舊版「孤兒訊息污染」的教訓）
+        user_entry.pop("inflight", None)
+        _telemetry({"route": route.reason, "error": f"{type(e).__name__}: {str(e)[:300]}",
+                    "usage": view.usage.as_rows()})
         if DEV:
-            with st.expander("🔧 [dev] 本回合", expanded=False):
-                st.json(dev)
+            st.code(traceback.format_exc()[-3000:])
+        return
+    except BaseException:
+        # 按了停止：背景執行緒不再往下讀。連線斷掉造成的停止不在這裡停——run_turn 判斷後交給重連接續
+        if not _stopped_by_disconnect(ctx["client"]):
+            halt.set()
+        raise
+
+    if view.escalated and view.socratic:
+        # Haiku 判定使用者「卡住需要引導」→ 進入 sticky 引導模式，之後的回合維持到退出詞（沿用舊版）
+        st.session_state["ac_mode_sticky"] = "socratic"
+    msg = view.answer_msg
+    final = M.display_text(E.answer_text(msg), final=True)
+    if not final.strip():
+        view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
+        ctx["done"] = True
+        user_entry.pop("inflight", None)
+        _telemetry({"route": route.reason, "error": "empty_answer", "usage": view.usage.as_rows()})
+        return
+    footer = M.build_web_sources_footer(view.sources + E.answer_citations(msg))
+    # 只在「這回合真的查過東西」（網路搜尋、讀網頁、氣象署）時才標示；什麼都沒查的
+    # 「💡 本回覆未經任何查證…」不顯示——2026-10-23 使用者決定，每則都掛很怪。
+    banner = EVB.build_banner(view.evidence) if view.evidence else ""
+    elapsed = time.time() - t0
+    badges = M.badges_markdown(mode=view.mode, web_calls=view.usage.web_searches,
+                               elapsed_s=elapsed, escalated=view.escalated)
+    view.close(elapsed)   # 先存進歷史再畫：畫到一半連線斷了，重連後歷史裡就有完整回答
+    dev.update({"final_mode": view.mode, "escalated": view.escalated,
+                "escalate_reason": view.escalate_reason, "secs": round(elapsed, 2),
+                "first_text_s": view.first_text_s, "resumed": bool(turn.get("resumed")),
+                "usd": round(view.usage.usd, 5), "calls": view.usage.as_rows(),
+                "evidence": EV.summarize(view.evidence), "trace": view.trace})
+    hist.append({"role": "assistant", "text": final + footer, "mode": view.mode,
+                 "badges": badges, "banner": banner, "dev": dev, **view.saved_status()})
+    ctx["done"] = True
+    user_entry.pop("pending", None)
+    user_entry.pop("inflight", None)
+    view.draw_finish(final + footer, badges=badges, banner=banner)
+    _telemetry(dev)
+    _redo_menu(len(hist) - 1, hist[-1])
+    if DEV:
+        with st.expander("🔧 [dev] 本回合", expanded=False):
+            st.json(dev)
 
 
 # ───────────────────────── 頁面 ─────────────────────────
@@ -326,7 +432,13 @@ if not _ensure_api_key():
 
 st.session_state.setdefault("ac_history", [])
 st.session_state.setdefault("ac_mode_sticky", "assist")   # 'assist' | 'socratic'（狀態放頁面，不靠模型記得）
+st.session_state.setdefault("ac_box", {})                 # 連線中斷時寄放還沒答完的那一題（run_turn）
 history: list[dict] = st.session_state["ac_history"]
+_wait_for_previous_turn(st.session_state["ac_box"])
+
+# 圖（含 deepagents）在開頁時就建好：冷啟動要匯入一大堆套件，放到第一題才建，那段時間連線最容易斷
+with st.spinner("安妮亞準備中…", show_time=True):
+    get_graph()
 
 # 輸入框先讀（它固定在頁面底部，呼叫順序不影響位置）：這一輪要跑新回合的話，舊的最後一則不畫選單，
 # 不然新回答畫出自己的選單後，畫面上會同時有兩個「⋯」
@@ -341,6 +453,23 @@ for i, m in enumerate(history):
         _render_message(m)
         if i == len(history) - 1 and role == "assistant" and not m.get("superseded") and not prompt:
             _redo_menu(i, m)
+
+# 連線中斷時還沒答完的那一題：重連後接著畫；使用者已經改問別的就放棄它
+inflight = st.session_state["ac_box"].pop("turn", None)
+if inflight is not None:
+    entry = inflight["user_entry"]
+    if prompt or redo:
+        if inflight.get("halt") is not None:
+            inflight["halt"].set()
+        entry.pop("inflight", None)
+        entry["stopped"] = True
+        rec = {"role": "assistant", "text": "", "mode": inflight["route"].mode, "pending": True, "stopped": True}
+        history.append(rec)
+        with st.chat_message("assistant", avatar=AVATAR.get(rec["mode"])):
+            _render_message(rec)
+    else:
+        run_turn(entry, inflight["text"], inflight["images"], inflight["route"], history,
+                 allow_escalate=inflight["allow_escalate"], resume=inflight)
 
 if st.session_state["ac_mode_sticky"] == "socratic":
     left, right = st.columns([5, 1])
