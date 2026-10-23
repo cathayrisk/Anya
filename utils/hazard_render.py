@@ -123,14 +123,29 @@ def _squash(v: Any) -> str:
     return re.sub(r"\s+", " ", str(v or "—")).strip()
 
 
+_INTENSITY_RE = re.compile(r"(\d)\s*級?\s*([強弱])?")
+
+
+def _intensity_rank(s: Any) -> float:
+    """「5強」>「5弱」>「4級」。解析不出來就排最低（不影響輸出，只用來挑同縣市的最大震度）。"""
+    m = _INTENSITY_RE.search(str(s or ""))
+    if not m:
+        return -1.0
+    return int(m.group(1)) + {"強": 0.5, "弱": 0.2}.get(m.group(2) or "", 0.0)
+
+
 def _earthquake(payload: dict) -> list[str]:
-    areas, seen = [], set()
+    # CWA 會同時回「單一縣市」和「南投縣、臺東縣 2級」這種合併條目，也會回完全重複的條目
+    # （2026-10-23 線上實測：合併條目沒拆，同一批縣市列了兩次）。拆開後每個縣市只列一次、取最大震度、照出現順序。
+    best: dict[str, Any] = {}
     for a in payload.get("shaking_areas") or []:
-        key = (a.get("county"), a.get("intensity"))
-        if key in seen:          # CWA 實測會回重複的縣市
-            continue
-        seen.add(key)
-        areas.append(f"{a.get('county')} {a.get('intensity')}")
+        for county in re.split(r"[、，,]\s*", str(a.get("county") or "")):
+            county = county.strip()
+            if not county:
+                continue
+            if county not in best or _intensity_rank(a.get("intensity")) > _intensity_rank(best[county]):
+                best[county] = a.get("intensity")
+    areas = [f"{c} {i}" for c, i in best.items()]
     out = [
         f"- 發生時間：{_fmt_time(payload.get('origin_time'))}",
         "- 震央：" + _squash(payload.get("location")),
