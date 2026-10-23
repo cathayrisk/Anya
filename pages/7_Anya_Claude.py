@@ -39,7 +39,7 @@ from anya_claude import history as H  # noqa: E402
 from anya_claude import mdfix as M  # noqa: E402
 from anya_claude import router as R  # noqa: E402
 from anya_claude import usage as U  # noqa: E402
-from anya_claude.view import TurnView, render_saved_status  # noqa: E402
+from anya_claude.view import TurnView, render_saved_status, render_widget  # noqa: E402
 from utils import evidence as EV  # noqa: E402
 from utils import evidence_banner as EVB  # noqa: E402
 from utils import hazard_prefetch as HZPF  # noqa: E402
@@ -62,17 +62,25 @@ PULSE_SECS = 0.5   # 等模型時多久碰一次畫面（「停止」的反應�
 REDO_SAME, REDO_DEEP, REDO_FAST = "🔁 重新回答", "🧠 改用深思模式重答", "⚡ 改用一般模式重答"
 
 
-def _ensure_api_key() -> bool:
-    if os.environ.get("ANTHROPIC_API_KEY"):
+def _secret_to_env(name: str) -> bool:
+    """st.secrets → 環境變數（不印出）。圖在背景執行緒跑，工具一律從環境變數讀金鑰。"""
+    if os.environ.get(name):
         return True
     try:
-        key = st.secrets.get("ANTHROPIC_API_KEY")
+        val = st.secrets.get(name)
     except Exception:
-        key = None
-    if key:
-        os.environ["ANTHROPIC_API_KEY"] = str(key)   # langchain-anthropic 從環境變數讀；不印出
+        val = None
+    if val:
+        os.environ[name] = str(val)
         return True
     return False
+
+
+def _ensure_api_key() -> bool:
+    _secret_to_env("CWA_API_KEY")          # 階段 2 深思模式的氣象署工具用；沒有也不擋頁面
+    _secret_to_env("SUPABASE_URL")         # 長期記憶（全體共用）；沒有就停用 save_lesson 與注入
+    _secret_to_env("SUPABASE_KEY")
+    return _secret_to_env("ANTHROPIC_API_KEY")
 
 
 @st.cache_resource(show_spinner=False)
@@ -106,6 +114,8 @@ def _render_message(msg: dict) -> None:
         st.caption(msg["banner"])
     if msg.get("text"):
         st.markdown(M.render_ready(msg["text"]), unsafe_allow_html=True)
+    if msg.get("widget"):
+        render_widget(msg["widget"])   # 同一個 wid：使用者在元件裡的操作（sessionStorage）回放時對得上
     for name in msg.get("images") or []:
         st.caption(f"🖼 {name}")
     if msg.get("stopped") and msg.get("role") == "assistant":
@@ -258,7 +268,7 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
                     break
                 if kind == "error":
                     raise payload
-                for ev in E.parse_stream_item(*payload):
+                for ev in E.parse_item(payload):
                     view.on(ev)
         except Exception as e:
             view.fail(U.friendly_error(e))
