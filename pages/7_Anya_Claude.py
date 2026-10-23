@@ -1,0 +1,380 @@
+# -*- coding: utf-8 -*-
+"""Anya（Claude 版）——2026-10 起和舊 Home.py 並存的新主聊天。
+
+階段 1（骨架＋一般模式）：
+- 第一層路由照搬 Home.py（anya_claude/router.py）；沒命中就交給 Haiku 5.5，
+  Haiku 覺得要深入時呼叫 escalate_to_deep 工具，升級到 Opus 5.5（取代 [[ESCALATE]] 暗號）。
+- 災防：分類 → controller prefetch（一定查、一定進 context、一定留憑證）→ 純即時題由程式直答。
+- 真串流：直接串 markdown；誠實剝除每次重畫都套（anya_claude/mdfix.display_text）。
+- 不設每日 Opus 上限（2026-10-23 使用者決定）；額度用完時畫面講人話（anya_claude/usage.py）。
+- 互動（2026-10-23 使用者挑的 Streamlit 新功能）：狀態列＝心裡話＋步驟時間軸（view／monologue／timeline）、
+  停止鈕（chat_input submit_mode="stop"，圖在背景執行緒跑、主執行緒每 0.5 秒 pulse 才停得即時）、
+  最新回答的「⋯」選單（重答／換模式重答，舊回答收進「前一版回答」）、回答裡的 Mermaid 圖（mdfix）。
+計畫：Anya-main(New)/anya-claude-改寫計畫-20261023.md。
+
+⚠️ 分層：anya_claude/ 裡除了 view.py 都不准 import streamlit——圖的節點跑在背景執行緒。
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import queue
+import sys
+import time
+import traceback
+from pathlib import Path
+
+import streamlit as st
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+st.set_page_config(page_title="Anya（Claude 版）", page_icon="🥜", layout="wide")
+
+from anya_claude import events as E  # noqa: E402
+from anya_claude import graph as G  # noqa: E402
+from anya_claude import history as H  # noqa: E402
+from anya_claude import mdfix as M  # noqa: E402
+from anya_claude import router as R  # noqa: E402
+from anya_claude import usage as U  # noqa: E402
+from anya_claude.view import TurnView, render_saved_status  # noqa: E402
+from utils import evidence as EV  # noqa: E402
+from utils import evidence_banner as EVB  # noqa: E402
+from utils import hazard_prefetch as HZPF  # noqa: E402
+from utils import hazard_render as HZR  # noqa: E402
+from utils.cwa_weather import get_earthquake_impl, get_typhoon_impl  # noqa: E402
+from utils.hazard_intent import classify_hazard_intent  # noqa: E402
+
+try:
+    from utils.rich_styles import inject_rich_styles
+    inject_rich_styles()
+except Exception:
+    pass
+
+DEV = str(st.query_params.get("dev", "")).strip() == "1"
+AVATAR = {"fast": "⚡", "deep": "💬", "socratic": "🧭", "cwa": "🌐"}
+MODE_LABEL = {"fast": "一般模式", "deep": "深思模式", "socratic": "提問引導", "cwa": "氣象署直答"}
+IMAGE_TYPES = ["jpg", "jpeg", "png", "webp", "gif"]
+PULSE_SECS = 0.5   # 等模型時多久碰一次畫面（「停止」的反應時間上限）
+# 最新一則回答的「⋯」選單（2026-10-23 使用者要的：重答、換模式重答）
+REDO_SAME, REDO_DEEP, REDO_FAST = "🔁 重新回答", "🧠 改用深思模式重答", "⚡ 改用一般模式重答"
+
+
+def _ensure_api_key() -> bool:
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception:
+        key = None
+    if key:
+        os.environ["ANTHROPIC_API_KEY"] = str(key)   # langchain-anthropic 從環境變數讀；不印出
+        return True
+    return False
+
+
+@st.cache_resource(show_spinner=False)
+def get_graph():
+    return G.build_graph()
+
+
+def _pf_earthquake():
+    o = get_earthquake_impl()
+    # found=False 是「CWA 這次沒回傳可顯示的事件」，**不等於「近期沒有地震」**
+    return json.dumps(o, ensure_ascii=False, default=str), (EV.STATUS_OK if o.get("found") else EV.STATUS_EMPTY)
+
+
+def _pf_typhoon():
+    o = get_typhoon_impl()
+    # has_active_taiwan_warning 是明確布林，「目前無警報」是官方的有效答案
+    return json.dumps(o, ensure_ascii=False, default=str), EV.STATUS_OK
+
+
+def _render_message(msg: dict) -> None:
+    if msg.get("superseded"):
+        # 被「重答」取代的舊回答：收起來留著比對，不帶進之後的對話
+        with st.expander(f"📜 前一版回答（{MODE_LABEL.get(msg.get('mode'), '')}）", expanded=False):
+            st.markdown(M.render_ready(msg.get("text") or "（沒有內容）"), unsafe_allow_html=True)
+        return
+    if msg.get("steps"):
+        render_saved_status(msg.get("status", ""), msg.get("status_state", "complete"), msg["steps"])
+    if msg.get("badges"):
+        st.markdown(msg["badges"])
+    if msg.get("banner"):
+        st.caption(msg["banner"])
+    if msg.get("text"):
+        st.markdown(M.render_ready(msg["text"]), unsafe_allow_html=True)
+    for name in msg.get("images") or []:
+        st.caption(f"🖼 {name}")
+    if msg.get("stopped") and msg.get("role") == "assistant":
+        st.markdown(":gray-badge[⏹️ 已停止] :small[:gray[沒寫完的這則不會帶進之後的對話。]]")
+    elif msg.get("pending") and not msg.get("stopped"):
+        st.markdown(":orange-badge[⏳ 沒有拿到回答] :small[:gray[這則不會帶進之後的對話。]]")
+    if DEV and msg.get("dev"):
+        with st.expander("🔧 [dev] 本回合", expanded=False):
+            st.json(msg["dev"])
+
+
+def _redo_options(msg: dict) -> list[str]:
+    mode = msg.get("mode")
+    if mode == "cwa":
+        return [REDO_SAME]
+    return [REDO_SAME, REDO_FAST if mode in ("deep", "socratic") else REDO_DEEP]
+
+
+def _redo_menu(index: int, msg: dict) -> None:
+    """只有最新一則回答有選單：重答會把它收進「前一版回答」，再用同一個提問重跑。
+    key 用歷史索引——回合剛跑完時畫的、和下一輪歷史迴圈畫的是同一個元件。"""
+    key = f"ac_redo_menu_{index}"
+    st.menu_button("", options=_redo_options(msg), icon=":material/more_horiz:", type="tertiary",
+                   key=key, help="重新回答／換模式重答", on_click=_on_redo, args=(key,))
+
+
+def _on_redo(key: str) -> None:
+    """menu_button 的 callback（在重跑之前執行）：舊回答標成被取代，下一輪重跑時重答。"""
+    choice = st.session_state.get(key)
+    kind = {REDO_SAME: "same", REDO_DEEP: "deep", REDO_FAST: "fast"}.get(choice)
+    if not kind:
+        return
+    for h in reversed(st.session_state.get("ac_history", [])):
+        if h.get("role") == "assistant" and not h.get("superseded"):
+            h["superseded"] = True
+            h["pending"] = True
+            break
+    st.session_state["ac_redo"] = kind
+
+
+def _telemetry(rec: dict) -> None:
+    try:
+        print("TELEMETRY_CLAUDE " + json.dumps(rec, ensure_ascii=False, default=str), flush=True)
+    except Exception:
+        pass
+
+
+def run_turn(user_entry: dict, text: str, images: list[dict], route: R.Route, hist: list[dict], *,
+             allow_escalate: bool = True) -> None:
+    """跑一回合。使用者按「停止」時 Streamlit 在下一個 st.* 呼叫丟 StopException（BaseException，
+    1.63 實測 finally 會執行）：這時畫面已經不能動，只把收到的部分存進歷史、標成已停止。"""
+    user_entry["pending"] = True   # 答完才拿掉；中途失敗或按停止，這則提問就不帶進之後的對話
+    ctx = {"view": None, "done": False, "t0": time.time()}
+    try:
+        _run_turn(ctx, user_entry, text, images, route, hist, allow_escalate)
+    except BaseException as e:
+        view = ctx["view"]
+        if not ctx["done"] and view is not None:
+            stopped = type(e).__name__ == "StopException"
+            rec = view.stopped_record(stopped=stopped)
+            hist.append({"role": "assistant", **rec, "pending": True, "stopped": True})
+            user_entry["stopped"] = True
+            _telemetry({"route": route.reason, "stopped": stopped,
+                        "error": None if stopped else f"{type(e).__name__}: {str(e)[:300]}",
+                        "secs": round(time.time() - ctx["t0"], 2), "usage": view.usage.as_rows()})
+        raise
+
+
+def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route: R.Route, hist: list[dict],
+              allow_escalate: bool) -> None:
+    t0 = ctx["t0"]
+    intent, pure, pure_why = None, False, ""
+    try:
+        # 翻譯請求不做災防分類（文章提到颱風不代表要查即時警報）；長訊息只看頭尾的指示部分
+        if route.reason != "translation":
+            inst = R.instruction_part(text)
+            intent = classify_hazard_intent(inst)
+            pure, pure_why = HZR.is_pure_live(inst, intent)
+    except Exception:
+        pass
+    start_mode = "socratic" if route.socratic else route.mode
+    # 災防題的狀態列用正經版台詞（問的人可能正在擔心，不開玩笑）
+    serious = route.reason == "hazard_hint" or (intent is not None and intent.should_prefetch)
+    with st.chat_message("assistant", avatar=AVATAR["cwa"] if pure else AVATAR[start_mode]):
+        view = TurnView(mode=start_mode, user_text=text, serious=serious, route_reason=route.reason)
+        ctx["view"] = view
+
+        # ── 災防 controller prefetch：把「要不要查」從模型手上收回來 ──
+        pf_results: list[dict] = []
+        block = ""
+        if intent is not None and intent.should_prefetch:
+            scopes = HZPF.prefetch_scopes(intent.scopes)
+            if scopes:
+                view.cwa_start()
+                pf_results = HZPF.run_prefetch(scopes, {EV.SCOPE_EARTHQUAKE: _pf_earthquake,
+                                                        EV.SCOPE_TYPHOON: _pf_typhoon})
+                view.cwa_done(pf_results)
+                view.add_evidence([EV.make_event(tool="prefetch/" + HZPF.SCOPE_TOOLS.get(r["scope"], r["scope"]),
+                                                 scope=r["scope"], status=r["status"],
+                                                 detail={"prefetch": True, "error": r["error"]})
+                                   for r in pf_results])
+                block = HZPF.build_context_block(pf_results)
+
+        dev = {"route": route.reason, "start_mode": start_mode,
+               "hazard": None if intent is None else {"state": intent.state, "scopes": list(intent.scopes),
+                                                      "pure_live": pure, "pure_reason": pure_why,
+                                                      "prefetched": [{k: r[k] for k in ("scope", "status", "error")}
+                                                                     for r in pf_results]}}
+
+        # ── 純即時災防題：程式直接渲染，不經模型 ──
+        if pure and pf_results:
+            payloads = {}
+            for r in pf_results:
+                if r.get("status") == EV.STATUS_OK and r.get("payload"):
+                    try:
+                        payloads[r["scope"]] = json.loads(r["payload"])
+                    except Exception:
+                        pass
+            hr_text = HZR.render(pf_results, payloads=payloads)
+            if hr_text:
+                view.mode = "cwa"
+                dev.update({"final_mode": "cwa", "escalated": False, "secs": round(time.time() - t0, 2), "usd": 0.0})
+                badges = M.badges_markdown(mode="cwa", elapsed_s=time.time() - t0)
+                # 自帶來源 footer，刻意不加 banner（沿用舊版）
+                view.finish(hr_text, badges=badges, banner="", elapsed_s=time.time() - t0)
+                ctx["done"] = True
+                user_entry.pop("pending", None)
+                hist.append({"role": "assistant", "text": hr_text, "mode": "cwa", "badges": badges,
+                             "dev": dev, **view.saved_status()})
+                _telemetry(dev)
+                _redo_menu(len(hist) - 1, hist[-1])
+                return
+            # render 回空字串＝欄位長相變了，退回讓模型作答（資料仍在 context）
+
+        # ── 模型回合：Haiku →（升級）→ Opus ──
+        # 只帶這則提問之前的歷史（重答時，後面會有被取代的舊回答，那些不送）
+        upto = next(i for i in range(len(hist) - 1, -1, -1) if hist[i] is user_entry)
+        state = G.initial_state(H.to_messages(hist[:upto]) + [G.user_message(text, images)],
+                                route=route.mode, socratic=route.socratic, context_block=block,
+                                allow_escalate=allow_escalate)
+        q, halt = G.stream_in_thread(get_graph(), state)
+        try:
+            while True:
+                try:
+                    kind, payload = q.get(timeout=PULSE_SECS)
+                except queue.Empty:
+                    view.pulse()   # 空檔也碰一下畫面：讓「停止」即時生效、台詞照樣輪替
+                    continue
+                if kind == "end":
+                    break
+                if kind == "error":
+                    raise payload
+                for ev in E.parse_stream_item(*payload):
+                    view.on(ev)
+        except Exception as e:
+            view.fail(U.friendly_error(e))
+            ctx["done"] = True             # 提問維持 pending：沒答到的不帶進之後的對話（舊版「孤兒訊息污染」的教訓）
+            _telemetry({"route": route.reason, "error": f"{type(e).__name__}: {str(e)[:300]}",
+                        "usage": view.usage.as_rows()})
+            if DEV:
+                st.code(traceback.format_exc()[-3000:])
+            return
+        finally:
+            halt.set()   # 按了停止（StopException）或出錯：背景執行緒不再往下讀
+
+        if view.escalated and view.socratic:
+            # Haiku 判定使用者「卡住需要引導」→ 進入 sticky 引導模式，之後的回合維持到退出詞（沿用舊版）
+            st.session_state["ac_mode_sticky"] = "socratic"
+        msg = view.answer_msg
+        final = M.display_text(E.answer_text(msg), final=True)
+        if not final.strip():
+            view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
+            ctx["done"] = True
+            _telemetry({"route": route.reason, "error": "empty_answer", "usage": view.usage.as_rows()})
+            return
+        footer = M.build_web_sources_footer(view.sources + E.answer_citations(msg))
+        # 只在「這回合真的查過東西」（網路搜尋、讀網頁、氣象署）時才標示；什麼都沒查的
+        # 「💡 本回覆未經任何查證…」不顯示——2026-10-23 使用者決定，每則都掛很怪。
+        banner = EVB.build_banner(view.evidence) if view.evidence else ""
+        elapsed = time.time() - t0
+        badges = M.badges_markdown(mode=view.mode, web_calls=view.usage.web_searches,
+                                   elapsed_s=elapsed, escalated=view.escalated)
+        view.finish(final + footer, badges=badges, banner=banner, elapsed_s=elapsed)
+        ctx["done"] = True
+        user_entry.pop("pending", None)
+
+        dev.update({"final_mode": view.mode, "escalated": view.escalated,
+                    "escalate_reason": view.escalate_reason, "secs": round(elapsed, 2),
+                    "first_text_s": view.first_text_s,
+                    "usd": round(view.usage.usd, 5), "calls": view.usage.as_rows(),
+                    "evidence": EV.summarize(view.evidence), "trace": view.trace})
+        hist.append({"role": "assistant", "text": final + footer, "mode": view.mode,
+                     "badges": badges, "banner": banner, "dev": dev, **view.saved_status()})
+        _telemetry(dev)
+        _redo_menu(len(hist) - 1, hist[-1])
+        if DEV:
+            with st.expander("🔧 [dev] 本回合", expanded=False):
+                st.json(dev)
+
+
+# ───────────────────────── 頁面 ─────────────────────────
+st.markdown("### 🥜 安妮亞（Claude 版・測試中）")
+st.caption("一般問題由 Haiku 5.5 快速回答；需要深入時會自動升級到 Opus 5.5。舊版主頁照常可用。")
+
+if not _ensure_api_key():
+    st.error("尚未設定 ANTHROPIC_API_KEY（Streamlit Cloud 的 Secrets），這一頁暫時不能用。")
+    st.stop()
+
+st.session_state.setdefault("ac_history", [])
+st.session_state.setdefault("ac_mode_sticky", "assist")   # 'assist' | 'socratic'（狀態放頁面，不靠模型記得）
+history: list[dict] = st.session_state["ac_history"]
+
+# 輸入框先讀（它固定在頁面底部，呼叫順序不影響位置）：這一輪要跑新回合的話，舊的最後一則不畫選單，
+# 不然新回答畫出自己的選單後，畫面上會同時有兩個「⋯」
+# submit_mode="stop"：送出後按鈕變成停止鈕（1.59 起），深思模式跑太久可以自己喊停
+prompt = st.chat_input("wakuwaku！輸入你的問題吧～", accept_file="multiple", file_type=IMAGE_TYPES,
+                       submit_mode="stop")
+redo = st.session_state.pop("ac_redo", None)
+
+for i, m in enumerate(history):
+    role = m.get("role", "assistant")
+    with st.chat_message(role, avatar=AVATAR.get(m.get("mode")) if role == "assistant" else None):
+        _render_message(m)
+        if i == len(history) - 1 and role == "assistant" and not m.get("superseded") and not prompt:
+            _redo_menu(i, m)
+
+if st.session_state["ac_mode_sticky"] == "socratic":
+    left, right = st.columns([5, 1])
+    left.markdown(":violet-badge[🧭 提問引導模式] "
+                  ":small[:gray[安妮亞只提問不給答案，幫你自己想清楚；說「直接說」或按右邊按鈕結束。]]")
+    if right.button("直接說", key="ac_socratic_exit", width="stretch"):
+        st.session_state["ac_mode_sticky"] = "assist"
+        st.rerun()
+
+if prompt:
+    text = (getattr(prompt, "text", None) if not isinstance(prompt, str) else prompt) or ""
+    text = text.strip()
+    images = []
+    for f in (getattr(prompt, "files", None) or []):
+        try:
+            images.append({"name": f.name, "mime": f.type or "image/png",
+                           "b64": base64.standard_b64encode(f.getvalue()).decode()})
+        except Exception:
+            pass
+    if text or images:
+        with st.chat_message("user"):
+            if text:
+                st.markdown(text)
+            for im in images:
+                st.image(base64.standard_b64decode(im["b64"]), caption=im["name"], width=220)
+        entry = {"role": "user", "text": text or "（請看圖）", "raw_text": text,
+                 "images": [im["name"] for im in images]}
+        history.append(entry)
+        st.session_state["ac_last_images"] = images   # 只留最新一則的圖（重答用），不累積
+        sticky = R.next_socratic_state(text, st.session_state["ac_mode_sticky"])
+        st.session_state["ac_mode_sticky"] = sticky
+        route = R.decide(text, socratic_active=(sticky == "socratic"), has_images=bool(images))
+        run_turn(entry, text, images, route, history)
+elif redo:
+    entry = next((h for h in reversed(history) if h.get("role") == "user"), None)
+    if entry is not None:
+        text = entry.get("raw_text", entry.get("text", ""))
+        images = st.session_state.get("ac_last_images", []) if entry.get("images") else []
+        entry.pop("stopped", None)
+        if redo == "deep":
+            route = R.Route("deep", "user_redo_deep")
+        elif redo == "fast":
+            route = R.Route("fast", "user_redo_fast")
+        else:
+            route = R.decide(text, socratic_active=(st.session_state["ac_mode_sticky"] == "socratic"),
+                             has_images=bool(images))
+        run_turn(entry, text, images, route, history, allow_escalate=(redo != "fast"))
