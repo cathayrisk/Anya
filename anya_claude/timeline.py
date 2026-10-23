@@ -13,6 +13,9 @@
 - 思考摘要是在下一個動作前一次送來的，從第一個摘要字算會變成「想了 0.1 秒」；改從上一步結束算。
 - Opus 的思考摘要是英文的，2026-10-23 使用者決定不顯示：「想了 N 秒」只記時間和接著做了什麼；
   想完緊接著呼叫 think 工具時併成同一步，底下放它寫的中文反思。
+- 搜尋過、帶引用的回答，API 是寫完才整段一次送來（2026-10-23 實測：510 字的片段同一刻到）。
+  所以「寫好了」從上一步結束算、「想了」算到摘要送達（摘要在想完時才送）；反思說「直接作答」
+  就先亮出撰寫回答，不然那幾秒畫面像卡住。
 """
 from __future__ import annotations
 
@@ -108,8 +111,9 @@ class Step:
     detail: list[str] = field(default_factory=list)
     started: float = 0.0
     ended: float = 0.0
-    calls: int = 0               # 搜尋／讀網頁的次數
+    calls: int = 0               # 搜尋／讀網頁的次數；撰寫回答：0＝先亮出來、字還沒到
     hits: int = 0                # 搜尋結果筆數
+    last: float = 0.0            # 深思：最後一個摘要片段到的時間（＝想完的時間）
 
     def record(self) -> dict:
         return {"label": self.label, "state": self.state, "detail": list(self.detail)}
@@ -332,6 +336,8 @@ class Timeline:
         if data.get("hint"):
             cur.detail.append("⚠️ 完整度偏低，系統提示改變查法")
         self._complete(cur)
+        if data.get("next_action") == "直接作答":
+            self.write(pending=True)
 
     # ── 模型 ──
     def escalate(self, *, reason: str, socratic: bool) -> None:
@@ -346,16 +352,24 @@ class Timeline:
     def think(self, text: str = "") -> None:
         """模型在想。摘要內容（英文）不顯示，只開一步記時間；想完做什麼由下一步補上。"""
         cur = self.current
+        if self._pending_write(cur):
+            return                                    # 決定作答之後的思考算進撰寫回答
         if cur.kind == "think" and cur.state == "running":
+            cur.last = self.clock()
             return
         self._open(Step("think", "🧠 :shimmer[深思中…]", detail=[THINKING]))
         self.current.started = cur.ended or self.current.started   # 模型在上一步結束後就開始想了
+        self.current.last = self.clock()
 
-    def write(self) -> None:
-        if self.current.kind == "write" and self.current.state == "running":
+    def write(self, *, pending: bool = False) -> None:
+        """開始寫回答。pending：反思說直接作答，字還沒到就先亮出來。"""
+        cur = self.current
+        if cur.kind == "write" and cur.state == "running":
+            cur.calls = cur.calls or int(not pending)
             return
-        self._open(Step("write", "✍️ :shimmer[撰寫回答…]",
+        self._open(Step("write", "✍️ :shimmer[撰寫回答…]", calls=int(not pending),
                         detail=[f"由 {MODEL_NAME.get(self.mode, '模型')} 撰寫"]))
+        self.current.started = cur.ended or self.current.started   # 從上一步結束算：回答常是寫完才整段送來
 
     # ── 結束 ──
     def finish(self, elapsed_s: float) -> None:
@@ -396,8 +410,18 @@ class Timeline:
             cur.state, cur.ended = state, self.clock()
             cur.label = _unshimmer(cur.label).rstrip("…") + "（中斷）"
 
+    @staticmethod
+    def _pending_write(step: Step) -> bool:
+        return step.kind == "write" and step.state == "running" and not step.calls
+
     def _open(self, step: Step) -> None:
         prev = self.current
+        if self._pending_write(prev):
+            # 先亮出的撰寫回答還沒有字，模型又去用工具：原地換成新的那一步（畫面上沿用同一格）
+            step.started = self.clock()
+            self.steps[-1] = step
+            self._bump()
+            return
         self._finish_current()
         if prev.kind == "think":
             prev.detail = [f"接著：{_verb(step.label)}"]
@@ -409,13 +433,14 @@ class Timeline:
         cur = self.current
         if cur.state != "running":
             return
-        took = _secs(self.clock() - cur.started)
+        end = cur.last if cur.kind == "think" and cur.last else self.clock()
+        took = _secs(end - cur.started)
         done = {"cwa": "🌐 查了氣象署即時資料", "search": self._search_label(cur),
                 "fetch": self._fetch_label(cur), "code": "🧮 用程式整理了資料",
                 "think": f"🧠 想了 {took}", "write": f"✍️ 寫好了・{took}",
                 "skill": "📚 讀了技能說明", "files": "📂 翻了資料", "notes": "🗒️ 寫了筆記", "todo": "📝 列了待辦"}
         cur.label = done.get(cur.kind, _unshimmer(cur.label).rstrip("…"))
-        cur.state, cur.ended = "complete", self.clock()
+        cur.state, cur.ended = "complete", end
 
     def _complete(self, step: Step) -> None:
         step.state, step.ended = "complete", self.clock()

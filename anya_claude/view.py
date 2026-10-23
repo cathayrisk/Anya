@@ -118,6 +118,7 @@ class TurnView:
         self._last_draw = 0.0
         self._t0 = time.time()
         self.first_text_s: float | None = None   # 首字時間（進 dev 與 telemetry；驗收看這個）
+        self._await_text = False                 # 已先亮出「撰寫回答」、第一個字還沒到
         self._show_wait()
 
     # ── 等待中 ──
@@ -144,8 +145,10 @@ class TurnView:
                 self._gap = False
             if self.first_text_s is None and ev.text.strip():
                 self.first_text_s = round(time.time() - self._t0, 2)
-            if self.stage != "writing" and ev.text.strip():
-                self.set_stage("writing")
+            if (self.stage != "writing" or self._await_text) and ev.text.strip():
+                if self.stage != "writing":
+                    self.set_stage("writing")
+                self._await_text = False
                 self.tl.write()
                 self._expand(False)            # 開始寫字就把時間軸收起來，不擋回答
             self.buf += ev.text
@@ -180,6 +183,9 @@ class TurnView:
                                 ev.data.get("text") or "")
         elif k == "reflect":
             self.tl.reflect(ev.data)
+            if self.tl.current.kind == "write":     # 反思說直接作答：先換成寫字的台詞（帶引用的回答寫完才整段送來）
+                self.set_stage("writing")
+                self._await_text = True
         elif k == "rubric_start":                   # 寫完再檢查：回答留在畫面上，標題換成「檢查中」
             self.tl.rubric_start(ev.data.get("reason") or "")
             self.set_stage("reflect")
