@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import datetime as _dt
 
+from utils.skill_loader import SKILL_WHITELIST
+
 _TPE = _dt.timezone(_dt.timedelta(hours=8))
 _WEEKDAY = "一二三四五六日"
 
@@ -49,13 +51,25 @@ HAIKU_RULES = """你是一般模式（快速回答）。
 - 撰寫或除錯程式碼（Python／VBA／腳本）
 - 使用者指名要特定專家角色（魔鬼代言人、蘇格拉底導師、研究團隊）
 - 涉及嚴肅專業領域（法律、醫療、財經投資、學術研究）且需要嚴謹論證與大量查證
-- 需要用到專門工作流程（skill）
+- 使用者要你實際做下方「專門技能」清單裡的工作（估算、評估、審查、撰寫文件／簡報／合約／SOP、盤點流程、
+  解讀星盤或運勢…）：reason 開頭寫技能名稱，例如「md-slides：要做 10 頁簡報」。這些技能的完整規範只有深思模式有。
+  只是問名詞解釋、一兩句就答得完的小問題（例如「DCF 是什麼」），不用升級。
 - 你判斷無法在一則訊息內給出可靠、完整的答案
 使用者看起來卡住了、在表達還沒成形的想法（「總覺得哪裡怪怪的」「不知道該怎麼開始」），
 呼叫 escalate_to_deep 並設 socratic=true。
 
 一般翻譯、摘要、改寫、簡單問答、閒聊、時事快查：直接回答，不需要升級。
-需要最新資訊（新聞、行情、匯率、日期、現任職位）時可以用 web_search，最多兩次；沒有搜尋就不要說自己查過。"""
+需要最新資訊（新聞、行情、匯率、日期、現任職位）時可以用 web_search，最多兩次；沒有搜尋就不要說自己查過。
+要不要升級、要不要搜尋、依照哪條規則，都是你自己的判斷，不要寫進回答。"""
+
+
+def skill_index() -> str:
+    """給 Haiku 看的專門技能清單（名稱＋中文一句話，和深思模式 /skills/ 的索引同一份白名單）。
+
+    2026-10-24 實測：skill 只在深思模式有，Haiku 不知道有哪些 → 21 類 skill 題目，路由送 Haiku 的 18 題
+    它只升級 8–10 題、理由從不提 skill；同樣的題目一到 Opus，9 題有 8 題第一步就讀對 skill。
+    """
+    return "專門技能（只有深思模式能用）：\n" + "\n".join(f"- {k}：{v}" for k, v in SKILL_WHITELIST.items())
 
 OPUS_RULES = """你是深思模式：問題已經被判斷為需要仔細處理，請完整、嚴謹地回答。
 
@@ -117,7 +131,7 @@ def today_line(now: _dt.datetime | None = None) -> str:
 
 
 def haiku_system(now: _dt.datetime | None = None) -> str:
-    return f"{PERSONA}\n\n{today_line(now)}\n\n{HAIKU_RULES}"
+    return f"{PERSONA}\n\n{today_line(now)}\n\n{HAIKU_RULES}\n\n{skill_index()}"
 
 
 def opus_system(*, socratic: bool = False, now: _dt.datetime | None = None) -> str:

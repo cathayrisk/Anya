@@ -75,11 +75,14 @@ def _deep_files() -> dict:
 
 
 def turn_note(state: TurnState, now=None, lessons_block: str | None = None) -> str:
-    """deep agent 每回合的系統訊息：日期＋長期記憶＋災防資料。三樣都會變，不放進固定系統提示（快取才不會失效）。"""
+    """deep agent 每回合的系統訊息：日期＋長期記憶＋災防資料＋一般模式轉交的理由（常帶技能名稱）。
+    都會變，不放進固定系統提示（快取才不會失效）。"""
     if lessons_block is None:
         from . import lessons
         lessons_block = lessons.block()
-    parts = (P.today_line(now), lessons_block, (state.get("context_block") or "").strip())
+    reason = (state.get("escalate_reason") or "").strip()
+    parts = (P.today_line(now), lessons_block, (state.get("context_block") or "").strip(),
+             f"一般模式轉交這題的理由：{reason}" if reason else "")
     return "\n\n".join(x for x in parts if x)
 
 

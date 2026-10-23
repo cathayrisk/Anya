@@ -61,6 +61,10 @@ def instruction_part(text: str) -> str:
     return t[:EDGE_CHARS] + "\n" + t[-EDGE_CHARS:]
 
 
+# 生日或星座：「合不合」旁邊要有這個才算問配對
+_ASTRO_PERSON = (r"(?:星座|星盤|生日|出生|\d{4}[/.\-年]\d{1,2}"
+                 r"|(?:牡羊|金牛|雙子|巨蟹|獅子|處女|天秤|天蠍|射手|摩羯|水瓶|雙魚)座)")
+
 # per-skill 高精度關鍵詞（命中即升級——Haiku 沒有 skill）
 SKILL_HINT_RES: dict[str, re.Pattern] = {
     "market-research": re.compile(r"TAM|SAM|SOM|市場規模|市場調查|市場區隔", re.IGNORECASE),
@@ -76,8 +80,14 @@ SKILL_HINT_RES: dict[str, re.Pattern] = {
         r"合相|三分|四分|六分|對分|梅花|刑|拱|相位|逆行)"
         r"|(?:合相|三分|四分|六分|對分|刑|拱)[^。！？\n]{0,6}?"
         r"(?:太陽|月亮|水星|金星|火星|木星|土星|天王星|海王星|冥王星|凱龍|上升|天頂)"),
-    "astro-forecast": re.compile(r"流年|行運|返照|小限|今年.{0,6}運[勢氣]"),
-    "astro-relationship": re.compile(r"合盤|兩人.{0,4}星盤|配對.{0,4}星盤|契合度"),
+    # 2026-10-24 實測漏接：「我明年的運勢如何？」「我跟男友合不合？我 1990/5/3…」→ Haiku 沒排盤、婉拒式自答
+    "astro-forecast": re.compile(
+        r"流年|行運|返照|小限|運勢|(?:今年|明年|下半年|上半年|這個月|下個月|\d{4}\s*年).{0,6}運氣"),
+    # 「合不合」單獨出現太寬（「合不合適」「合不合理」），要旁邊有生日或星座才算
+    "astro-relationship": re.compile(
+        r"合盤|兩人.{0,4}星盤|配對.{0,4}星盤|契合度"
+        r"|(?:合不合|配不配|速配)(?![適理法規用格]).{0,40}?" + _ASTRO_PERSON
+        + r"|" + _ASTRO_PERSON + r".{0,40}?(?:合不合|配不配|速配)(?![適理法規用格])"),
     "excel-vba": re.compile(
         r"\bvba\b|巨集|\.xlsm\b"
         r"|\bmacros?\b[\s\S]{0,24}(?:excel|workbook|worksheet|\.xlsm|vbe|module|\bsub\b|code"
