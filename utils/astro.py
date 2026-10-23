@@ -18,8 +18,26 @@
 """
 from __future__ import annotations
 
+import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+# kerykeion 6 的星曆（libephemeris）每算一個日期就對凱龍星印兩行 WARNING，一次流年上千行，
+# 把 Cloud 的紀錄洗掉（2026-10-24）。它只在第一次 import 時讀這個環境變數，所以模組一載入就設；
+# 萬一別處先 import 了 kerykeion，_kerykeion() 之後還會再用官方 API 調一次。
+os.environ.setdefault("LIBEPHEMERIS_LOG_LEVEL", "ERROR")
+
+
+class _DropMoonSamplingWarning(logging.Filter):
+    """kerykeion 對「取樣間隔比月亮的容許度窗口還寬」發的警告：行運月亮本來就不列（見 compute_transits），
+    這則對我們不成立，留著只會每次流年都在紀錄裡多一行。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not str(record.getMessage()).startswith("Transit sampling step")
+
+
+logging.getLogger().addFilter(_DropMoonSamplingWarning())
 
 # 台北預設值（使用者沒給地點時用；與 yoda agent 既有慣例一致）
 DEFAULT_LAT = 25.0330
@@ -65,9 +83,14 @@ def _kerykeion():
     """惰性載入。缺套件時回 None，呼叫端一律回 error 而不是炸掉。"""
     try:
         import kerykeion  # noqa: F401
-        return kerykeion
     except Exception:
         return None
+    try:   # 星曆警告只留錯誤（kerykeion 5 沒有 libephemeris，略過）
+        from libephemeris.logging_config import set_log_level
+        set_log_level(logging.ERROR)
+    except Exception:
+        pass
+    return kerykeion
 
 
 def parse_date(s: str) -> Dict[str, Any]:
@@ -620,6 +643,8 @@ def wheel_data(chart: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------- 預測
 MAJOR_ASPECTS = ("conjunction", "opposition", "trine", "square", "sextile")
 SLOW_BODIES = ("Jupiter", "Saturn", "Uranus", "Neptune", "Pluto", "Chiron")
+# 行運端不列的點：月亮一天走約 13 度，以天為單位取樣只會抓到偶然落在容許度裡的那幾天（kerykeion 也會警告）
+TRANSIT_SKIP = ("Moon",)
 
 
 def _zone(tz_name: str):
@@ -692,7 +717,7 @@ def compute_transits(name: str, birthdate: str, birth_time: Optional[str],
                 date_s = str(getattr(mom, "date", ""))[:10]
             for asp in (getattr(mom, "aspects", None) or []):
                 d = asp.model_dump() if hasattr(asp, "model_dump") else dict(asp)
-                if d.get("aspect") not in MAJOR_ASPECTS:
+                if d.get("aspect") not in MAJOR_ASPECTS or d.get("p1_name") in TRANSIT_SKIP:
                     continue
                 rows.append({
                     "date": date_s,
@@ -711,6 +736,7 @@ def compute_transits(name: str, birthdate: str, birth_time: Optional[str],
             "range": {"start": start_date, "days": days, "step_days": step, "tz": tzs},
             "highlights": rows[:limit],
             "total_found": len(rows),
+            "note": f"行運的月亮一天走約 13 度，每 {step} 天取樣抓不準，已排除；本命月亮被其他行星觸發的相位照常列出。",
         }
         w = build_warning(meta)
         if w:
