@@ -53,6 +53,17 @@ ENTITY_SCOPES: dict[str, tuple[str, ...]] = {
 # 屬於災防、但**沒有任何工具可查**——不可假裝已涵蓋
 UNCOVERED_ENTITIES = ("海嘯", "土石流", "淹水")
 
+# 口語的地震說法（2026-10-23 線上測試：「花蓮那邊最近是不是有在搖？」整題漏掉——沒查氣象署、
+# 也沒升級，模型拿新聞答還說「以氣象署為主」）。用 regex 不用詞表：單字「搖／晃」太常見
+# （搖頭、搖滾、去晃一下），要黏著時間／疑問詞或程度詞才算。說「有在搖」的人講的就是剛發生的事，
+# 所以命中也算即時訊號。anya_claude/router.py 共用這一條（決定要不要升級深思）。
+QUAKE_COLLOQUIAL_RE = re.compile(
+    r"地牛|天搖地動"
+    r"|(?:剛剛|剛才|昨晚|昨天|半夜|凌晨|早上|今天|最近|是不是|有沒有)[^。！？?\n]{0,6}?"
+    r"(?:搖|晃)(?![頭滾擺籃椅錢旗手曳桿])"
+    r"|(?:搖|晃)(?:得好|得很|好大|很大|很久|超大|好久)"
+)
+
 # ── 即時訊號 ────────────────────────────────────────────────────────────────
 LIVE_TIME = ("現在", "目前", "最近", "近期", "今天", "今日", "昨天", "剛剛", "剛才",
              "最新", "這幾天", "這陣子", "這禮拜", "這週", "本週")
@@ -100,6 +111,11 @@ def classify_hazard_intent(text: str) -> HazardIntent:
         if h:
             scopes.append(scope)
             ent_hits.extend(h)
+    colloquial = QUAKE_COLLOQUIAL_RE.search(t)
+    if colloquial:
+        if "earthquake_latest" not in scopes:
+            scopes.insert(0, "earthquake_latest")
+        ent_hits.append(colloquial.group(0))
     uncovered = _hits(t, UNCOVERED_ENTITIES)
 
     if not scopes and not uncovered:
@@ -110,10 +126,11 @@ def classify_hazard_intent(text: str) -> HazardIntent:
     q = LIVE_QUESTION_RE.search(t)
     know_hits = _hits(t, KNOWLEDGE)
     signals = {"entities": tuple(ent_hits), "time": time_hits, "action": action_hits,
-               "question": q.group(0) if q else None, "knowledge": know_hits}
+               "question": q.group(0) if q else None, "knowledge": know_hits,
+               "colloquial": colloquial.group(0) if colloquial else None}
 
     # live 優先：「為什麼**最近**地震這麼多」需要真實資料才答得好
-    if time_hits or action_hits or q:
+    if time_hits or action_hits or q or colloquial:
         state = STATE_LIVE
     elif know_hits:
         state = STATE_KNOWLEDGE
