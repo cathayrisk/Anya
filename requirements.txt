@@ -19,7 +19,13 @@ streamlit>=1.40.0,<1.64
 # 升級前先重驗上述結論。
 langchain-google-genai==4.4.0
 google-genai==2.22.0
-langgraph
+# Claude 版主聊天（pages/0_Anya_Claude.py，2026-10 起和舊 Home.py 並存）。
+# 版本照 tools/claude_spike/README.md 實測過的組合釘死；要升版先重跑 spike（T1 執行緒行為版本相依）。
+# 2026-10-23 已確認這兩個和上面的 langchain-google-genai==4.4.0 可以一起解析。
+# ⚠️ 之後加 deepagents==0.7.30 時，它要求 langchain-google-genai>=4.4.2——屆時要把上面那行
+#    小升到 4.4.2（google-genai 維持 2.22.0 可以解析），升完先對舊 Home.py 做線上冒煙測試。
+langchain-anthropic==1.7.6
+langgraph==1.2.16
 langchain
 langchain-community
 langchain-openai
