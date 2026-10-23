@@ -106,13 +106,37 @@ def parse_stream_item(mode: str, data: Any) -> list[Ev]:
     return []
 
 
+def paragraph_break(prev: str) -> str:
+    """接在 prev 後面、讓下一段另起一段要補的換行（已經有換行就補到兩個為止）。"""
+    if not prev.strip():
+        return ""
+    if prev.endswith("\n\n"):
+        return ""
+    return "\n" if prev.endswith("\n") else "\n\n"
+
+
 def answer_text(msg: AIMessage | None) -> str:
-    """把最終 AIMessage 的文字區塊接起來（server tool、thinking 區塊不算）。"""
+    """把最終 AIMessage 的文字區塊接起來（server tool、thinking 區塊不算）。
+
+    中間夾著工具區塊（例如「我去查一下」→ 搜尋 → 回答）時另起一段；2026-10-23 線上測試發現原本直接相接，
+    搜尋前那句和回答黏成同一行。連續的文字區塊（引用會把一段切成好幾塊）照舊直接接起來。
+    """
     if msg is None:
         return ""
     if isinstance(msg.content, str):
         return msg.content
-    return "".join(b.get("text", "") for b in msg.content if isinstance(b, dict) and b.get("type") == "text")
+    out, gap = "", False
+    for b in msg.content:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "text":
+            if gap:
+                out += paragraph_break(out)
+            out += b.get("text", "")
+            gap = False
+        else:
+            gap = True
+    return out
 
 
 def answer_citations(msg: AIMessage | None) -> list[dict]:

@@ -16,7 +16,7 @@ import streamlit as st
 from utils import evidence as EV
 
 from . import mdfix as M
-from .events import Ev
+from .events import Ev, paragraph_break
 from .monologue import Monologue
 from .timeline import Timeline
 from .usage import TurnUsage
@@ -84,6 +84,7 @@ class TurnView:
         self._pulse_ph = st.empty()   # 看不見；pulse() 用它讓停止要求即時生效
         self.mode = mode
         self.buf = ""
+        self._gap = False   # 剛經過工具（搜尋、讀網頁）：下一段文字要另起一段
         self.node = ""
         self.escalated = False
         self.escalate_reason = ""
@@ -118,7 +119,10 @@ class TurnView:
         k = ev.kind
         if k == "text":
             if ev.node and ev.node != self.node:   # 換了一個節點在說話（例如升級後的 Opus）：重新開始
-                self.node, self.buf = ev.node, ""
+                self.node, self.buf, self._gap = ev.node, "", False
+            if self._gap and ev.text.strip():      # 工具前後的文字另起一段（和 events.answer_text 一致）
+                self.buf += paragraph_break(self.buf)
+                self._gap = False
             if self.first_text_s is None and ev.text.strip():
                 self.first_text_s = round(time.time() - self._t0, 2)
             if self.stage != "writing" and ev.text.strip():
@@ -130,6 +134,7 @@ class TurnView:
         elif k == "thinking":
             self.tl.think(ev.text)
         elif k == "tool_start":
+            self._gap = True
             name = ev.data.get("name")
             if name == "web_search":
                 self.tl.search_start()
@@ -159,7 +164,7 @@ class TurnView:
             self.socratic = bool(ev.data.get("socratic"))
             self.mode = "socratic" if self.socratic else "deep"
             self.tl.escalate(reason=self.escalate_reason, socratic=self.socratic)
-            self.buf = ""
+            self.buf, self._gap = "", False
             self.answer_ph.empty()
             self._show_wait()
             self.stage, self._stage_t = ("socratic" if self.socratic else "escalate"), time.time()
