@@ -482,6 +482,7 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
         ctx["done"] = True
         user_entry.pop("inflight", None)
         _telemetry({"route": route.reason, "error": "research_not_started", "retried": view.retried,
+                    "retry_first": view.retry_first, "second_text": final.strip()[:CFG.RESEARCH_MIN_CHARS],
                     "usage": view.usage.as_rows()})
         return
     footer = doc_footer + M.build_web_sources_footer(view.sources + E.answer_citations(msg))
@@ -497,6 +498,8 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
                 "first_text_s": view.first_text_s, "resumed": bool(turn.get("resumed")), "retried": view.retried,
                 "usd": round(view.usage.usd, 5), "calls": view.usage.as_rows(),
                 "evidence": EV.summarize(view.evidence), "trace": view.trace})
+    if view.retried:   # 沒啟動那次寫了什麼、為什麼停（dev 面板與 telemetry 看得到，畫面上已清掉）
+        dev["retry_first"] = view.retry_first
     hist.append({"role": "assistant", "text": final + footer, "mode": view.mode,
                  "badges": badges, "banner": banner, "dev": dev, **view.saved_status()})
     if doc_footer:   # 引用結構一起存：之後追問時連同引用傳回去（history.to_messages）
