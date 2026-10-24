@@ -47,6 +47,7 @@ ROUTE_WHY = {
 MAX_TITLES = 5
 THINKING = "在想下一步怎麼做"      # 深思中那一步的內容（英文摘要不顯示；step 不能沒內容）
 REFLECT_LINES = 8
+CALC_LINES = 10
 
 # deep agent 的自訂工具 → 時間軸的哪一類步驟（group, 圖示, 動作）
 CLIENT_TOOLS = {
@@ -61,6 +62,7 @@ CLIENT_TOOLS = {
     "edit_file": ("notes", "🗒️", "改筆記"),
     "write_todos": ("todo", "📝", "列待辦"),
     "think": ("reflect", "🧠", "寫下反思"),
+    "calculate": ("calc", "🧮", "精確計算"),
     "create_widget": ("widget", "🧩", "做互動元件"),
     "save_lesson": ("lesson", "🧠", "記下教訓"),
     "get_natal_chart": ("astro", "🔮", "排本命盤"),
@@ -95,6 +97,11 @@ def _unshimmer(label: str) -> str:
 def _verb(label: str) -> str:
     """「🔎 :shimmer[上網搜尋…]」→「上網搜尋」"""
     return _unshimmer(label).split(" ", 1)[-1].rstrip("…")
+
+
+def _expr_view(expr: str) -> str:
+    """算式放進 markdown caption：* 會被當成斜體，換成 × 與 ^。"""
+    return expr.replace("**", "^").replace("*", "×")
 
 
 def _reflection_lines(text) -> list[str]:
@@ -270,7 +277,7 @@ class Timeline:
     def tool_result(self, name: str, status: str = "success", text: str = "") -> None:
         group = CLIENT_TOOLS.get(name, ("tool",))[0]
         cur = self.current
-        if cur.kind != group or group == "reflect":   # think 由 reflect 事件收尾
+        if cur.kind != group or group in ("reflect", "calc"):   # think 由 reflect 事件、calculate 由 calc 事件收尾
             return
         failed = status == "error" or '"ok": false' in (text or "")[:200]
         if group == "cwa":
@@ -325,6 +332,21 @@ class Timeline:
         if self.current.kind == "widget":
             self.current.detail = [_plain(title, 60)]
             self._bump()
+
+    def calc(self, results: list[dict]) -> None:
+        """calculate 算完（工具裡送的 calc 事件）：時間軸列出算式與結果，讓人看得到數字從哪來。連續算幾次併成一步。"""
+        if self.current.kind != "calc":
+            self.tool_call("calculate")
+        cur = self.current
+        if cur.detail == ["精確計算"]:
+            cur.detail = []
+        for r in results or []:
+            expr = _plain(_expr_view(r.get("expr") or ""), 60)
+            cur.detail.append(f"- {expr} ＝ {r['text']}" if "text" in r else f"- {expr}：{_plain(r.get('error'), 40)}")
+            cur.hits += "text" in r
+        cur.detail = cur.detail[-CALC_LINES:]
+        cur.label = f"🧮 精確計算・算了 {cur.hits} 筆"
+        self._complete(cur)
 
     def reflect(self, data: dict) -> None:
         if self.current.kind != "reflect" or self.current.state != "running":

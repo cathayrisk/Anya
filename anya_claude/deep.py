@@ -30,7 +30,7 @@ from .deep_mw import (PauseTurnMiddleware, PrevRequestBreakpointMiddleware, Rubr
                       UsageEventsMiddleware, grader_view, make_deliverable_rubric, rubric_event)
 
 RUBRIC_MAX_ITERATIONS = 2   # 評兩次＝最多補寫一次（第二次還不過就照現況交出去，時間軸會標出來）
-from .tools import CWA_TOOLS, create_widget, think
+from .tools import CWA_TOOLS, calculate, create_widget, think
 
 ROOT = Path(__file__).resolve().parents[1]
 _SKILL_SUFFIXES = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".bas", ".csv"}
@@ -116,7 +116,7 @@ def build_deep_agent(*, socratic: bool = False):
         middleware += [_rubric_middleware(), RubricStartMiddleware()]
     return create_deep_agent(
         model=model,
-        tools=[*CWA_TOOLS, think, create_widget, *extra, *CFG.DEEP_SERVER_TOOLS],
+        tools=[*CWA_TOOLS, think, calculate, create_widget, *extra, *CFG.DEEP_SERVER_TOOLS],
         system_prompt=P.deep_system(socratic=socratic),
         skills=["/skills/"],
         middleware=middleware,

@@ -181,6 +181,8 @@ class TurnView:
         elif k == "tool_result":
             self.tl.tool_result(ev.data.get("name") or "", ev.data.get("status") or "success",
                                 ev.data.get("text") or "")
+        elif k == "calc":
+            self.tl.calc(ev.data.get("results") or [])
         elif k == "reflect":
             self.tl.reflect(ev.data)
             if self.tl.current.kind == "write":     # 反思說直接作答：先換成寫字的台詞（帶引用的回答寫完才整段送來）

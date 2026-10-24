@@ -22,6 +22,8 @@ from langgraph.config import get_stream_writer
 
 from utils import evidence as EV
 
+from . import calc as CALC
+
 
 def _emit(payload: dict) -> None:
     try:
@@ -32,6 +34,26 @@ def _emit(payload: dict) -> None:
 
 def _evidence(tool_name: str, scope: str, status: str, detail: Any = None) -> None:
     _emit({"type": "evidence", "tool": tool_name, "scope": scope, "status": status, "detail": detail})
+
+
+# ───────── calculate（精確計算）─────────
+def run_calculate(expressions: list[str]) -> str:
+    """算式交給 calc（安全、Excel 慣例），結果送 calc 事件給時間軸，回傳給模型的 JSON。Haiku 節點也直接呼叫這個。"""
+    results = CALC.evaluate(expressions)
+    _emit({"type": "calc", "results": [{k: r[k] for k in ("expr", "text", "error") if k in r} for r in results]})
+    return json.dumps([{k: r[k] for k in ("expr", "name", "value", "text", "error") if k in r} for r in results],
+                      ensure_ascii=False, default=str)
+
+
+@tool
+def calculate(expressions: list[str]) -> str:
+    """精確計算數字，不要心算。利息、報酬、試算、月付、百分比、加總、換算都用這個工具算，回答裡的數字照結果寫。
+    expressions：一行一個算式，可以先定義變數再用，例如 ["r = 0.05/12", "n = 20*12", "fv(r, n, -10000)"]。
+    支援 + - * / // % **、括號、round/abs/min/max/sum/sqrt/exp/log/log10/ceil/floor，以及和 Excel 相同的財務函式：
+    fv(rate, nper, pmt, pv=0, when=0)、pv(rate, nper, pmt, fv=0, when=0)、pmt(rate, nper, pv, fv=0, when=0)、
+    nper(rate, pmt, pv, fv=0, when=0)、npv(rate, [CF0, CF1, …])（CF0 在第 0 期不折現）、irr([CF0, CF1, …])。
+    付出為負、收到為正；when=1 表示期初。百分比用小數（5% 寫 0.05），數字不要加千分位逗號。"""
+    return run_calculate(expressions)
 
 
 # ───────── 氣象署 ─────────

@@ -17,7 +17,7 @@ import threading
 from typing import Annotated, Any
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
@@ -27,6 +27,7 @@ from typing_extensions import NotRequired, TypedDict
 from . import config as CFG
 from . import prompts as P
 from .deep_mw import final_answer, web_search_count
+from .tools import calculate, run_calculate
 
 CACHE = {"type": "ephemeral", "ttl": "1h"}   # 同事常隔超過 5 分鐘才問下一題，5m 快取會一直失效
 
@@ -59,8 +60,8 @@ def _models() -> dict[str, Any]:
     haiku = ChatAnthropic(model=CFG.HAIKU, max_tokens=CFG.HAIKU_MAX_TOKENS, effort=CFG.HAIKU_EFFORT,
                           thinking=CFG.HAIKU_THINKING)
     return {
-        "haiku": haiku.bind_tools([escalate_to_deep, *CFG.HAIKU_SERVER_TOOLS]),
-        "haiku_solo": haiku.bind_tools(list(CFG.HAIKU_SERVER_TOOLS)),
+        "haiku": haiku.bind_tools([escalate_to_deep, calculate, *CFG.HAIKU_SERVER_TOOLS]),
+        "haiku_solo": haiku.bind_tools([calculate, *CFG.HAIKU_SERVER_TOOLS]),
     }
 
 
@@ -119,14 +120,21 @@ def _invoke(model, msgs: list[BaseMessage], *, label: str, model_id: str) -> tup
         if (resp.response_metadata or {}).get("stop_reason") != "pause_turn":
             break
         convo = convo + [resp]
-    if len(parts) == 1:
-        return parts[0], calls
+    return _merge(parts), calls
+
+
+def _merge(parts: list[AIMessage], *, tool_calls=None) -> AIMessage:
+    """幾段回應接成一則（pause_turn 續跑、Haiku 呼叫 calculate 前後）。tool_calls 預設沿用最後一段。"""
+    if len(parts) == 1 and tool_calls is None:
+        return parts[0]
     content: list = []
     for p in parts:
         content += p.content if isinstance(p.content, list) else [{"type": "text", "text": str(p.content)}]
-    merged = AIMessage(content=content, tool_calls=parts[-1].tool_calls,
-                       response_metadata=parts[-1].response_metadata)
-    return merged, calls
+    return AIMessage(content=content, tool_calls=parts[-1].tool_calls if tool_calls is None else tool_calls,
+                     response_metadata=parts[-1].response_metadata)
+
+
+CALC_ROUNDS = 3   # Haiku 一回合最多呼叫幾次 calculate（每次多一輪模型呼叫，約 +1 秒、不到 $0.001）
 
 
 def build_graph(*, deep_agents: dict[str, Any] | None = None, deep_files=None):
@@ -136,18 +144,32 @@ def build_graph(*, deep_agents: dict[str, Any] | None = None, deep_files=None):
     files_for = deep_files or _deep_files
 
     def haiku_node(state: TurnState):
+        """Haiku 回答；要算數字時呼叫 calculate（在這裡執行、把結果接回去再問一次），要升級就交給 opus。"""
         solo = state.get("allow_escalate") is False
-        resp, calls = _invoke(models["haiku_solo" if solo else "haiku"],
-                              compose(P.haiku_system(), state, note=NO_ESCALATE_NOTE if solo else ""),
-                              label="Haiku 一般", model_id=CFG.HAIKU)
-        esc = [tc for tc in (resp.tool_calls or []) if tc.get("name") == "escalate_to_deep"]
-        if esc:
-            args = esc[0].get("args") or {}
-            socratic = bool(state.get("socratic")) or bool(args.get("socratic"))
-            reason = str(args.get("reason") or "").strip()[:200]
-            get_stream_writer()({"type": "escalate", "reason": reason, "socratic": socratic})
-            return Command(goto="opus", update={"escalate_reason": reason, "socratic": socratic, "calls": calls})
-        return Command(goto=END, update={"answer": resp, "model_used": CFG.HAIKU, "calls": calls})
+        model = models["haiku_solo" if solo else "haiku"]
+        convo = compose(P.haiku_system(), state, note=NO_ESCALATE_NOTE if solo else "")
+        parts: list[AIMessage] = []
+        calls: list[dict] = []
+        for i in range(CALC_ROUNDS + 1):
+            resp, more = _invoke(model, convo, label="Haiku 一般" if i == 0 else f"Haiku 計算後{i}",
+                                 model_id=CFG.HAIKU)
+            parts.append(resp)
+            calls += more
+            esc = [tc for tc in (resp.tool_calls or []) if tc.get("name") == "escalate_to_deep"]
+            if esc:
+                args = esc[0].get("args") or {}
+                socratic = bool(state.get("socratic")) or bool(args.get("socratic"))
+                reason = str(args.get("reason") or "").strip()[:200]
+                get_stream_writer()({"type": "escalate", "reason": reason, "socratic": socratic})
+                return Command(goto="opus", update={"escalate_reason": reason, "socratic": socratic, "calls": calls})
+            todo = [tc for tc in (resp.tool_calls or []) if tc.get("name") == "calculate"]
+            if not todo or i == CALC_ROUNDS:
+                break
+            convo = convo + [resp] + [
+                ToolMessage(content=run_calculate((tc.get("args") or {}).get("expressions") or []),
+                            tool_call_id=tc.get("id") or "", name="calculate") for tc in todo]
+        return Command(goto=END, update={"answer": _merge(parts, tool_calls=[]), "model_used": CFG.HAIKU,
+                                         "calls": calls})
 
     def opus_node(state: TurnState):
         # deep agent 是子圖：它的逐字、工具、用量事件（UsageEventsMiddleware）都從子圖串出去
