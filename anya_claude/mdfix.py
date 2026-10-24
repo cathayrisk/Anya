@@ -308,6 +308,16 @@ def _url_key(url: str) -> str:
     return u.rstrip("/.,;")
 
 
+_SOURCE_LINE_RE = re.compile(r"^(\s*)(\[\d+\]\s)", re.M)
+
+
+def finish_research_report(text: str, seen: set[str]) -> tuple[str, int]:
+    """研究報告收尾：來源行改成清單、核對網址。回傳 (文字, 對不上的網址行數)。
+    2026-10-24 線上：模型照指示每行寫一筆「[n] 標題：網址」，但 Markdown 的單一換行不斷行，
+    整份來源清單畫成一個 3,800 字的段落（deepagents 範例也特別提醒要一行一筆）。改成清單項目。"""
+    return flag_unseen_urls(_SOURCE_LINE_RE.sub(r"\1- \2", text or ""), seen)
+
+
 def flag_unseen_urls(text: str, seen: set[str]) -> tuple[str, int]:
     """報告裡不在 seen 的網址，在那一行最後加註。回傳 (加註後的文字, 加註了幾行)。"""
     keys = {_url_key(u) for u in seen}
