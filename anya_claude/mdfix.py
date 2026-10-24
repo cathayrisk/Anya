@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from utils.honesty import finalize_response
+from utils.honesty import _FALSE_VERIFY_RE as _CLAIM_SENTENCE_RE
 from utils.mathtext import latex_to_plain
 
 CODE_FENCE_WHOLE_BLOCK_RE = re.compile(
@@ -226,11 +226,57 @@ def strip_leaked_plan(text: str, *, final: bool = True) -> str:
     return rest if not final else t      # 串流中後面還不夠判斷：先藏第一段；定稿仍不像中文回答就還原
 
 
-def display_text(buf: str, *, final: bool) -> str:
-    """串流中／定稿時要顯示的文字（尚未做 markdown 修復，交給 render_ready）。"""
+# ── 自稱查證的措辭 ──
+# 句子的偵測沿用舊版 utils/honesty.py（形狀是線上一個個補出來的），刪法這裡自己決定；舊版 Home 照舊用
+# finalize_response，不受影響。2026-10-24 線上：天氣題「限制」標題底下空白——舊刪法把含「查到」的句子整句
+# 刪到句號，「安妮亞查到的資料有點亂，…所以先講結論：明天很可能會下雨」連結論一起不見（本機同題 6 次：1 次
+# 結論整段消失、1 次「這是今天查到的預報，明天可能會變」被刪）。改成：
+# - 這回合真的查到資料（looked_up）：「查到」「查了」是實話，不刪；只刪「查證過」「核實過」這類過頭的說法。
+# - 沒查：照樣刪，但只刪宣稱所在的那一小段（到逗號、冒號為止），同一句後面的內容留著。
+# - 問句（「要不要我幫你查？」）、否定（「沒辦法幫你查」）是誠實話，不刪。
+_CLAIM_VERB_RE = re.compile(r"查證過|確認過|核實過|查好|查過|查到|查了一下|查了|查查|盯了一下|盯了"
+                            r"|(?:幫你|為你|替你)查")
+_OVERCLAIM_RE = re.compile(r"查證過|確認過|核實過")
+_CLAIM_LABEL_RE = re.compile(r"^[^\w\n]*(查詢結果|查證結果|查證資訊|查證完成|查詢完成|經查)")
+_TRUE_LABELS = ("查詢結果", "查詢完成")      # 真的查過時，這兩個小標是實話
+_ASK_RE = re.compile(r"[？?]|嗎|要不要|需不需要|想要我|需要我")
+_NEG_RE = re.compile(r"沒|未|無法|不能|不會|不曾")
+_CLAUSE_MARKS = "，,：:；;"
+_SENTENCE_MARKS = "。！？!?"
+
+
+def _fix_claim(m: re.Match, looked_up: bool) -> str:
+    s = m.group(0)
+    label = _CLAIM_LABEL_RE.match(s)
+    if label:                                   # 小標「查證結果：」：只拿掉標籤，內容在後面、不受影響
+        return s if looked_up and label.group(1) in _TRUE_LABELS else ""
+    v = (_OVERCLAIM_RE if looked_up else _CLAIM_VERB_RE).search(s)
+    if v is None or _ASK_RE.search(s) or _NEG_RE.search(s[:v.start()]):
+        return s
+    # 宣稱所在的那一小段：從前一個逗號／冒號之後（「結論：」這種開頭留著），到後面第一個標點為止
+    start = max(s.rfind(c, 0, v.start()) for c in _CLAUSE_MARKS) + 1
+    ends = [i for i in (s.find(c, v.end()) for c in _CLAUSE_MARKS + _SENTENCE_MARKS) if i >= 0]
+    end = min(ends) + 1 if ends else len(s)
+    rest = s[end:].lstrip()
+    if not re.search(r"\w", rest):              # 這一句只有宣稱：整句拿掉（和舊版一樣，連句尾的 emoji、換行）
+        return ""
+    return s[:start] + rest
+
+
+def strip_claims(text: str, *, looked_up: bool) -> str:
+    """拿掉模型自稱查證的措辭（Claude 頁面用；規則見上）。"""
+    if not text:
+        return ""
+    out = _CLAIM_SENTENCE_RE.sub(lambda m: _fix_claim(m, looked_up), text)
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
+def display_text(buf: str, *, final: bool, looked_up: bool = False) -> str:
+    """串流中／定稿時要顯示的文字（尚未做 markdown 修復，交給 render_ready）。
+    looked_up：這回合真的查到資料（搜尋、讀網頁、氣象署、占星工具），回答說「查到」是實話。"""
     # U+FFFD（無法顯示的字元）：2026-10-23 實測 Opus 在正式回答前送出只有這個字的文字區塊，畫面上變成一個「�」
     t = (buf or "").replace("�", "")
-    t = strip_leaked_plan(finalize_response(t, mode="claude"), final=final)
+    t = strip_leaked_plan(strip_claims(t, looked_up=looked_up), final=final)
     if not final and t:
         if t.count("```") % 2 == 1:
             # 畫到一半的 Mermaid 會變成紅色錯誤框（每次重畫都閃一次），整塊先藏起來，畫完才出現

@@ -87,6 +87,7 @@ def _plain(s: str, limit: int) -> str:
 
 
 def _secs(s: float) -> str:
+    s = max(s, 0.0)   # 事件時間（背景執行緒記的）和畫面當下的時間混用時，差一點點也不該出現負秒數
     return f"{s:.0f} 秒" if s >= 10 else f"{s:.1f} 秒"
 
 

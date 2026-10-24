@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -42,6 +43,9 @@ THINK_REDRAW = 0.15
 _TOOL_STAGE = {"web_search": "searching", "web_fetch": "fetching"}
 _CLIENT_STAGE = {"get_weather": "cwa", "get_earthquake_info": "cwa", "get_typhoon_info": "cwa",
                  "read_file": "skill", "think": "reflect"}
+# 拿到資料就算「查到」的自訂工具（回答裡說「查到」是實話，見 mdfix.strip_claims）。
+# 氣象署工具不列：它們有 evidence 事件，成功與否看那邊
+_LOOKUP_TOOLS = {"get_natal_chart", "get_astro_forecast", "get_synastry", "get_astro_reference"}
 # 狀態列台詞多久換一句（秒）。背景執行緒不能動 st.*，所以是主執行緒「有事件進來、或每 0.5 秒
 # 的 pulse()」時順便檢查。
 ROTATE_WAIT = 4.0
@@ -81,9 +85,11 @@ class TurnView:
     """一個回合的助理訊息區塊。用法：建立 → 逐一 on(ev) → finish(...)。"""
 
     def __init__(self, *, mode: str, user_text: str = "", serious: bool = False,
-                 route_reason: str = "default_fast"):
+                 route_reason: str = "default_fast", started_at: float | None = None):
+        """started_at：斷線接續時，原本那一輪開始的時間（「收到問題」和秒數從那時算）。"""
+        self._at = started_at              # 正在處理的事件是什麼時候發生的；None＝現在（見 _now）
         self.mono = Monologue(user_text, serious=serious)
-        self.tl = Timeline(route_reason=route_reason, mode=mode)
+        self.tl = Timeline(route_reason=route_reason, mode=mode, clock=self._now)
         self.header = self.mono.opening()
         # compact：收合時只有一行心裡話；一般模式先收著（通常一兩秒就答完），深思模式一開始就展開時間軸
         self._expanded = mode != "fast"
@@ -116,21 +122,37 @@ class TurnView:
         self.header_state = "running"
         self.trace: list[tuple] = []
         self._last_draw = 0.0
-        self._t0 = time.time()
+        self._t0 = self._now()
+        self._at = None
         self.first_text_s: float | None = None   # 首字時間（進 dev 與 telemetry；驗收看這個）
         self._await_text = False                 # 已先亮出「撰寫回答」、第一個字還沒到
+        self.looked_up = False                   # 這回合真的查到資料（搜尋、讀網頁、氣象署、占星工具）
         self._show_wait()
+
+    def _now(self) -> float:
+        return time.time() if self._at is None else self._at
+
+    @contextmanager
+    def _clock_at(self, at: float | None):
+        """這段期間時間軸用事件發生的時間算秒數，不用現在（斷線接續時重播的事件才不會全擠在同一刻）。"""
+        self._at = at
+        try:
+            yield
+        finally:
+            self._at = None
 
     # ── 等待中 ──
     def _show_wait(self):
         self.think_ph.markdown(_WAIT_CSS + _BARS, unsafe_allow_html=True)
 
     # ── 事件 ──
-    def on(self, ev: Ev) -> None:
-        if ev.kind not in ("text", "thinking") or not self.trace or self.trace[-1][1] != ev.kind:
-            # 事件順序（dev 面板看得到）：連續的 text／thinking 只記第一筆
-            self.trace.append((round(time.time() - self._t0, 1), ev.kind, ev.data.get("name") or ev.node))
-        self._on(ev)
+    def on(self, ev: Ev, at: float | None = None) -> None:
+        """at：事件在背景執行緒產生的時間（graph.stream_in_thread 記的）；沒給就當作現在。"""
+        with self._clock_at(at):
+            if ev.kind not in ("text", "thinking") or not self.trace or self.trace[-1][1] != ev.kind:
+                # 事件順序（dev 面板看得到）：連續的 text／thinking 只記第一筆
+                self.trace.append((round(self._now() - self._t0, 1), ev.kind, ev.data.get("name") or ev.node))
+            self._on(ev)
         if ev.kind not in ("usage", "answer"):   # 這兩個在回合尾端，接著就是 finish，不必再換台詞
             self._rotate()   # 放在事件之後：剛因事件換階段的不會馬上又被輪替（第一個字到時會閃一下）
         self._sync_steps(throttle=ev.kind == "thinking")
@@ -144,7 +166,7 @@ class TurnView:
                 self.buf += paragraph_break(self.buf)
                 self._gap = False
             if self.first_text_s is None and ev.text.strip():
-                self.first_text_s = round(time.time() - self._t0, 2)
+                self.first_text_s = round(self._now() - self._t0, 2)
             if (self.stage != "writing" or self._await_text) and ev.text.strip():
                 if self.stage != "writing":
                     self.set_stage("writing")
@@ -179,8 +201,10 @@ class TurnView:
         elif k == "tool_args":
             self.tl.tool_args(ev.data.get("calls") or [])
         elif k == "tool_result":
-            self.tl.tool_result(ev.data.get("name") or "", ev.data.get("status") or "success",
-                                ev.data.get("text") or "")
+            name, status, text = ev.data.get("name") or "", ev.data.get("status") or "success", ev.data.get("text") or ""
+            self.tl.tool_result(name, status, text)
+            if name in _LOOKUP_TOOLS and status != "error" and '"ok": false' not in text[:200]:
+                self.looked_up = True
         elif k == "calc":
             self.tl.calc(ev.data.get("results") or [])
         elif k == "reflect":
@@ -248,21 +272,25 @@ class TurnView:
         except Exception:
             pass
 
-    # 頁面在模型之前先查氣象署時用
-    def cwa_start(self) -> None:
-        self.tl.cwa_start()
+    # 頁面在模型之前先查氣象署時用（at：斷線接續重畫時，原本查的時間）
+    def cwa_start(self, at: float | None = None) -> None:
+        with self._clock_at(at):
+            self.tl.cwa_start()
         self.set_stage("cwa")
         self._expand(True)
         self._sync_steps()
 
-    def cwa_done(self, results: list[dict]) -> None:
-        self.tl.cwa_done(results)
+    def cwa_done(self, results: list[dict], at: float | None = None) -> None:
+        with self._clock_at(at):
+            self.tl.cwa_done(results)
         self._sync_steps()
 
     def add_evidence(self, events: list[dict]) -> None:
         self.evidence += list(events or [])
+        self.looked_up |= any(e.get("status") == EV.STATUS_OK for e in events or [])
 
     def _evidence(self, tool: str, scope: str, status: str, detail) -> None:
+        self.looked_up |= status == EV.STATUS_OK
         try:
             self.evidence.append(EV.make_event(tool=tool, scope=scope, status=status, detail=detail))
         except Exception:
@@ -338,7 +366,7 @@ class TurnView:
         if not force and now - self._last_draw < MIN_REDRAW:
             return
         self._last_draw = now
-        shown = M.display_text(self.buf, final=False)
+        shown = M.display_text(self.buf, final=False, looked_up=self.looked_up)
         if shown.strip():
             self.think_ph.empty()
             self.answer_ph.markdown(M.render_ready(shown), unsafe_allow_html=True)
@@ -390,7 +418,7 @@ class TurnView:
             self.tl.fail()
         out = {"status": "⏹️ 已停止" if stopped else "⚠️ 這次沒有完成",
                "status_state": "complete" if stopped else "error", "steps": self.tl.records(),
-               "text": M.display_text(self.buf, final=True), "mode": self.mode}
+               "text": M.display_text(self.buf, final=True, looked_up=self.looked_up), "mode": self.mode}
         if self.widget:
             out["widget"] = self.widget
         return out

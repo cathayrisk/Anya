@@ -14,6 +14,7 @@ from __future__ import annotations
 import operator
 import queue
 import threading
+import time
 from typing import Annotated, Any
 
 from langchain_anthropic import ChatAnthropic
@@ -201,12 +202,15 @@ STREAM_MODES = ["messages", "custom", "updates"]
 
 
 def stream_in_thread(graph, state: TurnState) -> tuple[queue.Queue, threading.Event]:
-    """在背景執行緒跑 graph.stream，項目丟進 queue：("item", (namespace, mode, data)) / ("error", exc) / ("end", None)。
+    """在背景執行緒跑 graph.stream，項目丟進 queue：("item", (產生時間, (namespace, mode, data))) /
+    ("error", exc) / ("end", None)。
 
     為什麼：Streamlit 只在 st.* 呼叫時檢查「停止」。直接在主執行緒 for 迴圈等 graph.stream，Opus
     默默跑程式、搜尋時沒有事件，主執行緒卡在等下一筆，按停止要等下一個事件才生效（實測晚了 70 秒，
     這段時間輸入框一直鎖著）。改成主執行緒用 queue.get(timeout) 等，空檔時自己碰一下畫面。
     halt.set() 之後，背景執行緒在下一筆項目時停止讀取（已送出的 API 呼叫會自己跑完）。
+    產生時間：時間軸的秒數照它算。斷線接續時，已收到的事件一口氣重播、斷線期間堆著的事件一口氣讀出來，
+    用讀到的時間算會全擠在同一刻（2026-10-24 線上：占星題接續後出現「想了 0.0 秒」）。
     """
     q: queue.Queue = queue.Queue()
     halt = threading.Event()
@@ -217,7 +221,7 @@ def stream_in_thread(graph, state: TurnState) -> tuple[queue.Queue, threading.Ev
             for item in graph.stream(state, stream_mode=STREAM_MODES, subgraphs=True):
                 if halt.is_set():
                     break
-                q.put(("item", item))
+                q.put(("item", (time.time(), item)))
         except BaseException as e:   # noqa: BLE001 — 交給主執行緒原樣處理
             q.put(("error", e))
         finally:
