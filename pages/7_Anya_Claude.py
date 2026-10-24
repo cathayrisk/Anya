@@ -170,27 +170,42 @@ def _telemetry(rec: dict) -> None:
 # 題目最常碰到。圖本來就在背景執行緒跑，所以連線斷掉時讓它繼續跑，重連後接著畫：
 # - 模型已經開始：已收到的事件重播一次，再接著讀還沒讀的（resume）
 # - 模型還沒開始就斷了：重連後整題重跑（restart，最多 MAX_RESTARTS 次）
-# 使用者自己按停止時連線沒換，照舊停下來。
+# 只有使用者自己按停止才真的停。2026-10-24 線上又抓到一次沒斷線也被停（流年題第 47 秒，連線沒換）：
+# fastReruns 下任何重跑要求（同一條連線送來的、或伺服器自己發的）都會停掉正在跑的題目，觸發點查不到。
+# 所以改成反過來判斷：在 Streamlit 處理「停止」按鈕的地方做記號，沒有記號的停止一律接著答。
 MAX_RESTARTS = 2
 
 
-def _client_now():
-    """這個工作階段目前的連線物件（斷線時是 None，重連後是新的物件）。拿不到就 None。"""
+@st.cache_resource(show_spinner=False)
+def _user_stops() -> dict:
+    """{session_id: 按停止的時間}。包一次 AppSession._handle_stop_script_request（使用者按停止鈕＝stop_script
+    指令走這裡；斷線、重跑要求不走這裡）。私有函式，streamlit 釘在 <1.64，tests 盯著它還在。"""
+    from streamlit.runtime.app_session import AppSession
+    stops: dict = {}
+    original = AppSession._handle_stop_script_request
+
+    def marked(self):
+        stops[self.id] = time.time()
+        return original(self)
+
+    AppSession._handle_stop_script_request = marked
+    return stops
+
+
+def _session_id() -> str:
     try:
-        from streamlit.runtime import get_instance
         from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_instance().get_client(get_script_run_ctx().session_id)
+        return get_script_run_ctx().session_id
     except Exception:
-        return None
+        return ""
 
 
-def _stopped_by_disconnect(client0) -> bool:
-    """這次的 StopException 是連線斷掉造成的（不是使用者按停止）？回合開始時記下的連線和現在不同就是斷過線。
-    Streamlit 先要求停止、才把連線拿掉（同一個呼叫），稍等一下再看。"""
-    if client0 is None:
-        return False
-    time.sleep(0.2)
-    return _client_now() is not client0
+def _stopped_by_user(ctx: dict) -> bool:
+    """這次的停止是使用者按了停止鈕（回合開始後才按的）？記號拿不到時當作是，照舊停下來。"""
+    stops, sid = ctx.get("user_stops"), ctx.get("sid")
+    if stops is None or not sid:
+        return True
+    return stops.get(sid, 0) >= ctx["t0_local"]
 
 
 def run_turn(user_entry: dict, text: str, images: list[dict], route: R.Route, hist: list[dict], *,
@@ -199,8 +214,8 @@ def run_turn(user_entry: dict, text: str, images: list[dict], route: R.Route, hi
     StopException（BaseException，1.63 實測 finally 會執行）：這時畫面已經不能動，只把收到的部分存進
     歷史、標成已停止。連線斷掉造成的停止則交給下一次重畫接著做（見上面）。"""
     user_entry["pending"] = True   # 答完才拿掉；中途失敗或按停止，這則提問就不帶進之後的對話
-    ctx = {"view": None, "done": False, "t0": (resume or {}).get("t0") or time.time(), "client": _client_now(),
-           "box": st.session_state["ac_box"],
+    ctx = {"view": None, "done": False, "t0": (resume or {}).get("t0") or time.time(), "t0_local": time.time(),
+           "user_stops": _user_stops(), "sid": _session_id(), "box": st.session_state["ac_box"],
            "turn": {"user_entry": user_entry, "text": text, "images": images, "route": route,
                     "allow_escalate": allow_escalate, "restarts": (resume or {}).get("restarts", 0)}}
     ctx["box"]["active"] = True   # 回合進行中（含停止後的收尾）；見頁面開頭的等待
@@ -225,14 +240,14 @@ def _on_turn_stopped(ctx: dict, e: BaseException, user_entry: dict, route: R.Rou
         return
     view = ctx["view"]
     stopped = type(e).__name__ == "StopException"
-    if stopped and _stopped_by_disconnect(ctx["client"]):
+    if stopped and not _stopped_by_user(ctx):
         turn = ctx["turn"]
         if turn.get("q") is not None or turn["restarts"] < MAX_RESTARTS:
             if turn.get("q") is None:
                 turn["restarts"] += 1
             ctx["box"]["turn"] = turn
             user_entry["inflight"] = True
-            _telemetry({"route": route.reason, "disconnected": True, "resume": turn.get("q") is not None,
+            _telemetry({"route": route.reason, "interrupted": True, "resume": turn.get("q") is not None,
                         "secs": round(time.time() - ctx["t0"], 2)})
             return
     if view is not None:
@@ -380,8 +395,8 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
             st.code(traceback.format_exc()[-3000:])
         return
     except BaseException:
-        # 按了停止：背景執行緒不再往下讀。連線斷掉造成的停止不在這裡停——run_turn 判斷後交給重連接續
-        if not _stopped_by_disconnect(ctx["client"]):
+        # 按了停止：背景執行緒不再往下讀。其他原因的停止不在這裡停——run_turn 寄放起來交給下一輪接續
+        if _stopped_by_user(ctx):
             halt.set()
         raise
 
