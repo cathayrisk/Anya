@@ -99,9 +99,12 @@ def _verb(label: str) -> str:
     return _unshimmer(label).split(" ", 1)[-1].rstrip("…")
 
 
-def _expr_view(expr: str) -> str:
-    """算式放進 markdown caption：* 會被當成斜體，換成 × 與 ^。"""
-    return expr.replace("**", "^").replace("*", "×")
+def _expr_view(expr: str, limit: int = 60) -> str:
+    """算式放進 markdown caption：* 會被當成斜體，換成 × 與 ^；方括號跳脫就好——_plain 換成全形括號，
+    清單會變成「irr(（-100, 25）)」看不出是清單（2026-10-24 線上）。"""
+    s = re.sub(r"\s+", " ", expr or "").strip()
+    s = s[:limit] + ("…" if len(s) > limit else "")
+    return s.replace("**", "^").replace("*", "×").replace("[", "\\[").replace("]", "\\]")
 
 
 def _reflection_lines(text) -> list[str]:
@@ -341,7 +344,7 @@ class Timeline:
         if cur.detail == ["精確計算"]:
             cur.detail = []
         for r in results or []:
-            expr = _plain(_expr_view(r.get("expr") or ""), 60)
+            expr = _expr_view(r.get("expr") or "")
             cur.detail.append(f"- {expr} ＝ {r['text']}" if "text" in r else f"- {expr}：{_plain(r.get('error'), 40)}")
             cur.hits += "text" in r
         cur.detail = cur.detail[-CALC_LINES:]
