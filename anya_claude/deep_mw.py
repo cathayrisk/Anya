@@ -271,21 +271,17 @@ def _server_tool_digest(msg: AIMessage) -> str:
 
 
 PRIOR_QUESTION_CHARS = 200
-PRIOR_ANSWER_CHARS = 400
 
 
 def _prior_note(prior: list) -> str:
-    """前一題縮成一小段：只讓 grader 看得懂「上面那份改短」這類接續的提問。"""
+    """前一題縮成一句：只讓 grader 看得懂「上面那份改短」這類接續的提問。
+    只放提問、不放回答：2026-10-24 線上驗收，前一題回答開頭寫著「依據 Microsoft Learn…安妮亞讀過原文」，
+    標明了不評分，grader 照樣評它「找不到查詢動作」，下一題（VBA 效能）因此補寫一輪，多花 $0.4、50 秒。"""
     q = next((m for m in reversed(prior) if isinstance(m, HumanMessage)), None)
-    a = next((m for m in reversed(prior) if isinstance(m, AIMessage) and m.text.strip()), None)
-    if q is None and a is None:
+    if q is None:
         return ""
-    lines = ["（先前的對話，只供理解這次的提問，不在評分範圍；前面查過的紀錄不會出現在下面的對話裡）"]
-    if q is not None:
-        lines.append(f"上一題：{q.text.strip()[:PRIOR_QUESTION_CHARS]}")
-    if a is not None:
-        lines.append(f"上一題的回答開頭：{a.text.strip()[:PRIOR_ANSWER_CHARS]}…")
-    return "\n".join(lines)
+    return ("（先前的對話，只供理解這次的提問，不在評分範圍）\n"
+            f"上一題：{q.text.strip()[:PRIOR_QUESTION_CHARS]}")
 
 
 def grader_view(messages: list) -> list:

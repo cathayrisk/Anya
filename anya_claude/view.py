@@ -173,6 +173,8 @@ class TurnView:
                 self._await_text = False
                 self.tl.write()
                 self._expand(False)            # 開始寫字就把時間軸收起來，不擋回答
+            if ev.text.strip():
+                self.tl.wrote()
             self.buf += ev.text
             self._draw()
         elif k == "thinking":

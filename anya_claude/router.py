@@ -15,6 +15,13 @@ try:
     from widget_templates import WIDGET_HINT_RE
 except Exception:  # 缺檔時降級：不因互動元件關鍵詞升級
     WIDGET_HINT_RE = None
+# 舊版關鍵詞沒有台灣常用的「閃卡」「字卡」：2026-10-24 線上驗收「做 5 張互動閃卡」留在 Haiku，
+# 它還回「互動在 Streamlit 裡不能翻面」。舊版 Home 共用 widget_templates.py，這裡另外補，不動它。
+WIDGET_EXTRA_RE = re.compile(r"閃卡|字卡|互動.{0,6}(?:測驗|練習|卡片)")
+
+
+def _wants_widget(t: str) -> bool:
+    return bool(WIDGET_EXTRA_RE.search(t) or (WIDGET_HINT_RE is not None and WIDGET_HINT_RE.search(t)))
 try:   # 口語地震說法（有在搖、地牛翻身…）：和災防分類器共用同一條
     from utils.hazard_intent import QUAKE_COLLOQUIAL_RE
 except Exception:
@@ -139,7 +146,7 @@ def next_socratic_state(text: str, current: str) -> str:
     t = instruction_part(text)
     if (SOCRATIC_EXIT_RE.search(t) or CODING_HINT_RE.search(t) or DEEP_RESEARCH_HINT_RE.search(t)
             or TRANSLATE_RE.search(t)
-            or (WIDGET_HINT_RE is not None and WIDGET_HINT_RE.search(t))):
+            or _wants_widget(t)):
         return "assist"
     if SOCRATIC_ENTER_RE.search(t):
         return "socratic"
@@ -166,7 +173,7 @@ def decide(text: str, *, socratic_active: bool = False, has_images: bool = False
     if FORCE_DEEP_RE.search(t):
         return Route("deep", "user_requested_deep")
     if (DEEP_RESEARCH_HINT_RE.search(t) or GENERAL_HINT_RE.search(t) or CODING_HINT_RE.search(t)
-            or (WIDGET_HINT_RE is not None and WIDGET_HINT_RE.search(t))):
+            or _wants_widget(t)):
         return Route("deep", "keyword_hint")
     skill = match_skill_hint(t)
     if skill:
