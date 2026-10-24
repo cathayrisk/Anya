@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.config import get_stream_writer
 
 from . import config as CFG
+from .docs import has_shelf, is_shelf
 
 
 def stop_reason(msg: Any) -> str:
@@ -167,7 +168,10 @@ NO_RUBRIC_TOOLS = {"get_natal_chart", "get_astro_forecast", "get_synastry", "get
 
 
 def deliverable_reason(messages: list) -> str:
-    """這回合算不算長交付物；是的話回傳理由（給時間軸），不是回空字串。占星回合一律不算。"""
+    """這回合算不算長交付物；是的話回傳理由（給時間軸），不是回空字串。占星回合、有上傳文件的對話一律不算：
+    評分員只看得到文字轉錄、看不到文件，會把根據文件寫的內容都評成「沒有根據」。文件的根據改由引用負責。"""
+    if has_shelf(messages):
+        return ""
     turn = _this_turn(messages)
     skills = []
     for m in turn:
@@ -277,7 +281,7 @@ def _prior_note(prior: list) -> str:
     """前一題縮成一句：只讓 grader 看得懂「上面那份改短」這類接續的提問。
     只放提問、不放回答：2026-10-24 線上驗收，前一題回答開頭寫著「依據 Microsoft Learn…安妮亞讀過原文」，
     標明了不評分，grader 照樣評它「找不到查詢動作」，下一題（VBA 效能）因此補寫一輪，多花 $0.4、50 秒。"""
-    q = next((m for m in reversed(prior) if isinstance(m, HumanMessage)), None)
+    q = next((m for m in reversed(prior) if isinstance(m, HumanMessage) and not is_shelf(m)), None)
     if q is None:
         return ""
     return ("（先前的對話，只供理解這次的提問，不在評分範圍）\n"

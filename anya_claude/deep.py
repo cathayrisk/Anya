@@ -26,6 +26,7 @@ from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware as _
 
 from . import config as CFG
 from . import prompts as P
+from .docs import has_shelf
 from .deep_mw import (PauseTurnMiddleware, PrevRequestBreakpointMiddleware, RubricStartMiddleware,
                       UsageEventsMiddleware, grader_view, make_deliverable_rubric, rubric_event)
 
@@ -53,6 +54,10 @@ class AnthropicPromptCachingMiddleware(_BaseCaching):
 
     def _apply_caching(self, request):
         req = super()._apply_caching(request)
+        if has_shelf(request.messages):
+            # 文件架自己帶一個 1h 斷點（docs.shelf_message）。斷點上限 4 個，工具那一個讓出來：
+            # 系統提示的斷點本來就涵蓋排在它前面的工具定義
+            req = req.override(tools=request.tools)
         return req.override(model_settings={**req.model_settings,
                                             "cache_control": {"type": "ephemeral", "ttl": MESSAGES_TTL}})
 

@@ -148,11 +148,12 @@ def paragraph_break(prev: str) -> str:
     return "\n" if prev.endswith("\n") else "\n\n"
 
 
-def answer_text(msg: AIMessage | None) -> str:
+def answer_text(msg: AIMessage | None, mark=None) -> str:
     """把最終 AIMessage 的文字區塊接起來（server tool、thinking 區塊不算）。
 
     中間夾著工具區塊（例如「我去查一下」→ 搜尋 → 回答）時另起一段；2026-10-23 線上測試發現原本直接相接，
     搜尋前那句和回答黏成同一行。連續的文字區塊（引用會把一段切成好幾塊）照舊直接接起來。
+    mark：每個文字區塊回傳要接在它後面的標記（文件引用的 [n]，見 docs.Citer），放在區塊結尾的換行之前。
     """
     if msg is None:
         return ""
@@ -165,7 +166,12 @@ def answer_text(msg: AIMessage | None) -> str:
         if b.get("type") == "text":
             if gap:
                 out += paragraph_break(out)
-            out += b.get("text", "")
+            text = b.get("text", "")
+            tag = mark(b) if mark else ""
+            if tag:
+                body = text.rstrip()
+                text = body + tag + text[len(body):]
+            out += text
             gap = False
         else:
             gap = True

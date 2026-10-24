@@ -38,7 +38,11 @@ def to_messages(history: list[dict], *, max_user_turns: int = CFG.HISTORY_USER_T
 
 
 _FOOTER_RE = re.compile(r"\n+---\n\*\*🌐 來源\*\*\n(?:- .*\n?)+\s*$")
+# 文件引用（docs.Citer）：段落後的 [n] 和最後的引用清單都是系統加的，不送回模型，免得它學著自己編號
+_DOC_FOOTER_RE = re.compile(r"\n+---\n\*\*📄 文件引用\*\*\n(?:\d+\. .*\n?)+")
+_DOC_MARK_RE = re.compile(r"<sup>\[\d+\]</sup>")
 
 
 def strip_sources_footer(text: str) -> str:
-    return _FOOTER_RE.sub("", text or "").rstrip()
+    text = _DOC_MARK_RE.sub("", _DOC_FOOTER_RE.sub("", text or ""))
+    return _FOOTER_RE.sub("", text).rstrip()

@@ -85,11 +85,13 @@ class TurnView:
     """一個回合的助理訊息區塊。用法：建立 → 逐一 on(ev) → finish(...)。"""
 
     def __init__(self, *, mode: str, user_text: str = "", serious: bool = False,
-                 route_reason: str = "default_fast", started_at: float | None = None):
-        """started_at：斷線接續時，原本那一輪開始的時間（「收到問題」和秒數從那時算）。"""
+                 route_reason: str = "default_fast", started_at: float | None = None, docs_line: str = ""):
+        """started_at：斷線接續時，原本那一輪開始的時間（「收到問題」和秒數從那時算）。
+        docs_line：這一題帶著的上傳文件（寫在「收到問題」那一步）。"""
         self._at = started_at              # 正在處理的事件是什麼時候發生的；None＝現在（見 _now）
         self.mono = Monologue(user_text, serious=serious)
-        self.tl = Timeline(route_reason=route_reason, mode=mode, clock=self._now)
+        self.tl = Timeline(route_reason=route_reason, mode=mode, clock=self._now,
+                           extra=[docs_line] if docs_line else None)
         self.header = self.mono.opening()
         # compact：收合時只有一行心裡話；一般模式先收著（通常一兩秒就答完），深思模式一開始就展開時間軸
         self._expanded = mode != "fast"

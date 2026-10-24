@@ -38,7 +38,7 @@ ROUTE_WHY = {
     "user_requested_deep": "你要求深思",
     "keyword_hint": "需要深入處理的任務",
     "contains_image": "有附圖片",
-    "has_docs": "有附文件",
+    "has_docs": "對話裡有上傳的文件",
     "has_url": "附了網址，要讀原文",
     "socratic_mode": "提問引導模式中",
     "user_redo_deep": "你要求改用深思模式重答",
@@ -134,13 +134,15 @@ class Step:
 class Timeline:
     """一回合一個。每次變動 version +1，畫面層看 version 決定要不要重畫。"""
 
-    def __init__(self, *, route_reason: str, mode: str, clock=time.time):
+    def __init__(self, *, route_reason: str, mode: str, clock=time.time, extra: list[str] | None = None):
+        """extra：「收到問題」那一步多寫的幾行（例如這一題帶著哪些上傳的文件）。"""
         self.clock = clock
         self.mode = mode
         self.version = 0
         now = clock()
         self.steps: list[Step] = [Step("received", "🥜 收到問題", "complete",
-                                       [f"交給{MODE_NAME.get(mode, mode)}：{route_why(route_reason)}"],
+                                       [f"交給{MODE_NAME.get(mode, mode)}：{route_why(route_reason)}",
+                                        *(extra or [])],
                                        started=now, ended=now)]
 
     @property

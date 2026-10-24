@@ -30,6 +30,7 @@ except Exception:
 DEEP_RESEARCH_HINT_RE = re.compile(
     r"深度研究|研究報告|文獻回顧|文獻探討|系統性(?:回顧|調查)|deep\s*research|literature\s*review"
 )
+PRODUCE_RE = re.compile(r"寫|撰寫|整理(?:成|出|一份)|做(?:一份|成)|產出|彙整成")
 # 明確的「寫程式」請求
 CODING_HINT_RE = re.compile(
     r"(?:寫|幫我做|產生|生成).{0,8}(?:程式|腳本|函式|巨集|macro|script|function)|"
@@ -160,8 +161,6 @@ def decide(text: str, *, socratic_active: bool = False, has_images: bool = False
         return Route("deep", "socratic_mode", socratic=True)
     if has_images:
         return Route("deep", "contains_image")
-    if has_docs:
-        return Route("deep", "has_docs")
     if URL_RE.search(t):
         return Route("deep", "has_url")
     if TRANSLATE_RE.search(t) and not FORCE_DEEP_RE.search(t):
@@ -172,10 +171,12 @@ def decide(text: str, *, socratic_active: bool = False, has_images: bool = False
         return Route("deep", "verify_hint")
     if FORCE_DEEP_RE.search(t):
         return Route("deep", "user_requested_deep")
-    if (DEEP_RESEARCH_HINT_RE.search(t) or GENERAL_HINT_RE.search(t) or CODING_HINT_RE.search(t)
-            or _wants_widget(t)):
+    # 有上傳文件時，「這份研究報告的結論是什麼」是在問文件，要「寫／整理出」研究報告才算深度研究
+    research = DEEP_RESEARCH_HINT_RE.search(t) and (not has_docs or PRODUCE_RE.search(t))
+    if research or GENERAL_HINT_RE.search(t) or CODING_HINT_RE.search(t) or _wants_widget(t):
         return Route("deep", "keyword_hint")
     skill = match_skill_hint(t)
     if skill:
         return Route("deep", f"skill_hint:{skill}")
-    return Route("fast", "default_fast")
+    # 問上傳的文件：Haiku 先答（附頁碼引用），要寫報告、跨文件比較時它自己升級（2026-10-24 使用者決定）
+    return Route("fast", "has_docs" if has_docs else "default_fast")
