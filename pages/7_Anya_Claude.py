@@ -486,7 +486,8 @@ if inflight is not None:
         run_turn(entry, inflight["text"], inflight["images"], inflight["route"], history,
                  allow_escalate=inflight["allow_escalate"], resume=inflight)
 
-if st.session_state["ac_mode_sticky"] == "socratic":
+sticky_drawn = st.session_state["ac_mode_sticky"]   # 模式列是在回合之前畫的（見檔尾）
+if sticky_drawn == "socratic":
     left, right = st.columns([5, 1])
     left.markdown(":violet-badge[🧭 提問引導模式] "
                   ":small[:gray[安妮亞只提問不給答案，幫你自己想清楚；說「直接說」或按右邊按鈕結束。]]")
@@ -532,3 +533,8 @@ elif redo:
             route = R.decide(text, socratic_active=(st.session_state["ac_mode_sticky"] == "socratic"),
                              has_images=bool(images))
         run_turn(entry, text, images, route, history, allow_escalate=(redo != "fast"))
+
+# 這一輪進入或離開了引導模式：上面的模式列（徽章與「直接說」按鈕）是回合前畫的，重畫一次才對得上。
+# 2026-10-24 實測：剛被判定要引導的那一輪看不到按鈕，要到下一輪才出現。
+if st.session_state["ac_mode_sticky"] != sticky_drawn:
+    st.rerun()
