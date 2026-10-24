@@ -10,6 +10,7 @@
 - 互動（2026-10-23 使用者挑的 Streamlit 新功能）：狀態列＝心裡話＋步驟時間軸（view／monologue／timeline）、
   停止鈕（chat_input submit_mode="stop"，圖在背景執行緒跑、主執行緒每 0.5 秒 pulse 才停得即時）、
   最新回答的「⋯」選單（重答／換模式重答，舊回答收進「前一版回答」）、回答裡的 Mermaid 圖（mdfix）。
+階段 3（文件面板，anya_claude/docs.py）：上傳的文件整份放在對話最前面（1h 快取），Haiku 先答、回答附頁碼引用。
 計畫：Anya-main(New)/anya-claude-改寫計畫-20261023.md。
 
 ⚠️ 分層：anya_claude/ 裡除了 view.py 都不准 import streamlit——圖的節點跑在背景執行緒。
@@ -33,6 +34,7 @@ if str(ROOT) not in sys.path:
 
 st.set_page_config(page_title="Anya（Claude 版）", page_icon="🥜", layout="wide")
 
+from anya_claude import docs as D  # noqa: E402
 from anya_claude import events as E  # noqa: E402
 from anya_claude import graph as G  # noqa: E402
 from anya_claude import history as H  # noqa: E402
@@ -217,7 +219,9 @@ def run_turn(user_entry: dict, text: str, images: list[dict], route: R.Route, hi
     ctx = {"view": None, "done": False, "t0": (resume or {}).get("t0") or time.time(), "t0_local": time.time(),
            "user_stops": _user_stops(), "sid": _session_id(), "box": st.session_state["ac_box"],
            "turn": {"user_entry": user_entry, "text": text, "images": images, "route": route,
-                    "allow_escalate": allow_escalate, "restarts": (resume or {}).get("restarts", 0)}}
+                    "allow_escalate": allow_escalate, "restarts": (resume or {}).get("restarts", 0),
+                    # 這一題開始時文件面板上有哪些文件（引用編號要對得上送進去的那一份清單）
+                    "docs": (resume or {}).get("docs", list(st.session_state.get("ac_docs") or []))}}
     ctx["box"]["active"] = True   # 回合進行中（含停止後的收尾）；見頁面開頭的等待
     try:
         if resume and resume.get("q") is not None:
@@ -268,12 +272,52 @@ def _wait_for_previous_turn(box: dict, timeout: float = 3.0) -> None:
     box.pop("active", None)
 
 
+DOC_TYPES = [e.lstrip(".") for e in (*D.SUPPORTED, *sorted(D.OLD_EXTS))]   # 舊格式也收，才能講清楚要怎麼轉
+
+
+def _doc_panel() -> None:
+    """文件面板（階段 3；2026-10-24 使用者選「獨立面板」，像舊版的引用資料夾）。
+    放進來的文件整段對話都會帶著（docs.shelf_message），只存在這次 session。"""
+    docs: list = st.session_state.setdefault("ac_docs", [])
+    gen = st.session_state.setdefault("ac_doc_gen", 0)
+    for ok, note in st.session_state.pop("ac_doc_notes", []):
+        st.toast(note, icon="📎" if ok else "⚠️")
+    with st.popover(f"📎 文件（{len(docs)}）" if docs else "📎 文件"):
+        st.caption(f"可上傳 PDF、Word、Excel、PowerPoint、CSV、純文字；最多 {D.MAX_DOCS} 份、"
+                   f"PDF 合計 {D.MAX_PDF_PAGES} 頁、{D.MAX_TOTAL_BYTES // 1024 // 1024}MB。"
+                   "之後的提問都會參考這些文件，回答附頁碼引用。文件只留在這次對話，重新整理頁面就會清掉。")
+        files = st.file_uploader("上傳文件", type=DOC_TYPES, accept_multiple_files=True,
+                                 key=f"ac_doc_up_{gen}", label_visibility="collapsed")
+        if files:
+            notes = []
+            for f in files:
+                doc, note = D.prepare(f.name, f.getvalue(), docs)
+                if doc is not None:
+                    docs.append(doc)
+                    note = note or f"已放進文件面板：{doc.summary}"
+                notes.append((doc is not None, note))
+            st.session_state["ac_doc_notes"] = notes
+            st.session_state["ac_doc_gen"] = gen + 1   # 換一個上傳元件：收過的檔案不會每次重畫都再處理一次
+            st.rerun()
+        for i, d in enumerate(docs):
+            left, right = st.columns([5, 1], vertical_alignment="center")
+            left.markdown(f"📄 {d.summary}")
+            if right.button("移除", key=f"ac_doc_rm_{gen}_{i}"):
+                docs.pop(i)
+                st.rerun()
+
+
+def _docs_line(docs: list | None) -> str:
+    return f"帶著 {len(docs)} 份上傳的文件：{'、'.join(d.summary for d in docs)}" if docs else ""
+
+
 def _resume_turn(ctx: dict, turn: dict, hist: list[dict]) -> None:
     """重連後接著畫同一題：同樣的狀態列，先重播已收到的事件，再接著讀背景執行緒還沒讀的。"""
     with st.chat_message("assistant", avatar=AVATAR[turn["start_mode"]]):
         # 重播用事件當時的時間：時間軸的秒數才會和原本那一輪一樣（不然全擠在重播那一刻，顯示「想了 0.0 秒」）
         view = TurnView(mode=turn["start_mode"], user_text=turn["text"], serious=turn["serious"],
-                        route_reason=turn["route"].reason, started_at=turn["t0"])
+                        route_reason=turn["route"].reason, started_at=turn["t0"],
+                        docs_line=_docs_line(turn.get("docs")))
         ctx["view"] = view
         if turn.get("pf_results"):
             pf_start, pf_end = turn.get("pf_at") or (turn["t0"], turn["t0"])
@@ -303,7 +347,8 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
     # 災防題的狀態列用正經版台詞（問的人可能正在擔心，不開玩笑）
     serious = route.reason == "hazard_hint" or (intent is not None and intent.should_prefetch)
     with st.chat_message("assistant", avatar=AVATAR["cwa"] if pure else AVATAR[start_mode]):
-        view = TurnView(mode=start_mode, user_text=text, serious=serious, route_reason=route.reason)
+        view = TurnView(mode=start_mode, user_text=text, serious=serious, route_reason=route.reason,
+                        docs_line=_docs_line(ctx["turn"]["docs"]))
         ctx["view"] = view
 
         # ── 災防 controller prefetch：把「要不要查」從模型手上收回來 ──
@@ -362,7 +407,13 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
         # ── 模型回合：Haiku →（升級）→ Opus ──
         # 只帶這則提問之前的歷史（重答時，後面會有被取代的舊回答，那些不送）
         upto = next(i for i in range(len(hist) - 1, -1, -1) if hist[i] is user_entry)
-        state = G.initial_state(H.to_messages(hist[:upto]) + [G.user_message(text, images)],
+        # 上傳的文件放在最前面（文件架，自帶 1h 快取斷點）：後面的歷史怎麼變，文件都讀得到快取
+        docs = ctx["turn"]["docs"]
+        shelf = D.shelf_message(docs)
+        if docs:
+            dev["docs"] = [{"kind": d.kind, "pages": d.pages, "kb": d.size // 1024} for d in docs]
+        state = G.initial_state(([shelf] if shelf else []) + H.to_messages(hist[:upto])
+                                + [G.user_message(text, images)],
                                 route=route.mode, socratic=route.socratic, context_block=block,
                                 allow_escalate=allow_escalate)
         q, halt = G.stream_in_thread(get_graph(), state)
@@ -410,14 +461,16 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
         # Haiku 判定使用者「卡住需要引導」→ 進入 sticky 引導模式，之後的回合維持到退出詞（沿用舊版）
         st.session_state["ac_mode_sticky"] = "socratic"
     msg = view.answer_msg
-    final = M.display_text(E.answer_text(msg), final=True, looked_up=view.looked_up)
+    # 文件引用：被引用的段落後面加 [n]、最後附引用清單（頁碼由程式從引用位置產生，不靠模型寫）
+    text, doc_footer = D.cited_answer(msg, turn.get("docs") or [])
+    final = M.display_text(text, final=True, looked_up=view.looked_up or bool(doc_footer))
     if not final.strip():
         view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
         ctx["done"] = True
         user_entry.pop("inflight", None)
         _telemetry({"route": route.reason, "error": "empty_answer", "usage": view.usage.as_rows()})
         return
-    footer = M.build_web_sources_footer(view.sources + E.answer_citations(msg))
+    footer = doc_footer + M.build_web_sources_footer(view.sources + E.answer_citations(msg))
     # 只在「這回合真的查過東西」（網路搜尋、讀網頁、氣象署）時才標示；什麼都沒查的
     # 「💡 本回覆未經任何查證…」不顯示——2026-10-23 使用者決定，每則都掛很怪。
     banner = EVB.build_banner(view.evidence) if view.evidence else ""
@@ -456,6 +509,7 @@ st.session_state.setdefault("ac_mode_sticky", "assist")   # 'assist' | 'socratic
 st.session_state.setdefault("ac_box", {})                 # 連線中斷時寄放還沒答完的那一題（run_turn）
 history: list[dict] = st.session_state["ac_history"]
 _wait_for_previous_turn(st.session_state["ac_box"])
+_doc_panel()
 
 # 圖（含 deepagents）在開頁時就建好：冷啟動要匯入一大堆套件，放到第一題才建，那段時間連線最容易斷
 with st.spinner("安妮亞準備中…", show_time=True):
@@ -523,7 +577,8 @@ if prompt:
         st.session_state["ac_last_images"] = images   # 只留最新一則的圖（重答用），不累積
         sticky = R.next_socratic_state(text, st.session_state["ac_mode_sticky"])
         st.session_state["ac_mode_sticky"] = sticky
-        route = R.decide(text, socratic_active=(sticky == "socratic"), has_images=bool(images))
+        route = R.decide(text, socratic_active=(sticky == "socratic"), has_images=bool(images),
+                         has_docs=bool(st.session_state.get("ac_docs")))
         run_turn(entry, text, images, route, history)
 elif redo:
     entry = next((h for h in reversed(history) if h.get("role") == "user"), None)
@@ -537,7 +592,7 @@ elif redo:
             route = R.Route("fast", "user_redo_fast")
         else:
             route = R.decide(text, socratic_active=(st.session_state["ac_mode_sticky"] == "socratic"),
-                             has_images=bool(images))
+                             has_images=bool(images), has_docs=bool(st.session_state.get("ac_docs")))
         run_turn(entry, text, images, route, history, allow_escalate=(redo != "fast"))
 
 # 這一輪進入或離開了引導模式：上面的模式列（徽章與「直接說」按鈕）是回合前畫的，重畫一次才對得上。
