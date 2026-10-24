@@ -27,7 +27,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from . import config as CFG
 from . import prompts as P
-from .deep_mw import final_answer, research_not_started, web_search_count
+from .deep_mw import attempt_note, final_answer, research_not_started, web_search_count
 from .tools import calculate, run_calculate
 
 CACHE = {"type": "ephemeral", "ttl": "1h"}   # 同事常隔超過 5 分鐘才問下一題，5m 快取會一直失效
@@ -189,8 +189,11 @@ def build_graph(*, deep_agents: dict[str, Any] | None = None, deep_files=None):
             inp["rubric"] = P.DEEP_RUBRIC   # 寫完再檢查（RubricMiddleware 看到 rubric 才啟動）
         out = agent.invoke(inp)
         if research and research_not_started(out.get("messages") or []):
-            # 2026-10-24 線上偶發：主持人沒派研究員、只吐出幾行簡體字；同一題重問就正常。自動重跑一次（失敗那次約 $0.05）
-            get_stream_writer()({"type": "retry", "reason": "第一次沒有派出研究員、回答很短，重新開始一次"})
+            # 2026-10-24 線上偶發：主持人沒派研究員、只吐出幾行簡體字；同一題重問就正常。自動重跑一次（失敗那次 $0.05–0.14；
+            # 10-25 線上第二次是想了 70 秒沒派就結束）
+            # first：第一次的回答與停止原因，只進 telemetry（畫面上照樣清掉）
+            get_stream_writer()({"type": "retry", "reason": "第一次沒有派出研究員、回答很短，重新開始一次",
+                                 "first": attempt_note(out.get("messages") or [])})
             out = agent.invoke(inp)
         try:
             from . import lessons

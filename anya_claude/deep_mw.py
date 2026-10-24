@@ -340,6 +340,15 @@ def research_not_started(messages: list) -> bool:
     return len(text.strip()) < CFG.RESEARCH_MIN_CHARS
 
 
+def attempt_note(messages: list) -> dict:
+    """沒啟動那次留給 telemetry 的線索：最終回答（本來就短於 RESEARCH_MIN_CHARS）與停止原因。
+    2026-10-25 線上第二次失敗沒留下回答：只知道 Opus 想了 70 秒、輸出 6,802 token 就結束，看不出寫了什麼。"""
+    final = final_answer(messages)
+    text = final.text if final is not None and isinstance(final.text, str) else ""
+    stop = (final.response_metadata or {}).get("stop_reason") if final is not None else None
+    return {"text": text.strip()[:CFG.RESEARCH_MIN_CHARS], "stop_reason": stop or ""}
+
+
 def server_sources(msg: AIMessage) -> tuple[int, int, list[dict]]:
     """一則回應裡的網路搜尋次數、讀網頁次數，與拿到的 [{url, title}]（搜尋結果＋讀到的網頁）。"""
     searches, fetches, found = 0, 0, []

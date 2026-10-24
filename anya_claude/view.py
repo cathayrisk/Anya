@@ -118,6 +118,7 @@ class TurnView:
         self.socratic = False
         self.research = False                    # Haiku 升級時要求走深度研究（階段 4）
         self.retried = False                     # 研究沒啟動、自動重跑過
+        self.retry_first: dict = {}              # 沒啟動那次的回答與停止原因（只進 telemetry）
         self.sources: list[dict] = []
         self.evidence: list[dict] = []
         self.usage = TurnUsage()
@@ -216,6 +217,7 @@ class TurnView:
             self.tl.calc(ev.data.get("results") or [])
         elif k == "retry":                          # 研究沒啟動、自動重跑：清掉第一次的回答（偶發亂碼），等重跑的結果
             self.retried = True
+            self.retry_first = ev.data.get("first") or {}
             self.tl.retry(ev.data.get("reason") or "")
             self.buf, self._gap = "", False
             self.answer_ph.empty()
