@@ -4,9 +4,9 @@
 做法（計畫檔階段 3；spike T5：10 條引文用 pypdf 核對，10/10 在標示的頁面上）：
 - PDF 原檔 base64 送：Claude 每頁同時讀文字和影像，掃描檔也看得懂（但掃描檔沒有文字層，引用不了）。
   引用帶頁碼（page_location，end_page_number 不含）。
-- Word、純文字：抽成文字。引用帶字元位置，沒有頁碼。
-- 簡報、Excel、CSV：每張投影片、每一段列做成一個區塊（custom content），引用帶區塊編號，
-  這裡換成「第 3 張投影片」「工作表「營收」第 2–41 列」。
+- 純文字：原樣送。引用帶字元位置，沒有頁碼。
+- Word、簡報、Excel、CSV：每段、每張投影片、每一段列做成一個區塊（custom content），引用帶區塊編號，
+  這裡換成「第 2 段」「第 3 張投影片」「工作表「營收」第 2–41 列」。
 - 全部放在對話最前面的一則訊息（文件架），最後一份標 1h 快取斷點：之後每題、每次模型呼叫都讀快取。
 - 不用 FAISS／embedding、不做 OCR（舊版 docstore 的做法）。簡報用標準函式庫解析，不加 python-pptx。
 
@@ -48,6 +48,7 @@ class Doc:
     blocks: list[str] = field(default_factory=list)   # blocks：每個引用區塊的文字
     labels: list[str] = field(default_factory=list)   # blocks：每個區塊的位置名稱
     scanned: bool = False           # PDF 抽不到文字層：看得懂，但引用不了
+    amount: str = ""                # 面板上顯示的份量（「3 張投影片」「85 列資料」「12 段」）
 
     @property
     def summary(self) -> str:
@@ -55,8 +56,7 @@ class Doc:
             return f"{self.name}（{self.pages} 頁{'，掃描檔' if self.scanned else ''}）"
         if self.kind == "text":
             return f"{self.name}（{len(self.data):,} 字）"
-        unit = "張投影片" if self.name.lower().endswith(".pptx") else "段"
-        return f"{self.name}（{len(self.blocks)} {unit}）"
+        return f"{self.name}（{self.amount or f'{len(self.blocks)} 段'}）"
 
 
 def _ext(name: str) -> str:
@@ -88,16 +88,24 @@ def _pdf(name: str, data: bytes) -> tuple[Doc | None, str]:
     return doc, ("這份看起來是掃描檔：安妮亞讀得懂，但回答沒辦法附頁碼引用。" if doc.scanned else "")
 
 
-def _docx(data: bytes) -> str:
+def _docx(data: bytes) -> tuple[list[str], list[str], int]:
+    """每段一個區塊、每個表格一個區塊（表格排在段落後面）。2026-10-24：整份當純文字送時，引用常把整份文字
+    標成一條，看不出引的是哪一條規定；一段一塊，引用就是「第 2 段」那一段。"""
     import docx
     d = docx.Document(io.BytesIO(data))
-    parts = [p.text for p in d.paragraphs if p.text.strip()]
-    for t in d.tables:
-        for row in t.rows:
-            cells = [c.text.strip() for c in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
-    return "\n".join(parts)
+    blocks, labels = [], []
+    for p in d.paragraphs:
+        if p.text.strip():
+            labels.append(f"第 {len(labels) + 1} 段")
+            blocks.append(p.text.strip())
+    n_paras = len(blocks)
+    for k, t in enumerate(d.tables, 1):
+        rows = [" | ".join(c.text.strip() for c in row.cells) for row in t.rows]
+        rows = [r for r in rows if r.strip(" |")]
+        if rows:
+            labels.append(f"表格 {k}")
+            blocks.append("\n".join(rows))
+    return blocks, labels, n_paras
 
 
 _SLIDE_RE = re.compile(r"ppt/slides/slide(\d+)\.xml$")
@@ -195,14 +203,22 @@ def prepare(name: str, data: bytes, existing: list[Doc]) -> tuple[Doc | None, st
                 return None, (f"PDF 合計最多 {MAX_PDF_PAGES} 頁（目前已有 {used} 頁），"
                               f"「{name}」有 {doc.pages} 頁放不進去。可以先拆成小份再上傳。")
             return doc, note
-        if ext in (".docx", *TEXT_EXTS):
-            text = (_docx(data) if ext == ".docx" else _decode(data)).strip()
+        if ext in TEXT_EXTS:
+            text = _decode(data).strip()
             if not text:
                 return None, f"「{name}」裡找不到文字。"
             if len(text) > MAX_TEXT_CHARS:
                 text, note = text[:MAX_TEXT_CHARS], f"「{name}」太長，只放得進前 {MAX_TEXT_CHARS:,} 字。"
             return Doc(name, "text", len(data), data=text), note
-        blocks, labels = _pptx(data) if ext == ".pptx" else _xlsx(data) if ext == ".xlsx" else _csv(data)
+        if ext == ".docx":
+            blocks, labels, n_paras = _docx(data)
+            amount = f"{n_paras} 段" + (f"、{len(blocks) - n_paras} 個表格" if len(blocks) > n_paras else "")
+        elif ext == ".pptx":
+            blocks, labels = _pptx(data)
+            amount = f"{len(blocks)} 張投影片"
+        else:
+            blocks, labels = _xlsx(data) if ext == ".xlsx" else _csv(data)
+            amount = f"{sum(len(b.splitlines()) - 2 for b in blocks):,} 列資料"   # 每塊扣掉標籤和表頭
     except Exception as e:  # noqa: BLE001 — 壞檔或加密的 Office 檔
         return None, f"「{name}」打不開（{type(e).__name__}），請確認檔案沒有損壞或加密。"
     if not blocks:
@@ -210,7 +226,7 @@ def prepare(name: str, data: bytes, existing: list[Doc]) -> tuple[Doc | None, st
     blocks, labels, cut = _cap_blocks(blocks, labels)
     if cut:
         note = f"「{name}」太長，只放得進前面的 {labels[-1]}。"
-    return Doc(name, "blocks", len(data), blocks=blocks, labels=labels), note
+    return Doc(name, "blocks", len(data), blocks=blocks, labels=labels, amount=amount), note
 
 
 # ── 送進對話 ──
@@ -239,6 +255,12 @@ def shelf_message(docs: list[Doc]) -> HumanMessage | None:
     return HumanMessage(blocks, additional_kwargs={SHELF_KEY: True})
 
 
+# 每題結尾的提醒（頁面併進 context_block，兩種模式都會在對話最後看到）。2026-10-24 線上與本機：第一題有引用，
+# 追問時一條都沒有——歷史裡的前一則回答是純文字（看不到引用），模型照著自己上一則的樣子寫
+TURN_NOTE = ("對話裡有使用者上傳的文件。這題如果根據文件回答，每個重點都要用引用標出出處"
+             "（歷史裡的前一則回答看不到引用，不代表這次不用）；正文用中文轉述，不要貼英文原句。")
+
+
 def is_shelf(msg: BaseMessage) -> bool:
     """有標記，或帶著快取斷點的文件區塊（中途被複製、標記沒跟著過去也認得出來）。"""
     if not isinstance(msg, HumanMessage):
@@ -251,6 +273,20 @@ def is_shelf(msg: BaseMessage) -> bool:
 
 def has_shelf(messages: list) -> bool:
     return any(is_shelf(m) for m in messages or [])
+
+
+def signature(docs: list[Doc]) -> list[list]:
+    """文件架的身分（順序有意義：引用的 document_index 照這個順序）。存進歷史用，所以是 list 不是 tuple。"""
+    return [[d.name, d.size] for d in docs or []]
+
+
+def cite_blocks(msg: AIMessage | None) -> list[dict]:
+    """回答的文字區塊連同引用，存進歷史、下一題原樣傳回去。2026-10-24：前一則回答以純文字放進歷史時，
+    追問常常一條引用都沒有（模型照著自己上一則的樣子寫）；保留引用結構後本機 6 次追問都有引用。"""
+    if msg is None or isinstance(msg.content, str):
+        return []
+    return [{k: v for k, v in b.items() if k in ("type", "text", "citations")}
+            for b in msg.content if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
 
 
 # ── 引用 → 註腳 ──
@@ -289,7 +325,9 @@ class Citer:
             doc = self.docs[i] if isinstance(i, int) and 0 <= i < len(self.docs) else None
             name = doc.name if doc else (c.get("document_title") or "文件")
             loc = _location(c, doc)
-            quote = re.sub(r"\s+", " ", c.get("cited_text") or "").strip()
+            # PDF 斷字會留下看不見的控制字元（2026-10-24 線上：「Spi\x02derMonkey」）
+            quote = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", c.get("cited_text") or "")
+            quote = re.sub(r"^【[^】]*】", "", re.sub(r"\s+", " ", quote).strip()).strip()   # 區塊開頭的位置標籤
             key = (name, loc, quote)
             if key not in self._keys:
                 self._keys[key] = len(self._keys) + 1

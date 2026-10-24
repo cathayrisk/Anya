@@ -16,12 +16,15 @@ from . import config as CFG
 _HTML_COMMENT_RE = re.compile(r"\n*<!--.*?-->", re.DOTALL)
 
 
-def to_messages(history: list[dict], *, max_user_turns: int = CFG.HISTORY_USER_TURNS) -> list[BaseMessage]:
+def to_messages(history: list[dict], *, max_user_turns: int = CFG.HISTORY_USER_TURNS,
+                docs_sig: list | None = None) -> list[BaseMessage]:
     """history 項目：{"role": "user"|"assistant", "text": str, ...}。
 
     - 只保留最近 max_user_turns 個使用者回合（從那則使用者訊息開始切，避免開頭是孤兒回答）
     - 空文字、尚未送達（pending）的訊息略過
     - 來源 footer 是系統附的，不送回模型（不然模型會學著自己寫來源清單）
+    - 引用了上傳文件的回答（cite_blocks）：文件架沒換（docs_sig 相同）就連同引用原樣傳回去，
+      模型追問時才會照樣附引用（見 docs.cite_blocks）；文件換過，引用編號對不上，退回純文字
     """
     items = [h for h in (history or []) if (h.get("text") or "").strip() and not h.get("pending")]
     user_idx = [i for i, h in enumerate(items) if h.get("role") == "user"]
@@ -32,6 +35,8 @@ def to_messages(history: list[dict], *, max_user_turns: int = CFG.HISTORY_USER_T
         text = _HTML_COMMENT_RE.sub("", h["text"]).strip()
         if h.get("role") == "user":
             out.append(HumanMessage(text))
+        elif h.get("cite_blocks") and docs_sig is not None and h.get("docs_sig") == docs_sig:
+            out.append(AIMessage(content=list(h["cite_blocks"])))
         else:
             out.append(AIMessage(strip_sources_footer(text)))
     return out
