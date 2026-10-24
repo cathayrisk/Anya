@@ -271,15 +271,17 @@ def _wait_for_previous_turn(box: dict, timeout: float = 3.0) -> None:
 def _resume_turn(ctx: dict, turn: dict, hist: list[dict]) -> None:
     """重連後接著畫同一題：同樣的狀態列，先重播已收到的事件，再接著讀背景執行緒還沒讀的。"""
     with st.chat_message("assistant", avatar=AVATAR[turn["start_mode"]]):
+        # 重播用事件當時的時間：時間軸的秒數才會和原本那一輪一樣（不然全擠在重播那一刻，顯示「想了 0.0 秒」）
         view = TurnView(mode=turn["start_mode"], user_text=turn["text"], serious=turn["serious"],
-                        route_reason=turn["route"].reason)
+                        route_reason=turn["route"].reason, started_at=turn["t0"])
         ctx["view"] = view
         if turn.get("pf_results"):
-            view.cwa_start()
-            view.cwa_done(turn["pf_results"])
+            pf_start, pf_end = turn.get("pf_at") or (turn["t0"], turn["t0"])
+            view.cwa_start(at=pf_start)
+            view.cwa_done(turn["pf_results"], at=pf_end)
             view.add_evidence(turn["pf_evidence"])
-        for ev in turn["events"]:
-            view.on(ev)
+        for at, ev in turn["events"]:
+            view.on(ev, at)
         turn["resumed"] = True
         ctx["turn"] = turn
         _consume_and_finish(ctx, view, turn, hist)
@@ -307,14 +309,17 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
         # ── 災防 controller prefetch：把「要不要查」從模型手上收回來 ──
         pf_results: list[dict] = []
         pf_evidence: list[dict] = []
+        pf_at: tuple[float, float] | None = None
         block = ""
         if intent is not None and intent.should_prefetch:
             scopes = HZPF.prefetch_scopes(intent.scopes)
             if scopes:
+                pf_start = time.time()
                 view.cwa_start()
                 pf_results = HZPF.run_prefetch(scopes, {EV.SCOPE_EARTHQUAKE: _pf_earthquake,
                                                         EV.SCOPE_TYPHOON: _pf_typhoon})
                 view.cwa_done(pf_results)
+                pf_at = (pf_start, time.time())   # 斷線接續重畫時照原本的時間畫
                 pf_evidence = [EV.make_event(tool="prefetch/" + HZPF.SCOPE_TOOLS.get(r["scope"], r["scope"]),
                                              scope=r["scope"], status=r["status"],
                                              detail={"prefetch": True, "error": r["error"]})
@@ -362,7 +367,7 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
                                 allow_escalate=allow_escalate)
         q, halt = G.stream_in_thread(get_graph(), state)
         ctx["turn"].update(q=q, halt=halt, events=[], start_mode=start_mode, serious=serious, dev=dev,
-                           pf_results=pf_results, pf_evidence=pf_evidence, t0=t0)
+                           pf_results=pf_results, pf_evidence=pf_evidence, pf_at=pf_at, t0=t0)
         _consume_and_finish(ctx, view, ctx["turn"], hist)
 
 
@@ -381,9 +386,10 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
                 break
             if kind == "error":
                 raise payload
-            for ev in E.parse_item(payload):
-                turn["events"].append(ev)   # 連線中斷後重畫時要重播
-                view.on(ev)
+            at, item = payload              # at：事件在背景執行緒產生的時間
+            for ev in E.parse_item(item):
+                turn["events"].append((at, ev))   # 連線中斷後重畫時要重播
+                view.on(ev, at)
     except Exception as e:
         halt.set()
         view.fail(U.friendly_error(e))
@@ -404,7 +410,7 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
         # Haiku 判定使用者「卡住需要引導」→ 進入 sticky 引導模式，之後的回合維持到退出詞（沿用舊版）
         st.session_state["ac_mode_sticky"] = "socratic"
     msg = view.answer_msg
-    final = M.display_text(E.answer_text(msg), final=True)
+    final = M.display_text(E.answer_text(msg), final=True, looked_up=view.looked_up)
     if not final.strip():
         view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
         ctx["done"] = True
