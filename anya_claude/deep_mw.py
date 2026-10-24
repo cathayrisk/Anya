@@ -160,14 +160,24 @@ def _this_turn(messages: list) -> list:
     return list(messages or []) if i is None else list(messages[i + 1:])
 
 
+# 占星解讀不跑寫完再檢查：它是象徵詮釋、不是事實交付，評分一直要它「標計算基準日、把解讀標成推估」
+# （2026-10-24 線上兩次都補寫後仍不過，每次多 30–50 秒）。用了占星 skill 或占星工具就整回合略過。
+NO_RUBRIC_SKILL_PREFIXES = ("astro-",)
+NO_RUBRIC_TOOLS = {"get_natal_chart", "get_astro_forecast", "get_synastry", "get_astro_reference"}
+
+
 def deliverable_reason(messages: list) -> str:
-    """這回合算不算長交付物；是的話回傳理由（給時間軸），不是回空字串。"""
+    """這回合算不算長交付物；是的話回傳理由（給時間軸），不是回空字串。占星回合一律不算。"""
     turn = _this_turn(messages)
     skills = []
     for m in turn:
         if isinstance(m, AIMessage):
             for tc in m.tool_calls or []:
+                if tc.get("name") in NO_RUBRIC_TOOLS:
+                    return ""
                 path = str((tc.get("args") or {}).get("file_path") or (tc.get("args") or {}).get("path") or "")
+                if path.startswith(tuple(f"/skills/{p}" for p in NO_RUBRIC_SKILL_PREFIXES)):
+                    return ""
                 if tc.get("name") == "read_file" and path.startswith("/skills/") and not path.startswith("/skills/widget-"):
                     name = path.split("/")[2] if path.count("/") >= 3 else path
                     if name not in skills:

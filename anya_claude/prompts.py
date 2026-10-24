@@ -108,6 +108,11 @@ DEEP_TOOL_RULES = """工具使用（深思模式）：
   系統訊息已經附上氣象署資料時就直接用，不必重查。不可用記憶回答即時災防資訊。
 - 要算數字（利息、報酬、試算、月付、百分比、加總、換算、估值）一律呼叫 calculate，不要心算；
   回答裡的數字照工具結果寫。
+- 寫研究報告、整理法規、或要引用官方數字時，先用 web_fetch 讀 1–2 份原文再寫（主管機關新聞稿或公告、
+  法規資料庫、公司公告或法說會資料、原始研究報告），不要只靠搜尋結果的摘要。挑最相關的那一頁讀
+  （整頁都會讀進來，不要讀首頁或目錄頁）；讀不到就在回答裡說明哪些內容只來自搜尋摘要。
+- 收到「寫完再檢查」的回饋後重寫時，直接給完整的最終回答：使用者沒看到第一版，不要寫「修訂版」
+  「這版補上了…」「改了哪些地方」。
 - 每輪搜尋或讀網頁告一段落、準備作答前，呼叫一次 think 記錄你的檢查（缺什麼、完整度、下一步）；
   think 回傳「策略警告」時要照著改查法。沒有搜尋的回合不用呼叫 think。
 - 互動元件（create_widget）：數字試算或參數探索用 widget-calculator；多對象多維度比較用 widget-comparison-matrix；
@@ -123,10 +128,21 @@ DEEP_TOOL_RULES = """工具使用（深思模式）：
 DEEP_RUBRIC = """1. 最後的回答涵蓋使用者這次提問的每一個子問題，沒有漏答、沒有答非所問。
 2. 回答裡凡是「查過」「根據官方／新聞／資料」的說法，對話紀錄裡都有對應的查詢動作（網路搜尋、讀網頁、氣象署等工具）；
    沒有在完全沒查的情況下宣稱查過。（搜尋結果的內文不會出現在紀錄裡，只要查詢動作與結果標題對得上就算通過，不要逐一核對數字。）
-3. 會變動的資訊（利率、匯率、股價、法規現況、最新事件、天氣與災防）有標日期、「截至何時」或資料來源時間。
-4. 沒查到、查不到或不確定的部分有明白說出來，沒有用推測或記憶填補；自己推算的數字有標明是推估。
+3. 回答引用的外部事實裡，會隨時間變動的（利率、匯率、股價、法規現況、最新事件、天氣與災防）有標日期、
+   「截至何時」或資料來源時間。程式碼、公式與計算過程、通用知識與定義、內部流程範本不適用這一條。
+4. 沒查到、查不到或不確定的部分有明白說出來，沒有用推測或記憶填補；自己估計的數字有標明是推估
+   （用 calculate 工具精確算出的數字不是推估）。
 （評分須知：來源清單由系統自動附在回答最後，不在這份紀錄裡；正文依規定不列來源，所以「正文沒寫出處」不算缺失。
-只有上面四項，不要另外加標準。）"""
+只有上面四項，不要另外加標準；每一項只有明確違反才判不通過，能合理判斷有做到就算通過。）"""
+
+# deepagents 內建的評分提示要求「無法正面確認的項目一律判失敗」。2026-10-24 統計：自我檢查跑了 11 次，
+# 要補寫 8 次、補寫後通過 0 次——缺口幾乎都是「沒標日期」「推估沒標清楚」這種可確認也可不確認的項目。
+# 換成「有明確缺陷才判失敗」（deep._grader_prompt 替換那一句）。
+GRADER_CONSERVATIVE = ("Be conservative: every criterion you cannot positively confirm should be marked failed "
+                       "with a `gap` describing what evidence would be needed.")
+GRADER_LENIENT = ("Fail a criterion only when the transcript shows a clear, concrete violation of it. If the response "
+                  "reasonably satisfies the criterion, mark it passed even if it could be more explicit; do not fail "
+                  "a criterion just because you cannot verify a detail from the transcript alone.")
 
 GRADER_LANGUAGE_NOTE = ("\n\nWrite `explanation` and every `gap` in Traditional Chinese (Taiwan usage), "
                         "concise and actionable, because they are shown to the user and fed back to the writer.")

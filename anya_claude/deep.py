@@ -129,9 +129,20 @@ def _rubric_middleware():
     只在長交付物上跑（讀了 skill、回答有程式碼、報告型長回答——deep_mw.deliverable_reason；
     2026-10-23 使用者決定一般問答不要跑：Haiku 評分不一致，一般問答每題多 15–20 秒卻幾乎每次都挑毛病）。
     呼叫時 state 也要有 rubric（graph.opus_node 決定，提問引導模式不放）。spike T6 驗過機制。"""
-    from deepagents.middleware.rubric import GRADER_SYSTEM_PROMPT, RubricMiddleware
+    from deepagents.middleware.rubric import RubricMiddleware
     grader = ChatAnthropic(model=CFG.HAIKU, max_tokens=4000, effort="low", thinking=CFG.HAIKU_THINKING)
     return make_deliverable_rubric(RubricMiddleware)(
         model=grader, max_iterations=RUBRIC_MAX_ITERATIONS, on_evaluation=rubric_event,
-                            system_prompt=GRADER_SYSTEM_PROMPT + P.GRADER_LANGUAGE_NOTE,
+                            system_prompt=grader_prompt(),
                             prepare_messages_for_grader=grader_view)
+
+
+def grader_prompt() -> str:
+    """deepagents 的評分提示，把「無法確認就判失敗」換成「有明確缺陷才判失敗」（理由見 prompts.GRADER_LENIENT）。
+    內建提示改了字就找不到那一句——那時改成附在最後，tests 也會紅。"""
+    from deepagents.middleware.rubric import GRADER_SYSTEM_PROMPT
+    if P.GRADER_CONSERVATIVE in GRADER_SYSTEM_PROMPT:
+        base = GRADER_SYSTEM_PROMPT.replace(P.GRADER_CONSERVATIVE, P.GRADER_LENIENT)
+    else:
+        base = GRADER_SYSTEM_PROMPT + "\n\n" + P.GRADER_LENIENT
+    return base + P.GRADER_LANGUAGE_NOTE

@@ -49,6 +49,16 @@ FORCE_DEEP_RE = re.compile(
 # 深思模式才有 web_fetch。放在翻譯之前——「翻譯這篇 https://…」也要先讀得到原文。
 URL_RE = re.compile(r"https?://[^\s<>\"'）)]+", re.IGNORECASE)
 
+# 引導模式裡也照一般流程回答的事實題：災防、天氣、查證、貼網址。2026-10-24 實測：引導模式中問「明天台北會下雨嗎」
+# 仍走提問引導（標籤「🧭 引導」），這次 Opus 自己決定直接答，但不保證每次都會。這一題照一般流程，模式不退出。
+WEATHER_HINT_RE = re.compile(r"天氣|下雨|降雨|會不會下|氣溫|溫度|颳風|要不要帶傘|冷不冷|熱不熱")
+
+
+def _live_fact(t: str) -> bool:
+    return bool(HAZARD_HINT_RE.search(t) or WEATHER_HINT_RE.search(t) or VERIFY_HINT_RE.search(t)
+                or URL_RE.search(t) or (QUAKE_COLLOQUIAL_RE is not None and QUAKE_COLLOQUIAL_RE.search(t)))
+
+
 # 翻譯請求：交給 Haiku（2026-10-23 使用者回報：翻譯一篇文章被送去深思，應該只有特殊任務才用深思）
 TRANSLATE_RE = re.compile(r"翻譯|翻成|譯成|翻為|譯為|中翻英|英翻中|日翻中|translate", re.IGNORECASE)
 
@@ -139,7 +149,7 @@ def next_socratic_state(text: str, current: str) -> str:
 def decide(text: str, *, socratic_active: bool = False, has_images: bool = False,
            has_docs: bool = False) -> Route:
     t = instruction_part(text)
-    if socratic_active:
+    if socratic_active and not _live_fact(t):
         return Route("deep", "socratic_mode", socratic=True)
     if has_images:
         return Route("deep", "contains_image")

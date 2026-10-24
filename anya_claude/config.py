@@ -27,6 +27,9 @@ OPUS_SERVER_TOOLS = [
 # 跑程式、從程式裡呼叫我們的自訂工具（氣象署），程式暫停等結果；續跑要把沙盒 container 帶回去，deepagents／
 # LangChain 都沒帶 → 第二次呼叫 400「code_execution tool use … without a corresponding result」，或模型在
 # 程式裡呼叫失敗後說「有查但沒拿到」。基本版沒有沙盒，模型只能直接呼叫工具：可靠、時間軸也看得到。
+# ⚠️ web_fetch 不要加 max_content_tokens：2026-10-24 實測，Haiku 單獨呼叫時有效（22,080 → 5,977 token），
+# 但深思模式（Opus＋deepagents）只要工具定義帶這個參數，研究報告題就輸出幾個亂碼字、完全不呼叫工具
+# （連續 3 次；拿掉後立刻正常，對照組見當次 scratchpad ifrs_isolate.py）。讀網頁的費用只能靠 max_uses 控制。
 DEEP_SERVER_TOOLS = [
     {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
     {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3},
