@@ -412,8 +412,9 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
         shelf = D.shelf_message(docs)
         if docs:
             dev["docs"] = [{"kind": d.kind, "pages": d.pages, "kb": d.size // 1024} for d in docs]
-        state = G.initial_state(([shelf] if shelf else []) + H.to_messages(hist[:upto])
-                                + [G.user_message(text, images)],
+            block = "\n\n".join(x for x in (block, D.TURN_NOTE) if x)   # 每題結尾提醒附引用、用中文轉述
+        past = H.to_messages(hist[:upto], docs_sig=D.signature(docs) if docs else None)
+        state = G.initial_state(([shelf] if shelf else []) + past + [G.user_message(text, images)],
                                 route=route.mode, socratic=route.socratic, context_block=block,
                                 allow_escalate=allow_escalate)
         q, halt = G.stream_in_thread(get_graph(), state)
@@ -485,6 +486,8 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
                 "evidence": EV.summarize(view.evidence), "trace": view.trace})
     hist.append({"role": "assistant", "text": final + footer, "mode": view.mode,
                  "badges": badges, "banner": banner, "dev": dev, **view.saved_status()})
+    if doc_footer:   # 引用結構一起存：之後追問時連同引用傳回去（history.to_messages）
+        hist[-1].update(cite_blocks=D.cite_blocks(msg), docs_sig=D.signature(turn.get("docs")))
     ctx["done"] = True
     user_entry.pop("pending", None)
     user_entry.pop("inflight", None)
