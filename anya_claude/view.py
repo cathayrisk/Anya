@@ -42,7 +42,7 @@ MIN_REDRAW = 0.06   # 重畫節流（秒）
 THINK_REDRAW = 0.15
 _TOOL_STAGE = {"web_search": "searching", "web_fetch": "fetching"}
 _CLIENT_STAGE = {"get_weather": "cwa", "get_earthquake_info": "cwa", "get_typhoon_info": "cwa",
-                 "read_file": "skill", "think": "reflect"}
+                 "read_file": "skill", "think": "reflect", "task": "searching"}
 # 拿到資料就算「查到」的自訂工具（回答裡說「查到」是實話，見 mdfix.strip_claims）。
 # 氣象署工具不列：它們有 evidence 事件，成功與否看那邊
 _LOOKUP_TOOLS = {"get_natal_chart", "get_astro_forecast", "get_synastry", "get_astro_reference"}
@@ -116,6 +116,7 @@ class TurnView:
         self.escalated = False
         self.escalate_reason = ""
         self.socratic = False
+        self.research = False                    # Haiku 升級時要求走深度研究（階段 4）
         self.sources: list[dict] = []
         self.evidence: list[dict] = []
         self.usage = TurnUsage()
@@ -129,6 +130,7 @@ class TurnView:
         self.first_text_s: float | None = None   # 首字時間（進 dev 與 telemetry；驗收看這個）
         self._await_text = False                 # 已先亮出「撰寫回答」、第一個字還沒到
         self.looked_up = False                   # 這回合真的查到資料（搜尋、讀網頁、氣象署、占星工具）
+        self.research_urls: set[str] = set()     # 研究員搜尋結果與讀到的網頁（收尾時核對報告列的網址）
         self._show_wait()
 
     def _now(self) -> float:
@@ -211,6 +213,12 @@ class TurnView:
                 self.looked_up = True
         elif k == "calc":
             self.tl.calc(ev.data.get("results") or [])
+        elif k == "research_sources":               # 階段 4：研究員查了一輪（子代理內部，畫面只看得到進度）
+            results = ev.data.get("results") or []
+            self.research_urls.update(r["url"] for r in results if r.get("url"))
+            self.looked_up |= bool(results)
+            self.tl.research_progress(int(ev.data.get("searches") or 0) + int(ev.data.get("fetches") or 0),
+                                      len(results))
         elif k == "reflect":
             self.tl.reflect(ev.data)
             if self.tl.current.kind == "write":     # 反思說直接作答：先換成寫字的台詞（帶引用的回答寫完才整段送來）
@@ -252,6 +260,7 @@ class TurnView:
             self.escalated = True
             self.escalate_reason = ev.data.get("reason") or ""
             self.socratic = bool(ev.data.get("socratic"))
+            self.research = bool(ev.data.get("research"))
             self.mode = "socratic" if self.socratic else "deep"
             self.tl.escalate(reason=self.escalate_reason, socratic=self.socratic)
             self.buf, self._gap = "", False

@@ -295,6 +295,31 @@ def display_text(buf: str, *, final: bool, looked_up: bool = False) -> str:
     return t
 
 
+# ── 研究報告的網址核對（階段 4）──
+# 研究模式的報告自己列來源（系統看不到研究員的搜尋）。網址必須真的出現在研究員的搜尋結果或讀到的網頁裡；
+# 對不上的不刪（可能只是寫法不同），旁邊標明讓人自己確認。
+_URL_RE = re.compile(r"https?://[^\s)\]」>，。、]+")
+UNSEEN_URL_NOTE = " :orange[（這個網址不在研究員的搜尋結果裡，請自行確認）]"
+
+
+def _url_key(url: str) -> str:
+    """比對用：不分 http(s)、www、大小寫、查詢字串與錨點、結尾斜線。"""
+    u = re.sub(r"^https?://(www\.)?", "", url.strip().lower()).split("#")[0].split("?")[0]
+    return u.rstrip("/.,;")
+
+
+def flag_unseen_urls(text: str, seen: set[str]) -> tuple[str, int]:
+    """報告裡不在 seen 的網址，在那一行最後加註。回傳 (加註後的文字, 加註了幾行)。"""
+    keys = {_url_key(u) for u in seen}
+    out, n = [], 0
+    for line in (text or "").split("\n"):
+        urls = _URL_RE.findall(line)
+        if urls and any(_url_key(u) not in keys for u in urls) and UNSEEN_URL_NOTE not in line:
+            line, n = line + UNSEEN_URL_NOTE, n + 1
+        out.append(line)
+    return "\n".join(out), n
+
+
 def build_web_sources_footer(sources: list[dict], max_n: int = 6) -> str:
     """來源 footer 由系統產生，不靠模型（沿用 Home.py 的格式）。"""
     seen = set()
@@ -326,9 +351,11 @@ def _badge(label: str, color: str) -> str:
 
 
 def badges_markdown(*, mode: str, web_calls: int = 0, elapsed_s: float | None = None,
-                    escalated: bool = False) -> str:
+                    escalated: bool = False, research: bool = False) -> str:
     label, color = _MODE_BADGE.get(mode, _MODE_BADGE["deep"])
     items = [_badge(label, color)]
+    if research:
+        items.append(_badge("🔬 深度研究", "blue"))
     if escalated:
         items.append(_badge("↑ 自動升級", "orange"))
     items.append(_badge(f"Web:{web_calls}" if web_calls else "Web:off", "violet" if web_calls else "gray"))

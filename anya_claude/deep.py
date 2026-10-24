@@ -27,11 +27,12 @@ from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware as _
 from . import config as CFG
 from . import prompts as P
 from .docs import has_shelf
-from .deep_mw import (PauseTurnMiddleware, PrevRequestBreakpointMiddleware, RubricStartMiddleware,
-                      UsageEventsMiddleware, grader_view, make_deliverable_rubric, rubric_event)
+from .deep_mw import (PauseTurnMiddleware, PrevRequestBreakpointMiddleware, ResearchSourcesMiddleware,
+                      RubricStartMiddleware, UsageEventsMiddleware, grader_view, make_deliverable_rubric,
+                      rubric_event)
 
 RUBRIC_MAX_ITERATIONS = 2   # 評兩次＝最多補寫一次（第二次還不過就照現況交出去，時間軸會標出來）
-from .tools import CWA_TOOLS, calculate, create_widget, think
+from .tools import CWA_TOOLS, calculate, create_widget, quiet_think, think
 
 ROOT = Path(__file__).resolve().parents[1]
 _SKILL_SUFFIXES = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".bas", ".csv"}
@@ -126,6 +127,58 @@ def build_deep_agent(*, socratic: bool = False):
         skills=["/skills/"],
         middleware=middleware,
         name="anya-deep",
+    )
+
+
+def build_research_agent():
+    """階段 4 深度研究：Opus 主持（定題、派工、整合、寫報告），研究員（CFG.RESEARCHER_MODEL，目前 Haiku）分頭上網查，
+    Sonnet 魔鬼代言人審查。主持人自己沒有上網工具（deepagents deep_research 範例：研究一律交給子代理），讀到的是
+    研究員濃縮過的回報，不用像單一 Opus 那樣把幾萬 token 的搜尋結果全讀進去。2026-10-24 使用者選定：
+    「深度研究／研究報告」都走這條、題目模糊不反問（寫明假設）、魔鬼代言人用 Sonnet、研究員實測後改 Haiku。"""
+    from deepagents import create_deep_agent
+    from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
+
+    install_cache_ttl()
+    install_opus_profile()
+    sonnet = ChatAnthropic(model=CFG.SONNET, max_tokens=CFG.RESEARCHER_MAX_TOKENS, effort="medium")
+    rid = CFG.RESEARCHER_MODEL
+    rmodel = sonnet if rid == CFG.SONNET else ChatAnthropic(
+        model=rid, max_tokens=CFG.RESEARCHER_MAX_TOKENS, effort="low", thinking=CFG.HAIKU_THINKING)
+    researcher = {
+        "name": "researcher",
+        "description": "研究員：交給它一個子題（附今天日期、地域與期間、要找的數字或事實），它會上網查證並回報"
+                       "重點、資料日期、來源評級與來源網址。一次只給一個子題；要查好幾個子題就派好幾位、同一則回應送出。",
+        "system_prompt": P.RESEARCHER_PROMPT,
+        "model": rmodel,
+        "tools": [quiet_think, *CFG.RESEARCH_SERVER_TOOLS],
+        "middleware": [PauseTurnMiddleware(),
+                       UsageEventsMiddleware(label=f"{CFG.MODEL_LABEL[rid].split()[0]} 研究員", model_id=rid),
+                       ResearchSourcesMiddleware(who="researcher"),
+                       ModelCallLimitMiddleware(run_limit=CFG.RESEARCHER_MAX_CALLS, exit_behavior="end")],
+    }
+    devil = {
+        "name": "devils-advocate",
+        "description": "魔鬼代言人：把整理好的重點結論與證據全文交給它，它會找出證據不足、被忽略的反方觀點、"
+                       "資料過時或口徑不一的地方。它沒有上網工具、看不到對話，內容要放在任務描述裡。",
+        "system_prompt": P.DEVIL_PROMPT,
+        "model": sonnet,
+        "tools": [],
+        "middleware": [UsageEventsMiddleware(label="Sonnet 魔鬼代言人", model_id=CFG.SONNET),
+                       ModelCallLimitMiddleware(run_limit=2, exit_behavior="end")],
+    }
+    model = ChatAnthropic(model=CFG.OPUS, max_tokens=CFG.OPUS_MAX_TOKENS, effort=CFG.OPUS_EFFORT)
+    # 派工上限：每輪最多 MAX_RESEARCHERS 位研究員、最多 MAX_RESEARCH_ROUNDS 輪，再加魔鬼代言人一次
+    max_tasks = CFG.MAX_RESEARCHERS * CFG.MAX_RESEARCH_ROUNDS + 1
+    middleware = [PauseTurnMiddleware(), UsageEventsMiddleware(label="Opus 主持", model_id=CFG.OPUS),
+                  PrevRequestBreakpointMiddleware(),
+                  ToolCallLimitMiddleware(tool_name="task", run_limit=max_tasks, exit_behavior="continue")]
+    return create_deep_agent(
+        model=model,
+        tools=[think, calculate],
+        system_prompt=P.research_system(),
+        subagents=[researcher, devil],
+        middleware=middleware,
+        name="anya-research",
     )
 
 

@@ -96,7 +96,8 @@ def _fetch_payload(content: Any) -> dict:
     return {"status": "error", "url": "", "error": code or "unknown"}
 
 
-CUSTOM_KINDS = ("escalate", "usage", "reflect", "evidence", "widget", "rubric_start", "rubric", "calc")
+CUSTOM_KINDS = ("escalate", "usage", "reflect", "evidence", "widget", "rubric_start", "rubric", "calc",
+                "research_sources")
 
 
 def parse_item(item: tuple) -> list[Ev]:
@@ -104,8 +105,9 @@ def parse_item(item: tuple) -> list[Ev]:
     階段 2 的 deep agent 是節點裡的子圖，要 subgraphs=True 才拿得到它的逐字與工具事件（p2_stream_probe 實測）。"""
     if len(item) == 3:
         ns, mode, data = item
-        # 第二層以下的子圖（例如寫完再檢查的 grader agent）：它的逐字和節點更新不是回答，不能畫進答案區。
-        # custom 事件照收（工具、middleware 主動送的）。子代理目前關著，第二層沒有其他正當來源。
+        # 第二層以下的子圖（寫完再檢查的 grader、階段 4 的研究員與魔鬼代言人）：它們的逐字和節點更新不是回答，
+        # 不能畫進答案區。custom 事件照收（寫完再檢查的評分結果就是從這一層送出來的）；研究員的反思用
+        # tools.quiet_think，本來就不送事件
         if len(ns) >= 2 and mode in ("messages", "updates"):
             return []
         return parse_stream_item(mode, data)

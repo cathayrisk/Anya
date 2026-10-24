@@ -216,6 +216,24 @@ def think(reflection: str, key_finding: str, next_action: str, confidence: int, 
     next_action：「繼續搜尋」「換工具」「直接作答」三選一。
     confidence：0–100，目前能完整回答問題的程度；≥80 就直接作答。
     """
+    return _reflect(reflection, key_finding, next_action, confidence, runtime, show=True)
+
+
+@tool("think")
+def quiet_think(reflection: str, key_finding: str, next_action: str, confidence: int, runtime: ToolRuntime) -> str:
+    """策略性反思：每次搜尋或讀網頁之後，停下來評估找到什麼、還缺什麼，並決定下一步（不會取得新資訊）。
+
+    reflection：1.發現摘要 2.來源之間的矛盾 3.還缺的資訊 4.下一步怎麼查。用正體中文寫。
+    key_finding：1–2 句，這一輪最重要的發現。
+    next_action：「繼續搜尋」「換工具」「直接作答」三選一。
+    confidence：0–100，目前能完整回報這個子題的程度；≥80 就停止搜尋、開始回報。
+    """
+    # 研究員用（階段 4）：反思不畫到時間軸——平行的幾位研究員各自反思，混進主時間軸會看不出是誰；
+    # 策略提示照樣給
+    return _reflect(reflection, key_finding, next_action, confidence, runtime, show=False)
+
+
+def _reflect(reflection, key_finding, next_action, confidence, runtime, *, show: bool) -> str:
     try:
         conf = max(0, min(100, int(confidence)))
     except (TypeError, ValueError):
@@ -225,9 +243,10 @@ def think(reflection: str, key_finding: str, next_action: str, confidence: int, 
     history = _previous_confidences((runtime.state or {}).get("messages") if runtime else [])
     confs = history if history and history[-1] == conf else history + [conf]
     hint = strategy_hint(confs)
-    _emit({"type": "reflect", "n": len(confs), "confidence": conf, "next_action": action,
-           "key_finding": (key_finding or "").strip()[:200], "reflection": (reflection or "").strip()[:1500],
-           "hint": bool(hint)})
+    if show:
+        _emit({"type": "reflect", "n": len(confs), "confidence": conf, "next_action": action,
+               "key_finding": (key_finding or "").strip()[:200], "reflection": (reflection or "").strip()[:1500],
+               "hint": bool(hint)})
     out: dict[str, Any] = {"ok": True}
     if hint:
         out["strategy_hint"] = hint

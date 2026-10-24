@@ -40,6 +40,7 @@ ROUTE_WHY = {
     "contains_image": "有附圖片",
     "has_docs": "對話裡有上傳的文件",
     "has_url": "附了網址，要讀原文",
+    "research": "要做深度研究，派研究員分頭查",
     "socratic_mode": "提問引導模式中",
     "user_redo_deep": "你要求改用深思模式重答",
     "user_redo_fast": "你要求改用一般模式重答",
@@ -69,9 +70,12 @@ CLIENT_TOOLS = {
     "get_astro_forecast": ("astro", "🔮", "推算流年"),
     "get_synastry": ("astro", "🔮", "計算合盤"),
     "get_astro_reference": ("astro_ref", "📖", "查占星原型文章"),
+    "task": ("task", "🧑‍🔬", "派研究員"),          # 階段 4：派子代理（研究員／魔鬼代言人），tool_args 才知道派誰
 }
+SUBAGENT_NAME = {"researcher": "研究員", "devils-advocate": "魔鬼代言人"}
 _WAIT_SEARCH = "等待搜尋結果…"
 _WAIT_FETCH = "等待網頁內容…"
+REFLECT_WAIT = "檢查資料夠不夠回答問題"   # 反思那一步在結果送來前的內容（reflect 用它認出還沒填的那格）
 
 
 def route_why(reason: str) -> str:
@@ -124,8 +128,10 @@ class Step:
     started: float = 0.0
     ended: float = 0.0
     calls: int = 0               # 搜尋／讀網頁的次數；撰寫回答：0＝先亮出來、字還沒到
-    hits: int = 0                # 搜尋結果筆數
+    hits: int = 0                # 搜尋結果筆數；派工：已回報的子代理數
     last: float = 0.0            # 深思：最後一個摘要片段到的時間（＝想完的時間）；撰寫：最後一個字到的時間
+    searched: int = 0            # 派工：研究員合計搜尋＋讀網頁次數
+    found: int = 0               # 派工：研究員合計拿到的來源數
 
     def record(self) -> dict:
         return {"label": self.label, "state": self.state, "detail": list(self.detail)}
@@ -245,15 +251,16 @@ class Timeline:
         if group == "reflect" and cur.kind == "think" and cur.state == "running":
             # 想完緊接著寫反思：併成同一步，秒數從開始想算起，內容換成中文反思
             cur.kind, cur.calls = "reflect", 1
-            cur.label, cur.detail = f"{icon} :shimmer[{verb}…]", ["檢查資料夠不夠回答問題"]
+            cur.label, cur.detail = f"{icon} :shimmer[{verb}…]", [REFLECT_WAIT]
             self._bump()
             return
-        if cur.kind == group and group != "reflect":           # 連續同類（例如讀好幾個檔）併成一步
+        # 連續同類（例如讀好幾個檔、同一則回應平行派的研究員）併成一步；派工已全部回報完的不併，另起一步
+        if cur.kind == group and group != "reflect" and (group != "task" or cur.hits < cur.calls):
             cur.state, cur.calls = "running", cur.calls + 1
             cur.label = f"{icon} :shimmer[{verb}…]"
             self._bump()
             return
-        detail = {"reflect": ["檢查資料夠不夠回答問題"], "cwa": ["中央氣象署開放資料"]}.get(group, [verb])
+        detail = {"reflect": [REFLECT_WAIT], "cwa": ["中央氣象署開放資料"]}.get(group, [verb])
         self._open(Step(group, f"{icon} :shimmer[{verb}…]", calls=1, detail=list(detail)))
 
     def tool_args(self, calls: list[dict]) -> None:
@@ -277,11 +284,35 @@ class Timeline:
                 cur.detail = [f"- {mark.get(t.get('status'), '⬜')} {_plain(t.get('content'), 60)}"
                               for t in (args.get("todos") or [])][:10] or cur.detail
                 changed = True
+            elif name == "task" and cur.kind == "task":
+                kind = str(args.get("subagent_type") or "")
+                line = f"- {SUBAGENT_NAME.get(kind, kind or '子代理')}：{_plain(args.get('description'), 60)}"
+                if line not in cur.detail:
+                    cur.detail = [d for d in cur.detail if d != "派研究員"] + [line]
+                    cur.label = self._task_label(cur)
+                    changed = True
         if changed:
             self._bump()
 
+    def _waiting_task(self) -> Step | None:
+        """還在等子代理回報的派工那一步（不一定是目前這一步：主持人可能同時呼叫了別的工具）。"""
+        return next((s for s in reversed(self.steps) if s.kind == "task" and s.hits < s.calls), None)
+
     def tool_result(self, name: str, status: str = "success", text: str = "") -> None:
         group = CLIENT_TOOLS.get(name, ("tool",))[0]
+        if group == "task":
+            # 平行派的幾位一個個回報；全部回報才算這一步完成
+            step = self._waiting_task()
+            if step is None:
+                return
+            step.hits += 1
+            done = step.hits >= step.calls
+            step.label = self._task_label(step, done=done)
+            if done:
+                self._complete(step)
+            else:
+                self._bump()
+            return
         cur = self.current
         if cur.kind != group or group in ("reflect", "calc"):   # think 由 reflect 事件、calculate 由 calc 事件收尾
             return
@@ -333,6 +364,29 @@ class Timeline:
             cur.label = "🔍 自我檢查沒跑完（不影響回答）"
         self._complete(cur)
 
+    def research_progress(self, searches: int, found: int) -> None:
+        """研究員查了一輪（deep_mw.ResearchSourcesMiddleware 送的）：派工那一步的進度跟著跳。"""
+        step = self._waiting_task()
+        if step is None:
+            return
+        step.searched += searches
+        step.found += found
+        step.label = self._task_label(step)
+        self._bump()
+
+    @staticmethod
+    def _task_label(cur: Step, done: bool = False) -> str:
+        n_res = sum(1 for d in cur.detail if d.startswith("- 研究員"))
+        progress = f"查了 {cur.searched} 次、找到 {cur.found} 個來源" if cur.searched else ""
+        if n_res:
+            if done:
+                return f"🧑‍🔬 {n_res} 位研究員回報了" + (f"・{progress}" if progress else "")
+            back = f"・{cur.hits}/{cur.calls} 位回報" if cur.hits else ""
+            return f"🧑‍🔬 :shimmer[{n_res} 位研究員分頭查{('・' + progress) if progress else ''}{back}…]"
+        if any(d.startswith("- 魔鬼代言人") for d in cur.detail):
+            return "😈 魔鬼代言人審查完" if done else "😈 :shimmer[請魔鬼代言人挑毛病…]"
+        return "🧑‍🔬 子代理回報了" if done else "🧑‍🔬 :shimmer[派研究員…]"
+
     def widget(self, title: str) -> None:
         """create_widget 通過檢查、送出元件（在 tool_result 之前到）：時間軸寫上元件標題。"""
         if self.current.kind == "widget":
@@ -355,17 +409,25 @@ class Timeline:
         self._complete(cur)
 
     def reflect(self, data: dict) -> None:
-        if self.current.kind != "reflect" or self.current.state != "running":
-            self.tool_call("think")
         cur = self.current
-        cur.label = (f"🧠 想了 {_secs(self.clock() - cur.started)}・第 {data.get('n', 1)} 次反思・"
-                     f"完整度 {data.get('confidence', 0)}%・{data.get('next_action') or '繼續'}")
-        cur.detail = ([f"💡 {_plain(data.get('key_finding') or '（沒寫發現）', 120)}"]
-                      + _reflection_lines(data.get("reflection")))
+        if cur.kind == "reflect" and cur.state == "running":
+            target = cur
+        else:
+            # 同一則回應裡「反思＋派研究員」（階段 4 實測）：反思的結果在工具執行時才送來，這時目前那一步是派工。
+            # 補進前面那格還沒有內容的反思，不要開新的一步把派工收掉（收掉後研究進度、回報都畫不上去）
+            target = next((s for s in reversed(self.steps) if s.kind == "reflect" and s.detail == [REFLECT_WAIT]),
+                          None)
+            if target is None:
+                self.tool_call("think")
+                target = cur = self.current
+        target.label = (f"🧠 想了 {_secs(self.clock() - target.started)}・第 {data.get('n', 1)} 次反思・"
+                        f"完整度 {data.get('confidence', 0)}%・{data.get('next_action') or '繼續'}")
+        target.detail = ([f"💡 {_plain(data.get('key_finding') or '（沒寫發現）', 120)}"]
+                         + _reflection_lines(data.get("reflection")))
         if data.get("hint"):
-            cur.detail.append("⚠️ 完整度偏低，系統提示改變查法")
-        self._complete(cur)
-        if data.get("next_action") == "直接作答":
+            target.detail.append("⚠️ 完整度偏低，系統提示改變查法")
+        self._complete(target)
+        if target is cur and data.get("next_action") == "直接作答":
             self.write(pending=True)
 
     # ── 模型 ──

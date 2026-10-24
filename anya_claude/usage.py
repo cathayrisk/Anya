@@ -45,6 +45,9 @@ def cost_usd(model: str, usage: dict | None, web_searches: int = 0, *, cache_ttl
     total_in = int(usage.get("input_tokens") or 0)
     out = int(usage.get("output_tokens") or 0)
     base, w5, w1, rd, o = CFG.PRICES.get(model, CFG.PRICES[CFG.OPUS])
+    if total_in > CFG.LONG_PROMPT_TOKENS and model in CFG.PRICES_LONG:
+        # 有 server tool 時 input_tokens 是整個請求的累計，可能比單次 prompt 長——寧可多算，不要少算
+        base, w5, w1, rd, o = CFG.PRICES_LONG[model]
     unknown_price = w1 if cache_ttl == "1h" else w5
     plain = max(0, total_in - cache_read - w5_tok - w1_tok - unknown)
     return (plain * base + w5_tok * w5 + w1_tok * w1 + unknown * unknown_price + cache_read * rd + out * o) / 1e6 \

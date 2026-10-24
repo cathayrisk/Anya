@@ -141,6 +141,7 @@ class Route:
     mode: str               # "fast"（Haiku）| "deep"（Opus）
     reason: str             # 進 dev 面板與 log，日後調規則才知道是哪條命中
     socratic: bool = False
+    research: bool = False  # 階段 4 深度研究：Opus 主持、派研究員（2026-10-24 使用者決定「深度研究／研究報告」都走）
 
 
 def next_socratic_state(text: str, current: str) -> str:
@@ -173,8 +174,9 @@ def decide(text: str, *, socratic_active: bool = False, has_images: bool = False
     if FORCE_DEEP_RE.search(t):
         return Route("deep", "user_requested_deep")
     # 有上傳文件時，「這份研究報告的結論是什麼」是在問文件，要「寫／整理出」研究報告才算深度研究
-    research = DEEP_RESEARCH_HINT_RE.search(t) and (not has_docs or PRODUCE_RE.search(t))
-    if research or GENERAL_HINT_RE.search(t) or CODING_HINT_RE.search(t) or _wants_widget(t):
+    if DEEP_RESEARCH_HINT_RE.search(t) and (not has_docs or PRODUCE_RE.search(t)):
+        return Route("deep", "research", research=True)
+    if GENERAL_HINT_RE.search(t) or CODING_HINT_RE.search(t) or _wants_widget(t):
         return Route("deep", "keyword_hint")
     skill = match_skill_hint(t)
     if skill:

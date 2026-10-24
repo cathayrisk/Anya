@@ -4,6 +4,10 @@ from __future__ import annotations
 
 HAIKU = "claude-haiku-5-5"
 OPUS = "claude-opus-5-5"
+SONNET = "claude-sonnet-5-5"   # 階段 4 魔鬼代言人
+# 階段 4 研究員：2026-10-24 使用者先選 Sonnet（單一子題試算 $0.08），完整試跑 IFRS 研究題研究員合計 $0.9、
+# 整題 $1.6–1.7；換 Haiku 整題 $0.83、研究員合計 $0.20，內容一樣扎實 → 使用者改選 Haiku
+RESEARCHER_MODEL = HAIKU
 
 # effort：Haiku 用 low（spike T2：簡單題首字約 0.7 秒），Opus 預設本來就是 medium，明寫避免日後預設變動
 HAIKU_EFFORT = "low"
@@ -35,6 +39,19 @@ DEEP_SERVER_TOOLS = [
     {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3},
 ]
 
+# 階段 4 研究流程（deepagents 的 deep_research 範例：最多 3 位平行、最多 3 輪；這裡收緊成 2 輪控制時間與費用）
+MAX_RESEARCHERS = 3            # 一輪最多派幾位研究員（平行）
+MAX_RESEARCH_ROUNDS = 2        # 最多派幾輪（第二輪補缺口）
+RESEARCHER_MAX_CALLS = 8       # 每位研究員最多呼叫模型幾次（搜尋＋反思交錯，約 5 次搜尋）
+RESEARCHER_MAX_TOKENS = 8000
+# 研究員用基本版（理由同 DEEP_SERVER_TOOLS）。讀網頁不加 max_content_tokens（見上面的 ⚠️）。
+# 2026-10-24 第一次試跑：搜尋 5＋讀網頁 2 時，一位研究員單次輸入 12.6 萬 token，3 位合計 $0.90（主持人才 $0.62）
+# → 收緊成搜尋 4、讀網頁 1
+RESEARCH_SERVER_TOOLS = [
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 4},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 1},
+]
+
 # server tool 的迴圈太長時 API 會回 stop_reason="pause_turn"，要把回應接回去再送一次
 MAX_PAUSE_CONTINUES = 3
 
@@ -45,7 +62,12 @@ HISTORY_USER_TURNS = 18
 PRICES = {
     HAIKU: (0.10, 0.125, 0.20, 0.01, 0.50),
     OPUS: (4.00, 5.00, 8.00, 0.20, 20.00),
+    SONNET: (2.00, 2.50, 4.00, 0.10, 10.00),
 }
+# Haiku 5.5 的 prompt 超過 10 萬 token（含快取讀寫）整次改用這組價目（2026-10 官方價目表）。
+# 大份文件、研究員連續搜尋都會超過；之前一律用低價算，用量記錄會少算到 1/5
+PRICES_LONG = {HAIKU: (0.50, 0.625, 1.00, 0.05, 2.50)}
+LONG_PROMPT_TOKENS = 100_000
 WEB_SEARCH_USD = 10 / 1000
 
-MODEL_LABEL = {HAIKU: "Haiku 5.5", OPUS: "Opus 5.5"}
+MODEL_LABEL = {HAIKU: "Haiku 5.5", OPUS: "Opus 5.5", SONNET: "Sonnet 5.5"}
