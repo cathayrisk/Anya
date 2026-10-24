@@ -17,15 +17,17 @@ streamlit>=1.40.0,<1.64
 #     invoke_with_backoff 處理 → 兩種卡死機制並存，需 attempt 級 telemetry 才分得出。
 #   - 若 Cloud 部署 log 顯示實際安裝的不是這兩版，以 log 為準修正 pin。
 # 升級前先重驗上述結論。
-langchain-google-genai==4.4.0
+# 2026-10-23 階段 2：4.4.0 → 4.4.2（deepagents 0.7.30 要求 >=4.4.2；google-genai 維持 2.22.0 可以解析）。
+# 上傳後要對舊 Home.py 做線上冒煙測試（Gemini 那條路也吃這個套件）。
+langchain-google-genai==4.4.2
 google-genai==2.22.0
 # Claude 版主聊天（pages/0_Anya_Claude.py，2026-10 起和舊 Home.py 並存）。
 # 版本照 tools/claude_spike/README.md 實測過的組合釘死；要升版先重跑 spike（T1 執行緒行為版本相依）。
-# 2026-10-23 已確認這兩個和上面的 langchain-google-genai==4.4.0 可以一起解析。
-# ⚠️ 之後加 deepagents==0.7.30 時，它要求 langchain-google-genai>=4.4.2——屆時要把上面那行
-#    小升到 4.4.2（google-genai 維持 2.22.0 可以解析），升完先對舊 Home.py 做線上冒煙測試。
+# deepagents 釘 0.7.30：anya_claude/deep.py 換掉了它內部的快取 middleware 類別（private 模組，
+# tests/test_claude_deep.py 盯著），升版前先跑那支測試。
 langchain-anthropic==1.7.6
 langgraph==1.2.16
+deepagents==0.7.30
 langchain
 langchain-community
 langchain-openai
@@ -34,7 +36,6 @@ langchain-core
 langgraph-supervisor
 openai
 openai-agents
-deepagents
 #gpt-researcher>=0.10.0,<0.15.0
 langsmith
 
