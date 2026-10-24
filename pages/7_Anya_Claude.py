@@ -416,7 +416,7 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
         past = H.to_messages(hist[:upto], docs_sig=D.signature(docs) if docs else None)
         state = G.initial_state(([shelf] if shelf else []) + past + [G.user_message(text, images)],
                                 route=route.mode, socratic=route.socratic, context_block=block,
-                                allow_escalate=allow_escalate)
+                                allow_escalate=allow_escalate, research=route.research)
         q, halt = G.stream_in_thread(get_graph(), state)
         ctx["turn"].update(q=q, halt=halt, events=[], start_mode=start_mode, serious=serious, dev=dev,
                            pf_results=pf_results, pf_evidence=pf_evidence, pf_at=pf_at, t0=t0)
@@ -465,6 +465,10 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
     # 文件引用：被引用的段落後面加 [n]、最後附引用清單（頁碼由程式從引用位置產生，不靠模型寫）
     text, doc_footer = D.cited_answer(msg, turn.get("docs") or [])
     final = M.display_text(text, final=True, looked_up=view.looked_up or bool(doc_footer))
+    research = route.research or view.research
+    if research:
+        # 研究報告自己列來源：網址要真的出現在研究員的搜尋結果裡，對不上的標出來（mdfix.flag_unseen_urls）
+        final, dev["unseen_urls"] = M.flag_unseen_urls(final, view.research_urls)
     if not final.strip():
         view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
         ctx["done"] = True
@@ -477,7 +481,7 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
     banner = EVB.build_banner(view.evidence) if view.evidence else ""
     elapsed = time.time() - t0
     badges = M.badges_markdown(mode=view.mode, web_calls=view.usage.web_searches,
-                               elapsed_s=elapsed, escalated=view.escalated)
+                               elapsed_s=elapsed, escalated=view.escalated, research=research)
     view.close(elapsed)   # 先存進歷史再畫：畫到一半連線斷了，重連後歷史裡就有完整回答
     dev.update({"final_mode": view.mode, "escalated": view.escalated,
                 "escalate_reason": view.escalate_reason, "secs": round(elapsed, 2),
