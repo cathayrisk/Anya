@@ -97,7 +97,7 @@ def _fetch_payload(content: Any) -> dict:
 
 
 CUSTOM_KINDS = ("escalate", "usage", "reflect", "evidence", "widget", "rubric_start", "rubric", "calc",
-                "research_sources")
+                "research_sources", "retry")
 
 
 def parse_item(item: tuple) -> list[Ev]:

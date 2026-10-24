@@ -329,6 +329,17 @@ def rubric_event(evaluation: dict) -> None:
         pass
 
 
+def research_not_started(messages: list) -> bool:
+    """研究模式這一題有沒有真的開始：主持人一位研究員都沒派（沒有 task 呼叫）、回答又很短，就算沒啟動。
+    graph.opus_node 會自動重跑一次；還是這樣，頁面當成失敗、不存進歷史（亂碼會一路帶進之後的對話）。"""
+    turn = _this_turn(messages)
+    if any(isinstance(m, AIMessage) and any(tc.get("name") == "task" for tc in (m.tool_calls or [])) for m in turn):
+        return False
+    final = final_answer(messages)
+    text = final.text if final is not None and isinstance(final.text, str) else ""
+    return len(text.strip()) < CFG.RESEARCH_MIN_CHARS
+
+
 def server_sources(msg: AIMessage) -> tuple[int, int, list[dict]]:
     """一則回應裡的網路搜尋次數、讀網頁次數，與拿到的 [{url, title}]（搜尋結果＋讀到的網頁）。"""
     searches, fetches, found = 0, 0, []

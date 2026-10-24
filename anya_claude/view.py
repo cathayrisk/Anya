@@ -117,6 +117,7 @@ class TurnView:
         self.escalate_reason = ""
         self.socratic = False
         self.research = False                    # Haiku 升級時要求走深度研究（階段 4）
+        self.retried = False                     # 研究沒啟動、自動重跑過
         self.sources: list[dict] = []
         self.evidence: list[dict] = []
         self.usage = TurnUsage()
@@ -213,6 +214,14 @@ class TurnView:
                 self.looked_up = True
         elif k == "calc":
             self.tl.calc(ev.data.get("results") or [])
+        elif k == "retry":                          # 研究沒啟動、自動重跑：清掉第一次的回答（偶發亂碼），等重跑的結果
+            self.retried = True
+            self.tl.retry(ev.data.get("reason") or "")
+            self.buf, self._gap = "", False
+            self.answer_ph.empty()
+            self._show_wait()
+            self.stage, self._stage_t = "deep_thinking", time.time()
+            self._expand(True)
         elif k == "research_sources":               # 階段 4：研究員查了一輪（子代理內部，畫面只看得到進度）
             results = ev.data.get("results") or []
             self.research_urls.update(r["url"] for r in results if r.get("url"))

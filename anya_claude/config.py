@@ -43,6 +43,9 @@ DEEP_SERVER_TOOLS = [
 MAX_RESEARCHERS = 3            # 一輪最多派幾位研究員（平行）
 MAX_RESEARCH_ROUNDS = 2        # 最多派幾輪（第二輪補缺口）
 RESEARCHER_MAX_CALLS = 8       # 每位研究員最多呼叫模型幾次（搜尋＋反思交錯，約 5 次搜尋）
+# 研究沒啟動的判準：主持人一位研究員都沒派、回答又短於這個字數（deep_mw.research_not_started）。
+# 2026-10-24 線上偶發：重啟後第一題只輸出幾行簡體字（「1 个参与者对话」），31 秒 $0.05；正常報告都上萬字
+RESEARCH_MIN_CHARS = 400
 RESEARCHER_MAX_TOKENS = 8000
 # 研究員用基本版（理由同 DEEP_SERVER_TOOLS）。讀網頁不加 max_content_tokens（見上面的 ⚠️）。
 # 2026-10-24 第一次試跑：搜尋 5＋讀網頁 2 時，一位研究員單次輸入 12.6 萬 token，3 位合計 $0.90（主持人才 $0.62）

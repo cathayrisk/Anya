@@ -364,6 +364,11 @@ class Timeline:
             cur.label = "🔍 自我檢查沒跑完（不影響回答）"
         self._complete(cur)
 
+    def retry(self, reason: str) -> None:
+        """研究沒啟動、自動重跑（graph.opus_node）：記一步，讓人知道前面那幾步作廢了。"""
+        self._open(Step("retry", "🔁 研究沒有啟動，重新開始", detail=[_plain(reason, 80) or "重新開始一次"]))
+        self._complete(self.current)
+
     def research_progress(self, searches: int, found: int) -> None:
         """研究員查了一輪（deep_mw.ResearchSourcesMiddleware 送的）：派工那一步的進度跟著跳。"""
         step = self._waiting_task()

@@ -27,7 +27,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from . import config as CFG
 from . import prompts as P
-from .deep_mw import final_answer, web_search_count
+from .deep_mw import final_answer, research_not_started, web_search_count
 from .tools import calculate, run_calculate
 
 CACHE = {"type": "ephemeral", "ttl": "1h"}   # 同事常隔超過 5 分鐘才問下一題，5m 快取會一直失效
@@ -188,6 +188,10 @@ def build_graph(*, deep_agents: dict[str, Any] | None = None, deep_files=None):
         if not socratic and not research:   # 研究流程由魔鬼代言人審查，不再跑通用的寫完再檢查
             inp["rubric"] = P.DEEP_RUBRIC   # 寫完再檢查（RubricMiddleware 看到 rubric 才啟動）
         out = agent.invoke(inp)
+        if research and research_not_started(out.get("messages") or []):
+            # 2026-10-24 線上偶發：主持人沒派研究員、只吐出幾行簡體字；同一題重問就正常。自動重跑一次（失敗那次約 $0.05）
+            get_stream_writer()({"type": "retry", "reason": "第一次沒有派出研究員、回答很短，重新開始一次"})
+            out = agent.invoke(inp)
         try:
             from . import lessons
             lessons.maybe_distill(out.get("messages") or [])   # 卡關後又解決 → 背景萃取搜尋教訓
