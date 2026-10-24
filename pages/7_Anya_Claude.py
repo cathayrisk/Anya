@@ -467,8 +467,8 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
     final = M.display_text(text, final=True, looked_up=view.looked_up or bool(doc_footer))
     research = route.research or view.research
     if research:
-        # 研究報告自己列來源：網址要真的出現在研究員的搜尋結果裡，對不上的標出來（mdfix.flag_unseen_urls）
-        final, dev["unseen_urls"] = M.flag_unseen_urls(final, view.research_urls)
+        # 研究報告自己列來源：來源行改成清單；網址要真的出現在研究員的搜尋結果裡，對不上的標出來
+        final, dev["unseen_urls"] = M.finish_research_report(final, view.research_urls)
     if not final.strip():
         view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
         ctx["done"] = True
