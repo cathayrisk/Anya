@@ -96,15 +96,13 @@ def _fetch_payload(content: Any) -> dict:
     return {"status": "error", "url": "", "error": code or "unknown"}
 
 
-CUSTOM_KINDS = ("escalate", "usage", "reflect", "evidence", "widget", "rubric_start", "rubric", "calc",
-                "research_sources", "retry")
+CUSTOM_KINDS = ("escalate", "usage", "reflect", "evidence", "widget", "rubric_start", "rubric", "calc")
 
 
 def subgraph_depth(ns: tuple) -> int:
-    """namespace 有幾層子圖。同一個節點第二次呼叫子圖時，LangGraph 會在後面多接一段純數字（第幾次呼叫）：
-    研究沒啟動自動重跑（graph.opus_node）那次，主持人是 ('opus:…', '1')、研究員是 ('opus:…', '1', 'tools:…')。
-    2026-10-25 線上：直接數段數，重跑那次主持人的逐字和派研究員步驟全被當成第二層濾掉
-    （tests/test_claude_events.py 用真的 LangGraph 盯著這個編號方式）。"""
+    """namespace 有幾層子圖。同一個節點第二次呼叫子圖時，LangGraph 會在後面多接一段純數字（第幾次呼叫），
+    例如 ('opus:…', '1') 仍是第一層。2026-10-25 研究模式自動重跑時踩過：直接數段數，重跑那次主持人的逐字全被
+    當成第二層濾掉（研究模式後來收掉；tests/test_claude_events.py 用真的 LangGraph 盯著這個編號方式）。"""
     return sum(1 for part in ns if not part.isdigit())
 
 
@@ -113,9 +111,8 @@ def parse_item(item: tuple) -> list[Ev]:
     階段 2 的 deep agent 是節點裡的子圖，要 subgraphs=True 才拿得到它的逐字與工具事件（p2_stream_probe 實測）。"""
     if len(item) == 3:
         ns, mode, data = item
-        # 第二層以下的子圖（寫完再檢查的 grader、階段 4 的研究員與魔鬼代言人）：它們的逐字和節點更新不是回答，
-        # 不能畫進答案區。custom 事件照收（寫完再檢查的評分結果就是從這一層送出來的）；研究員的反思用
-        # tools.quiet_think，本來就不送事件
+        # 第二層以下的子圖（寫完再檢查的 grader）：它的逐字和節點更新不是回答，不能畫進答案區。
+        # custom 事件照收（寫完再檢查的評分結果就是從這一層送出來的）
         if subgraph_depth(ns) >= 2 and mode in ("messages", "updates"):
             return []
         return parse_stream_item(mode, data)

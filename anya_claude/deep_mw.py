@@ -329,69 +329,6 @@ def rubric_event(evaluation: dict) -> None:
         pass
 
 
-def research_not_started(messages: list) -> bool:
-    """研究模式這一題有沒有真的開始：主持人一位研究員都沒派（沒有 task 呼叫）、回答又很短，就算沒啟動。
-    graph.opus_node 會自動重跑一次；還是這樣，頁面當成失敗、不存進歷史（亂碼會一路帶進之後的對話）。"""
-    turn = _this_turn(messages)
-    if any(isinstance(m, AIMessage) and any(tc.get("name") == "task" for tc in (m.tool_calls or [])) for m in turn):
-        return False
-    final = final_answer(messages)
-    text = final.text if final is not None and isinstance(final.text, str) else ""
-    return len(text.strip()) < CFG.RESEARCH_MIN_CHARS
-
-
-def attempt_note(messages: list) -> dict:
-    """沒啟動那次留給 telemetry 的線索：最終回答（本來就短於 RESEARCH_MIN_CHARS）與停止原因。
-    2026-10-25 線上第二次失敗沒留下回答：只知道 Opus 想了 70 秒、輸出 6,802 token 就結束，看不出寫了什麼。"""
-    final = final_answer(messages)
-    text = final.text if final is not None and isinstance(final.text, str) else ""
-    stop = (final.response_metadata or {}).get("stop_reason") if final is not None else None
-    return {"text": text.strip()[:CFG.RESEARCH_MIN_CHARS], "stop_reason": stop or ""}
-
-
-def server_sources(msg: AIMessage) -> tuple[int, int, list[dict]]:
-    """一則回應裡的網路搜尋次數、讀網頁次數，與拿到的 [{url, title}]（搜尋結果＋讀到的網頁）。"""
-    searches, fetches, found = 0, 0, []
-    for b in msg.content if isinstance(msg.content, list) else []:
-        if not isinstance(b, dict):
-            continue
-        t = b.get("type")
-        if t == "server_tool_use":
-            searches += b.get("name") == "web_search"
-            fetches += b.get("name") == "web_fetch"
-        elif t == "web_search_tool_result" and isinstance(b.get("content"), list):
-            found += [{"url": r.get("url") or "", "title": r.get("title") or ""}
-                      for r in b["content"] if isinstance(r, dict) and r.get("url")]
-        elif t == "web_fetch_tool_result":
-            c = b.get("content") or {}
-            if isinstance(c, dict) and c.get("type") == "web_fetch_result" and c.get("url"):
-                found.append({"url": c["url"], "title": ((c.get("content") or {}).get("title") or c["url"])})
-    return searches, fetches, found
-
-
-class ResearchSourcesMiddleware(AgentMiddleware):
-    """研究員每次回應後送出「查了幾次、拿到哪些網址」（custom 事件 research_sources）。
-    子代理的逐字與搜尋事件在畫面上看不到（events.parse_item 擋掉第二層以下的 messages），這裡讓時間軸看得到進度，
-    也讓頁面在收尾時核對：報告列的網址都要真的出現在研究員的搜尋結果裡（research.check_sources）。"""
-
-    def __init__(self, *, who: str):
-        super().__init__()
-        self.who = who
-
-    def after_model(self, state, runtime) -> dict[str, Any] | None:
-        msgs = state.get("messages") or []
-        last = msgs[-1] if msgs else None
-        if isinstance(last, AIMessage):
-            searches, fetches, found = server_sources(last)
-            if searches or fetches or found:
-                try:
-                    get_stream_writer()({"type": "research_sources", "who": self.who, "searches": searches,
-                                         "fetches": fetches, "results": found})
-                except Exception:
-                    pass
-        return None
-
-
 class UsageEventsMiddleware(AgentMiddleware):
     def __init__(self, *, label: str, model_id: str):
         super().__init__()

@@ -27,20 +27,19 @@ from typing_extensions import NotRequired, TypedDict
 
 from . import config as CFG
 from . import prompts as P
-from .deep_mw import attempt_note, final_answer, research_not_started, web_search_count
+from .deep_mw import final_answer, web_search_count
 from .tools import calculate, run_calculate
 
 CACHE = {"type": "ephemeral", "ttl": "1h"}   # 同事常隔超過 5 分鐘才問下一題，5m 快取會一直失效
 
 
 @tool
-def escalate_to_deep(reason: str, socratic: bool = False, research: bool = False) -> str:
+def escalate_to_deep(reason: str, socratic: bool = False) -> str:
     """把這題交給深思模式（Opus）。符合升級規則時呼叫，呼叫前不要先寫任何回答。
 
     Args:
         reason: 一句話說明為什麼要升級。
         socratic: 使用者卡住、需要被引導思考（而不是要答案）時設為 true。
-        research: 使用者要一份研究報告、深度研究或文獻回顧時設為 true（會派研究員分頭上網查）。
     """
     return "已轉交深思模式"
 
@@ -49,7 +48,7 @@ class TurnState(TypedDict):
     messages: list[BaseMessage]          # 歷史＋本回合使用者訊息（不含系統提示）
     route: str                           # "fast" | "deep"
     socratic: bool
-    research: NotRequired[bool]          # 深度研究：主持人派研究員（階段 4）
+    wide_search: NotRequired[bool]       # 研究報告題：深思模式放寬搜尋次數（router 判定）
     context_block: NotRequired[str]      # 災防 prefetch 的官方資料；空字串＝沒有
     allow_escalate: NotRequired[bool]    # False＝使用者指定「改用一般模式重答」，Haiku 不能自己升級
     escalate_reason: NotRequired[str]
@@ -71,7 +70,7 @@ def _models() -> dict[str, Any]:
 def _deep_agents() -> dict[str, Any]:
     from . import deep   # 延遲 import：deepagents 很重，只有建圖時才載入
     return {"assist": deep.build_deep_agent(socratic=False), "socratic": deep.build_deep_agent(socratic=True),
-            "research": deep.build_research_agent()}
+            "assist_wide": deep.build_deep_agent(wide_search=True)}
 
 
 def _deep_files() -> dict:
@@ -163,11 +162,9 @@ def build_graph(*, deep_agents: dict[str, Any] | None = None, deep_files=None):
             if esc:
                 args = esc[0].get("args") or {}
                 socratic = bool(state.get("socratic")) or bool(args.get("socratic"))
-                research = not socratic and bool(args.get("research"))
                 reason = str(args.get("reason") or "").strip()[:200]
-                get_stream_writer()({"type": "escalate", "reason": reason, "socratic": socratic, "research": research})
-                return Command(goto="opus", update={"escalate_reason": reason, "socratic": socratic,
-                                                    "research": research, "calls": calls})
+                get_stream_writer()({"type": "escalate", "reason": reason, "socratic": socratic})
+                return Command(goto="opus", update={"escalate_reason": reason, "socratic": socratic, "calls": calls})
             todo = [tc for tc in (resp.tool_calls or []) if tc.get("name") == "calculate"]
             if not todo or i == CALC_ROUNDS:
                 break
@@ -180,21 +177,14 @@ def build_graph(*, deep_agents: dict[str, Any] | None = None, deep_files=None):
     def opus_node(state: TurnState):
         # deep agent 是子圖：它的逐字、工具、用量事件（UsageEventsMiddleware）都從子圖串出去
         socratic = bool(state.get("socratic"))
-        research = not socratic and bool(state.get("research"))
-        agent = agents["socratic"] if socratic else agents.get("research", agents["assist"]) if research \
+        wide = not socratic and bool(state.get("wide_search"))
+        agent = agents["socratic"] if socratic else agents.get("assist_wide", agents["assist"]) if wide \
             else agents["assist"]
         msgs = list(state["messages"]) + [SystemMessage(turn_note(state))]
         inp = {"messages": msgs, "files": files_for()}
-        if not socratic and not research:   # 研究流程由魔鬼代言人審查，不再跑通用的寫完再檢查
+        if not socratic:   # 提問引導模式是在問問題、不是交答案，不跑寫完再檢查
             inp["rubric"] = P.DEEP_RUBRIC   # 寫完再檢查（RubricMiddleware 看到 rubric 才啟動）
         out = agent.invoke(inp)
-        if research and research_not_started(out.get("messages") or []):
-            # 2026-10-24 線上偶發：主持人沒派研究員、只吐出幾行簡體字；同一題重問就正常。自動重跑一次（失敗那次 $0.05–0.14；
-            # 10-25 線上第二次是想了 70 秒沒派就結束）
-            # first：第一次的回答與停止原因，只進 telemetry（畫面上照樣清掉）
-            get_stream_writer()({"type": "retry", "reason": "第一次沒有派出研究員、回答很短，重新開始一次",
-                                 "first": attempt_note(out.get("messages") or [])})
-            out = agent.invoke(inp)
         try:
             from . import lessons
             lessons.maybe_distill(out.get("messages") or [])   # 卡關後又解決 → 背景萃取搜尋教訓
@@ -246,8 +236,8 @@ def stream_in_thread(graph, state: TurnState) -> tuple[queue.Queue, threading.Ev
 
 
 def initial_state(messages: list[BaseMessage], *, route: str, socratic: bool,
-                  context_block: str = "", allow_escalate: bool = True, research: bool = False) -> TurnState:
-    return {"messages": messages, "route": route, "socratic": socratic, "research": research,
+                  context_block: str = "", allow_escalate: bool = True, wide_search: bool = False) -> TurnState:
+    return {"messages": messages, "route": route, "socratic": socratic, "wide_search": wide_search,
             "context_block": context_block, "allow_escalate": allow_escalate, "calls": []}
 
 

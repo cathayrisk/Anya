@@ -42,7 +42,7 @@ MIN_REDRAW = 0.06   # 重畫節流（秒）
 THINK_REDRAW = 0.15
 _TOOL_STAGE = {"web_search": "searching", "web_fetch": "fetching"}
 _CLIENT_STAGE = {"get_weather": "cwa", "get_earthquake_info": "cwa", "get_typhoon_info": "cwa",
-                 "read_file": "skill", "think": "reflect", "task": "searching"}
+                 "read_file": "skill", "think": "reflect"}
 # 拿到資料就算「查到」的自訂工具（回答裡說「查到」是實話，見 mdfix.strip_claims）。
 # 氣象署工具不列：它們有 evidence 事件，成功與否看那邊
 _LOOKUP_TOOLS = {"get_natal_chart", "get_astro_forecast", "get_synastry", "get_astro_reference"}
@@ -116,9 +116,6 @@ class TurnView:
         self.escalated = False
         self.escalate_reason = ""
         self.socratic = False
-        self.research = route_reason == "research"   # 深度研究（階段 4）：路由直接判定，或 Haiku 升級時要求
-        self.retried = False                     # 研究沒啟動、自動重跑過
-        self.retry_first: dict = {}              # 沒啟動那次的回答與停止原因（只進 telemetry）
         self.sources: list[dict] = []
         self.evidence: list[dict] = []
         self.usage = TurnUsage()
@@ -132,7 +129,6 @@ class TurnView:
         self.first_text_s: float | None = None   # 首字時間（進 dev 與 telemetry；驗收看這個）
         self._await_text = False                 # 已先亮出「撰寫回答」、第一個字還沒到
         self.looked_up = False                   # 這回合真的查到資料（搜尋、讀網頁、氣象署、占星工具）
-        self.research_urls: set[str] = set()     # 研究員搜尋結果與讀到的網頁（收尾時核對報告列的網址）
         self._show_wait()
 
     def _now(self) -> float:
@@ -202,17 +198,8 @@ class TurnView:
             name = ev.data.get("name") or ""
             if name == "escalate_to_deep":          # Haiku 的升級工具由 escalate 事件處理
                 return
-            drafted = self.research and bool(self.buf.strip())
-            if drafted:
-                # 研究模式：主持人派工前寫的（2026-10-25 線上是一段英文計畫，研究那 3 分鐘一直留在答案區）不會進
-                # 最後的報告（deep_mw.final_answer 只取最後一段），畫面上先收起來
-                self.buf = ""
-                self.answer_ph.empty()
-                self._show_wait()
             self._gap = True
             self.tl.tool_call(name)
-            if drafted:
-                self.tl.draft_cleared()
             self.set_stage(_CLIENT_STAGE.get(name, "organizing"))
             self._expand(True)
         elif k == "tool_args":
@@ -224,21 +211,6 @@ class TurnView:
                 self.looked_up = True
         elif k == "calc":
             self.tl.calc(ev.data.get("results") or [])
-        elif k == "retry":                          # 研究沒啟動、自動重跑：清掉第一次的回答（偶發亂碼），等重跑的結果
-            self.retried = True
-            self.retry_first = ev.data.get("first") or {}
-            self.tl.retry(ev.data.get("reason") or "")
-            self.buf, self._gap = "", False
-            self.answer_ph.empty()
-            self._show_wait()
-            self.stage, self._stage_t = "deep_thinking", time.time()
-            self._expand(True)
-        elif k == "research_sources":               # 階段 4：研究員查了一輪（子代理內部，畫面只看得到進度）
-            results = ev.data.get("results") or []
-            self.research_urls.update(r["url"] for r in results if r.get("url"))
-            self.looked_up |= bool(results)
-            self.tl.research_progress(int(ev.data.get("searches") or 0) + int(ev.data.get("fetches") or 0),
-                                      len(results))
         elif k == "reflect":
             self.tl.reflect(ev.data)
             if self.tl.current.kind == "write":     # 反思說直接作答：先換成寫字的台詞（帶引用的回答寫完才整段送來）
@@ -280,7 +252,6 @@ class TurnView:
             self.escalated = True
             self.escalate_reason = ev.data.get("reason") or ""
             self.socratic = bool(ev.data.get("socratic"))
-            self.research = bool(ev.data.get("research"))
             self.mode = "socratic" if self.socratic else "deep"
             self.tl.escalate(reason=self.escalate_reason, socratic=self.socratic)
             self.buf, self._gap = "", False

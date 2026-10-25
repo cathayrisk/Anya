@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 try:
     from widget_templates import WIDGET_HINT_RE
@@ -141,7 +141,7 @@ class Route:
     mode: str               # "fast"（Haiku）| "deep"（Opus）
     reason: str             # 進 dev 面板與 log，日後調規則才知道是哪條命中
     socratic: bool = False
-    research: bool = False  # 階段 4 深度研究：Opus 主持、派研究員（2026-10-24 使用者決定「深度研究／研究報告」都走）
+    wide_search: bool = False   # 研究報告題：深思模式放寬搜尋次數（config.WIDE_SERVER_TOOLS）
 
 
 def next_socratic_state(text: str, current: str) -> str:
@@ -156,8 +156,22 @@ def next_socratic_state(text: str, current: str) -> str:
     return current if current in ("assist", "socratic") else "assist"
 
 
+def _wants_report(t: str, has_docs: bool) -> bool:
+    # 有上傳文件時，「這份研究報告的結論是什麼」是在問文件，要「寫／整理出」研究報告才算
+    return bool(DEEP_RESEARCH_HINT_RE.search(t) and (not has_docs or PRODUCE_RE.search(t)))
+
+
 def decide(text: str, *, socratic_active: bool = False, has_images: bool = False,
            has_docs: bool = False) -> Route:
+    route = _decide(text, socratic_active=socratic_active, has_images=has_images, has_docs=has_docs)
+    # 研究報告題：不管哪條規則先命中（災防、貼網址、查證…），只要走深思模式就放寬搜尋次數。
+    # 2026-10-25 研究模式收掉；之前災防規則排在研究前面，含「颱風」的研究題拿不到研究流程
+    if route.mode == "deep" and not route.socratic and _wants_report(instruction_part(text), has_docs):
+        route = replace(route, wide_search=True)
+    return route
+
+
+def _decide(text: str, *, socratic_active: bool, has_images: bool, has_docs: bool) -> Route:
     t = instruction_part(text)
     if socratic_active and not _live_fact(t):
         return Route("deep", "socratic_mode", socratic=True)
@@ -173,9 +187,8 @@ def decide(text: str, *, socratic_active: bool = False, has_images: bool = False
         return Route("deep", "verify_hint")
     if FORCE_DEEP_RE.search(t):
         return Route("deep", "user_requested_deep")
-    # 有上傳文件時，「這份研究報告的結論是什麼」是在問文件，要「寫／整理出」研究報告才算深度研究
-    if DEEP_RESEARCH_HINT_RE.search(t) and (not has_docs or PRODUCE_RE.search(t)):
-        return Route("deep", "research", research=True)
+    if _wants_report(t, has_docs):
+        return Route("deep", "research")
     if GENERAL_HINT_RE.search(t) or CODING_HINT_RE.search(t) or _wants_widget(t):
         return Route("deep", "keyword_hint")
     skill = match_skill_hint(t)
