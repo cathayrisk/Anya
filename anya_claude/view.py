@@ -116,7 +116,7 @@ class TurnView:
         self.escalated = False
         self.escalate_reason = ""
         self.socratic = False
-        self.research = False                    # Haiku 升級時要求走深度研究（階段 4）
+        self.research = route_reason == "research"   # 深度研究（階段 4）：路由直接判定，或 Haiku 升級時要求
         self.retried = False                     # 研究沒啟動、自動重跑過
         self.retry_first: dict = {}              # 沒啟動那次的回答與停止原因（只進 telemetry）
         self.sources: list[dict] = []
@@ -202,8 +202,17 @@ class TurnView:
             name = ev.data.get("name") or ""
             if name == "escalate_to_deep":          # Haiku 的升級工具由 escalate 事件處理
                 return
+            drafted = self.research and bool(self.buf.strip())
+            if drafted:
+                # 研究模式：主持人派工前寫的（2026-10-25 線上是一段英文計畫，研究那 3 分鐘一直留在答案區）不會進
+                # 最後的報告（deep_mw.final_answer 只取最後一段），畫面上先收起來
+                self.buf = ""
+                self.answer_ph.empty()
+                self._show_wait()
             self._gap = True
             self.tl.tool_call(name)
+            if drafted:
+                self.tl.draft_cleared()
             self.set_stage(_CLIENT_STAGE.get(name, "organizing"))
             self._expand(True)
         elif k == "tool_args":

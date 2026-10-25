@@ -473,6 +473,16 @@ class Timeline:
                         detail=[f"由 {MODEL_NAME.get(self.mode, '模型')} 撰寫"]))
         self.current.started = cur.ended or self.current.started   # 從上一步結束算：回答常是寫完才整段送來
 
+    def draft_cleared(self) -> None:
+        """研究模式：主持人派工前寫的那段畫面上已經收起來（view）。最近那一格「寫好了」改名，免得看起來像回答寫完了。"""
+        for s in reversed(self.steps):
+            if s.kind == "write":
+                if s.state == "complete" and s.label.startswith("✍️ 寫好了"):
+                    s.label = s.label.replace("✍️ 寫好了", "📝 派工前的草稿", 1)
+                    s.detail = ["畫面上已收起；最後的回答只放研究報告"]
+                    self._bump()
+                return
+
     def wrote(self) -> None:
         """收到一段回答文字：記下時間。寫完一句開場接著去想、去用工具時，撰寫那一步算到最後一個字，
         後面的「想了」才不會變成 0 秒（2026-10-24 線上驗收：VBA 題「寫好了 4.5 秒」接「想了 0.0 秒」）。"""
