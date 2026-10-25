@@ -34,7 +34,6 @@ if str(ROOT) not in sys.path:
 
 st.set_page_config(page_title="Anya（Claude 版）", page_icon="🥜", layout="wide")
 
-from anya_claude import config as CFG  # noqa: E402
 from anya_claude import docs as D  # noqa: E402
 from anya_claude import events as E  # noqa: E402
 from anya_claude import graph as G  # noqa: E402
@@ -417,7 +416,7 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
         past = H.to_messages(hist[:upto], docs_sig=D.signature(docs) if docs else None)
         state = G.initial_state(([shelf] if shelf else []) + past + [G.user_message(text, images)],
                                 route=route.mode, socratic=route.socratic, context_block=block,
-                                allow_escalate=allow_escalate, research=route.research)
+                                allow_escalate=allow_escalate, wide_search=route.wide_search)
         q, halt = G.stream_in_thread(get_graph(), state)
         ctx["turn"].update(q=q, halt=halt, events=[], start_mode=start_mode, serious=serious, dev=dev,
                            pf_results=pf_results, pf_evidence=pf_evidence, pf_at=pf_at, t0=t0)
@@ -466,24 +465,11 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
     # 文件引用：被引用的段落後面加 [n]、最後附引用清單（頁碼由程式從引用位置產生，不靠模型寫）
     text, doc_footer = D.cited_answer(msg, turn.get("docs") or [])
     final = M.display_text(text, final=True, looked_up=view.looked_up or bool(doc_footer))
-    research = route.research or view.research
-    if research:
-        # 研究報告自己列來源：來源行改成清單；網址要真的出現在研究員的搜尋結果裡，對不上的標出來
-        final, dev["unseen_urls"] = M.finish_research_report(final, view.research_urls)
     if not final.strip():
         view.fail("安妮亞這次沒有拿到回答 🙏 請再試一次。")
         ctx["done"] = True
         user_entry.pop("inflight", None)
         _telemetry({"route": route.reason, "error": "empty_answer", "usage": view.usage.as_rows()})
-        return
-    if research and not any(s.kind == "task" for s in view.tl.steps) and len(final.strip()) < CFG.RESEARCH_MIN_CHARS:
-        # 自動重跑後還是沒派研究員、回答很短（偶發亂碼）：當成失敗，不存進歷史——不然會一路帶進之後的對話
-        view.fail("安妮亞這次的研究沒有成功開始（重試後還是沒有派出研究員）🙏 請再問一次。")
-        ctx["done"] = True
-        user_entry.pop("inflight", None)
-        _telemetry({"route": route.reason, "error": "research_not_started", "retried": view.retried,
-                    "retry_first": view.retry_first, "second_text": final.strip()[:CFG.RESEARCH_MIN_CHARS],
-                    "usage": view.usage.as_rows()})
         return
     footer = doc_footer + M.build_web_sources_footer(view.sources + E.answer_citations(msg))
     # 只在「這回合真的查過東西」（網路搜尋、讀網頁、氣象署）時才標示；什麼都沒查的
@@ -491,15 +477,13 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
     banner = EVB.build_banner(view.evidence) if view.evidence else ""
     elapsed = time.time() - t0
     badges = M.badges_markdown(mode=view.mode, web_calls=view.usage.web_searches,
-                               elapsed_s=elapsed, escalated=view.escalated, research=research)
+                               elapsed_s=elapsed, escalated=view.escalated)
     view.close(elapsed)   # 先存進歷史再畫：畫到一半連線斷了，重連後歷史裡就有完整回答
     dev.update({"final_mode": view.mode, "escalated": view.escalated,
                 "escalate_reason": view.escalate_reason, "secs": round(elapsed, 2),
-                "first_text_s": view.first_text_s, "resumed": bool(turn.get("resumed")), "retried": view.retried,
+                "first_text_s": view.first_text_s, "resumed": bool(turn.get("resumed")),
                 "usd": round(view.usage.usd, 5), "calls": view.usage.as_rows(),
                 "evidence": EV.summarize(view.evidence), "trace": view.trace})
-    if view.retried:   # 沒啟動那次寫了什麼、為什麼停（dev 面板與 telemetry 看得到，畫面上已清掉）
-        dev["retry_first"] = view.retry_first
     hist.append({"role": "assistant", "text": final + footer, "mode": view.mode,
                  "badges": badges, "banner": banner, "dev": dev, **view.saved_status()})
     if doc_footer:   # 引用結構一起存：之後追問時連同引用傳回去（history.to_messages）
