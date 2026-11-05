@@ -501,7 +501,7 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
 
 # ───────────────────────── 頁面 ─────────────────────────
 st.markdown("### 🥜 安妮亞（Claude 版・測試中）")
-st.caption("一般問題由 Haiku 5.5 快速回答；需要深入時會自動升級到 Opus 5.5。舊版主頁照常可用。")
+st.caption("一般問題由 Haiku 5.5 快速回答；需要深入時會自動升級到 Opus 5.5。")
 
 if not _ensure_api_key():
     st.error("尚未設定 ANTHROPIC_API_KEY（Streamlit Cloud 的 Secrets），這一頁暫時不能用。")
