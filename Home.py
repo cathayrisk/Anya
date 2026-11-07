@@ -59,6 +59,9 @@ except Exception:
 DEV = str(st.query_params.get("dev", "")).strip() == "1"
 MODE_LABEL = {"fast": "一般模式", "deep": "深思模式", "socratic": "提問引導", "cwa": "氣象署直答"}
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp", "gif"]
+# 發問者頭像（花生，見 anya_claude/avatars.py）。用 getattr：只上傳了頁面、還沒 Reboot 時，
+# 記憶體裡還是舊的 avatars 模組（Streamlit Cloud 不會重載），沒有 USER 就先用預設圖示，不要整頁壞掉
+USER_AVATAR = getattr(A, "USER", None)
 PULSE_SECS = 0.5   # 等模型時多久碰一次畫面（「停止」的反應時間上限）
 # 最新一則回答的「⋯」選單（2026-10-23 使用者要的：重答、換模式重答）
 REDO_SAME, REDO_DEEP, REDO_FAST = "🔁 重新回答", "🧠 改用深思模式重答", "⚡ 改用一般模式重答"
@@ -530,7 +533,7 @@ redo = st.session_state.pop("ac_redo", None)
 for i, m in enumerate(history):
     role = m.get("role", "assistant")
     with st.chat_message(role, avatar=A.for_mode(m.get("mode"), serious=bool(m.get("serious")))
-                         if role == "assistant" else None):
+                         if role == "assistant" else USER_AVATAR):
         _render_message(m)
         if i == len(history) - 1 and role == "assistant" and not m.get("superseded") and not prompt:
             _redo_menu(i, m)
@@ -573,7 +576,7 @@ if prompt:
         except Exception:
             pass
     if text or images:
-        with st.chat_message("user"):
+        with st.chat_message("user", avatar=USER_AVATAR):
             if text:
                 st.markdown(text)
             for im in images:
