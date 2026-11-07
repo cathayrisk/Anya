@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""聊天頭像（anya_claude/avatars.py，2026-11-07）：依模式換安妮亞的表情、災防題一律 🌐、缺圖退回 emoji。"""
+"""聊天頭像（anya_claude/avatars.py，2026-11-07）：依模式換安妮亞的表情、災防題一律 🌐、缺圖退回 emoji；發問者用花生。"""
 import ast
 import shutil
 from pathlib import Path
@@ -12,7 +12,7 @@ PAGE = ROOT / "pages" / "7_Anya_Claude.py"
 
 def test_shipped_avatars_are_small_square_pngs_streamlit_passes_through():
     from PIL import Image
-    for name in A.FILES.values():
+    for name in [*A.FILES.values(), A.USER_FILE]:
         path = A.STATIC / name
         assert path.is_file(), f"static/{name} 不見了（網頁上傳漏傳？）"
         with Image.open(path) as im:
@@ -27,6 +27,15 @@ def test_resolve_uses_the_images():
     for mode, name in A.FILES.items():
         assert table[mode].endswith(name) and Path(table[mode]).is_file()
     assert table["cwa"] == "🌐"
+    assert A.resolve_user() == str(A.STATIC / A.USER_FILE) == A.USER
+
+
+def test_user_avatar_missing_or_broken_falls_back_to_streamlit_default(tmp_path):
+    assert A.resolve_user(tmp_path) is None                         # 花生圖沒傳
+    (tmp_path / A.USER_FILE).write_bytes(b"not a png")              # 上傳到一半壞掉
+    assert A.resolve_user(tmp_path) is None
+    shutil.copy(A.STATIC / A.USER_FILE, tmp_path / A.USER_FILE)
+    assert A.resolve_user(tmp_path) == str(tmp_path / A.USER_FILE)
 
 
 def test_missing_or_broken_image_falls_back_to_emoji(tmp_path):
@@ -63,6 +72,29 @@ def test_every_assistant_bubble_gets_its_avatar_from_for_mode():
     for c in assistant:
         av = next((k.value for k in c.keywords if k.arg == "avatar"), None)
         assert av is not None and "A.for_mode(" in ast.unparse(av), ast.unparse(c)
+
+
+def test_every_user_bubble_gets_the_peanut():
+    """發問者泡泡（剛送出的、重畫歷史的）都用花生；歷史迴圈是 role 變數，助理用 for_mode、發問者用花生。"""
+    calls = [n for n in ast.walk(_page_tree()) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "chat_message"]
+    user = [c for c in calls if c.args and isinstance(c.args[0], ast.Constant) and c.args[0].value == "user"]
+    either = [c for c in calls if c.args and isinstance(c.args[0], ast.Name)]
+    assert user and either
+    for c in user + either:
+        av = next((k.value for k in c.keywords if k.arg == "avatar"), None)
+        assert av is not None and "USER_AVATAR" in ast.unparse(av), ast.unparse(c)
+
+
+def test_page_survives_an_old_avatars_module():
+    """只上傳了頁面、還沒 Reboot 時，記憶體裡是舊的 avatars（沒有 USER）：頁面要用 getattr 取，不能直接 A.USER。"""
+    tree = _page_tree()
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "USER_AVATAR" for t in n.targets)]
+    assert len(assigns) == 1
+    assert ast.unparse(assigns[0].value) == "getattr(A, 'USER', None)"
+    assert not any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "A"
+                   and n.attr == "USER" for n in ast.walk(tree))
 
 
 def test_saved_answers_remember_if_it_was_a_hazard_turn():
