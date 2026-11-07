@@ -34,6 +34,7 @@ if str(ROOT) not in sys.path:
 
 st.set_page_config(page_title="Anya（Claude 版）", page_icon="🥜", layout="wide")
 
+from anya_claude import avatars as A  # noqa: E402
 from anya_claude import docs as D  # noqa: E402
 from anya_claude import events as E  # noqa: E402
 from anya_claude import graph as G  # noqa: E402
@@ -56,7 +57,6 @@ except Exception:
     pass
 
 DEV = str(st.query_params.get("dev", "")).strip() == "1"
-AVATAR = {"fast": "⚡", "deep": "💬", "socratic": "🧭", "cwa": "🌐"}
 MODE_LABEL = {"fast": "一般模式", "deep": "深思模式", "socratic": "提問引導", "cwa": "氣象署直答"}
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp", "gif"]
 PULSE_SECS = 0.5   # 等模型時多久碰一次畫面（「停止」的反應時間上限）
@@ -256,7 +256,8 @@ def _on_turn_stopped(ctx: dict, e: BaseException, user_entry: dict, route: R.Rou
             return
     if view is not None:
         rec = view.stopped_record(stopped=stopped)
-        hist.append({"role": "assistant", **rec, "pending": True, "stopped": True})
+        hist.append({"role": "assistant", **rec, "serious": bool(ctx["turn"].get("serious")),
+                     "pending": True, "stopped": True})
         user_entry["stopped"] = True
         _telemetry({"route": route.reason, "stopped": stopped,
                     "error": None if stopped else f"{type(e).__name__}: {str(e)[:300]}",
@@ -313,7 +314,7 @@ def _docs_line(docs: list | None) -> str:
 
 def _resume_turn(ctx: dict, turn: dict, hist: list[dict]) -> None:
     """重連後接著畫同一題：同樣的狀態列，先重播已收到的事件，再接著讀背景執行緒還沒讀的。"""
-    with st.chat_message("assistant", avatar=AVATAR[turn["start_mode"]]):
+    with st.chat_message("assistant", avatar=A.for_mode(turn["start_mode"], serious=bool(turn.get("serious")))):
         # 重播用事件當時的時間：時間軸的秒數才會和原本那一輪一樣（不然全擠在重播那一刻，顯示「想了 0.0 秒」）
         view = TurnView(mode=turn["start_mode"], user_text=turn["text"], serious=turn["serious"],
                         route_reason=turn["route"].reason, started_at=turn["t0"],
@@ -346,7 +347,8 @@ def _run_turn(ctx: dict, user_entry: dict, text: str, images: list[dict], route:
     start_mode = "socratic" if route.socratic else route.mode
     # 災防題的狀態列用正經版台詞（問的人可能正在擔心，不開玩笑）
     serious = route.reason == "hazard_hint" or (intent is not None and intent.should_prefetch)
-    with st.chat_message("assistant", avatar=AVATAR["cwa"] if pure else AVATAR[start_mode]):
+    ctx["turn"]["serious"] = serious   # 存歷史時要用（頭像：災防題一律 🌐）；查氣象署時就按停止也拿得到
+    with st.chat_message("assistant", avatar=A.for_mode("cwa" if pure else start_mode, serious=serious)):
         view = TurnView(mode=start_mode, user_text=text, serious=serious, route_reason=route.reason,
                         docs_line=_docs_line(ctx["turn"]["docs"]))
         ctx["view"] = view
@@ -484,7 +486,7 @@ def _consume_and_finish(ctx: dict, view: TurnView, turn: dict, hist: list[dict])
                 "first_text_s": view.first_text_s, "resumed": bool(turn.get("resumed")),
                 "usd": round(view.usage.usd, 5), "calls": view.usage.as_rows(),
                 "evidence": EV.summarize(view.evidence), "trace": view.trace})
-    hist.append({"role": "assistant", "text": final + footer, "mode": view.mode,
+    hist.append({"role": "assistant", "text": final + footer, "mode": view.mode, "serious": bool(turn.get("serious")),
                  "badges": badges, "banner": banner, "dev": dev, **view.saved_status()})
     if doc_footer:   # 引用結構一起存：之後追問時連同引用傳回去（history.to_messages）
         hist[-1].update(cite_blocks=D.cite_blocks(msg), docs_sig=D.signature(turn.get("docs")))
@@ -527,7 +529,8 @@ redo = st.session_state.pop("ac_redo", None)
 
 for i, m in enumerate(history):
     role = m.get("role", "assistant")
-    with st.chat_message(role, avatar=AVATAR.get(m.get("mode")) if role == "assistant" else None):
+    with st.chat_message(role, avatar=A.for_mode(m.get("mode"), serious=bool(m.get("serious")))
+                         if role == "assistant" else None):
         _render_message(m)
         if i == len(history) - 1 and role == "assistant" and not m.get("superseded") and not prompt:
             _redo_menu(i, m)
@@ -541,9 +544,10 @@ if inflight is not None:
             inflight["halt"].set()
         entry.pop("inflight", None)
         entry["stopped"] = True
-        rec = {"role": "assistant", "text": "", "mode": inflight["route"].mode, "pending": True, "stopped": True}
+        rec = {"role": "assistant", "text": "", "mode": inflight["route"].mode, "serious": bool(inflight.get("serious")),
+               "pending": True, "stopped": True}
         history.append(rec)
-        with st.chat_message("assistant", avatar=AVATAR.get(rec["mode"])):
+        with st.chat_message("assistant", avatar=A.for_mode(rec["mode"], serious=rec["serious"])):
             _render_message(rec)
     else:
         run_turn(entry, inflight["text"], inflight["images"], inflight["route"], history,
