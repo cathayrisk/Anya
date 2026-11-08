@@ -3,7 +3,7 @@
 """
 pages/預測市場.py 的純邏輯測試（完全離線）。
 
-為什麼要這樣載入：本機到 *.polymarket.com 的 DNS 被導向非官方 IP，無法對實際 API 驗證；
+為什麼要這樣載入：*.polymarket.com 在台灣依法院命令封鎖，本機無法對實際 API 驗證（也不該繞過）；
 而 Streamlit 頁面直接 import 會執行到 UI 段（st.stop() 會炸）。
 因此這裡把原始碼切在 `st.set_page_config` 之前，只 exec 純邏輯的上半段，
 並注入一個把 st.cache_* 裝飾器變成 pass-through 的假 streamlit。
@@ -17,6 +17,7 @@ import types
 
 import pandas as pd
 import pytest
+import requests
 
 PAGE = pathlib.Path(__file__).resolve().parents[1] / "pages" / "預測市場.py"
 UI_MARKER = "st.set_page_config("
@@ -551,3 +552,238 @@ def test_fee_info_uses_schedule_rate_not_taker_base_fee(pm):
 def test_fee_fields_survive_slimming(pm):
     for key in ("feesEnabled", "feeType", "feeSchedule"):
         assert key in pm.MARKET_KEEP, f"{key} 不在 MARKET_KEEP 裡，手續費揭露會整條失效"
+
+
+# -----------------------
+# 2026-11：Protocol V2 市場代號、Data API v2（走勢、未平倉、累計成交、結算）
+# 官方文件來源：docs.polymarket.com 的 Protocol V2 遷移、market-data、api-reference（經 Context7 查閱）
+# -----------------------
+def _fake_http(routes):
+    """routes：{網址結尾: 回應 dict／依 params 產生回應的函式／例外}。回傳 (假函式, 呼叫紀錄)。"""
+    calls = []
+
+    def fake(url, params, timeout=10, retries=3, backoff=0.7):
+        calls.append((url, dict(params)))
+        for suffix, resp in routes.items():
+            if url.endswith(suffix):
+                if isinstance(resp, Exception):
+                    raise resp
+                return resp(params) if callable(resp) else resp
+        raise AssertionError(f"沒有預期的呼叫：{url}")
+
+    return fake, calls
+
+
+def test_outcome_ids_follows_version_not_field_presence(pm):
+    both = {"version": "v2", "positionIds": ["111", "222"], "clobTokenIds": '["999", "888"]'}
+    assert pm.outcome_ids(both) == ["111", "222"]
+    v1 = {"version": "v1", "positionIds": ["111", "222"], "clobTokenIds": '["999", "888"]'}
+    assert pm.outcome_ids(v1) == ["999", "888"]
+    assert pm.outcome_ids({"clobTokenIds": '["999", "888"]'}) == ["999", "888"]   # 沒有 version 的舊資料照 v1
+    assert pm.outcome_ids({"version": "V2", "positionIds": '["5", "6"]'}) == ["5", "6"]  # 大小寫、字串形式都收
+    assert pm.outcome_ids({"version": "v3", "positionIds": ["1"]}) == []          # 官方說不支援的版本
+
+
+def test_outcome_ids_keeps_positions_when_an_id_is_missing(pm):
+    assert pm.outcome_ids({"version": "v2", "positionIds": ["111", ""]}) == ["111", None]
+    assert pm.outcome_ids({"version": "v2", "positionIds": [None, "222"]}) == [None, "222"]
+    assert pm.outcome_ids({"version": "v2"}) == []                                 # 新版代號還沒提供
+
+
+def test_event_outcomes_uses_v2_position_ids(pm):
+    ev = {"markets": [{
+        "version": "v2", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.3", "0.7"]',
+        "positionIds": ["111", "222"], "clobTokenIds": '["999", "888"]',
+        "bestBid": "0.29", "bestAsk": "0.31",
+    }]}
+    odf, _, _ = pm.event_outcomes(ev)
+    assert odf["token_id"].tolist() == ["111", "222"]
+
+
+def test_slim_event_keeps_v2_fields(pm):
+    ev = {"id": "1", "markets": [{"version": "v2", "positionIds": ["1", "2"], "conditionId": "0xc",
+                                  "description": "規則" * 500}]}
+    m = pm.slim_event(ev)["markets"][0]
+    assert m["version"] == "v2" and m["positionIds"] == ["1", "2"] and m["conditionId"] == "0xc"
+    assert "description" not in m
+
+
+def test_history_bucket_seconds_respects_official_limits(pm):
+    assert pm.history_bucket_seconds("max", 10) is None
+    assert pm.history_bucket_seconds("all", 1) is None
+    assert pm.history_bucket_seconds("1d", 10) == 600
+    assert pm.history_bucket_seconds("1h", 1) == 60
+    b1w = pm.history_bucket_seconds("1w", 1)
+    assert b1w >= 300 and b1w % 60 == 0 and 604800 / b1w <= pm.HISTORY_MAX_POINTS
+    b1m = pm.history_bucket_seconds("1m", 1)
+    assert b1m >= 600 and 2592000 / b1m <= pm.HISTORY_MAX_POINTS
+    assert pm.history_bucket_seconds("1d", 10_000) == 86400
+
+
+def test_parse_history_v2_documented_shape(pm):
+    payload = {
+        "data": [{"timestamp": 1788354000, "price": 0.255, "resolution_seconds": 3600},
+                 {"timestamp": 1788357600, "price": "0.26", "resolution_seconds": 3600}],
+        "pagination": {"limit": 2, "has_more": True, "next_cursor": "abc"},
+    }
+    pts, cursor = pm.parse_history_v2(payload)
+    assert pts == [{"t": 1788354000, "p": 0.255}, {"t": 1788357600, "p": 0.26}]
+    assert cursor == "abc"
+    payload["pagination"]["has_more"] = False
+    assert pm.parse_history_v2(payload)[1] is None
+
+
+def test_parse_history_v2_alternate_shape_and_garbage(pm):
+    iso = "2026-11-01T00:00:00Z"
+    payload = {"points": [{"timestamp": iso, "price": "0.5"}, {"timestamp": None, "price": 0.1}, "x"],
+               "next_cursor": "n2"}
+    pts, cursor = pm.parse_history_v2(payload)
+    assert pts == [{"t": int(pd.Timestamp(iso).timestamp()), "p": 0.5}] and cursor == "n2"
+    assert pm.parse_history_v2({"data": [{"timestamp": 1788354000000, "price": 0.4}]})[0] == \
+        [{"t": 1788354000, "p": 0.4}]                                               # 毫秒也認得
+    assert pm.parse_history_v2(None) == ([], None)
+    assert pm.parse_history_v2({"data": "壞掉"}) == ([], None)
+
+
+def test_history_prefers_v2_and_follows_cursor(pm, monkeypatch):
+    pages = {
+        None: {"data": [{"timestamp": 100, "price": 0.1}], "pagination": {"has_more": True, "next_cursor": "c2"}},
+        "c2": {"data": [{"timestamp": 100, "price": 0.1}, {"timestamp": 200, "price": 0.2}],
+               "pagination": {"has_more": False}},
+    }
+    fake, calls = _fake_http({"/v2/prices-history": lambda p: pages[p.get("cursor")]})
+    monkeypatch.setitem(pm._history_raw.__globals__, "_http_get_json", fake)
+    pts, src = pm._history_raw("https://data", "https://clob", "123", "1d", 10)
+    assert src == "v2"
+    assert pts == [{"t": 100, "p": 0.1}, {"t": 200, "p": 0.2}]                      # 分頁交界的重複點去掉
+    assert calls[0][1] == {"token_id": "123", "interval": "1d", "bucket_seconds": 600}
+    assert calls[1][1]["cursor"] == "c2"
+    assert all("clob" not in url for url, _ in calls)                               # 新版有資料就不碰舊版
+
+
+def test_history_falls_back_to_legacy_when_v2_fails(pm, monkeypatch):
+    fake, calls = _fake_http({
+        "/v2/prices-history": requests.exceptions.HTTPError("新版 404"),
+        "/prices-history": {"history": [{"t": 1, "p": 0.4}]},
+    })
+    monkeypatch.setitem(pm._history_raw.__globals__, "_http_get_json", fake)
+    assert pm._history_raw("https://data", "https://clob", "123", "1d", 10) == ([{"t": 1, "p": 0.4}], "legacy")
+    assert calls[-1][1] == {"market": "123", "interval": "1d", "fidelity": 10}
+
+
+def test_history_raises_the_v2_error_when_both_fail(pm, monkeypatch):
+    fake, _ = _fake_http({
+        "/v2/prices-history": requests.exceptions.HTTPError("新版壞了"),
+        "/prices-history": requests.exceptions.HTTPError("舊版也壞了"),
+    })
+    monkeypatch.setitem(pm._history_raw.__globals__, "_http_get_json", fake)
+    with pytest.raises(requests.exceptions.HTTPError, match="新版壞了"):
+        pm._history_raw("https://data", "https://clob", "123", "1d", 10)
+
+
+def test_history_empty_everywhere_is_not_an_error(pm, monkeypatch):
+    fake, _ = _fake_http({
+        "/v2/prices-history": {"data": [], "pagination": {"has_more": False}},
+        "/prices-history": {"history": []},
+    })
+    monkeypatch.setitem(pm._history_raw.__globals__, "_http_get_json", fake)
+    assert pm._history_raw("https://data", "https://clob", "123", "1d", 10) == ([], "empty")
+
+
+def test_prices_history_reports_its_source(pm, monkeypatch):
+    fake, _ = _fake_http({"/v2/prices-history": {"data": [{"timestamp": 5, "price": 0.5}]}})
+    monkeypatch.setitem(pm.prices_history.__globals__, "_http_get_json", fake)
+    out = pm.prices_history("https://data", "https://clob", "1", "1d", 10)
+    assert out == {"points": [{"t": 5, "p": 0.5}], "source": "v2"}
+
+
+def test_scan_histories_counts_sources(pm, monkeypatch):
+    def v2(params):
+        if params["token_id"] == "old":
+            raise requests.exceptions.HTTPError("沒有新版")
+        return {"data": [{"timestamp": 1, "price": 0.5}]}
+
+    fake, _ = _fake_http({"/v2/prices-history": v2, "/prices-history": {"history": [{"t": 1, "p": 0.6}]}})
+    monkeypatch.setitem(pm.scan_histories.__globals__, "_http_get_json", fake)
+    out = pm.scan_histories("https://data", "https://clob", ("new", "old"), "1d", 10)
+    assert out["points"] == {"new": [{"t": 1, "p": 0.5}], "old": [{"t": 1, "p": 0.6}]}
+    assert out["sources"] == {"v2": 1, "legacy": 1}
+
+
+def test_open_interest_dedupes_and_chunks_at_20(pm, monkeypatch):
+    ids = tuple(f"0x{i:02d}" for i in range(25)) + ("0x00", "", " ")
+
+    def oi(params):
+        return {"data": [{"condition_id": c, "value": 1.5} for c in params["condition"].split(",")]}
+
+    fake, calls = _fake_http({"/v2/oi": oi})
+    monkeypatch.setitem(pm.fetch_open_interest.__globals__, "_http_get_json", fake)
+    out = pm.fetch_open_interest("https://data", ids)
+    assert len(out) == 25 and out["0x07"] == 1.5
+    assert [len(p["condition"].split(",")) for _, p in calls] == [20, 5]
+
+
+def test_live_volume_reads_conditions_and_skips_bad_event_ids(pm, monkeypatch):
+    def lv(params):
+        assert params["event_id"] == "123"
+        return {"data": {"conditions": [{"condition_id": "0xa", "taker_volume": 10},
+                                        {"condition_id": "0xb", "taker_volume": "2.5"}],
+                         "taker_volume_total": 12.5}}
+
+    fake, calls = _fake_http({"/v2/live-volume": lv})
+    monkeypatch.setitem(pm.fetch_live_volume.__globals__, "_http_get_json", fake)
+    assert pm.fetch_live_volume("https://data", ("123", "abc", "")) == {"0xa": 10.0, "0xb": 2.5}
+    assert pm.fetch_live_volume("https://data", ("abc",)) == {}        # 全部不合法：不發請求（官方會回 400）
+    assert len(calls) == 1
+
+
+def test_resolutions_keep_first_row_and_known_fields(pm, monkeypatch):
+    rows = {"data": [
+        {"condition_id": "0xa", "status": "active", "expected_settlement_time": "2026-12-10T19:00:00Z",
+         "was_disputed": False, "payouts": [1, 0]},
+        {"condition_id": "0xa", "status": "resolved"},
+    ]}
+    fake, _ = _fake_http({"/v2/resolutions": rows})
+    monkeypatch.setitem(pm.fetch_resolutions.__globals__, "_http_get_json", fake)
+    assert pm.fetch_resolutions("https://data", ("0xa",)) == {
+        "0xa": {"status": "active", "expected_settlement_time": "2026-12-10T19:00:00Z", "was_disputed": False}
+    }
+
+
+def test_event_market_facts_sums_and_picks_earliest_settlement(pm):
+    ev = {"markets": [{"conditionId": "0xa"}, {"conditionId": "0xb"}, {"question": "沒有 conditionId"}]}
+    res = {"0xa": {"status": "active", "expected_settlement_time": "2026-12-10T19:00:00Z"},
+           "0xb": {"status": "proposed", "expected_settlement_time": 1797000000, "was_disputed": True}}
+    f = pm.event_market_facts(ev, {"0xa": 100.0, "0xb": 50.0}, {"0xa": 7.0}, res)
+    assert f["open_interest"] == 150.0 and f["taker_volume"] == 7.0 and f["n_markets"] == 2
+    assert f["statuses"] == ["active", "proposed"] and f["was_disputed"] is True
+    assert f["expected_settlement"] == "2026-12-11 03:00"              # 最早的那個，換成台北時間
+
+
+def test_event_market_facts_missing_data_is_dash_not_zero(pm):
+    ev = {"markets": [{"conditionId": "0xa"}]}
+    f = pm.event_market_facts(ev, None, {}, None)
+    assert f["open_interest"] is None and f["taker_volume"] is None and f["expected_settlement"] is None
+    assert pm.event_market_facts(ev, {"0xother": 5.0}, None, None)["open_interest"] is None
+
+
+def test_try_fetch_isolates_failures(pm):
+    def boom():
+        raise ValueError("壞了")
+
+    value, err = pm.try_fetch(boom)
+    assert value is None and isinstance(err, ValueError)
+    assert pm.try_fetch(lambda a: a + 1, 1) == (2, None)
+
+
+def test_ssl_error_explains_the_court_ordered_block(pm):
+    msg = pm.explain_network_error(requests.exceptions.SSLError("x"))
+    assert "法院" in msg and "封鎖" in msg
+    assert "8.8.8.8" not in msg                                         # 不再教人換 DNS 繞過封鎖
+
+
+def test_ui_uses_v2_history_with_legacy_fallback():
+    src = PAGE.read_text(encoding="utf-8")
+    assert "prices_history(DATA, CLOB," in src
+    assert "DATA, CLOB, tuple(p[0] for p in pairs)" in src
+    assert "clobTokenIds\"))]" not in src                                # 代號一律走 outcome_ids
